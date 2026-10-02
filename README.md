@@ -32,7 +32,7 @@ python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
 curl http://localhost:8000/v1/models
 ```
 Run `source tools/strix_halo/env.sh` again in every new shell before serving.
-Status: these steps were run end to end from a fresh clone on a second Strix Halo machine (build in about 8 minutes, MiMo served from the Hugging Face files). The first request after a build is slow while the kernels warm up.
+Status: build and MiMo serving were verified from a fresh clone on a second Strix Halo machine (build in about 8 minutes). GLM from a fresh download and `env.sh --check` have not been run there yet. The first request after a build is slow while the kernels warm up.
 
 MiMo: `hf download yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz --local-dir ./mimo-pack`, then `python tools/mimo/serve.py --model ./mimo-pack --port 8000 -c 131072`. Speculative decoding (DFlash, 4 bpw drafter, confidence-truncated drafts) is on by default: the server uses the pack's `drafter/` directory (or `$MIMO_DRAFTER`, or `--drafter <dir>`). Without a drafter it logs one line and decodes plain. Set `MIMO_SPEC=0` in the lane script (`tools/lanes/serve_mimo.sh`) or pass `--no-dflash` to `serve.py` for plain decode. Greedy output under speculation is not token-identical to plain decode: near-tied logits can flip under the batched verify. A loaded drafter costs 2 to 4 % prefill. Details: `tools/mimo/SERVE.md`.
 
