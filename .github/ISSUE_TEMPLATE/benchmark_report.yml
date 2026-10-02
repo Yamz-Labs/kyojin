@@ -1,0 +1,34 @@
+name: Benchmark report
+description: Share the numbers from `tools/bench.sh` on your machine
+labels: ["benchmark"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start the server from the README quickstart, then run `tools/bench.sh` and paste its output below. Thank you for sharing.
+  - type: textarea
+    id: result
+    attributes:
+      label: Output of tools/bench.sh
+      description: Paste the whole markdown block.
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Machine
+      description: Product name, RAM size and speed, cooling or power mode if you changed it.
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Server command
+      description: The command that started the server, with flags and environment variables.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything unusual (other load on the machine, changed kernel parameters, first launch or warm cache).

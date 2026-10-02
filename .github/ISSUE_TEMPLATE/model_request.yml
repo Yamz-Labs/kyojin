@@ -1,0 +1,30 @@
+name: Model request
+description: Ask for support for another model
+labels: ["model request"]
+body:
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Link to the model page.
+    validations:
+      required: true
+  - type: input
+    id: size
+    attributes:
+      label: Architecture and size
+      description: Architecture family, parameter count, expected size on disk after quantisation.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this model
+      description: What you want to run and what you tried (for example, whether upstream ExLlamaV3 already supports it).
+    validations:
+      required: true
+  - type: input
+    id: licence
+    attributes:
+      label: Licence
+      description: Licence of the weights.

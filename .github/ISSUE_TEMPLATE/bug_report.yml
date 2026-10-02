@@ -1,0 +1,61 @@
+name: Bug report
+description: Something does not build, load, serve or run correctly
+labels: ["bug"]
+body:
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      description: CPU / APU, GPU, RAM size, BIOS memory split if you changed it.
+      placeholder: "Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB"
+    validations:
+      required: true
+  - type: input
+    id: kernel
+    attributes:
+      label: Linux distribution and kernel
+      description: Output of `uname -r` and the distribution name.
+    validations:
+      required: true
+  - type: input
+    id: rocm
+    attributes:
+      label: ROCm and PyTorch versions
+      description: Output of `bash tools/strix_halo/env.sh --check`, or `rocm-sdk version` and `python -c "import torch; print(torch.__version__)"`.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Kyojin version
+      description: Release tag or commit (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Model pack and size.
+      placeholder: "yamz-labs/GLM-5.3-Flash-EXL3-Yamz"
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran, with all flags and environment variables.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What happened and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The server or build log, from the start through the error. Remove anything private.
+      render: text
+    validations:
+      required: true

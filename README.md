@@ -17,7 +17,7 @@ Weights: [Yamz on Hugging Face](https://huggingface.co/yamz-labs) - `yamz-labs/G
 Requirements: Linux (Ubuntu/Debian tested), a gfx1151 machine with 128 GB, Python 3.12, `gcc`, a ROCm 7 `libhsa-runtime64.so.1` (the PyTorch copy segfaults on gfx1151 and Ubuntu's own `libhsa-runtime64-1` is ROCm 5.7, too old; `tools/strix_halo/env.sh` finds the one inside the SDK wheel below first, then /opt/rocm, or take `EXL3_HSA_LIB=<path>`), ROCm 7.0 or newer (ROCm 6.4 has no gfx1151 code), a ROCm build of PyTorch for gfx1151, and a ROCm SDK devel tree with the `hipsparse/` and `thrust/` headers (the `rocm-sdk-devel` wheel).
 
 ```bash
-git clone https://github.com/Yamz-Labs/kyojin Yamz-Labs/kyojin kyojin && cd kyojinYamz-Labs/kyojin kyojin && cd kyojin cd kyojin
+git clone https://github.com/Yamz-Labs/kyojin && cd kyojin
 python3 -m venv .venv && source .venv/bin/activate
 # 1. ROCm torch + SDK first (AMD gfx1151 wheels; plain `pip install torch` gives a CUDA/CPU build that cannot run here):
 pip install --pre torch rocm-sdk-devel --index-url https://rocm.nightlies.amd.com/v2/gfx1151/
@@ -55,6 +55,10 @@ One machine: Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB LPDDR5X, ROCm. Ot
 llama.cpp (ROCm, UD-IQ1_S 1.56 bpw, `-fa 1 -ub 2048`, no MTP), same machine: pp4096 197.9, pp16384 158.3, tg128 16.74, tg at 64K 7.19 tok/s. Coarser quant: engine and format are compared together.
 
 Quality against the official FP8 weights (129 held-out rows): see the model cards.
+
+## Share your numbers
+Start a server from the quickstart, then run `tools/bench.sh` (standard library only, `--base` and `--model` select the server). It measures prefill on a prompt of about 3.5K tokens and decode on prose, chat and code with the prompts behind the table above, and prints one Markdown block with your hardware and versions.
+Paste it into a [benchmark report](https://github.com/Yamz-Labs/kyojin/issues/new?template=benchmark_report.yml). Results from other gfx1151 machines and other ROCm GPUs are the most useful contribution. See `CONTRIBUTING.md`.
 
 ## Optional refusal hook
 The engine can project one fixed direction out of the residual stream at run time. It edits no weights and no quantised data. Off unless `EXL3_ABLIT_RUNTIME=/path/to/spec.json` is set or the model folder contains `uncensor_spec.json`.
