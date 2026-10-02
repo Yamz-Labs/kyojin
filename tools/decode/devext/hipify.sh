@@ -1,0 +1,4 @@
+#!/bin/bash
+# Regenerate exl3_dec.hip from exl3_dec.cu (same rewrites torch's hipify applies to this file).
+Q=$(cd "$(dirname "$0")/../../.." && pwd)/exllamav3/exllamav3_ext/quant
+sed 's|#include <cuda_runtime.h>|#include <hip/hip_runtime.h>|; s|#include <cuda_fp16.h>|#include <hip/hip_fp16.h>|; s|#include <c10/cuda/CUDAGuard.h>|#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>|; s|#include <ATen/cuda/CUDAContext.h>|#include <ATen/hip/HIPContext.h>|; s|#include "../util.cuh"|#include "../util_hip.cuh"|; s|at::cuda::OptionalCUDAGuard|at::hip::OptionalHIPGuardMasqueradingAsCUDA|; s|cudaStream_t stream = at::cuda::getCurrentCUDAStream()|hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA()|; s|cudaPeekAtLastError|hipPeekAtLastError|; s|std::max(|::max(|' $Q/exl3_dec.cu > $Q/exl3_dec.hip

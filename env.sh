@@ -1,0 +1,1 @@
+tools/strix_halo/env.sh

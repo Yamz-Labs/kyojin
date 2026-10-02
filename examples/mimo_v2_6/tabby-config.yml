@@ -1,0 +1,84 @@
+# TabbyAPI config for the MiMo-V2.6-Flash-RL EXL3 quant with DFlash speculative decoding.
+#
+#   python main.py --config /path/to/this/file
+#
+# Copy it, replace the two /path/to placeholders, and you are done. The equivalent
+# generated-from-env version is examples/mimo_v2_6/serve.sh; see doc/mimo_v2_6.md for
+# the build, the knobs and the memory budget.
+#
+# Requires: TabbyAPI from github.com/benthecarman/tabbyAPI branch mimo-v2.6-flash
+#           (one patch: honour EXL3_LOAD_DEVICE), driven against an editable install
+#           of this exllamav3 branch.
+
+network:
+  host: 127.0.0.1           # loopback. Bind wider only with disable_auth: false.
+  port: 8080
+  disable_auth: true        # false -> keys come from <tabbyAPI>/api_tokens.yml
+  allowed_origins: []
+  api_servers: ["OAI"]
+
+logging:
+  log_prompt: false
+  log_generation_params: false
+  log_requests: false
+  log_live_status: false    # true prints "draft 16/28 accepted (57%)" per step
+
+model:
+  # model_dir is a DIRECTORY OF MODELS; model_name is the subdirectory.
+  model_dir: /path/to/models          # e.g. /data/hf/exl3
+  model_name: mimo-2.25bpw-hq         # -> /data/hf/exl3/mimo-2.25bpw-hq
+
+  max_seq_len: 262144       # 256k costs 6.75 GiB of KV at one slot; the DFlash drafter
+                            # adds a flat 2.85 GiB, not a per-token term. 393216 is the
+                            # largest clean setting measured on a 128 GB unified box.
+  cache_size: 262144        # paged-cache tokens, multiple of 256
+  cache_mode: FP16          # 8,8 / 6,6 / Q8 / Q6 halve the 27 KiB/token paged term.
+                            # Global-attention layers ONLY -- the 39 sliding-window
+                            # layers live on a fixed fp16 ring. q8 verified working
+                            # and coherent on this quant; FP16 is the default.
+  chunk_size: 2048
+  max_batch_size: 1         # each extra slot: +175.5 MiB SWA ring + paged span
+                            # + a 35.0 MiB draft ring. DFlash at batch > 1 is untested.
+
+  gpu_split_auto: true      # ignored when EXL3_LOAD_DEVICE is set (see below)
+  gpu_split: []             # e.g. [110] to hard-set the GB allowance
+  warmup: false
+  vision: false             # the port is text-only
+
+  # The MiMo chat template emits <think>...</think> and accepts
+  # chat_template_kwargs: {enable_thinking: false} per request. TabbyAPI splits the
+  # block into the OAI `reasoning_content` field, in blocking and streaming responses.
+  reasoning: true
+  reasoning_start_token: "<think>"
+  reasoning_end_token: "</think>"
+  start_in_reasoning: auto
+
+  # prompt_template deliberately unset: TabbyAPI reads
+  # <model_dir>/<model_name>/chat_template.jinja (shipped by convert.py) and
+  # auto-detects the tool-call format as qwen3_coder -- verified end to end against
+  # the real model (finish_reason: tool_calls, parsed 1 tool call (qwen3_coder)).
+
+draft_model:
+  # Staged with: python util/prepare_dflash_draft.py
+  # BF16, 2.81 GiB resident, loads in 1.3 s; draft KV is 20.0 KiB/token.
+  draft_mode: model                   # or `ngram` (+ ngram_match_min), or `disabled`
+  draft_model_dir: /path/to/models
+  draft_model_name: mimo-dflash-draft
+  draft_cache_mode: FP16
+  dynamic_draft: true       # measured: coding 1.38x, reasoning 1.78x, prose 0.87x.
+                            # false gives the static 7-token window: coding 1.58x,
+                            # reasoning 1.70x, prose 0.67x (a real slowdown).
+  # draft_num_tokens: 7     # the drafter's own default
+
+developer:
+  unsafe_launch: false
+
+# Environment variables read by exllamav3 itself, not by this file:
+#
+#   EXL3_LOAD_DEVICE=cuda:0        single-device load. REQUIRED on unified memory
+#                                  (GB10); autosplit's headroom check reads MemFree.
+#   EXL3_MIMO_FP32_MLP_LAYERS=none fp32 MoE intermediates on the listed layers. Off by
+#                                  default; layer 47's overflow is fixed by interm_div.
+#   EXL3_MIMO_MLP_ACT_LIMIT=0      clamp act_fn(g) and u on those layers (0 = off)
+#   EXL3_MIMO_FP32_MLP_FUSED=0     1 keeps the fp16 fused prefill tier -- A/B only.
+#   EXL3_KEEP_PAGE_CACHE=0         1 keeps the shards' page cache after load.

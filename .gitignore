@@ -1,0 +1,31 @@
+*.egg-info/
+build/
+uv.lock
+
+*.pyc
+__pycache__/
+.idea
+venv
+dist
+
+# produced by `pip install -e .`
+exllamav3_ext.cpython-*.so
+
+# hipify-generated files
+exllamav3/exllamav3_ext/**/*_hip.*
+exllamav3/exllamav3_ext/**/*.hip
+exllamav3/exllamav3_ext/**/hip_*.*
+!exllamav3/exllamav3_ext/hip/hip_mma.cuh
+.sdk-deps/
+.rebuild.*/
+build/
+*.so
+logs/
+profiles/
+logs-r17/
+.build.lock
+.rebuild.*
+sse.out
+scratch/pfskip1/*.logits.pt
+scratch/pfskip1/pfb1_results.json
+.venv*

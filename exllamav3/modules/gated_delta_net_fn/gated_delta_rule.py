@@ -1,0 +1,241 @@
+import torch
+from ...ext import exllamav3_ext as ext
+from ...util.tensor import get_for_device, buffered_arange
+
+# The vendored fla chunk kernels (exllamav3.vendor.fla) query the devices and Triton at import, so
+# they are imported on first use rather than with the library
+
+def torch_recurrent_gated_delta_rule(
+    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
+):
+    """
+    For reference, not used
+    """
+
+    def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
+        inv_norm = 1 / torch.sqrt(
+            (x * x).sum(dim = dim, keepdim = True)
+            + eps
+        )
+        return x * inv_norm
+
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+
+    batch_size, sequence_length, num_heads, k_head_dim = key.shape
+
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query
+
+    core_attn_out = torch.zeros(batch_size, sequence_length, num_heads, v_head_dim).to(value)
+
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+
+    query = query.float()
+    key = key.float()
+    value = value.float()
+    beta = beta.float()
+    g = g.float()
+
+    for i in range(sequence_length):
+        q_t = query[:, i, :]
+        k_t = key[:, i, :]
+        v_t = value[:, i, :]
+        g_t = g[:, i, :].exp().unsqueeze(-1)
+        beta_t = beta[:, i, :].unsqueeze(-1)
+        kv_mem = last_recurrent_state * k_t.unsqueeze(-1)
+        kv_mem = kv_mem.sum(dim = -2)
+        v_t = v_t - kv_mem * g_t
+        upd = k_t.unsqueeze(-1) * v_t.unsqueeze(-2) * beta_t.unsqueeze(-1)
+        last_recurrent_state = last_recurrent_state * g_t.unsqueeze(-1) + upd
+        core_attn_out[:, i, :] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2) * scale
+
+    if not output_final_state:
+        last_recurrent_state = None
+    return core_attn_out, last_recurrent_state
+
+
+def torch_recurrent_kda(q, k, v, g, beta, state):
+    """Sequential per-channel-decay (KDA) delta rule, fp32, mirroring the GLM5.3/Kimi
+    reference. q/k/v: (b, s, h, d); g: (b, s, h, d) log-decay per k-channel; beta: (b, s, h);
+    state: (b, h, dk, dv), updated in place. Returns (b, s, h, dv) bf16."""
+    b, s, h, dk = k.shape
+    dv = v.shape[-1]
+    q, k, v, g, beta = [t.float() for t in (q, k, v, g, beta)]
+
+    def l2norm(x):
+        return x * torch.rsqrt((x * x).sum(dim = -1, keepdim = True) + 1e-6)
+    q = l2norm(q) * (dk ** -0.5)
+    k = l2norm(k)
+
+    out = torch.empty((b, s, h, dv), dtype = torch.float, device = v.device)
+    for i in range(s):
+        g_i = g[:, i].exp().unsqueeze(-1)                       # (b, h, dk, 1)
+        state *= g_i
+        kv_mem = (state * k[:, i].unsqueeze(-1)).sum(dim = -2)  # (b, h, dv)
+        delta = (v[:, i] - kv_mem) * beta[:, i].unsqueeze(-1)
+        state += k[:, i].unsqueeze(-1) * delta.unsqueeze(-2)
+        out[:, i] = (state * q[:, i].unsqueeze(-1)).sum(dim = -2)
+    return out.to(torch.bfloat16)
+
+
+def gated_delta_rule_fn(
+    mixed_qkv: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    recurrent_slots: torch.Tensor,
+    history: bool,
+    save_state: bool,
+    num_k_heads: int,
+    num_v_heads: int,
+    k_dim: int,
+    v_dim: int,
+    k_head_dim: int,
+    v_head_dim: int,
+    params: dict = None,
+    channelwise_g: bool = False,
+    g_cumsum: bool = False,
+):
+    # g_cumsum: g already holds fla's chunk-local cumsum (EXL3_KDA_G_FUSED); only valid on the chunk path
+    if params is None:
+        params = {}
+
+    # EXL3_PF_GLUE: the conv wrote q | k | v as contiguous planes (3, bsz, seq, dim); no split copies
+    planar = mixed_qkv.dim() == 4
+    if planar:
+        bsz, seqlen = mixed_qkv.shape[1], mixed_qkv.shape[2]
+    else:
+        bsz, seqlen, _ = mixed_qkv.shape
+
+    # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
+    # channelwise CUDA recurrent kernel (in-kernel q/k l2norm, history-capable) otherwise
+    if channelwise_g:
+        if seqlen >= num_v_heads and not history:
+            from ...vendor.fla import chunk_kda
+            if planar:
+                q, k, v = mixed_qkv.unbind(0)
+            else:
+                q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+            q = q.view(bsz, seqlen, -1, k_head_dim)
+            k = k.view(bsz, seqlen, -1, k_head_dim)
+            v = v.view(bsz, seqlen, -1, v_head_dim)
+
+            recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
+            if recurrent_slots_cpu is None:
+                recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
+            core_attn_out = []
+            for i, s in enumerate(recurrent_slots_cpu.tolist()):
+                state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
+                core_attn, new_state = chunk_kda(
+                    q[i:i + 1], k[i:i + 1], v[i:i + 1],
+                    g = g[i:i + 1],
+                    beta = beta[i:i + 1],
+                    initial_state = state,
+                    output_final_state = save_state,
+                    use_qk_l2norm_in_kernel = True,
+                    g_cumsum = g_cumsum,
+                    ckpt = params.get("kda_ckpt") if bsz == 1 else None,
+                )
+                if save_state and state is not None:
+                    state.copy_(new_state)
+                core_attn_out.append(core_attn)
+            if planar and len(core_attn_out) == 1:
+                return core_attn_out[0].to(torch.bfloat16)  # bsz 1: skip the one-tensor cat copy
+            return torch.cat(core_attn_out, dim = 0).to(torch.bfloat16)
+
+        assert not g_cumsum, "g_cumsum is only valid on the KDA chunk path"
+        assert not planar, "planar qkv is only produced for the KDA chunk path"
+        core_attn_out = torch.empty(
+            (bsz, seqlen, num_v_heads, v_head_dim),
+            dtype = torch.bfloat16,
+            device = mixed_qkv.device,
+        )
+        if recurrent_state is None:
+            recurrent_state = torch.zeros(
+                (bsz, 1, num_v_heads, k_head_dim, v_head_dim),
+                dtype = torch.float,
+                device = mixed_qkv.device
+            )
+        ext.cuda_recurrent_gated_delta_rule(
+            mixed_qkv.contiguous(),
+            g.contiguous(),
+            beta.contiguous(),
+            recurrent_state,
+            core_attn_out,
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            recurrent_slots,
+            history,
+        )
+        return core_attn_out
+
+    assert not g_cumsum, "g_cumsum is only valid on the KDA chunk path"
+    # Chunked rule
+    if seqlen >= num_v_heads and not history:
+        from ...vendor.fla import chunk_gated_delta_rule
+
+        q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+        q = q.view(bsz, seqlen, -1, k_head_dim)
+        k = k.view(bsz, seqlen, -1, k_head_dim)
+        v = v.view(bsz, seqlen, -1, v_head_dim)
+
+        # (Grouped attn supported in fla-core now)
+        recurrent_slots_cpu = get_for_device(params, "recurrent_slots", "cpu", None)
+        if recurrent_slots_cpu is None:
+            recurrent_slots_cpu = buffered_arange(bsz, mixed_qkv.device)
+        core_attn_out = []
+        for i, s in enumerate(recurrent_slots_cpu.tolist()):
+            state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
+            core_attn, new_state = chunk_gated_delta_rule(
+                q[i:i + 1], k[i:i + 1], v[i:i + 1],
+                g = g[i:i + 1],
+                beta = beta[i:i + 1],
+                initial_state = state,
+                output_final_state = save_state,
+                use_qk_l2norm_in_kernel = True,
+            )
+            if save_state and state is not None:
+                state.copy_(new_state)
+            core_attn_out.append(core_attn)
+
+        core_attn_out = torch.cat(core_attn_out, dim = 0)
+
+    # Fused recurrent rule
+    else:
+        core_attn_out = torch.empty(
+            (bsz, seqlen, num_v_heads, v_head_dim),
+            dtype = torch.bfloat16,
+            device = mixed_qkv.device,
+        )
+
+        if recurrent_state is None:
+            recurrent_state = torch.zeros(
+                (bsz, 1, num_v_heads, k_head_dim, v_head_dim),
+                dtype = torch.float,
+                device = mixed_qkv.device
+            )
+
+        ext.cuda_recurrent_gated_delta_rule(
+            mixed_qkv,
+            g,
+            beta,
+            recurrent_state,
+            core_attn_out,
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            recurrent_slots,
+            history,
+        )
+
+    return core_attn_out

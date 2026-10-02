@@ -1,0 +1,20 @@
+// stall1: KFD eviction / SVM / userptr / GPU-fault activity, one line per event (epoch ns), plus 1 s counters.
+// sudo bpftrace tools/glm/stall_kfd.bt > scratch/stall1/kfd_<tag>.log
+kprobe:amdgpu_hmm_invalidate_hsa { @inv_hsa++; }
+kprobe:svm_range_cpu_invalidate_pagetables { @inv_svm++; }
+kprobe:amdgpu_amdkfd_evict_userptr { @ev_userptr++; }
+kprobe:kgd2kfd_quiesce_mm { printf("quiesce %s\n", comm); @quiesce++; }
+kprobe:kfd_process_evict_queues { @evq[tid] = nsecs; }
+kretprobe:kfd_process_evict_queues /@evq[tid]/ { printf("evict_q %d us\n", (nsecs - @evq[tid]) / 1000); delete(@evq[tid]); }
+kprobe:kfd_process_restore_queues { @rsq[tid] = nsecs; }
+kretprobe:kfd_process_restore_queues /@rsq[tid]/ { printf("restore_q %d us\n", (nsecs - @rsq[tid]) / 1000); delete(@rsq[tid]); }
+kprobe:svm_range_restore_work { @srw[tid] = nsecs; }
+kretprobe:svm_range_restore_work /@srw[tid]/ { printf("svm_restore %d us\n", (nsecs - @srw[tid]) / 1000); delete(@srw[tid]); }
+kprobe:amdgpu_amdkfd_restore_userptr_worker { @urw[tid] = nsecs; }
+kretprobe:amdgpu_amdkfd_restore_userptr_worker /@urw[tid]/ { printf("userptr_restore %d us\n", (nsecs - @urw[tid]) / 1000); delete(@urw[tid]); }
+kprobe:svm_range_restore_pages { @gpufault++; }
+interval:s:1 {
+  printf("tick inv_hsa %lld inv_svm %lld ev_userptr %lld quiesce %lld gpufault %lld\n",
+         @inv_hsa, @inv_svm, @ev_userptr, @quiesce, @gpufault);
+  @inv_hsa = 0; @inv_svm = 0; @ev_userptr = 0; @quiesce = 0; @gpufault = 0;
+}
