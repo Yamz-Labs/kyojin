@@ -355,10 +355,13 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
     b_buf = torch.empty(max(k * n for n, k, _, _, _ in todo), device="cuda", dtype=torch.half)
     c_buf = torch.empty(max(cbytes(n, ldn, f32, mc) for n, _, ldn, f32, mc in todo), device="cuda", dtype=torch.uint8)
     print(mem_line("prime-bufs"), flush=True)
-    last = None
+    last, shown = None, t0
     for n, k, ldn, f32, mc in todo:
         if time.perf_counter() - t0 > budget_s:
             break
+        if time.perf_counter() - shown > 30.0:   # the port opens only after this pass: show it is alive
+            shown = time.perf_counter()
+            print(f"serve: dense GEMM prime: {done} of {len(todo)} keys, {shown - t0:.0f} s", flush=True)
         dt = torch.float32 if f32 else torch.half
         w = n if ldn else n + 64
         if last != (n, k):   # finite data: the tuner keeps only winners whose output equals the default's
@@ -457,6 +460,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens}
 
+        def finish_for(message: dict[str, Any], raw: str) -> str:
+            # A reply cut by max_tokens is "length", not "stop" (clients use it to tell a truncated answer).
+            finish = message.pop("finish_reason", "stop")
+            if finish == "stop" and engine.count_tokens(raw) >= body.get("max_tokens", 4096):
+                finish = "length"
+            return finish
+
         def timings(raw: str) -> dict[str, Any]:
             # llama.cpp names: the swap orchestrator reads cache_n as the verdict of a KV restore
             st = getattr(engine, "last_stats", None) or {}
@@ -503,7 +513,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             if "tool_calls" in message:
                 await response.write(sse(event({"tool_calls": [
                     dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
-            await response.write(sse(event({}, message.get("finish_reason", "stop")) |
+            await response.write(sse(event({}, finish_for(message, text[len(prefix):])) |
                                      {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
             await response.write(b"data: [DONE]\n\n")
             await response.write_eof()
@@ -512,7 +522,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         raw = "".join([d async for d in deltas()])
         text, _ = stop_text(prefix + raw, body["_stop"])
         message = parse_completion(text)
-        finish = message.pop("finish_reason", "stop")
+        finish = finish_for(message, text[len(prefix):])
         return web.json_response({
             "id": request_id, "object": "chat.completion", "created": created, "model": model_id,
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],

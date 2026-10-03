@@ -89,6 +89,10 @@ class ServeTests(unittest.TestCase):
             self.assertEqual(body["choices"][0]["message"]["content"], "hello")
             self.assertEqual(body["choices"][0]["message"]["reasoning_content"], "why")
             self.assertIn("usage", body)
+            self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+            cut = await (await client.post("/v1/chat/completions", json={
+                "model": "test-model", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]})).json()
+            self.assertEqual(cut["choices"][0]["finish_reason"], "length")
             await client.close()
 
         run(check())
