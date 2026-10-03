@@ -107,7 +107,9 @@ class PLELayerState:
             self.id_state[slot, :self.ctx].copy_(temp)
 
     def stash(self, slot, position: int = 0):
-        return (self.conv_state[slot, :, :self.win].cpu(), self.id_state[slot, :self.ctx].cpu())
+        # id_state lives on the CPU: .cpu() would return a view of the live slot, so a stashed checkpoint
+        # changes whenever the slot advances; clone it
+        return (self.conv_state[slot, :, :self.win].cpu(), self.id_state[slot, :self.ctx].cpu().clone())
 
     def unstash(self, slot, stashed, position: int = 0):
         self.conv_state[slot, :, :self.win].copy_(stashed[0])
