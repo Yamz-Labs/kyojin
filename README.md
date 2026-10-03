@@ -2,7 +2,11 @@
 
 # Kyojin
 
-Kyojin is the Yamz inference engine for AMD Strix Halo, built on [ExLlamaV3](https://github.com/turboderp-org/exllamav3) by turboderp. It adds a ROCm decode and prefill path for the AMD Ryzen AI Max+ 395 (Radeon 8060S, gfx1151, unified memory) and serving for two large MoE models with multi-token prediction:
+Kyojin is the Yamz inference engine for AMD Strix Halo, built on [ExLlamaV3](https://github.com/turboderp-org/exllamav3) by turboderp. It adds a ROCm decode and prefill path for the AMD Ryzen AI Max+ 395 (Radeon 8060S, gfx1151, unified memory) and serving for two large MoE models with multi-token prediction.
+
+The AMD work starts from [vcruz305/exllamav3-amd](https://github.com/vcruz305/exllamav3-amd) (first gfx1151 port) and [sdougbrown/exllamav3](https://github.com/sdougbrown/exllamav3) (ROCm decode path for gfx12). Full credits are [below](#credits-and-licence).
+
+The two models:
 
 - GLM-5.3-Flash (`glm_moe_dsa`: MLA attention, sparse indexer, MTP)
 - MiMo-V2.6-Flash (`mimo_v2`, DFlash drafter)
@@ -81,3 +85,5 @@ The CUDA build is the upstream one and is unchanged. Install a CUDA 12.4 or newe
 
 ## Credits and licence
 ExLlamaV3 by turboderp (MIT, `LICENSE` unchanged). ROCm decode path for gfx12 from sdougbrown/exllamav3; first gfx1151 port from vcruz305/exllamav3-amd. `exllamav3/vendor/fla` is flash-linear-attention (MIT). GLM-5.3-Flash is by Z.ai, MiMo-V2.6-Flash by Xiaomi; check each base licence before redistributing weights. Additions: MIT. This project is not affiliated with Z.ai, Xiaomi or turboderp.
+
+News and benchmarks: [@YamzLabs on X](https://x.com/YamzLabs).
