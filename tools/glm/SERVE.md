@@ -62,6 +62,13 @@ python tools/glm/mtp_eh_sidecar.py <official GLM-5.3 checkpoint dir> <model fold
 ### `GET /v1/models`
 One entry: `{"id": "<model-id>", "object": "model", "created": 0, "owned_by": "local"}`.
 
+### `GET /metrics`
+Prometheus text (llama.cpp `llamacpp:*` names) for scraping. Counters accumulate when a
+request completes; `requests_processing`, `requests_deferred` and `kv_cache_usage_ratio`
+are read live. `spec_decode_num_drafts_total` is derived from the accepted+rejected draft
+token counts divided by `--num-draft` (exact except for a final MTP window truncated by
+`max_tokens`).
+
 ### `POST /v1/chat/completions`
 
 Honored:

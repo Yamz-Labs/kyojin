@@ -19,6 +19,9 @@ import aiohttp
 from aiohttp import web
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # tools/ for the shared serve_metrics
+from serve_metrics import Metrics
+
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
 EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
 # Name inside the model folder. Not *.safetensors, so the weight loader never indexes it as model weights
@@ -450,18 +453,37 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
     return done, time.perf_counter() - t0
 
 
-def create_app(engine: Any, model_id: str, template: str) -> web.Application:
-    """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
+def create_app(engine: Any, model_id: str, template: str, num_draft: int = 0) -> web.Application:
+    """Build the HTTP layer around a resident engine (also accepts a fake engine in tests).
+
+    num_draft: MTP draft tokens per verification round (args.num_draft); used only to derive
+    llamacpp:spec_decode_num_drafts_total from the accepted+rejected draft token counts.
+    """
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
+    processing = 0  # admitted requests; closure, app config is immutable after startup
     app = web.Application(client_max_size=16 * 1024**2)
-    app.update(engine=engine, model_id=model_id, template=template, queue=queue)
+    app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
+
+    def observe(st: dict[str, Any], prompt_tokens: int) -> None:
+        # The MTP window is a fixed num_draft tokens, so rounds = proposed / num_draft
+        # (exact except for a final window truncated by max_new_tokens).
+        accepted = int(st.get("accepted_draft_tokens", 0))
+        rejected = int(st.get("rejected_draft_tokens", 0))
+        proposed = accepted + rejected
+        app["metrics"].observe(
+            prompt_tokens=prompt_tokens, cached=int(st.get("cached_tokens", 0)),
+            predicted=int(st.get("new_tokens", 0)),
+            prefill_s=float(st.get("time_prefill") or 0.0), generate_s=float(st.get("time_generate") or 0.0),
+            drafts=proposed // max(num_draft, 1) if proposed else 0,
+            draft_tokens=proposed, accepted=accepted)
 
     async def models(_: web.Request) -> web.Response:
         return web.json_response({"object": "list", "data": [
             {"id": model_id, "object": "model", "created": 0, "owned_by": "local"}]})
 
     async def worker() -> None:
+        nonlocal processing
         while True:
             body, out = await queue.get()
             cancel = body.get("_cancel")
@@ -470,6 +492,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 queue.task_done()
                 continue
             store = getattr(engine, "slot_store", None)
+            processing += 1  # admitted: counted from the dequeue, incl. lock and slot restore
             try:
                 async with lock:
                     if store is not None:
@@ -484,6 +507,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             except Exception as exc:
                 out.put_nowait(exc)
             finally:
+                processing -= 1
                 if store is not None:
                     store.busy = False
                 queue.task_done()
@@ -617,6 +641,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
                 await response.write(sse(event({}, finish_for(message, text[len(prefix):])) |
                                          {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
+                observe(getattr(engine, "last_stats", None) or {}, prompt_tokens)
                 await response.write(b"data: [DONE]\n\n")
                 await response.write_eof()
             except ConnectionResetError:
@@ -636,7 +661,6 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     await response.write_eof()
                 except ConnectionError:
                     pass
-            return response
 
         try:
             raw = "".join([d async for d in deltas()])
@@ -651,6 +675,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         text, _ = stop_text(prefix + raw, body["_stop"])
         message = parse_completion(text)
         finish = finish_for(message, text[len(prefix):])
+        observe(getattr(engine, "last_stats", None) or {}, prompt_tokens)
         return web.json_response({
             "id": request_id, "object": "chat.completion", "created": created, "model": model_id,
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],
@@ -720,6 +745,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             raise
         text, stopped = stop_text(text, job["_stop"])
         st = getattr(engine, "last_stats", None) or {}
+        observe(st, int(st.get("prompt_tokens", 0)))
         return web.json_response({
             "id": f"cmpl-{uuid.uuid4().hex}", "object": "completion", "created": int(time.time()),
             "model": model_id, "content": text,
@@ -753,10 +779,25 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             return web.json_response({"error": {"code": 400, "message": f"{type(exc).__name__}: {exc}", "type": "invalid_request_error"}},
                                      status=400)
 
+    async def metrics_view(_: web.Request) -> web.Response:
+        # used_tokens = pages referenced by active jobs: in-flight tokens, retained cache excluded.
+        # get_cache_stats is memoized on the page tables; the except covers fake engines and a
+        # page-table mutation in the worker thread mid-walk.
+        gen = getattr(engine, "generator", None) or getattr(engine, "greedy_generator", None)
+        try:
+            cs = gen.get_cache_stats()
+            kv = cs["used_tokens"] / cs["max_tokens"] if cs.get("max_tokens") else 0.0
+        except Exception:                                        # noqa: BLE001
+            kv = 0.0
+        return web.Response(body=app["metrics"].render(
+            processing=processing, deferred=queue.qsize(), kv_ratio=kv),
+            headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})
+
     if getattr(engine, "slot_store", None) is not None:
         app.router.add_get("/slots", slots)
         app.router.add_post("/slots/{id}", slot_action)
     app.router.add_get("/v1/models", models)
+    app.router.add_get("/metrics", metrics_view)
     app.router.add_post("/v1/chat/completions", completions)
     app.router.add_post("/apply-template", apply_template)
     app.router.add_post("/completion", completion)
@@ -818,7 +859,8 @@ def main() -> None:
         from rss_probe import install
         install(engine)
         print(f"serve: rss probe -> {os.environ['EXL3_SERVE_RSS_LOG']}", flush=True)
-    web.run_app(create_app(engine, args.model_id, template), host=args.host, port=args.port)
+    web.run_app(create_app(engine, args.model_id, template, num_draft=args.num_draft),
+                host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

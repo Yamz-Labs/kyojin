@@ -22,12 +22,20 @@ class FakeEngine:
 
     async def generate(self, prompt: str, **kwargs):
         self.prompts.append(prompt)
+        self.last_stats = {"cached_tokens": 8, "new_tokens": 4, "prompt_tokens": 20,
+                           "time_prefill": 0.5, "time_generate": 1.0,
+                           "accepted_draft_tokens": 6, "rejected_draft_tokens": 6}
         for i in range(0, len(self.output), 3):  # small chunks cut tags in half
             yield self.output[i:i + 3]
 
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def metrics_samples(text: str) -> dict:
+    return {line.split()[0]: float(line.split()[1]) for line in text.splitlines()
+            if line and not line.startswith("#")}
 
 
 class ServeTests(unittest.TestCase):
@@ -313,6 +321,41 @@ class ServeTests(unittest.TestCase):
             await client.close()
 
         run(check())
+
+    def test_metrics_endpoint(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        engine = FakeEngine('hello there')
+        app = serve.create_app(engine, "m", self.template, num_draft=2)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            await client.post("/v1/chat/completions", json={
+                "model": "m", "messages": [{"role": "user", "content": "one two three four"}]})
+            resp = await client.get("/metrics")
+            text = await resp.text()
+            await client.close()
+            return resp, text
+
+        resp, text = run(check())
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(resp.headers["Content-Type"].startswith("text/plain"))
+        import serve_metrics
+        for name, mtype, _ in serve_metrics.METRICS:
+            self.assertIn(f"# HELP {name} ", text)
+            self.assertIn(f"# TYPE {name} {mtype}", text)
+        v = metrics_samples(text)
+        st = engine.last_stats
+        prompt_tokens = engine.count_tokens(engine.prompts[-1])
+        serve_metrics.assert_reported(
+            v, self, prompt_tokens=prompt_tokens, cached=st["cached_tokens"],
+            predicted=st["new_tokens"], prefill_s=st["time_prefill"], generate_s=st["time_generate"],
+            drafts=(st["accepted_draft_tokens"] + st["rejected_draft_tokens"]) // 2,
+            draft_tokens=st["accepted_draft_tokens"] + st["rejected_draft_tokens"],
+            accepted=st["accepted_draft_tokens"])
+        self.assertEqual(v["llamacpp:requests_processing"], 0)
+        self.assertEqual(v["llamacpp:requests_deferred"], 0)
+        self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0)  # fake engine: no get_cache_stats
 
 
 if __name__ == "__main__":
