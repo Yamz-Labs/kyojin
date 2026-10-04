@@ -18,7 +18,6 @@ import asyncio
 import json
 import os
 import re
-import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -29,7 +28,7 @@ import aiohttp
 from aiohttp import web
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # tools/ for the shared serve_metrics
+# serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
 
 DEFAULT_MODEL = os.path.expanduser("~/models/mimo26-exl3")

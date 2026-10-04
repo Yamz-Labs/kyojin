@@ -19,7 +19,7 @@ import aiohttp
 from aiohttp import web
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # tools/ for the shared serve_metrics
+# serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
 
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
