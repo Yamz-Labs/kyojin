@@ -12,10 +12,15 @@ sys.path.insert(0, str(Path(__file__).parent))
 import serve
 
 
+class FakeGenerator:
+    num_draft_tokens = 2  # /metrics derives the round count from the engine's window
+
+
 class FakeEngine:
     def __init__(self, output: str):
         self.output = output
         self.prompts = []
+        self.greedy_generator = FakeGenerator()
 
     def count_tokens(self, text: str) -> int:
         return len(text.split())
@@ -325,7 +330,7 @@ class ServeTests(unittest.TestCase):
     def test_metrics_endpoint(self):
         from aiohttp.test_utils import TestClient, TestServer
         engine = FakeEngine('hello there')
-        app = serve.create_app(engine, "m", self.template, num_draft=2)
+        app = serve.create_app(engine, "m", self.template)
 
         async def check():
             client = TestClient(TestServer(app))

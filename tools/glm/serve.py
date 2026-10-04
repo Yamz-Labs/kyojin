@@ -453,12 +453,8 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
     return done, time.perf_counter() - t0
 
 
-def create_app(engine: Any, model_id: str, template: str, num_draft: int = 0) -> web.Application:
-    """Build the HTTP layer around a resident engine (also accepts a fake engine in tests).
-
-    num_draft: MTP draft tokens per verification round (args.num_draft); used only to derive
-    llamacpp:spec_decode_num_drafts_total from the accepted+rejected draft token counts.
-    """
+def create_app(engine: Any, model_id: str, template: str) -> web.Application:
+    """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
     processing = 0  # admitted requests; closure, app config is immutable after startup
@@ -466,8 +462,9 @@ def create_app(engine: Any, model_id: str, template: str, num_draft: int = 0) ->
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
-        # The MTP window is a fixed num_draft tokens, so rounds = proposed / num_draft
-        # (exact except for a final window truncated by max_new_tokens).
+        # The MTP window is a fixed num_draft_tokens per round, so rounds = proposed / window
+        # (exact except for a final window truncated by max_new_tokens). No generator -> no rounds.
+        num_draft = int(getattr(getattr(engine, "greedy_generator", None), "num_draft_tokens", 0) or 0)
         accepted = int(st.get("accepted_draft_tokens", 0))
         rejected = int(st.get("rejected_draft_tokens", 0))
         proposed = accepted + rejected
@@ -475,7 +472,7 @@ def create_app(engine: Any, model_id: str, template: str, num_draft: int = 0) ->
             prompt_tokens=prompt_tokens, cached=int(st.get("cached_tokens", 0)),
             predicted=int(st.get("new_tokens", 0)),
             prefill_s=float(st.get("time_prefill") or 0.0), generate_s=float(st.get("time_generate") or 0.0),
-            drafts=proposed // max(num_draft, 1) if proposed else 0,
+            drafts=proposed // num_draft if proposed and num_draft else 0,
             draft_tokens=proposed, accepted=accepted)
 
     async def models(_: web.Request) -> web.Response:
@@ -859,8 +856,7 @@ def main() -> None:
         from rss_probe import install
         install(engine)
         print(f"serve: rss probe -> {os.environ['EXL3_SERVE_RSS_LOG']}", flush=True)
-    web.run_app(create_app(engine, args.model_id, template, num_draft=args.num_draft),
-                host=args.host, port=args.port)
+    web.run_app(create_app(engine, args.model_id, template), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
