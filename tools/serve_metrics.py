@@ -9,6 +9,7 @@ from __future__ import annotations
 
 # (name, type, help) in the order the /metrics body renders them.
 METRICS = [
+    ("llamacpp:prompt_tokens_total", "counter", "Total prompt tokens"),
     ("llamacpp:prompt_tokens_cached_total", "counter", "Total prompt tokens reused from cache"),
     ("llamacpp:prompt_seconds_total", "counter", "Prompt process time"),
     ("llamacpp:tokens_predicted_total", "counter", "Total tokens generated"),
@@ -34,6 +35,7 @@ class Metrics:
     """Counters plus the last request's speeds, observed from the engine's eos event."""
 
     def __init__(self) -> None:
+        self.prompt_tokens_total = 0.0
         self.prompt_cached_total = 0.0
         self.prompt_seconds_total = 0.0
         self.tokens_predicted_total = 0.0
@@ -48,6 +50,7 @@ class Metrics:
     def observe(self, *, prompt_tokens: int, cached: int, predicted: int,
                 prefill_s: float, generate_s: float,
                 drafts: int = 0, draft_tokens: int = 0, accepted: int = 0) -> None:
+        self.prompt_tokens_total += prompt_tokens
         self.prompt_cached_total += cached
         self.prompt_seconds_total += prefill_s
         self.tokens_predicted_total += predicted
@@ -63,6 +66,7 @@ class Metrics:
 
     def render(self, *, processing: int, deferred: int, kv_ratio: float) -> bytes:
         values = {
+            "llamacpp:prompt_tokens_total": self.prompt_tokens_total,
             "llamacpp:prompt_tokens_cached_total": self.prompt_cached_total,
             "llamacpp:prompt_seconds_total": self.prompt_seconds_total,
             "llamacpp:tokens_predicted_total": self.tokens_predicted_total,
@@ -88,6 +92,7 @@ def assert_reported(samples: dict, test, *, prompt_tokens: int, cached: int, pre
                     accepted: int) -> None:
     """unittest helper: rendered /metrics samples must match one observed request."""
     expected = {
+        "llamacpp:prompt_tokens_total": prompt_tokens,
         "llamacpp:prompt_tokens_cached_total": cached,
         "llamacpp:prompt_seconds_total": prefill_s,
         "llamacpp:tokens_predicted_total": predicted,
