@@ -331,5 +331,79 @@ class ServeTests(unittest.TestCase):
         self.assertEqual(engine.resets, 1)
 
 
+    def test_client_disconnect_cancels_the_job(self):
+        """Stream and non-stream drops stop generation within a few steps, a job cancelled while queued
+        never runs, and the request after them is served."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class SlowEngine(FakeEngine):
+            steps = 0
+            stopped = None
+
+            async def generate(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                cancel = kwargs.get("cancel")
+                if "slow" not in prompt:
+                    yield "ok"
+                    return
+                self.stopped = None
+                for _ in range(1000):
+                    if cancel is not None and cancel.is_set():
+                        self.stopped = "cancelled"
+                        return
+                    self.steps += 1
+                    await asyncio.sleep(0.01)
+                    yield "t "
+                self.stopped = "finished"
+
+        def body(text, stream):
+            return {"model": "m", "stream": stream, "messages": [{"role": "user", "content": text}]}
+
+        async def settle(engine, want_steps_at_most):
+            for _ in range(200):
+                if engine.stopped is not None:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertEqual(engine.stopped, "cancelled")
+            self.assertLess(engine.steps, want_steps_at_most)
+
+        async def check():
+            engine = SlowEngine("x")
+            client = TestClient(TestServer(serve.create_app(engine, "m", TEMPLATE)))
+            await client.start_server()
+            # 1. streaming drop mid-stream
+            response = await client.post("/v1/chat/completions", json=body("slow a", True))
+            await response.content.readany()
+            await asyncio.sleep(0.15)
+            response.close()
+            await settle(engine, 100)
+            # 2. a following request is served at once
+            ok = await asyncio.wait_for(client.post("/v1/chat/completions", json=body("hi", False)), 5)
+            self.assertEqual(ok.status, 200)
+            self.assertEqual((await ok.json())["choices"][0]["message"]["content"], "ok")
+            # 3. non-streaming drop
+            engine.steps = 0
+            try:
+                await asyncio.wait_for(client.post("/v1/chat/completions", json=body("slow b", False)), 0.3)
+            except asyncio.TimeoutError:
+                pass
+            await settle(engine, 100)
+            # 4. a job cancelled while queued never reaches the engine
+            engine.steps, engine.prompts = 0, []
+            first = await client.post("/v1/chat/completions", json=body("slow c", True))
+            await first.content.readany()
+            try:
+                await asyncio.wait_for(client.post("/v1/chat/completions", json=body("slow queued", False)), 0.3)
+            except asyncio.TimeoutError:
+                pass
+            first.close()
+            ok = await asyncio.wait_for(client.post("/v1/chat/completions", json=body("hi again", False)), 5)
+            self.assertEqual(ok.status, 200)
+            self.assertFalse(any("slow queued" in p for p in engine.prompts))
+            await client.close()
+
+        run(check())
+
+
 if __name__ == "__main__":
     unittest.main()

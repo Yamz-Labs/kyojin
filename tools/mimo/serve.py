@@ -252,14 +252,20 @@ class ResidentEngine:
             self.generator.spec_gate = SpecGate()
 
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float, top_p: float,
-                       stop: list[str], reset_gate: bool = False) -> AsyncIterator[str]:
-        """Yield incremental decoded text. The caller serializes access to this method."""
+                       stop: list[str], reset_gate: bool = False,
+                       cancel: asyncio.Event | None = None) -> AsyncIterator[str]:
+        """Yield incremental decoded text. The caller serializes access to this method.
+
+        When `cancel` is set (client gone) the job is cancelled between two generator steps. A step is one
+        prefill chunk or one decode step, so a drop during prefill stops at the next chunk boundary."""
         import torch  # noqa: F401  (keeps the ROCm runtime loaded for the worker thread)
         from exllamav3.generator.sampler import ComboSampler, GreedySampler
         ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
         if getattr(self, "slot_store", None) is not None:
             self.slot_store.note_prompt(prompt, ids)
         self.last_stats = {}
+        if cancel is not None and cancel.is_set():
+            return                          # the client left while the request was queued: no prefill
         sampler = (GreedySampler() if temperature == 0 else
                    ComboSampler(temperature=max(temperature, 1e-6), top_p=top_p, min_p=0.0))
         if reset_gate:
@@ -268,18 +274,27 @@ class ResidentEngine:
                        stop_conditions=list(self.config.eos_token_id_list) + stop)
         self.generator.enqueue(job)
         loop = asyncio.get_running_loop()
-        while self.generator.num_remaining_jobs():
-            batch = await loop.run_in_executor(None, lambda: list(self.generator.iterate()))
-            for event in batch:
-                if event.get("error"):
-                    raise RuntimeError(str(event["error"]))
-                text = event.get("text", "")
-                if text:
-                    yield text
-                if event.get("eos"):
-                    self.last_stats = event
+        try:
+            while self.generator.num_remaining_jobs():
+                if cancel is not None and cancel.is_set():
+                    self.generator.cancel(job)
                     return
-        torch.cuda.synchronize()
+                batch = await loop.run_in_executor(None, lambda: list(self.generator.iterate()))
+                for event in batch:
+                    if event.get("error"):
+                        raise RuntimeError(str(event["error"]))
+                    text = event.get("text", "")
+                    if text:
+                        yield text
+                    if event.get("eos"):
+                        self.last_stats = event
+                        return
+            torch.cuda.synchronize()
+        finally:
+            # Whatever way the call ends (error, client gone, cancelled task) no job stays in the Generator:
+            # a leftover job would run inside the next request.
+            if self.generator.num_remaining_jobs():
+                self.generator.clear_queue()
 
     def load_prior(self, cal) -> None:
         """Seed the confidence calibrator from draft_conf_prior.json in the drafter directory (EXL3_DRAFT_PRIOR=0 skips it)."""
@@ -319,6 +334,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     async def worker() -> None:
         while True:
             body, out = await queue.get()
+            cancel = body.get("_cancel")
+            if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
+                out.put_nowait(None)
+                queue.task_done()
+                continue
             store = getattr(engine, "slot_store", None)
             try:
                 async with lock:
@@ -329,7 +349,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         max_tokens=token_limit(body),
                         temperature=body.get("temperature", SERVE_DEFAULTS["temperature"]),
                         top_p=body.get("top_p", SERVE_DEFAULTS["top_p"]), stop=body.get("_stop", []),
-                        reset_gate=body.get("_reset_gate", False)):
+                        reset_gate=body.get("_reset_gate", False),
+                        cancel=body.get("_cancel")):
                         out.put_nowait(delta)
                     out.put_nowait(None)
             except Exception as exc:                             # noqa: BLE001
@@ -344,6 +365,30 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
     async def close(app_: web.Application) -> None:
         app_["worker_task"].cancel()
+
+    async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue) -> AsyncIterator[str]:
+        """Items the worker produced for one request. Nothing is written to the client while a job is
+        queued or prefilling (and never, for a non-streaming reply), so a client that hung up is noticed
+        by polling the transport. Raises ConnectionResetError and sets `cancel` when it has left."""
+        while True:
+            tr = request.transport
+            if tr is None or tr.is_closing():
+                cancel.set()
+                raise ConnectionResetError("client left")
+            try:
+                item = await asyncio.wait_for(out.get(), 0.5)
+            except asyncio.TimeoutError:
+                continue
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    def client_left(cancel: asyncio.Event, path: str) -> web.Response:
+        cancel.set()
+        print(f"serve: client left {path}, job cancelled", file=sys.stderr, flush=True)
+        return web.Response(status=499)
 
     async def completions(request: web.Request) -> web.StreamResponse:
         try:
@@ -378,14 +423,12 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             return base | {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
         out: asyncio.Queue = asyncio.Queue()
+        cancel = body["_cancel"] = asyncio.Event()
         await queue.put((body, out))
         # MiMo's generation prompt is "<|im_start|>assistant\n": no implicit <think> block.
 
-        async def deltas() -> AsyncIterator[str]:
-            while (item := await out.get()) is not None:
-                if isinstance(item, Exception):
-                    raise item
-                yield item
+        def deltas() -> AsyncIterator[str]:
+            return drain(request, cancel, out)
 
         def usage(raw: str) -> dict[str, int]:
             completion_tokens = engine.count_tokens(raw)
@@ -454,9 +497,14 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                                          {"usage": usage(text), "timings": timings()}))
                 await response.write(b"data: [DONE]\n\n")
                 await response.write_eof()
-            except (ConnectionResetError, asyncio.CancelledError):
-                raise                                                # client left: nothing to send
+            except ConnectionResetError:
+                client_left(cancel, "stream")                        # client left: nothing to send
+                return response
+            except asyncio.CancelledError:
+                cancel.set()
+                raise
             except Exception as exc:                                   # noqa: BLE001
+                cancel.set()
                 # Fail inside the stream, but still end it the OpenAI way: clients such as OpenCode report
                 # "stream ended without finish_reason" and retry when the connection just drops.
                 try:
@@ -468,7 +516,16 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     pass
             return response
 
-        raw = "".join([d async for d in deltas()])
+        try:
+            raw = "".join([d async for d in deltas()])
+        except ConnectionResetError:
+            return client_left(cancel, "request")
+        except asyncio.CancelledError:
+            cancel.set()
+            raise
+        except Exception:
+            cancel.set()
+            raise
         text, _ = stop_text(raw, body["_stop"])
         message = parse_completion(text)
         finish = finish_for(message, text)
@@ -525,12 +582,20 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             raise web.HTTPBadRequest(reason=str(exc)) from exc
 
         out: asyncio.Queue = asyncio.Queue()
+        cancel = job["_cancel"] = asyncio.Event()
         await queue.put((job, out))
         text = ""
-        while (item := await out.get()) is not None:
-            if isinstance(item, Exception):
-                raise item
-            text += item
+        try:
+            async for item in drain(request, cancel, out):
+                text += item
+        except ConnectionResetError:
+            return client_left(cancel, "completion")
+        except asyncio.CancelledError:
+            cancel.set()
+            raise
+        except Exception:
+            cancel.set()
+            raise
         text, stopped = stop_text(text, job["_stop"])
         st = getattr(engine, "last_stats", None) or {}
         return web.json_response({
