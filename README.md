@@ -42,6 +42,8 @@ First GLM launch: the server tunes its dense GEMM kernels before it opens the po
 
 GLM reasons at maximum effort by default. With a small `max_tokens`, the reasoning can use the whole budget: `content` is then empty and `finish_reason` is `length`. Send `"reasoning_effort": "low"` in the request (or start the server with `--default-reasoning-effort low`), or allow at least 1000 tokens. The server defaults to greedy sampling when a request gives no temperature; set the sampling values of the model card in your client, or with `--default-temperature` and `--default-top-p`.
 
+Optional for GLM: an unquantized MTP `eh_proj` sidecar raises draft acceptance (about +5 % decode). The pack does not ship it and the server starts without it (one log line). To add it, see "Optional MTP sidecar" in `tools/glm/SERVE.md`.
+
 Memory: GLM at `-c 131072` leaves about 10 GiB free on a 128 GB machine. Close browsers and other large processes first, or use a smaller `-c`.
 
 MiMo: `hf download yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz --local-dir ./mimo-pack`, then `python tools/mimo/serve.py --model ./mimo-pack --port 8000 -c 131072`. Speculative decoding (DFlash, 4 bpw drafter, confidence-truncated drafts) is on by default: the server uses the pack's `drafter/` directory (or `$MIMO_DRAFTER`, or `--drafter <dir>`). Without a drafter it logs one line and decodes plain. Set `MIMO_SPEC=0` in the lane script (`tools/lanes/serve_mimo.sh`) or pass `--no-dflash` to `serve.py` for plain decode. Greedy output under speculation is not token-identical to plain decode: near-tied logits can flip under the batched verify. A loaded drafter costs 2 to 4 % prefill. Details: `tools/mimo/SERVE.md`.
