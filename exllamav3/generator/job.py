@@ -1243,6 +1243,15 @@ class Job:
             big = int(os.environ.get("EXL3_PREFILL_BIG_CHUNK", "4096"))
             if big > 65535:
                 raise ValueError(f"EXL3_PREFILL_BIG_CHUNK={big}: a forward is limited to 65535 rows (mixer kernel grid.y)")
+            # EXL3_PREFILL_BIG_CHUNK_MAXPOS (default 0 = off): from this kv position on, plain chunks again (smaller
+            # workspace, lower peak GPU/unified memory at very long context); the cached big-chunk workspace is
+            # released once per job at the switch
+            maxpos = int(os.environ.get("EXL3_PREFILL_BIG_CHUNK_MAXPOS", "0"))
+            if maxpos and big > chunk and seq.kv_position >= maxpos:
+                big = chunk
+                if not getattr(self, "_big_chunk_released", False):
+                    self._big_chunk_released = True
+                    torch.cuda.empty_cache()
             remaining = len(seq.sequence_ids) - 1 - seq.kv_position
             big_tail = big > chunk and big % chunk == 0 and self.big_tail_enabled()
             if big_tail:
