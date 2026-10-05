@@ -1,6 +1,7 @@
 """Loader for qsa_prefill.hip (one wave per (row, kv head)). Same call shape as qsa_prefill.qsa_prefill_attend (fp16, shared or per-row block table)."""
 import ctypes, hashlib, os, re, shutil, subprocess
 import torch
+from exllamav3.util.hip_lib import find_hip_runtime
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qsa_prefill.hip")
 _state = {}
 
@@ -49,8 +50,8 @@ def hsaco_stats(path):
 def _load(defs = ""):
     if defs in _state: return _state[defs]
     cache = compile_hsaco(defs, torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
-    p = os.path.join(os.path.dirname(torch.__file__), "lib", "libamdhip64.so")
-    if not os.path.isfile(p):   # the copy torch already loaded
+    p = find_hip_runtime()
+    if p is None:   # the copy torch already loaded
         p = next(l.split()[-1] for l in open("/proc/self/maps") if "libamdhip64" in l)
     lib = ctypes.CDLL(p)
     torch.cuda.init()

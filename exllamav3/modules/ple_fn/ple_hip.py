@@ -2,6 +2,7 @@
 # hipcc genco (cached by source hash), launched through torch's libamdhip64 on the current stream.
 import ctypes, hashlib, os, shutil, subprocess
 import torch
+from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ple_hip.hip")
 _state = {}
@@ -42,7 +43,7 @@ def _load():
     if "fns" in _state:
         return _state["fns"]
     cache = compile_hsaco(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
-    lib = ctypes.CDLL(os.path.join(os.path.dirname(torch.__file__), "lib", "libamdhip64.so"))
+    lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
     if lib.hipModuleLoad(ctypes.byref(mod), cache.encode()) != 0:
