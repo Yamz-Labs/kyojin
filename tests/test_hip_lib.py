@@ -46,3 +46,47 @@ def test_none_when_absent_and_load_raises(tmp_path):
         pass
     else:
         raise AssertionError("expected OSError")
+
+
+def _maps(*paths):
+    return "\n".join(f"7f00{i}000-7f00{i}fff r-xp 00000000 08:01 {i}  {p}" for i, p in enumerate(paths)) + "\n"
+
+
+def _default_dir_find(maps):
+    import sys, types
+    fake = types.ModuleType("torch")
+    fake.__file__ = "/nonexistent/torch/__init__.py"
+    saved = sys.modules.get("torch")
+    sys.modules["torch"] = fake
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            return hip_lib.find_hip_runtime(read_maps = lambda: maps), err.getvalue()
+    finally:
+        if saved is None:
+            del sys.modules["torch"]
+        else:
+            sys.modules["torch"] = saved
+
+
+def test_default_dir_falls_back_to_the_mapped_library_and_logs_once():
+    hip_lib._logged.clear()
+    maps = _maps("/usr/lib/libc.so.6", "/venv/_rocm_sdk_core/lib/libamdhip64.so.7")
+    path, log = _default_dir_find(maps)
+    assert path == "/venv/_rocm_sdk_core/lib/libamdhip64.so.7"
+    assert log.count("\n") == 1 and "already loaded" in log
+    assert _default_dir_find(maps)[1] == ""
+
+
+def test_default_dir_none_when_nothing_is_mapped_or_maps_unreadable():
+    hip_lib._logged.clear()
+    assert _default_dir_find(_maps("/usr/lib/libc.so.6"))[0] is None
+
+    def boom():
+        raise OSError("no /proc")
+    assert hip_lib._loaded_hip_runtime(boom) is None
+
+
+def test_explicit_dir_never_uses_the_mapped_library(tmp_path):
+    hip_lib._logged.clear()
+    assert hip_lib.find_hip_runtime(str(tmp_path), read_maps = lambda: _maps("/x/libamdhip64.so.7")) is None
