@@ -504,7 +504,9 @@ class BCAttn:
             # Quantized K/V: the gather reads the packed pages through the shared QC
             # loaders (scales + H32 appended to the runtime args, same as the dense slots)
             ct = "*i32" if self.quant else "*fp16"
-            k_sp_split = _compile_kernel(dev, _qsa_sparse_split_kernel,
+            from .qsa_triton import QSA_PIPE, QSA_PIPE_NW, _qsa_sparse_split_pipe_kernel
+            use_pipe = QSA_PIPE and self.k_bits == 0 and self.v_bits == 0 and block_n == 32
+            k_sp_split = _compile_kernel(dev, _qsa_sparse_split_pipe_kernel if use_pipe else _qsa_sparse_split_kernel,
                 {"q": "*fp16", "k_cache": ct, "v_cache": ct, "block_table": "*i32",
                  "indices": "*i32", "partial_o": "*fp32", "partial_ml": "*fp32",
                  "k_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
@@ -516,7 +518,7 @@ class BCAttn:
                      page_size = PAGE_SIZE, head_dim = self.head_dim, K_pad = k_pad,
                      scale = float(self.sm_scale), BLOCK_H = block_h, BLOCK_N = block_n,
                      PAGED = 1, QCK = self.k_bits, QCV = self.v_bits),
-                4, 2)
+                QSA_PIPE_NW if use_pipe else 4, 2)
 
             k_sp_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel,
                 {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",

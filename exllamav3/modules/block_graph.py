@@ -139,7 +139,7 @@ class _BlockGraphSlot:
 
 def _verify_union_dev_ok(x: torch.Tensor, params: dict, draft: bool = False) -> bool:
     """R-row DFlash/MTP verify through exl3_dec_moe_union with the device-built unique table
-    (EXL3_DEC_MOE_UNION_DEV=1): no host sync, so the block is capturable. The host
+    (EXL3_DEC_MOE_UNION_DEV=1, REPORT-28): no host sync, so the block is capturable. The host
     table path (UNION_DEV=0) copies the picks to the CPU and must stay eager."""
     rows = x.shape[0] * x.shape[1]
     return ((BLOCK_GRAPH_DRAFT >= 2 if draft else BLOCK_GRAPH_VERIFY) and
@@ -214,7 +214,7 @@ class BlockGraphRunner:
         attn = self.block.attn
         mlp = self.block.mlp
         # Batch-1 decode MoE (exl3_dec_router + exl3_dec_moe, GLM-5.3: E = 288, K 2): both launch
-        # sync-free on device tables, so a rows == 1 block is capturable
+        # sync-free on device tables, so a rows == 1 block is capturable (REPORT-31)
         dec_moe_ok = BLOCK_GRAPH_DEC_MOE and getattr(mlp, "support_dec_moe", False) and \
             x.dim() >= 2 and (x.shape[0] * x.shape[1] == 1 or _verify_union_dev_ok(x, params, draft))
         if not isinstance(mlp, BlockSparseMLP) or \

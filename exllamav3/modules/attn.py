@@ -7,7 +7,7 @@ from ..util.tensor import get_for_device, to2
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
 from .multilinear import MultiLinear, SlicedMultiLinear
-from .quant.exl3 import MAX_BSZN_GEMV_R
+from .quant.exl3 import MAX_BSZN_GEMV_R, row_pad_pitch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
@@ -17,6 +17,7 @@ from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_at
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+_QKV_IG_MULTI = os.environ.get("EXL3_ATTN_QKV_IG_MULTI", "1") != "0"   # (q|gate, k, v one launch)
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -684,8 +685,52 @@ class Attention(Module):
         self._dec_qkv = lins
         return lins
 
+    def _dec_qkv_ig_linears(self):
+        """q (interleaved q|gate per head) / k / v Linears when one exl3_dec_gemv_multi launch can replace their
+        three forwards, else None."""
+        lins = getattr(self, "_dec_qkv_ig", False)
+        if lins is False:
+            from .mla_attn import dec_proj_ok, dec_proj_shapes
+            lins = None
+            cand = [self.q_proj, self.k_proj] + ([] if self.use_k_as_v else [self.v_proj])
+            if self.interleaved_gate and self.g_proj is None and all(l is not None for l in cand) and \
+                    all(dec_proj_ok(l) for l in cand) and dec_proj_shapes(cand):
+                lins = cand
+            self._dec_qkv_ig = lins
+        return lins
+
+    def _project_qkv_ig_dec(self, x: torch.Tensor, params: dict, bsz: int, q_len: int):
+        rows = bsz * q_len
+        if rows > MAX_BSZN_GEMV_R or x.dtype != torch.half or x.shape[-1] != self.q_proj.in_features or \
+                not x.is_contiguous() or "capture" in params or "ovr" in params:
+            return None
+        if rows > 1 and not (params.get("dflash_verify") and hasattr(ext, "exl3_dec_gemv_r_multi") and
+                             os.environ.get("EXL3_VERIFY_GEMV_R", os.environ.get("EXL3_DEC_MOE_UNION", "0")) != "0"):
+            return None
+        lins = self._dec_qkv_ig_linears()
+        if lins is None:
+            return None
+        from .mla_attn import dec_proj_multi
+        outs = dec_proj_multi(lins, x, rows)
+        qg = outs[0].view(bsz, q_len, -1)
+        k = outs[1].view(bsz, q_len, -1)
+        v = outs[2].view(bsz, q_len, -1) if len(outs) > 2 else k
+        if self.head_dim % 8 == 0 and qg.dtype == torch.half:
+            q = torch.empty((bsz, q_len, self.num_q_heads, self.head_dim), dtype = torch.half, device = qg.device)
+            g = torch.empty((bsz, q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = qg.device)
+            ext.deinterleave_qg(qg, q, g, self.head_dim)
+        else:
+            q, g = torch.chunk(qg.view(bsz, q_len, -1, self.head_dim * 2), 2, dim = -1)
+            g = g.reshape(bsz, q_len, -1)
+        return self.finish_qkv(q, k, v, g, bsz, q_len, params)
+
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
+
+        if _QKV_IG_MULTI and self.interleaved_gate:
+            r = self._project_qkv_ig_dec(x, params, bsz, q_len)
+            if r is not None:
+                return r
 
         # Batch-1 decode: q, k and v in one exl3_dec launch (both Hadamard stages fused)
         if bsz * q_len == 1 and x.dtype == torch.half and dim == self.q_proj.in_features and \
@@ -704,7 +749,7 @@ class Attention(Module):
                 v = outs[2] if len(outs) > 2 else k
                 return self.finish_qkv(q, k, v, None, bsz, q_len, params)
 
-        # DFlash verify (R rows): same fused launch as the bsz==1 case above,
+        # DFlash verify (R rows, REPORT-17): same fused launch as the bsz==1 case above,
         # generalized to R rows via exl3_dec_gemv_r_multi -- see sliding_attn.py's identical
         # branch for why the fused multi-matrix call (not per-Linear dec_gemv_r) is required for
         # bit-exactness (shared strips_total -> shared ktw/kbs with the batch-1 launch). This is
@@ -899,7 +944,19 @@ class Attention(Module):
             # Drop the zero lanes V was padded into so o_proj sees num_q_heads * v_head_dim
             o = o.view(bsz, seqlen, self.num_q_heads, self.head_dim)[..., : self.v_head_dim]
             o = o.reshape(bsz, seqlen, self.num_q_heads * self.v_head_dim).contiguous()
-        x = self.o_proj.forward(o, params)
+        o_dt = None
+        if params.get("pfe_y_half") and os.environ.get("EXL3_PFE_OPROJ", "1") == "1" and \
+                "capture" not in params and "quant_preserve" not in params:
+            from .quant import exl3 as _exl3
+            m = self.o_proj
+            rows = o.numel() // o.shape[-1]
+            if _exl3._f32_via_f16 and rows > max(_exl3.AUTO_RECONSTRUCT_THRESHOLD, _exl3._f32_via_f16_min_rows - 1) \
+                    and type(m.inner).__name__ == "LinearEXL3" and m.inner.bias is None \
+                    and not self.config.infer_params.no_reconstruct and not params.get("reconstruct") \
+                    and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 \
+                    and m.softcap == 0.0 and m.out_features == m.out_features_unpadded:
+                o_dt = torch.half
+        x = self.o_proj.forward(o, params, o_dt)
         return x
 
 
@@ -1229,36 +1286,74 @@ class Attention(Module):
 
         if qsa_sparse:
             qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
-            o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
+            o = self.qsa_indexer.sparse_attend_verify(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
         else:
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
             # quantized-cache prefill size its staging to the window instead of the job's pages
             max_kv_len = int(qsa_seqlens_cpu.max().item()) if qsa_seqlens_cpu is not None else None
-            o = attn_dispatch(
-                q = q,
-                k = k,
-                v = v,
-                cache = cache,
-                cache_idx = self.layer_idx,
-                cache_instance = params.get("layer_instance"),
-                block_table = block_table,
-                cache_seqlens = cache_seqlens,
-                causal = causal,
-                sm_scale = self.sm_scale,
-                window_size = self.window_arg(),
-                softcap = self.logit_softcapping,
-                non_causal_spans = non_causal_spans,
-                sinks = self.sinks,
-                dispatch_cache = self.dispatch_cache,
-                max_kv_len = max_kv_len,
-                v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
-            )
+            if (
+                1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and
+                os.environ.get("EXL3_VERIFY_ATTN_LOOP", "0") != "0"
+            ):
+                # Row-invariant verify: the R-row paged decode tiles the KV span from the batch's single
+                # cache_seqlens/q_len, a different float order than R batch-1 calls. Run the exact
+                # batch-1 call per row (each appends its own K/V at cache_seqlens + i and attends i + 1 keys).
+                o = torch.cat([attn_dispatch(
+                    q = q[:, i:i + 1],
+                    k = k[:, i:i + 1],
+                    v = v[:, i:i + 1],
+                    cache = cache,
+                    cache_idx = self.layer_idx,
+                    cache_instance = params.get("layer_instance"),
+                    block_table = block_table,
+                    cache_seqlens = cache_seqlens + i,
+                    causal = causal,
+                    sm_scale = self.sm_scale,
+                    window_size = self.window_arg(),
+                    softcap = self.logit_softcapping,
+                    non_causal_spans = None,
+                    sinks = self.sinks,
+                    dispatch_cache = self.dispatch_cache,
+                    max_kv_len = max_kv_len,
+                    v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                ) for i in range(seqlen)], dim = 1)
+            else:
+                o = attn_dispatch(
+                    q = q,
+                    k = k,
+                    v = v,
+                    cache = cache,
+                    cache_idx = self.layer_idx,
+                    cache_instance = params.get("layer_instance"),
+                    block_table = block_table,
+                    cache_seqlens = cache_seqlens,
+                    causal = causal,
+                    sm_scale = self.sm_scale,
+                    window_size = self.window_arg(),
+                    softcap = self.logit_softcapping,
+                    non_causal_spans = non_causal_spans,
+                    sinks = self.sinks,
+                    dispatch_cache = self.dispatch_cache,
+                    max_kv_len = max_kv_len,
+                    v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                )
 
         if self.headwise_gate:
             if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
             else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
-        if self.full_gate or self.interleaved_gate: ext.mul_sigmoid_(o, g)
+        pitch = 0
+        if (self.full_gate or self.interleaved_gate) and self.v_head_dim == self.head_dim and not self.headwise_gate and \
+                o.dtype == torch.half and g.dtype == torch.half and o.is_contiguous() and g.is_contiguous() and \
+                getattr(ext, "mul_sigmoid_pad", None) is not None:
+            pitch = row_pad_pitch(self.o_proj, o.shape[-1], o.numel() // o.shape[-1], params)
+        if pitch:
+            # same fp16 product as mul_sigmoid_, written at a padded row pitch (o_proj reads it at full rate)
+            o2 = torch.empty((o.numel() // o.shape[-1], pitch), dtype = torch.half, device = o.device)[:, :o.shape[-1]].view(o.shape)
+            ext.mul_sigmoid_pad(o, g, o2, pitch)
+            o = o2
+        elif self.full_gate or self.interleaved_gate:
+            ext.mul_sigmoid_(o, g)
 
         o = self.project_o(o, bsz, seqlen, params)
         return o

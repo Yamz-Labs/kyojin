@@ -7,6 +7,7 @@ from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, ML
 from .hyperconnections import HyperConnection
 from . import ablit_runtime
 from ..util import profile_opt
+from . import moe_fused
 
 class TransformerBlock(Module):
 
@@ -41,6 +42,10 @@ class TransformerBlock(Module):
         self.mlp_post_norm = mlp_post_norm
         self.attn_hc = attn_hc
         self.mlp_hc = mlp_hc
+        # EXL3_MOE_FUSED=1: fused MoE half-layer for R <= 4 rows (moe_fused.py). Attribute so a harness can toggle it per block.
+        self._moe_fused_on = moe_fused.enabled_by_env()
+        self._moe_fused = None
+        self._moe_fused_tried = False
         self.qbits_key = qbits_key
         self.out_dtype = out_dtype
 
@@ -141,15 +146,21 @@ class TransformerBlock(Module):
         """MLP half of forward (norm, MLP, residual/hc apply). `y_resid` is a pending attention
         output whose residual add is folded into the MLP input norm. Returns the new residual."""
         if self.mlp:
+            if self.mlp_hc and self._moe_fused_on:
+                fused_x = moe_fused.maybe_apply(self, x, params, hc_pending)
+                if fused_x is not None:
+                    return fused_x
             if self.mlp_hc:
-                if hc_pending is not None and not self.mlp_norm:
+                gr_pend = hc_pending is not None and hc_pending[3] is None and not self.mlp_norm
+                if hc_pending is not None and not self.mlp_norm and not gr_pend:
                     HyperConnection.flush_pending(x, hc_pending)
                     hc_pending = None
                 fused = self.mlp_hc.mix_norm(x, params, self.mlp_norm, hc_pending) if self.mlp_norm else None
                 if fused is not None:
                     hc_post, hc_comb, y = fused
                 else:
-                    hc_post, hc_comb, y = self.mlp_hc.mix(x, params)
+                    hc_post, hc_comb, y = self.mlp_hc.mix(x, params, pending = hc_pending) if gr_pend \
+                        else self.mlp_hc.mix(x, params)
                     y = y.half()
                     if self.mlp_norm:
                         y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
@@ -199,6 +210,8 @@ class TransformerBlock(Module):
                 # EXL3_PF_HC_FUSE: defer into the next block's attn mix_norm (see pf_can_defer)
                 if hc_defer and HyperConnection.pf_can_defer(x, y, hc_post, hc_comb, params):
                     params["hc_pending"] = (x, y, hc_post, hc_comb)
+                elif hc_defer and hc_comb is None and hasattr(self.mlp_hc, "gr_can_defer") and self.mlp_hc.gr_can_defer(x, y, hc_post, params):
+                    params["hc_pending"] = (x, y, hc_post, None)
                 else:
                     x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
@@ -230,7 +243,9 @@ class TransformerBlock(Module):
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
-        if hc_pending is not None and not (self.attn and self.attn_hc and self.attn_norm):
+        gr_pend = hc_pending is not None and hc_pending[3] is None and bool(self.attn and self.attn_hc) \
+            and not self.attn_norm
+        if hc_pending is not None and not gr_pend and not (self.attn and self.attn_hc and self.attn_norm):
             HyperConnection.flush_pending(x, hc_pending)
             hc_pending = None
         hc_defer = not export_state and self.layer_scalar_f is None
@@ -244,7 +259,12 @@ class TransformerBlock(Module):
                 if fused is not None:
                     hc_post, hc_comb, y = fused
                 else:
-                    hc_post, hc_comb, y = self.attn_hc.mix(x, params)
+                    params["hc_pad_ok"] = True      # the attention site accepts a row-padded block input
+                    try:
+                        hc_post, hc_comb, y = self.attn_hc.mix(x, params, pending = hc_pending) if gr_pend \
+                            else self.attn_hc.mix(x, params)
+                    finally:
+                        params.pop("hc_pad_ok", None)
                     y = y.half()
                     if self.attn_norm:
                         y = self.attn_norm.forward(y, params, out_dtype = torch.half)
@@ -252,7 +272,17 @@ class TransformerBlock(Module):
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
-            y = self.attn.forward(y, params)
+            # EXL3_PFE_OPROJ: this site's residual apply (hc_apply) reads fp16 or fp32 y alike, so the
+            # attention output projection may skip its fp32 widen (see GatedDeltaNet / Attention.project_o)
+            pfe_half = bool(self.attn_hc) and not self.ablit and self.attn_resid_scalar is None \
+                and not export_state and "pfe_y_half" not in params
+            if pfe_half:
+                params["pfe_y_half"] = True
+            try:
+                y = self.attn.forward(y, params)
+            finally:
+                if pfe_half:
+                    params.pop("pfe_y_half", None)
             if y is None:
                 # EXL3_PF_SKIP: kv_only -- attention wrote its K/V (and indexer) rows and the
                 # caller discards this block's output, so nothing below has an input to read
@@ -267,6 +297,9 @@ class TransformerBlock(Module):
                 if self.mlp and self.mlp_hc and self.mlp_norm \
                         and HyperConnection.pf_can_defer(x, y, hc_post, hc_comb, params):
                     mlp_pending = (x, y, hc_post, hc_comb)
+                elif self.mlp and self.mlp_hc and not self.mlp_norm and hc_comb is None \
+                        and hasattr(self.mlp_hc, "gr_can_defer") and self.mlp_hc.gr_can_defer(x, y, hc_post, params):
+                    mlp_pending = (x, y, hc_post, None)
                 else:
                     x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.attn_post_norm:

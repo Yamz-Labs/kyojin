@@ -103,3 +103,5 @@ void exl3_gemv
     bool mcg,
     bool mul1
 );
+
+void exl3_moe_valu_override(int64_t v);   // test hook: force EXL3_MOE_VALU on (1) / off (0) / back to env (-1) in this process

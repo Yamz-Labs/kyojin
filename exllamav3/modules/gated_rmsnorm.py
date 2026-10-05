@@ -110,6 +110,7 @@ class GatedRMSNorm(Module):
         params,
         out_dtype: torch.dtype | None = None,
         gate: torch.Tensor = None,
+        out_pitch: int = 0,
     ) -> torch.Tensor:
         gate_act = 1 if self.gate_activation == "sigmoid" else 0
         if gate_act and not (x.dtype == torch.bfloat16 and x.is_contiguous() and gate.is_contiguous()):
@@ -119,15 +120,24 @@ class GatedRMSNorm(Module):
             h = self.weight.to(torch.float32) * h
             h = h * torch.sigmoid(gate.to(torch.float32))
             return h.to(out_dtype or self.out_dtype or x.dtype)
+        if out_pitch:
+            # write y with a padded token-row pitch (see exl3.row_pad_pitch); the caller checked eligibility.
+            # y is a (bsz, seqlen, heads, dim) view of a (tokens, out_pitch) buffer
+            assert _hip and x.dim() >= 3 and (out_dtype or self.out_dtype) == torch.half
+            hd = x.shape[-2] * x.shape[-1]
+            y = torch.empty((x.numel() // hd, out_pitch), dtype = torch.half, device = x.device)[:, :hd].view(x.shape)
+            ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias, self.groups, self.gate_first, gate_act, out_pitch)
+            return y
         y = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
         # EXL3_KDA_NORM_FUSED: norm.cu is not built on ROCm, so ext.gated_rms_norm is a ~12-kernel torch
         # fallback with fp32 intermediates. One Triton pass instead (gated_delta_net_fn/kda_norm.py)
         if (
-            gate_act and _hip and self.groups == 1 and not self.gate_first
+            _hip and self.groups == 1 and not self.gate_first
+            and x.dtype == torch.bfloat16 and x.is_contiguous() and gate.is_contiguous()
             and os.environ.get("EXL3_KDA_NORM_FUSED", "0") == "1"
         ):
             from .gated_delta_net_fn.kda_norm import kda_norm
-            kda_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias)
+            kda_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias, silu = not gate_act)
             return y
         ext.gated_rms_norm(x, self.weight, y, gate, self.rms_norm_eps, self.constant_bias, self.groups, self.gate_first, gate_act)
         return y

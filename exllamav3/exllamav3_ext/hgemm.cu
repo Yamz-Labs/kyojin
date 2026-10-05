@@ -5,6 +5,7 @@
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
+#include "pad_pitch.h"
 #include <limits>
 #include <cstdlib>
 #include <type_traits>
@@ -17,6 +18,30 @@ Row-major matmul using cuBLAS, a @ b -> c
 */
 
 using bfloat16 = __nv_bfloat16;
+
+// row stride (elements) of the activation operand. Contiguous -> k (unchanged behaviour).
+// A row-padded view (stride > k, columns contiguous, leading dims collapsible) is accepted so a producer can leave
+// a non-power-of-two row pitch: K=6144 fp16 rows are 12288 B apart and the GEMM reads them at ~half rate.
+// Returns false if the view cannot be expressed as one (m, k) matrix with a single row pitch or if the
+// storage cannot hold (m-1)*lda + k elements (the bound that keeps the library from reading outside the buffer).
+static bool a_row_pitch(const at::Tensor& a, int64_t& lda)
+{
+    const int dim = a.dim();
+    if (dim < 1) return false;
+    const int64_t k = a.size(-1);
+    if (k < 1) return false;
+    if (dim == 1) { lda = k; return true; }
+    if (a.stride(-1) != 1) return false;
+    int64_t m = a.size(-2);
+    for (int i = dim - 3; i >= 0; --i)
+    {
+        if (a.size(i + 1) != 1 && a.stride(i) != a.stride(i + 1) * a.size(i + 1)) return false;
+        m *= a.size(i);
+    }
+    lda = m == 1 ? k : a.stride(-2);
+    if (lda < k || lda > std::numeric_limits<int>::max()) return false;
+    return pad_view_fits(a.storage_offset(), m, lda, k, (int64_t) (a.storage().nbytes() / sizeof(at::Half)));
+}
 
 static void hgemm_gemmex_impl
 (
@@ -48,6 +73,8 @@ static void hgemm_gemmex_impl
     int size_k = a.size(-1);
     int size_m = a.numel() / size_k;
     int size_n = b.size(-1);
+    int64_t a_pitch = 0;
+    TORCH_CHECK(a_row_pitch(a, a_pitch), "hgemm: a must be contiguous or a row-padded view inside its storage");
     int64_t c_stride_m = c.stride(-2);
     TORCH_CHECK(c_stride_m >= size_n, "c row stride is too small");
     TORCH_CHECK(c_stride_m <= std::numeric_limits<int>::max(), "c row stride is too large");
@@ -70,7 +97,7 @@ static void hgemm_gemmex_impl
         CUBLAS_OP_N, CUBLAS_OP_N,
         size_n, size_m, size_k,
         &alpha_, b_ptr, CUDA_R_16F, size_n,
-                 a_ptr, CUDA_R_16F, size_k,
+                 a_ptr, CUDA_R_16F, (int) a_pitch,
         &beta_,  c.data_ptr(), c_type, (int) c_stride_m,
         CUBLAS_COMPUTE_32F,
         CUBLAS_GEMM_DEFAULT_TENSOR_OP
@@ -179,13 +206,13 @@ static rocblas_handle handle(int device)
 
 struct Call
 {
-    rocblas_handle h; int m, n, k, ldc; const void* a; const void* b; void* c; rocblas_datatype ct;
+    rocblas_handle h; int m, n, k, ldc, lda; const void* a; const void* b; void* c; rocblas_datatype ct;
     rocblas_status run(rocblas_gemm_algo algo, int sol) const
     {
         float alpha = 1.0f, beta = 0.0f;
         // column-major: C^T[n, m] = B^T[n, k] @ A^T[k, m], same mapping as hgemm_gemmex_impl
         return rocblas_gemm_ex(h, rocblas_operation_none, rocblas_operation_none, n, m, k,
-                               &alpha, b, rocblas_datatype_f16_r, n, a, rocblas_datatype_f16_r, k,
+                               &alpha, b, rocblas_datatype_f16_r, n, a, rocblas_datatype_f16_r, lda,
                                &beta, c, ct, ldc, c, ct, ldc, rocblas_datatype_f32_r,
                                algo, sol, rocblas_gemm_flags_none);
     }
@@ -276,7 +303,9 @@ static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, 
     if (m < MIN_M) return false;
     if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
     if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
-    if (b.dim() != 2 || !b.is_contiguous() || !a.is_contiguous() || c.stride(-1) != 1) return false;
+    if (b.dim() != 2 || !b.is_contiguous() || c.stride(-1) != 1) return false;
+    int64_t lda = 0;
+    if (!a_row_pitch(a, lda)) return false;
     const int64_t ldc = c.stride(-2);
     if (ldc > std::numeric_limits<int>::max()) return false;
     int device;
@@ -286,8 +315,9 @@ static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, 
     std::lock_guard<std::mutex> lock(g_mutex);
     load(device);
     const bool f32 = c.dtype() == at::kFloat;
-    Key key(n, k, m_class(m), ldc == n ? 1 : 0, f32 ? 1 : 0);
-    Call call{handle(device), m, n, k, (int) ldc, a.data_ptr(), b.data_ptr(), c.data_ptr(),
+    // bit 1 of the ldc field: padded A pitch (its winner is screened on the padded layout)
+    Key key(n, k, m_class(m), (ldc == n ? 1 : 0) | (lda != k ? 2 : 0), f32 ? 1 : 0);
+    Call call{handle(device), m, n, k, (int) ldc, (int) lda, a.data_ptr(), b.data_ptr(), c.data_ptr(),
               f32 ? rocblas_datatype_f32_r : rocblas_datatype_f16_r};
     rocblas_set_stream(call.h, stream);
     auto it = g_cache.find(key);

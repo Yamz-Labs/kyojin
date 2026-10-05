@@ -16,7 +16,27 @@ void fused_gated_rms_norm
     double constant_bias,
     int64_t w_groups,
     bool gate_first,
-    int64_t gate_act
+    int64_t gate_act,
+    int64_t y_pitch,   // 0 = y contiguous; else y is [tokens, y_pitch] storage
+    int64_t hpt        // heads per token row when y_pitch != 0
+);
+
+// out[row, 0:k] = x[row, 0:k] for 2-byte elements, out at row pitch `pitch` (consumer-side row padding of a GEMM input)
+void pad_copy
+(
+    const at::Tensor& x,
+    at::Tensor& out,
+    int64_t pitch
+);
+
+// out = x * sigmoid(g) (fp16; the ext_fallbacks.mul_sigmoid_ arithmetic: sigmoid rounded to half, then the half product)
+// written to a row-padded view: x, g contiguous [..., k], out columns contiguous at row pitch `pitch`
+void mul_sigmoid_pad
+(
+    const at::Tensor& x,
+    const at::Tensor& g,
+    at::Tensor& out,
+    int64_t pitch
 );
 
 // z = silu(x) * y (ext_fallbacks._act_mul contract incl. act_limit clamps); x/y f16 or f32, z f16

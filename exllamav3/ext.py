@@ -235,19 +235,51 @@ if torch.version.hip:
     if hasattr(exllamav3_ext, "fused_gated_rms_norm") and os.environ.get("EXL3_FUSE_GNORM", "1") != "0":
         _fb_gated_rms_norm = _fb.gated_rms_norm
 
-        def _gated_rms_norm_rocm(x, w, y, g, eps, constant_bias, w_groups, gate_first, gate_act = 0):
+        def _gated_rms_norm_rocm(x, w, y, g, eps, constant_bias, w_groups, gate_first, gate_act = 0, y_pitch = 0):
             if (x.is_cuda and x.dtype == torch.bfloat16 and y.dtype in (torch.float16, torch.float32) and
                     w.dtype in (torch.bfloat16, torch.float32) and
                     (g.dtype in (torch.bfloat16, torch.float32) or
                      (g.dtype == torch.float16 and ROCM_KNOBS["gnorm_f16g"])) and
-                    x.is_contiguous() and y.is_contiguous() and g.is_contiguous() and w.is_contiguous() and
+                    x.is_contiguous() and (y.is_contiguous() or (y_pitch and y.dtype == torch.float16 and x.dim() >= 3)) and g.is_contiguous() and w.is_contiguous() and
                     x.shape == y.shape == g.shape and x.shape[-1] <= 512 and x.shape[-1] % 128 == 0 and w_groups >= 1 and
                     w.numel() == w_groups * x.shape[-1] and gate_act in (0, 1)):
-                exllamav3_ext.fused_gated_rms_norm(x, w, y, g, eps, constant_bias, w_groups, gate_first, gate_act)
+                exllamav3_ext.fused_gated_rms_norm(x, w, y, g, eps, constant_bias, w_groups, gate_first, gate_act,
+                                                   y_pitch, x.shape[-2] if y_pitch else 1)
                 return
+            assert not y_pitch, "padded gated-norm output needs the fused kernel"
             _fb_gated_rms_norm(x, w, y, g, eps, constant_bias, w_groups, gate_first, gate_act)
 
+        def _gn_pad_ok(x, w, y_dtype, g, w_groups, gate_act = 0):
+            """True when _gated_rms_norm_rocm can write a row-padded fp16 y: the fused kernel's own conditions."""
+            return (x.is_cuda and x.dtype == torch.bfloat16 and x.dim() >= 3 and y_dtype == torch.float16 and
+                    w.dtype in (torch.bfloat16, torch.float32) and
+                    (g.dtype in (torch.bfloat16, torch.float32) or
+                     (g.dtype == torch.float16 and ROCM_KNOBS["gnorm_f16g"])) and
+                    x.is_contiguous() and g.is_contiguous() and w.is_contiguous() and x.shape == g.shape and
+                    x.shape[-1] <= 512 and x.shape[-1] % 128 == 0 and w_groups >= 1 and
+                    w.numel() == w_groups * x.shape[-1] and gate_act in (0, 1))
+        _gated_rms_norm_rocm.pad_ok = _gn_pad_ok
         setattr(exllamav3_ext, "gated_rms_norm", _gated_rms_norm_rocm)
+
+    # deinterleave_qg: hand HIP copy kernel (modules/ple_fn/ple_hip.hip), pure copy so bitwise equal; EXL3_DQ_HIP=1
+    if True:  # flag read per call so one process can A/B it
+        _fb_deinterleave_qg = _fb.deinterleave_qg
+
+        def _deinterleave_qg_rocm(qg, q, g, head_dim):
+            if (os.environ.get("EXL3_DQ_HIP", "0") == "1" and head_dim % 8 == 0 and qg.is_cuda and qg.dtype == torch.float16 and q.dtype == torch.float16
+                    and g.dtype == torch.float16 and qg.is_contiguous() and q.is_contiguous() and g.is_contiguous()
+                    and q.numel() == g.numel() and q.numel() * 2 == qg.numel() and q.numel() > 0
+                    and qg.data_ptr() % 16 == 0 and q.data_ptr() % 16 == 0 and g.data_ptr() % 16 == 0
+                    and qg.numel() % (2 * head_dim) == 0):
+                try:
+                    from .modules.ple_fn import ple_hip
+                    ple_hip.deinterleave_qg(qg, q, g, head_dim)
+                    return
+                except Exception:
+                    pass
+            _fb_deinterleave_qg(qg, q, g, head_dim)
+
+        setattr(exllamav3_ext, "deinterleave_qg", _deinterleave_qg_rocm)
 
     # r35: runtime-mutable knobs (in-process A/B)
     ROCM_KNOBS = {"silu_lim": os.environ.get("EXL3_FUSE_SILU_LIM", "1") != "0",

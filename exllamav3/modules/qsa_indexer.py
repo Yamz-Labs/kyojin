@@ -9,6 +9,26 @@ from .linear import Linear
 from .rmsnorm import RMSNorm
 from ..model.config import Config
 
+# row-invariant verify in the sparse regime. In a verify forward (R = 2..8 rows) the indexer's qk
+# projection, the per-row top-k selection and the gathered sparse attention are launched once for R rows, a different
+# float order than the R = 1 launches plain decode makes. Both knobs run the exact R = 1 call per row.
+#   EXL3_VERIFY_QSA_PROJ=1   qk projection per row
+#   EXL3_VERIFY_QSA_ATTN=all|sel|att   selection and attention per row / selection only / attention only
+# EXL3_QSA_SHADOW=1 (diagnostic): also run the per-row twin and count bitwise mismatches in SHADOW.
+VERIFY_QSA_PROJ = {"on": os.environ.get("EXL3_VERIFY_QSA_PROJ", "0") not in ("", "0")}
+VERIFY_QSA_ATTN = {"mode": {"": "", "0": "", "1": "all", "all": "all", "sel": "sel", "att": "att"}.get(os.environ.get("EXL3_VERIFY_QSA_ATTN", ""), "")}
+QSA_SHADOW = {"on": os.environ.get("EXL3_QSA_SHADOW", "0") not in ("", "0")}
+SHADOW: dict = {}
+
+
+def shadow_note(key: str, a: torch.Tensor, b: torch.Tensor) -> None:
+    n = SHADOW.setdefault(key, [0, 0, 0.0])
+    n[0] += 1
+    if not torch.equal(a, b):
+        n[1] += 1
+        if a.is_floating_point():
+            n[2] = max(n[2], float((a.float() - b.float()).abs().max()))
+
 """
 QSA (Qwen sparse attention) indexer: selects which tokens each query may attend to, at 4-token
 block granularity (Qwen3.8-Flash-Next full-attention layers).
@@ -36,6 +56,20 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
     h = r // 2
     rot = torch.cat((-x_rope[..., h:], x_rope[..., :h]), dim = -1)
     return torch.cat((x_rope * cos + rot * sin, x_pass), dim = -1)
+
+
+_PF_HIP = {"ok": None}
+def _pf_hip_ready() -> bool:
+    """EXL3_QSA_PF_HIP (default 1, 0 = Triton pair): first use loads the proven HIP prefill kernel; a missing compiler or proof disables it with a warning."""
+    if _PF_HIP["ok"] is None:
+        try:
+            from .attention_fn.qsa_prefill_hip import _load
+            _load()
+            _PF_HIP["ok"] = True
+        except Exception as e:
+            print(f" !! QSA prefill HIP kernel unavailable, using the Triton pair: {str(e)[:200]}")
+            _PF_HIP["ok"] = False
+    return _PF_HIP["ok"]
 
 
 class QSAIndexer(Module):
@@ -486,7 +520,17 @@ class QSAIndexer(Module):
         npr = bt.shape[1]
         page_size = layer.raw_k.shape[1]
 
-        qk = self.index_qk_proj.forward(x.contiguous(), params).view(R, (H + 1) * dk)
+        xc = x.contiguous()
+        qk = self.index_qk_proj.forward(xc, params).view(R, (H + 1) * dk)
+        if bsz == 1 and 1 < seqlen <= 8 and params.get("dflash_verify") and (VERIFY_QSA_PROJ["on"] or QSA_SHADOW["on"]):
+            qk = qk.clone()
+            p1 = dict(params, dflash_verify = False)
+            rows1 = torch.cat([self.index_qk_proj.forward(xc[:, i:i + 1], p1).reshape(1, (H + 1) * dk).clone()
+                               for i in range(seqlen)], dim = 0)
+            if QSA_SHADOW["on"]:
+                shadow_note("proj", qk, rows1)
+            if VERIFY_QSA_PROJ["on"]:
+                qk = rows1
         q = self._workspace(R, R * H * dk, torch.half, "qsa_up_q", dev) \
             .view(bsz, seqlen, H, dk)
         kraw = self._workspace(R, R * dk, torch.half, "qsa_up_k", dev) \
@@ -648,6 +692,7 @@ class QSAIndexer(Module):
         q_idx: torch.Tensor,
         block_table: torch.Tensor,
         cache_seqlens_cpu: torch.Tensor,
+        indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Sparse paged attention through the gathered-GQA kernel: per-row selection over the
@@ -656,12 +701,14 @@ class QSAIndexer(Module):
         OOMed on long prefills). Serves cached prefill chunks and every eager sparse fallback
         (bsz > 1, MTP verify). K/V for the current tokens must already be written to the cache.
         q: (bsz, seq, num_q_heads, head_dim) roped; q_idx: roped indexer queries from
-        update_planes. Returns (bsz, seq, num_q_heads, head_dim) fp16.
+        update_planes. indices: precomputed selection (bsz * seq, K_pad), else computed here.
+        Returns (bsz, seq, num_q_heads, head_dim) fp16.
         """
         from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         from ..cache.quant import CacheLayer_quant
         bsz, seq = q.shape[:2]
-        indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
+        if indices is None:
+            indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
         if isinstance(layer, CacheLayer_quant):
@@ -672,10 +719,46 @@ class QSAIndexer(Module):
             k_arg = layer.k.view(-1, attn.num_kv_heads, attn.head_dim)
             v_arg = layer.v.view(-1, attn.num_kv_heads, attn.head_dim)
             qc, page_size = None, layer.k.shape[1]
+        q_rows = q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous()
+        if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and qc is None and bsz == 1 and seq >= 64 and seq <= 4096 * 4
+                and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
+                and q_rows.dtype == torch.half and k_arg.dtype == torch.half and _pf_hip_ready()):
+            # one wave per (row, kv head) HIP kernel, bit-identical to the Triton pair (fp16 cache, prefill chunks only)
+            from .attention_fn.qsa_prefill_hip import qsa_prefill_hip
+            o = qsa_prefill_hip(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
+            return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
         o = qsa_sparse_attend_rows(
-            q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
+            q_rows,
             k_arg, v_arg, indices, attn.sm_scale,
             block_table = bt_rows, page_size = page_size,
             qc = qc, n_kv_heads = attn.num_kv_heads,
         )
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+
+    def sparse_attend_verify(self, layer, attn, q, q_idx, block_table, cache_seqlens_cpu) -> torch.Tensor:
+        """sparse_attend for a verify forward: optionally row-invariant (the R = 1 call per row, as plain decode)."""
+        bsz, seq = q.shape[:2]
+        mode = VERIFY_QSA_ATTN["mode"]
+        if not (bsz == 1 and 1 < seq <= 8) or not (mode or QSA_SHADOW["on"]):
+            return self.sparse_attend(layer, attn, q, q_idx, block_table, cache_seqlens_cpu)
+        def row_idx(i):
+            return self.select_indices_paged(layer, q_idx[:, i:i + 1], block_table, cache_seqlens_cpu + i).clone()
+        def attend_rows(idx):
+            return torch.cat([self.sparse_attend(layer, attn, q[:, i:i + 1], q_idx[:, i:i + 1], block_table,
+                                                 cache_seqlens_cpu + i, indices = idx[i:i + 1]).clone()
+                              for i in range(seq)], dim = 1)
+        idx_rows = torch.cat([row_idx(i) for i in range(seq)], dim = 0)
+        idx_all = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
+        if QSA_SHADOW["on"]:
+            o_all = self.sparse_attend(layer, attn, q, q_idx, block_table, cache_seqlens_cpu, indices = idx_all)
+            shadow_note("sel", idx_all, idx_rows)
+            shadow_note("att_rowwise_vs_batched_same_idx", o_all, attend_rows(idx_all))
+            shadow_note("att_rowwise_vs_batched_row_idx", self.sparse_attend(
+                layer, attn, q, q_idx, block_table, cache_seqlens_cpu, indices = idx_rows), attend_rows(idx_rows))
+        if mode == "all":
+            return attend_rows(idx_rows)
+        if mode == "sel":     # per-row selection, one attention launch
+            return self.sparse_attend(layer, attn, q, q_idx, block_table, cache_seqlens_cpu, indices = idx_rows)
+        if mode == "att":     # one selection, per-row attention
+            return attend_rows(idx_all)
+        return self.sparse_attend(layer, attn, q, q_idx, block_table, cache_seqlens_cpu, indices = idx_all)

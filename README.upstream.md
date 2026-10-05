@@ -1,4 +1,4 @@
-> ## 🟥 AMD fork — adds RDNA 3.5 (gfx1151 / Strix Halo) support
+> ## 🟥 AMD port — adds RDNA 3.5 (gfx1151 / Strix Halo) support
 >
 > **This branch adds AMD GPU functionality that is not in upstream ExLlamaV3.** Upstream targets
 > CUDA; the [`sdougbrown/exllamav3`](https://github.com/sdougbrown/exllamav3) base this is built on

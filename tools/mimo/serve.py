@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """msrv -- OpenAI-compatible server for MiMo-V2.6 EXL3 with DFlash drafting + SpecGate.
 
-The HTTP/streaming layer is adapted from tools/glm/serve.py (the GLM server); the engine wiring is
+The HTTP/streaming layer is adapted from tools/glm/serve.py (glm-serve); the engine wiring is
 adapted from scripts/dflash-bench.py so the served decode path is the measured one (plain ~30 t/s,
 DFlash with a 4 bpw EXL3 drafter and confidence-truncated draft length).
 
@@ -32,8 +32,8 @@ DEFAULT_MODEL = os.path.expanduser("~/models/mimo26-exl3")
 DEFAULT_MODEL_ID = "MiMo-2.6-EXL3"
 DEFAULT_CTX = 4096
 DEFAULT_NDT = 7
-# Sampling used when a request omits temperature/top_p. Agent clients often send neither, so
-# a plain-greedy default makes the lane loop; the lane launchers pass the model-card values (T1.0, top_p 0.95).
+# Sampling used when a request omits temperature/top_p. The client sends neither on the main agent loop, so
+# a plain-greedy default makes the lane loop; the lane launcher passes the model-card values (T1.0, top_p 0.95).
 SERVE_DEFAULTS: dict[str, float] = {"temperature": 0.0, "top_p": 1.0}
 # The template uses a zero-width space inside the tag so plain prose does not trigger tools.
 TOOL_OPEN = "<tool_call>"
@@ -77,96 +77,56 @@ def _json_value(raw: str) -> Any:
 # ---------------------------------------------------------------------------- completion parsing
 
 _NAME_RE = re.compile(r"<function=([^\s>]+)\s*>")
-_FUNC_RE = re.compile(r"<function=([^\s>]+)\s*>(.*?)(?:</function>|(?=<function=)|\Z)", re.S)
 _PARAM_RE = re.compile(r"<parameter=([^\s>]+)\s*>(.*?)</parameter>", re.S)
 
 
-def _schema_types(tools: list[dict[str, Any]] | None, name: str) -> dict[str, Any]:
-    """Property schemas of the declared tool `name` ({} when unknown)."""
-    for tool in tools or []:
-        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
-        if fn.get("name") == name:
-            params = fn.get("parameters") or fn.get("input_schema") or {}
-            props = params.get("properties") if isinstance(params, dict) else None
-            return props if isinstance(props, dict) else {}
-    return {}
-
-
-def _coerce(value: str, schema: Any) -> Any:
-    """XML parameter text -> typed value. Strings stay strings unless the schema asks for another type."""
-    kind = schema.get("type") if isinstance(schema, dict) else None
-    kinds = kind if isinstance(kind, list) else [kind]
-    if "string" in kinds and len(kinds) == 1:
-        return value
-    parsed = _json_value(value)
-    if parsed is value:  # not JSON
-        return value
-    if isinstance(parsed, (dict, list)):
-        return parsed
-    # scalars: only when the schema declares a non-string type, else keep the text (e.g. "007", "true" as a name)
-    if kinds != [None] and any(k in kinds for k in ("integer", "number", "boolean", "null")):
-        return parsed
-    return value
-
-
-def _xml_params(raw: str, props: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    """MiMo's template teaches <parameter=key>value</parameter>: map it to a dict."""
+def _xml_params(raw: str) -> dict[str, Any] | None:
+    """MiMo's template teaches <parameter=key>value</parameter>: map it to a dict (object/array values parsed as JSON, the rest kept as text)."""
     found = _PARAM_RE.findall(raw)
-    if not found:
-        return None
-    props = props or {}
-    return {k: _coerce(v.strip("\n") if props.get(k, {}).get("type") == "string" else v.strip(), props.get(k))
-            for k, v in found}
+    vals = {k: v.strip() for k, v in found}
+    return {k: (j if isinstance(j := _json_value(v), (dict, list)) else v) for k, v in vals.items()} if vals else None
 
 
-def _parse_call(name: str, body: str, tools: list[dict[str, Any]] | None) -> dict[str, Any]:
-    args_text = body.split("</function>")[0].strip()
-    args: Any = {}
-    if args_text:
-        args = _json_value(args_text)
-        if isinstance(args, str):  # not JSON: try the XML parameter form
-            xml = _xml_params(args_text, _schema_types(tools, name))
-            if xml is not None:
-                args = xml
-    # A malformed body is passed through raw (never silently turned into {} and executed):
-    # the client fails json.loads and reports the error back to the model.
-    arguments = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else args_text
-    return {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-            "function": {"name": name, "arguments": arguments}}
-
-
-def parse_completion(text: str, tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """Split MiMo <think> blocks and <tool_call><function=NAME>...</function></tool_call>
-    blocks into OpenAI message fields. A block body is JSON or <parameter=k>v</parameter> XML;
-    one block may hold several <function=...> elements. An unterminated trailing <tool_call>
-    (generation cut off) is dropped from the content and yields no call."""
+def parse_completion(text: str) -> dict[str, Any]:
+    """Split MiMo <think> blocks and <tool_call><function=NAME>{json}</function></tool_call>
+    blocks into OpenAI message fields."""
     calls: list[dict[str, Any]] = []
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
-
-    def prose(chunk: str) -> None:
-        if "<think>" in chunk:
-            before, after = chunk.split("<think>", 1)
-            content_parts.append(before)
-            thinking, _, chunk = after.partition("</think>")
-            reasoning_parts.append(thinking)
-        content_parts.append(chunk)
-
     # A bare "</think>" with no opener is left as literal content: MiMo's template never ends the
     # generation prompt inside a think block (it emits "<think></think>" for enable_thinking=false),
     # so the streamed and non-streamed paths classify the same text identically.
     cursor = 0
     pattern = re.compile(re.escape(TOOL_OPEN) + r"(.*?)" + re.escape(TOOL_CLOSE), re.S)
     for match in pattern.finditer(text):
-        prose(text[cursor:match.start()])
-        cursor = match.end()  # always advance: a nameless block must not leak or duplicate text
-        for fn in _FUNC_RE.finditer(match.group(1)):
-            calls.append(_parse_call(fn.group(1), fn.group(2), tools))
+        visible = text[cursor:match.start()]
+        if "<think>" in visible:
+            before, after = visible.split("<think>", 1)
+            content_parts.append(before)
+            thinking, _, visible = after.partition("</think>")
+            reasoning_parts.append(thinking)
+        content_parts.append(visible)
+        body = match.group(1)
+        name_match = _NAME_RE.search(body)
+        if not name_match:
+            continue
+        args_text = body[name_match.end():]
+        args_text = args_text.split("</function>")[0].strip()
+        args = _json_value(args_text) if args_text else {}
+        if isinstance(args, str) and (xml := _xml_params(args_text)) is not None:
+            args = xml
+        calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                      "function": {"name": name_match.group(1),
+                                   "arguments": args_text if isinstance(args, str)
+                                   else json.dumps(args, ensure_ascii=False)}})
+        cursor = match.end()
     tail = text[cursor:]
-    open_at = tail.find(TOOL_OPEN)
-    if open_at >= 0 and tail[open_at + len(TOOL_OPEN):].lstrip().startswith("<function="):
-        tail = tail[:open_at]  # cut-off call: do not leak raw XML; prose that merely mentions the tag stays
-    prose(tail)
+    if "<think>" in tail:
+        before, after = tail.split("<think>", 1)
+        content_parts.append(before)
+        thinking, _, tail = after.partition("</think>")
+        reasoning_parts.append(thinking)
+    content_parts.append(tail)
     message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
     reasoning = "".join(reasoning_parts)
     if reasoning:
@@ -200,6 +160,17 @@ class ResidentEngine:
                  spec_gate: bool = False, ctx: int | None = None,
                  reset_gate_per_request: bool = False,
                  dynamic_draft: bool = True, draft_confidence: float = 0.6):
+        # Lossless speculation (mimoident1): every verify row uses the exact R=1 arithmetic, so
+        # speculative output equals plain greedy output (20/20 prompts). Costs about 5 % chat and
+        # 12 % code tok/s. EXL3_MIMO_LOSSLESS=0 restores the fast, not bit-identical verify.
+        # Set before the exllamav3 import. Catch-up fusion stays automatic (on with the union MoE).
+        if os.environ.get("EXL3_MIMO_LOSSLESS", "1") != "0":
+            for k, v in (("EXL3_VERIFY_ATTN_LOOP", "1"), ("EXL3_VERIFY_GEMV_R", "1"),
+                         ("EXL3_DEC_MOE_UNION", "1")):
+                os.environ.setdefault(k, v)
+        # v2mimochk1: the one-launch wide-N verify GEMV (specrow1, lm_head) is a Qwen win but costs MiMo
+        # about 7 % tok/s (35.6/31.0/42.3 -> 33.2/28.9/39.5). Off by default here; the caller's env wins.
+        os.environ.setdefault("EXL3_VERIFY_WIDE_R", "0")
         import torch
         from exllamav3 import Config, Generator, Job, model_init
 
@@ -442,7 +413,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 await flush(False)
             text, _ = stop_text(text, body["_stop"])
             await flush(True)
-            message = parse_completion(text, body.get("tools"))
+            message = parse_completion(text)
             if "tool_calls" in message:
                 await response.write(sse(event({"tool_calls": [
                     dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
@@ -454,7 +425,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
         raw = "".join([d async for d in deltas()])
         text, _ = stop_text(raw, body["_stop"])
-        message = parse_completion(text, body.get("tools"))
+        message = parse_completion(text)
         finish = message.pop("finish_reason", "stop")
         return web.json_response({
             "id": request_id, "object": "chat.completion", "created": created, "model": model_id,
@@ -581,7 +552,6 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--no-uncensor", action="store_true", help="ignore a bundled uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--drafter", default=None,
                         help="drafter directory (default: $MIMO_DRAFTER, <model>/drafter, then <model>-drafter)")
@@ -604,8 +574,6 @@ def main() -> None:
     parser.add_argument("--default-temperature", type=float, default=0.0, help="used when a request omits temperature")
     parser.add_argument("--default-top-p", type=float, default=1.0, help="used when a request omits top_p")
     args = parser.parse_args()
-    if args.no_uncensor:
-        os.environ["EXL3_ABLIT_RUNTIME"] = "off"
     SERVE_DEFAULTS.update(temperature=args.default_temperature, top_p=args.default_top_p)
 
     torch.set_grad_enabled(False)

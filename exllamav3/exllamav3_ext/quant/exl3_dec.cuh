@@ -9,7 +9,7 @@
 // a 512-column strip, so one launch covers what the generic path does in three.
 //
 // K (bits per weight) in {2, 2.5, 3, 4, 5, 6}. `mcg` selects the codebook for all matrices of a
-// launch (uniform per layer): false = mul1, true = mcg (GLM-5.3-Flash packs).
+// launch (uniform per layer): false = mul1, true = mcg (GLM-5.3-Flash packs, see REPORT-22).
 // The two templates decode bit-identically to their codebook's reference decode; only the
 // summation order differs from the reconstruct+hgemm path.
 
@@ -62,7 +62,7 @@ void exl3_dec_gemv_multi
     bool mcg = false
 );
 
-// R-row dense GEMV: y[R, N] = x[R, K] @ W, one launch, each weight tile decoded once
+// R-row dense GEMV (REPORT-17): y[R, N] = x[R, K] @ W, one launch, each weight tile decoded once
 // and applied to every row -- bit-exact vs R independent exl3_dec_gemv calls PROVIDED the caller
 // doesn't touch EXL3_DEC_KTW/EXL3_DEC_MIN_BLOCKS/EXL3_DEC_KBS differently between the two (same
 // pick_ktw/kbs_of call as batch-1). x must be contiguous [R, K]; no strided (x_gstride) form yet.
@@ -165,7 +165,7 @@ void exl3_dec_moe_shared
     bool mcg
 );
 
-// R-row union MoE, R<=8: x [R,H] fp16, out [R,H] fp32, selected/weights [R,topk].
+// R-row union MoE (REPORT-16), R<=8: x [R,H] fp16, out [R,H] fp32, selected/weights [R,topk].
 // Each unique expert across the R rows' selections is decoded once and applied to every row that
 // picked it, in the exact batch-1 exl3_dec_moe per-lane arithmetic order (row r bit-identical to
 // a fresh batch-1 call). act: fp16 [R*topk, I], down_part: fp32 [R*topk, H] workspaces.

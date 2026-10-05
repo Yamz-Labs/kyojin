@@ -2070,6 +2070,24 @@ __device__ __forceinline__ void unpack_s8x4(uint32_t v, float& f0, float& f1, fl
     f3 = (float) ((int) v >> 24);
 }
 
+// group scales (gs != 0): fn scales per 128 consecutive k of (h, d), f32 [M][H * D / 128]; up scales per 64 ranks per column,
+// f32 [H][D / 4][ceil(LR / 64)][4]. Weight = half(code * scale) as fp32 (bit-exact twin of the fp16 kernels on the dequantised half weights).
+#define GS_FN_G 128
+#define GS_UP_G 64
+// The product must be rounded to fp32 BEFORE the half rounding (the fp16 twin sees half(fp32(q * sc))); without the barrier the compiler
+// fuses mul + convert into one v_fma_mix and rounds once (differs on exact half ties).
+#ifndef GS_NOFUSE
+#define GS_NOFUSE(p) asm volatile("" : "+v"(p))
+#endif
+__device__ __forceinline__ float gs_dq(float q, float sc) { float p = q * sc; GS_NOFUSE(p); return __half2float(__float2half_rn(p)); }
+__device__ __forceinline__ void gs_unpack_s8x4(uint32_t v, float sc, float& f0, float& f1, float& f2, float& f3)
+{
+    unpack_s8x4(v, f0, f1, f2, f3);
+    f0 = gs_dq(f0, sc); f1 = gs_dq(f1, sc); f2 = gs_dq(f2, sc); f3 = gs_dq(f3, sc);
+}
+__device__ __forceinline__ size_t gs_fn_idx(int j, int h, int c8, int D) { return (size_t) j * (4 * D / GS_FN_G) + (size_t) h * (D / GS_FN_G) + (c8 >> 4); }
+__device__ __forceinline__ size_t gs_up_idx(int h, int c, int i, int D, int LR) { return (((size_t) h * (D / 4) + c) * ((LR + GS_UP_G - 1) / GS_UP_G) + (i >> 6)) * 4; }
+
 template <int H>
 __global__ __launch_bounds__(GR_THREADS_A)
 void gr_dots_q8_kernel
@@ -2079,7 +2097,8 @@ void gr_dots_q8_kernel
     const float* __restrict__ fn_scale,  // (M)
     float* __restrict__ dots,            // (R, M + 1, H): per-stream dots, row M = sum sq
     const int M,
-    const int D
+    const int D,
+    const int gs = 0
 )
 {
     const int r = blockIdx.y;
@@ -2105,8 +2124,17 @@ void gr_dots_q8_kernel
                 float4 s1 = s4[(size_t) h * D4 + 2 * c + 1];
                 int2 pk = f8[c];
                 float w0, w1, w2, w3, w4, w5, w6, w7;
-                unpack_s8x4((uint32_t) pk.x, w0, w1, w2, w3);
-                unpack_s8x4((uint32_t) pk.y, w4, w5, w6, w7);
+                if (gs)
+                {
+                    const float gsc = fn_scale[gs_fn_idx(j, h, c, D)];
+                    gs_unpack_s8x4((uint32_t) pk.x, gsc, w0, w1, w2, w3);
+                    gs_unpack_s8x4((uint32_t) pk.y, gsc, w4, w5, w6, w7);
+                }
+                else
+                {
+                    unpack_s8x4((uint32_t) pk.x, w0, w1, w2, w3);
+                    unpack_s8x4((uint32_t) pk.y, w4, w5, w6, w7);
+                }
                 a = fmaf(s0.x, w0, a); a = fmaf(s0.y, w1, a);
                 a = fmaf(s0.z, w2, a); a = fmaf(s0.w, w3, a);
                 a = fmaf(s1.x, w4, a); a = fmaf(s1.y, w5, a);
@@ -2132,7 +2160,7 @@ void gr_dots_q8_kernel
         #pragma unroll
         for (int w = 0; w < GR_THREADS_A / 32; ++w)
             v += red[threadIdx.x][w];
-        if (j < M) v *= fn_scale[j];
+        if (j < M && !gs) v *= fn_scale[j];
         dots[((size_t) r * (M + 1) + j) * H + threadIdx.x] = v;
     }
 }
@@ -2151,7 +2179,8 @@ void gr_finalize_q8_kernel
     const int D,
     const int LR,
     const int chunk_cols,
-    const float rms_eps
+    const float rms_eps,
+    const int gs = 0
 )
 {
     const int r = blockIdx.y;
@@ -2194,9 +2223,15 @@ void gr_finalize_q8_kernel
         float4 g[H];
         #pragma unroll
         for (int h = 0; h < H; ++h) g[h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 gsc[H];
         for (int i = lane; i < LR; i += 32)
         {
             float ti = t_s[i];
+            if (gs && (((i - lane) & 32) == 0))     // the 32-rank step that opens a 64-rank group (warp-uniform, lane < 32)
+            {
+                #pragma unroll
+                for (int h = 0; h < H; ++h) gsc[h] = *(const float4*) (up_scale + gs_up_idx(h, c, i, D, LR));
+            }
             #pragma unroll
             for (int h = 0; h < H; ++h)
             {
@@ -2204,6 +2239,7 @@ void gr_finalize_q8_kernel
                 uint32_t u = *(const uint32_t*) (upt + ((((size_t) h * D4 + c) * LR + i) * 4));
                 float u0, u1, u2, u3;
                 unpack_s8x4(u, u0, u1, u2, u3);
+                if (gs) { u0 = gs_dq(u0, gsc[h].x); u1 = gs_dq(u1, gsc[h].y); u2 = gs_dq(u2, gsc[h].z); u3 = gs_dq(u3, gsc[h].w); }
                 g[h].x = fmaf(ti, u0, g[h].x);
                 g[h].y = fmaf(ti, u1, g[h].y);
                 g[h].z = fmaf(ti, u2, g[h].z);
@@ -2224,7 +2260,7 @@ void gr_finalize_q8_kernel
         #pragma unroll
         for (int h = 0; h < H; ++h)
         {
-            const float4 sc = *(const float4*) (up_scale + (size_t) h * D + 4 * c);
+            const float4 sc = gs ? make_float4(1.0f, 1.0f, 1.0f, 1.0f) : *(const float4*) (up_scale + (size_t) h * D + 4 * c);
             float4 sv = s4[(size_t) h * D4 + c];
             half4 wq = *(const half4*) (w + (size_t) h * D + 4 * c);
             float coef = rmr_s[h] * inv_h;
@@ -2242,6 +2278,21 @@ void gr_finalize_q8_kernel
         else
             ((float4*) ((float*) mixed + (size_t) r * D))[c] = o;
     }
+}
+
+#include "hc_mix_q8r.cuh"
+
+// One-pass-over-rows int8 mix: bit-identical to the one-row-per-block kernels, default ON,
+// EXL3_GR_MIX_Q8_1PASS=0 restores the old launch (read once at first call).
+static bool gr_q8_onepass()
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char* e = getenv("EXL3_GR_MIX_Q8_1PASS");
+        v = (e && *e == '0') ? 0 : 1;
+    }
+    return v == 1;
 }
 
 void gr_mix_q8
@@ -2282,9 +2333,12 @@ void gr_mix_q8
     TORCH_CHECK(dots.scalar_type() == at::kFloat, "gr_mix_q8: dots must be float32");
     TORCH_CHECK(mixed.scalar_type() == at::kFloat || mixed.scalar_type() == at::kHalf, "gr_mix_q8: mixed must be float32 or float16");
     TORCH_CHECK(fn.dim() == 2 && fn.size(0) == M && fn.size(1) == H * D, "gr_mix_q8: fn must have shape (LR [+ 4], 4 * D)");
-    TORCH_CHECK(fn_scale.dim() == 1 && fn_scale.size(0) == M, "gr_mix_q8: fn_scale must have shape (M)");
+    // group scales when fn_scale has M * H * D / 128 entries (then up_scale has H * D * ceil(LR / 64))
+    const int gs = fn_scale.numel() != M ? 1 : 0;
+    TORCH_CHECK(!gs || D % GS_FN_G == 0, "gr_mix_q8: group scales need D % 128 == 0");
+    TORCH_CHECK(fn_scale.dim() == 1 && fn_scale.size(0) == (gs ? (int64_t) M * H * D / GS_FN_G : (int64_t) M), "gr_mix_q8: fn_scale must have shape (M) or (M * 4 * D / 128)");
     TORCH_CHECK(upt.size(0) == H && upt.size(1) == D / 4 && upt.size(3) == 4, "gr_mix_q8: upt must have shape (4, D / 4, LR, 4)");
-    TORCH_CHECK(up_scale.dim() == 1 && up_scale.size(0) == H * D, "gr_mix_q8: up_scale must have shape (4 * D)");
+    TORCH_CHECK(up_scale.dim() == 1 && up_scale.size(0) == (gs ? (int64_t) H * D * ((LR + GS_UP_G - 1) / GS_UP_G) : (int64_t) H * D), "gr_mix_q8: up_scale must have shape (4 * D) or (4 * D * ceil(LR / 64))");
     TORCH_CHECK(w.dim() == 1 && w.size(0) == H * D, "gr_mix_q8: w must have shape (4 * D)");
     TORCH_CHECK(dots.dim() == 3 && dots.size(0) == R && dots.size(1) == M + 1 && dots.size(2) == H, "gr_mix_q8: dots must have shape (R, M + 1, 4)");
     TORCH_CHECK(mixed.dim() == 2 && mixed.size(0) == R && mixed.size(1) == D, "gr_mix_q8: mixed must have shape (R, D)");
@@ -2305,11 +2359,23 @@ void gr_mix_q8
 
     const at::cuda::OptionalCUDAGuard device_guard(device);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    if (R <= GRR_MAX_RT && gr_q8_onepass())     // measured domain: decode / MTP verify rows; larger R keeps the old launch
+    {
+        grr_launch
+        (
+            (const float*) streams.data_ptr(), (const int8_t*) fn.data_ptr(), (const float*) fn_scale.data_ptr(),
+            (const int8_t*) upt.data_ptr(), (const float*) up_scale.data_ptr(), (const half*) w.data_ptr(),
+            post ? (float*) post.value().data_ptr() : nullptr, mixed.data_ptr(), (float*) dots.data_ptr(),
+            (int) R, (int) M, (int) D, (int) LR, (float) rms_eps, mixed.dtype() == at::kHalf, 512, stream, gs
+        );
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
     dim3 grid_a(M + 1, R);
     gr_dots_q8_kernel<4><<<grid_a, GR_THREADS_A, 0, stream>>>
     (
         (const float*) streams.data_ptr(), (const int8_t*) fn.data_ptr(), (const float*) fn_scale.data_ptr(),
-        (float*) dots.data_ptr(), M, D
+        (float*) dots.data_ptr(), M, D, gs
     );
     cuda_check(cudaPeekAtLastError());
 
@@ -2323,7 +2389,7 @@ void gr_mix_q8
     #define ARGS_Q8 \
         (const float*) streams.data_ptr(), (const float*) dots.data_ptr(), \
         (const int8_t*) upt.data_ptr(), (const float*) up_scale.data_ptr(), (const half*) w.data_ptr(), \
-        post_p, mixed.data_ptr(), D, LR, chunk_cols, (float) rms_eps
+        post_p, mixed.data_ptr(), D, LR, chunk_cols, (float) rms_eps, gs
     if (mixed.dtype() == at::kHalf)
         gr_finalize_q8_kernel<4, true><<<grid_c, NUM_THREADS, smem, stream>>>(ARGS_Q8);
     else

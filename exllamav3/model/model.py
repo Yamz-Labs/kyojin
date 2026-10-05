@@ -509,6 +509,12 @@ class Model(Model_TPMixin, Model_LSMixin):
         kwargs["generator"] = False
         f = self.load_gen(*args, **kwargs)
         for _ in f: pass
+        try:
+            from ..modules import moe_fused
+            moe_fused.report(self)
+        except Exception as e:                                            # noqa: BLE001  (diagnostics must never break a load)
+            import sys
+            print(f"[moe_fused] WARNING fused-status report failed: {e!r}", file = sys.stderr)
 
         # CPU-offloaded MoE experts: make sure the worker processes are up before the first
         # forward (spawned during module loading when the offload count is exact, so the child's

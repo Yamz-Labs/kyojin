@@ -1,3 +1,4 @@
+import os
 import torch
 from ...ext import exllamav3_ext as ext
 from ...util.tensor import get_for_device, buffered_arange
@@ -181,7 +182,9 @@ def gated_delta_rule_fn(
     assert not g_cumsum, "g_cumsum is only valid on the KDA chunk path"
     # Chunked rule
     if seqlen >= num_v_heads and not history:
-        from ...vendor.fla import chunk_gated_delta_rule
+        from ...vendor.fla import chunk_gated_delta_rule, chunk_gated_delta_rule_pf
+        # EXL3_GDN_PF (default 1): strided q / k / v straight from the conv output, no contiguous copies, no single-tensor cat (bit-equal)
+        pf = os.environ.get("EXL3_GDN_PF", "1") == "1"
 
         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
         q = q.view(bsz, seqlen, -1, k_head_dim)
@@ -195,19 +198,24 @@ def gated_delta_rule_fn(
         core_attn_out = []
         for i, s in enumerate(recurrent_slots_cpu.tolist()):
             state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
-            core_attn, new_state = chunk_gated_delta_rule(
-                q[i:i + 1], k[i:i + 1], v[i:i + 1],
-                g = g[i:i + 1],
-                beta = beta[i:i + 1],
-                initial_state = state,
-                output_final_state = save_state,
-                use_qk_l2norm_in_kernel = True,
-            )
+            if pf:
+                core_attn, new_state = chunk_gated_delta_rule_pf(
+                    q[i:i + 1], k[i:i + 1], v[i:i + 1], g = g[i:i + 1], beta = beta[i:i + 1],
+                    initial_state = state, output_final_state = save_state)
+            else:
+                core_attn, new_state = chunk_gated_delta_rule(
+                    q[i:i + 1], k[i:i + 1], v[i:i + 1],
+                    g = g[i:i + 1],
+                    beta = beta[i:i + 1],
+                    initial_state = state,
+                    output_final_state = save_state,
+                    use_qk_l2norm_in_kernel = True,
+                )
             if save_state and state is not None:
                 state.copy_(new_state)
             core_attn_out.append(core_attn)
 
-        core_attn_out = torch.cat(core_attn_out, dim = 0)
+        core_attn_out = core_attn_out[0] if pf and len(core_attn_out) == 1 else torch.cat(core_attn_out, dim = 0)
 
     # Fused recurrent rule
     else:

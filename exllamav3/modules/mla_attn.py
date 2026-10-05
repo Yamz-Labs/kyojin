@@ -33,6 +33,7 @@ MAX_DECODE_QLEN = 16
 # the score transient at (256 rows, tile) regardless of context length; must be a multiple
 # of the page size (256)
 _score_tile = int(os.environ.get("EXL3_DSA_SCORE_TILE", 32768))
+_kpool_eager_rows = int(os.environ.get("EXL3_DSA_KPOOL_EAGER_ROWS", 1024))  # 0 = one shot (old path)
 assert _score_tile % 256 == 0 and _score_tile > 0
 
 # Decode/verify has few query rows.  When enabled, score the whole visible slab in one
@@ -966,16 +967,25 @@ class MLAttention(Module):
                 probs = torch.softmax(gg + self.idx_kpool_ape.unsqueeze(0), dim = 1)
                 pool_keys = (probs * gk).sum(dim = 1)
 
-                sc = torch.einsum("shd,pd->shp", q_idx[b].float(), pool_keys)
-                sc = F.relu(sc * (D_i ** -0.5))
-                sc = torch.einsum("sh,shp->sp", w[b].float() * (H_i ** -0.5), sc)
-
                 q_pos = host_seqlens[b] + torch.arange(seqlen, device = x.device)
                 pool_end = torch.arange(n_pools, device = x.device) * P + (P - 1)
-                sc = sc.masked_fill(pool_end.unsqueeze(0) > q_pos.unsqueeze(1), -float("inf"))
-
                 select_k = min(self.index_topk // P, n_pools)
-                top_sc, top_pool = sc.topk(select_k, dim = -1)
+                qf, wb = q_idx[b], w[b]
+                # Query-chunked: the [rows, H_i, n_pools] fp32 score cube is 8 GiB per copy at 16K tokens.
+                # Rows are independent, so every chunk computes the same per-row values.
+                step = _kpool_eager_rows if _kpool_eager_rows > 0 else seqlen
+                top_sc_l, top_pool_l = [], []
+                for r0 in range(0, seqlen, step):
+                    r1 = min(r0 + step, seqlen)
+                    sc = torch.einsum("shd,pd->shp", qf[r0:r1].float(), pool_keys)
+                    sc = F.relu(sc * (D_i ** -0.5))
+                    sc = torch.einsum("sh,shp->sp", wb[r0:r1].float() * (H_i ** -0.5), sc)
+                    sc = sc.masked_fill(pool_end.unsqueeze(0) > q_pos[r0:r1].unsqueeze(1), -float("inf"))
+                    ts, tp = sc.topk(select_k, dim = -1)
+                    del sc
+                    top_sc_l.append(ts); top_pool_l.append(tp)
+                top_sc = top_sc_l[0] if len(top_sc_l) == 1 else torch.cat(top_sc_l)
+                top_pool = top_pool_l[0] if len(top_pool_l) == 1 else torch.cat(top_pool_l)
                 exp = (top_pool.unsqueeze(-1) * P +
                        torch.arange(P, device = x.device)).view(seqlen, -1)
                 exp = torch.where(

@@ -46,7 +46,7 @@ def _torch_rowsum(x_ptr, o_r, m, D: tl.constexpr, BR: tl.constexpr, NT: tl.const
 @triton.jit(do_not_specialize = ["R"])
 def kda_norm_kernel(
     x_ptr, g_ptr, w_ptr, y_ptr, R, eps, cbias,
-    D: tl.constexpr, BR: tl.constexpr, NT: tl.constexpr,
+    D: tl.constexpr, BR: tl.constexpr, NT: tl.constexpr, SILU: tl.constexpr = False,
 ):
     i_r = tl.program_id(0).to(tl.int64)
     o_r = i_r * BR + tl.arange(0, BR)
@@ -68,7 +68,10 @@ def kda_norm_kernel(
     w = tl.load(w_ptr + o_d).to(tl.float32) + cbias
     h = h * w[None, :]
     gf = tl.load(g_ptr + p, mask = m, other = 0.0).to(tl.float32)
-    h = h * (1.0 / (1.0 + libdevice.exp(-gf)))
+    if SILU:
+        h = h * (gf / (1.0 + libdevice.exp(-gf)))  # torch silu: x / (1 + exp(-x))
+    else:
+        h = h * (1.0 / (1.0 + libdevice.exp(-gf)))
     if y_ptr.dtype.element_ty == tl.float16:
         # Triton's fp32 -> fp16 cast on gfx1151 is not round-to-nearest-even on ties (~1e3 of 16.7M values off by
         # an ulp, fp_downcast_rounding = "rtne" does not change it). Round in fp32 first so the cast is exact:
@@ -94,6 +97,7 @@ def kda_norm(
     br: int = 8,
     num_warps: int = 2,
     nt: int = 32,
+    silu: bool = False,
 ) -> None:
     """
     x: (..., D) bf16 contiguous; g: same shape, fp16/bf16/fp32 contiguous; w: (D,) bf16/fp32;
@@ -106,6 +110,6 @@ def kda_norm(
     grid = (triton.cdiv(R, br),)
     # enable_fp_fusion = False: no FMA contraction, so x*x, the sum and the scaling match torch's separate kernels
     kda_norm_kernel[grid](
-        x, g, w, y, R, float(eps), float(constant_bias), D, br, nt,
+        x, g, w, y, R, float(eps), float(constant_bias), D, br, nt, silu,
         num_warps = num_warps, enable_fp_fusion = False,
     )

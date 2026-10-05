@@ -1,6 +1,6 @@
 // Batch-1 EXL3 decode kernels for RDNA3.5 (gfx1151). See exl3_dec.cuh.
 //
-// Layout facts used here (ref/frac_reconstruct.py, validated bit-exact against the fork's HIP
+// Layout facts used here (ref/frac_reconstruct.py, validated bit-exact against the port's HIP
 // reconstruct kernels):
 //   - trellis[kt][nt][WORDS] u32: tile (kt, nt) covers W rows 16kt.., columns 16nt.. (y = x @ W)
 //   - the tile bit stream is MSB-first inside each u32; ring position p has its 16-bit window at
@@ -30,6 +30,12 @@
 #include <ATen/ops/empty.h>
 #include "exl3_dec.cuh"
 #include "../util.cuh"
+
+// QWG_ABLATE=1 compiles runtime ablation arms into the dense gemv (env EXL3_QWG_DABL; timing only, garbage results by design):
+// bit 1 = no trellis decode (loads kept alive by an xor), bit 2 = no DRAM stream (every k-tile read is k-row 0..ktw-1), bit 4 = no epilogue
+#if !defined(QWG_ABLATE)
+#define QWG_ABLATE 0
+#endif
 
 namespace exl3dec {
 
@@ -346,7 +352,7 @@ template <int KB2> constexpr int ring_of() { return Fmt<KB2>::WORDS <= 32 ? EXL3
 
 // Accumulate x[kt0 .. kt0 + n) . W[.., nt] for one lane (n % RING == 0), tile words streamed
 // through a RING-deep register ring. xs: LDS input (fp16) for this wave's k range, 16 per k-tile.
-template <int KB2, int CB = 2, int RING_ = 0>
+template <int KB2, int CB = 2, int RING_ = 0, bool NODEC = false>
 __device__ __forceinline__ void lane_gemv(const u32x4* tiles, size_t tstride, const half* xs, int n, float* acc)
 {
     constexpr int VEC = Fmt<KB2>::VEC;
@@ -388,20 +394,21 @@ __device__ __forceinline__ void lane_gemv(const u32x4* tiles, size_t tstride, co
             const f16x2* xq = reinterpret_cast<const f16x2*>(xs + i * 16);
             #pragma unroll
             for (int q = 0; q < 8; ++q) xp[q] = xq[q];
-            tile_dot<KB2, CB>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
+            if constexpr (NODEC) { uint32_t xx = 0; for (int v = 0; v < VEC; ++v) xx ^= buf[r][v].x ^ buf[r][v].y ^ buf[r][v].z ^ buf[r][v].w; acc[0] += __uint_as_float(xx & 0x3fffffff); }
+            else tile_dot<KB2, CB>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
             if (i + RING < n) load_tile<KB2>(tiles + (i + RING) * tstride, buf[r]);
             __builtin_amdgcn_sched_barrier(0);   // keep the scheduler from interleaving tiles (VGPR blowup)
         }
     }
 }
 
-// R-row variant: each tile is loaded once (identical RING pipeline to lane_gemv), then
+// R-row variant (REPORT-16): each tile is loaded once (identical RING pipeline to lane_gemv), then
 // applied to `nrows` independent input rows in the exact same per-row tile_dot/pair_dot arithmetic
 // lane_gemv would run for a batch-1 call on that row -- so row j of acc is bit-identical to what a
 // batch-1 lane_gemv(..., xs_rows[j], n, acc_row_j) call would produce. xp is scoped inside the row
 // loop (not hoisted per-row), so only one row's 8 xp registers are live at a time; acc[MOE_R_MAX][16]
 // (only the first `nrows` rows used) is the only cost that scales with rows.
-// RM: compile-time row bound. The row loop used to run to the runtime nrows, which
+// RM (REPORT-28): compile-time row bound. The row loop used to run to the runtime nrows, which
 // indexes acc[j] dynamically and pushes the whole accumulator array to scratch memory; unrolled to
 // RM with a uniform `j < nrows` guard, acc stays in VGPRs. Arithmetic per row is unchanged.
 // RING_ (default ring_of<KB2>) only sets how many tiles are in flight; the per-tile arithmetic and
@@ -640,6 +647,9 @@ struct Jobs
     int K;
     int kbs;        // k blocks
     int x_gstride;  // strided input (see prologue_x), 0: contiguous
+#if QWG_ABLATE
+    int abl;
+#endif
 };
 
 template <int KB2, int CB = 2>
@@ -680,10 +690,20 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
     const int nt = strip * 32 + lane;
     if (nt < NT)
     {
+#if QWG_ABLATE
+        const int kt0 = (jobs.abl & 2) ? 0 : k0 / 16 + wave * ktw;
+        const u32x4* tiles = job.trellis + ((size_t) kt0 * NT + nt) * VEC;
+        if (jobs.abl & 1) lane_gemv<KB2, CB, 0, true>(tiles, (size_t) NT * VEC, xs + wave * ktw * 16, ktw, acc);
+        else              lane_gemv<KB2, CB>(tiles, (size_t) NT * VEC, xs + wave * ktw * 16, ktw, acc);
+#else
         const int kt0 = k0 / 16 + wave * ktw;
         const u32x4* tiles = job.trellis + ((size_t) kt0 * NT + nt) * VEC;
         lane_gemv<KB2, CB>(tiles, (size_t) NT * VEC, xs + wave * ktw * 16, ktw, acc);
+#endif
     }
+#if QWG_ABLATE
+    if (jobs.abl & 4) { if (acc[0] == 1.2345f) *reinterpret_cast<float*>(job.out) = acc[1]; return; }
+#endif
     block_reduce<CB>(acc, red, z, xsum, wave, lane, tid);
 
     const int col0 = strip * STRIP;
@@ -1007,7 +1027,7 @@ void moe_down_kernel(MoeArgs a, int kbs)
 
 
 // ------------------------------------------------------------------------------------------------
-// R-row union MoE: verify-window MoE, R<=8 rows sharing one launch. Each *unique*
+// R-row union MoE (REPORT-16): verify-window MoE, R<=8 rows sharing one launch. Each *unique*
 // expert across the R rows' top-k selections is decoded exactly once (grid.y = unique-expert
 // index u, not row) and its lane_gemv accumulation is run once per row assigned to it, in the
 // exact per-lane arithmetic order (tile_dot/pair_dot, same acc[16] sequence) a batch-1
@@ -1294,7 +1314,7 @@ void moe_down_kernel_r(MoeArgsR a, int kbs, int ctr_b_off)
     }
 }
 
-// Device-side unique-expert / assignment table for the R-row union MoE: no host sync.
+// Device-side unique-expert / assignment table for the R-row union MoE (REPORT-28): no host sync.
 // Generic in E, topk (<= 64) and R (<= MOE_R_MAX). Slot i = row * topk + k. A slot "leads" when no
 // earlier slot selected the same expert; leader i gets u = number of leaders before it, and
 // assign[u * MOE_R_MAX + c] lists every slot with that expert in slot order (same as the host build).
@@ -1368,7 +1388,8 @@ __global__ void moe_combine_kernel_r(MoeArgsR a)
 // arrive reduces and selects.
 
 constexpr int ROUTER_KCHUNK = 64;
-constexpr int CTR_ROUTER = 4000;
+constexpr int CTR_ROUTER = 4000;          // one arrival counter per row: CTR_ROUTER + row
+constexpr int ROUTER_NORM_MAX_ROWS = 8;
 
 // Fused pre-norm (NORM): the block also computes the MLP pre-norm of r + xa (rms_norm_res_in
 // semantics, the same arithmetic as rms_norm_kernel mode 2), writes its 64 normalized fp16 inputs to
@@ -1407,6 +1428,21 @@ void router_kernel(const half* __restrict__ x, RouterNorm rn, const half* __rest
     const int tid = threadIdx.x;
     const int kb = blockIdx.x;
     const int nkb = gridDim.x;
+    // Multi-row launch (gridDim.y = NR verify rows, exl3_dec_router_norm with NR > 1): block row `row`
+    // runs exactly the single-row code on row `row`'s slices of xa / r / y / sel / wts, its own
+    // scratch slab and its own arrival counter, so every row is bitwise a single-row launch.
+    // gridDim.y == 1 (all single-row callers): row 0, no offset, nothing changes.
+    if (const int row = blockIdx.y)
+    {
+        x += (size_t) row * H;
+        rn.xa = reinterpret_cast<const char*>(rn.xa) + (size_t) row * H * (rn.xa_half ? 2 : 4);
+        rn.r += (size_t) row * H;
+        rn.y += (size_t) row * H;
+        sel += (size_t) row * topk;
+        wts += (size_t) row * topk;
+        scratch += (size_t) row * nkb * E;
+        counters += row;
+    }
     __shared__ float xs[ROUTER_KCHUNK];
     __shared__ float red[2048];
     const int k0 = kb * ROUTER_KCHUNK;
@@ -2113,6 +2149,9 @@ static void dec_gemv_impl
     jobs.K = Kdim;
     jobs.kbs = kbs_of(Kdim / 16, ktw, env_int("EXL3_DEC_KBS", 0));
     jobs.x_gstride = (int) x_gstride;
+#if QWG_ABLATE
+    jobs.abl = env_int("EXL3_QWG_DABL", 0);
+#endif
     int blocks = 0, part = 0, ctr = CTR_GEMV;
     for (int i = 0; i < n; ++i)
     {
@@ -2196,7 +2235,7 @@ void exl3_dec_gemv_strided
 }
 
 // ------------------------------------------------------------------------------------------------
-// R-row dense GEMV: each weight tile is decoded once (identical RING pipeline to
+// R-row dense GEMV (REPORT-17): each weight tile is decoded once (identical RING pipeline to
 // batch-1's gemv_kernel) and applied to up to `rpb` rows via lane_gemv_r, in the exact per-row
 // arithmetic order (tile_dot/pair_dot/block_reduce/arrive) a batch-1 exl3_dec_gemv call would
 // use for that row -- so row j's output is bit-identical to a fresh batch-1 call, PROVIDED ktw
@@ -2396,6 +2435,9 @@ static void dec_gemv_r_impl
     int rpb = std::max(1, std::min(R, GEMV_R_ROW_BUDGET / ktw));
     const int rpb_cap = env_int("EXL3_GEMV_R_RPB", 0);
     if (rpb_cap > 0) rpb = std::min(rpb, rpb_cap);
+    // mimoident2 (MiMo, R 5..8 verify, bitwise independent of rpb): the 8-row kernel variant wins at R 5-6
+    // but loses at R 7-8 (131 vs 123 ms per verify forward, spills); from R 7 on run two 4-row chunks (grid.y = 2).
+    else if (R >= 7 && rpb > 4 && env_int("EXL3_GEMV_R_RPB78", 4) > 0) rpb = env_int("EXL3_GEMV_R_RPB78", 4);
 
     JobsR jobs;
     jobs.count = n;
@@ -2672,7 +2714,7 @@ void exl3_dec_moe_shared
     cuda_check(cudaPeekAtLastError());
 }
 
-// R-row union MoE. See the comment above MoeArgsR. Builds the unique-expert /
+// R-row union MoE, REPORT-16. See the comment above MoeArgsR. Builds the unique-expert /
 // assignment table on the host (R * topk <= 80 entries, negligible next to the GEMVs) and runs
 // gu + down + combine. x: [R, H] fp16, out: [R, H] fp32, selected/weights: [R, topk].
 void exl3_dec_moe_union
@@ -2752,7 +2794,7 @@ void exl3_dec_moe_union
     }
     else
     {
-        // table built on device, grid.y = max possible U, padded slots exit at once
+        // REPORT-28: table built on device, grid.y = max possible U, padded slots exit at once
         const int64_t experts_d = experts;
         TORCH_CHECK(topk <= 64, "exl3_dec_moe_union: device table needs topk <= 64");
         U = (int) std::min<int64_t>((int64_t) R * topk, experts_d);
@@ -2967,17 +3009,23 @@ void exl3_dec_router_norm
 {
     const at::cuda::OptionalCUDAGuard device_guard(xa.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    const int H = xa.numel();
-    TORCH_CHECK((xa.dtype() == at::kHalf || xa.dtype() == at::kFloat) && xa.is_contiguous() && xa.numel() == xa.size(-1),
-                "exl3_dec_router_norm: xa fp16/fp32 [1, H]");
-    TORCH_CHECK(r.dtype() == at::kFloat && r.is_contiguous() && r.numel() == H, "exl3_dec_router_norm: r fp32 [1, H]");
-    TORCH_CHECK(y.dtype() == at::kHalf && y.is_contiguous() && y.numel() == H, "exl3_dec_router_norm: y fp16 [1, H]");
-    TORCH_CHECK(gate.dtype() == at::kHalf && gate.is_contiguous() && gate.dim() == 2 && gate.size(0) == H, "exl3_dec_router_norm: gate fp16 [H, E]");
+    // NR rows (1..ROUTER_NORM_MAX_ROWS) in one launch: xa / r / y are [NR, H], selected / weights [NR, topk]
+    TORCH_CHECK(gate.dtype() == at::kHalf && gate.is_contiguous() && gate.dim() == 2, "exl3_dec_router_norm: gate fp16 [H, E]");
+    const int H = gate.size(0);
     const int E = gate.size(1);
-    const int topk = selected.numel();
+    TORCH_CHECK(H > 0 && xa.numel() % H == 0, "exl3_dec_router_norm: xa size");
+    const int NR = xa.numel() / H;
+    TORCH_CHECK(NR >= 1 && NR <= ROUTER_NORM_MAX_ROWS, "exl3_dec_router_norm: rows 1..8");
+    TORCH_CHECK((xa.dtype() == at::kHalf || xa.dtype() == at::kFloat) && xa.is_contiguous() && xa.numel() == (int64_t) NR * H,
+                "exl3_dec_router_norm: xa fp16/fp32 [NR, H]");
+    TORCH_CHECK(r.dtype() == at::kFloat && r.is_contiguous() && r.numel() == (int64_t) NR * H, "exl3_dec_router_norm: r fp32 [NR, H]");
+    TORCH_CHECK(y.dtype() == at::kHalf && y.is_contiguous() && y.numel() == (int64_t) NR * H, "exl3_dec_router_norm: y fp16 [NR, H]");
+    TORCH_CHECK(selected.numel() % NR == 0, "exl3_dec_router_norm: selected size");
+    const int topk = selected.numel() / NR;
     TORCH_CHECK(H % ROUTER_KCHUNK == 0 && E <= 1024 && E % 8 == 0 && topk <= 64 && topk <= E, "exl3_dec_router_norm: unsupported shape");
-    TORCH_CHECK(selected.dtype() == at::kLong && weights.dtype() == at::kHalf && weights.numel() == topk, "exl3_dec_router_norm: outputs");
-    TORCH_CHECK(scratch.numel() >= (int64_t) (H / ROUTER_KCHUNK) * E && counters.numel() > CTR_ROUTER, "exl3_dec_router_norm: workspace");
+    TORCH_CHECK(selected.dtype() == at::kLong && selected.is_contiguous() && weights.dtype() == at::kHalf && weights.is_contiguous() &&
+                weights.numel() == (int64_t) NR * topk, "exl3_dec_router_norm: outputs");
+    TORCH_CHECK(scratch.numel() >= (int64_t) NR * (H / ROUTER_KCHUNK) * E && counters.numel() >= CTR_ROUTER + NR, "exl3_dec_router_norm: workspace");
     const float* bp = nullptr;
     if (bias.has_value() && bias->defined())
     {
@@ -2999,7 +3047,7 @@ void exl3_dec_router_norm
     }
     rn.eps = (float) eps; rn.cbias = (float) constant_bias; rn.cscale = (float) constant_scale;
     rn.y = reinterpret_cast<half*>(y.data_ptr());
-    router_kernel<true><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(
+    router_kernel<true><<<dim3(H / ROUTER_KCHUNK, NR), 256, 0, stream>>>(
         nullptr, rn, reinterpret_cast<const half*>(gate.data_ptr()), bp,
         selected.data_ptr<int64_t>(), reinterpret_cast<half*>(weights.data_ptr()),
         scratch.data_ptr<float>(), counters.data_ptr<int>(), H, E, topk, (float) scale);

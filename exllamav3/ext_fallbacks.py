@@ -225,6 +225,25 @@ def deinterleave_qg(
     g.copy_(chunks[..., head_dim:].reshape_as(g))
 
 
+_ROWINV_ROWS = 64
+
+
+def _mean_sq(x: torch.Tensor) -> torch.Tensor:
+    """mean(x^2) over the last axis of a (rows, dim) fp32 tensor, row-invariant for rows <= 64.
+
+    torch picks the reduction tree from the (rows, dim) shape, so the same row can round
+    differently at different row counts. Short inputs (decode, R <= 8 verify rows) are zero
+    padded to a fixed 64 rows: every row then goes through the same reduction config.
+    """
+    rows, dim = x.shape
+    sq = x.square()
+    if rows >= _ROWINV_ROWS:
+        return sq.mean(dim = -1, keepdim = True)
+    pad = sq.new_zeros((_ROWINV_ROWS, dim))
+    pad[:rows] = sq
+    return pad.mean(dim = -1, keepdim = True)[:rows]
+
+
 # -- Norm ops (norm.cu) --------------------------------------------------------
 
 def rms_norm(
@@ -272,7 +291,7 @@ def rms_norm(
         xf = xr[r0:r0 + row_chunk].float()
         if x.dtype == torch.float16:
             xf = xf.clamp(min = -65504.0, max = 65504.0)
-        xf = xf * torch.rsqrt(xf.square().mean(dim = -1, keepdim = True) + eps)
+        xf = xf * torch.rsqrt(_mean_sq(xf) + eps)
         xf = xf * constant_scale
         if wf is not None:
             if w_groups == 1:
@@ -312,7 +331,7 @@ def rms_norm_res_in(
         wf = w.float() + constant_bias if constant_bias != 0.0 else w.float()
     else:
         wf = None
-    var = rf.pow(2).mean(dim = -1, keepdim = True) + eps
+    var = _mean_sq(rf.reshape(-1, rf.shape[-1])).reshape(*rf.shape[:-1], 1) + eps
     rf = rf * torch.rsqrt(var) * constant_scale
     if wf is not None:
         rf = rf * wf
@@ -347,7 +366,7 @@ def gated_rms_norm(
     gate = torch.sigmoid(gf) if gate_act == 1 else F.silu(gf)
     norm_input = xf * gate if gate_first else xf
     hidden = norm_input * torch.rsqrt(
-        norm_input.square().mean(dim = -1, keepdim = True) + eps
+        _mean_sq(norm_input) + eps
     )
     wf = w.float().reshape(w_groups, dim)
     if constant_bias != 0.0:

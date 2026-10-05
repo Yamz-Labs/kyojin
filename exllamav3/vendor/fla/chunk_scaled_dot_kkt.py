@@ -23,7 +23,7 @@ from .utils import autotune_cache_kwargs
         triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64, 128]
         for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for num_stages in [1, 2, 3, 4]
     ],
     key=['H', 'HV', 'K', 'BT', 'IS_VARLEN'],
     **autotune_cache_kwargs,

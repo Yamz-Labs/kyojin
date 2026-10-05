@@ -12,7 +12,7 @@ _state = {}
 def _hipcc():
     for p in (os.environ.get("EXL3_HIPCC"),
               os.path.join(os.environ.get("EXL3_ROCM_SDK", ""), "bin", "hipcc"),
-              "~/kyojin/.venv-gfx1151/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipcc",
+              "$EXL3_ROOT",
               shutil.which("hipcc"), "/opt/rocm/bin/hipcc"):
         if p and os.path.isfile(p):
             return p

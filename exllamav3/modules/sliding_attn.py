@@ -6,7 +6,7 @@ from ..util.rope import RopeSettings, RoPE
 from ..util.tensor import get_for_device, to2, g_tensor_cache
 from . import Module, Linear, RMSNorm, LayerNorm
 from ..constants import PAGE_SIZE
-from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_prefill
+from .attention_fn.triton_paged import paged_attn_triton_decode, paged_attn_triton_decode_rows, paged_attn_triton_prefill
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_swa, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 from .multilinear import MultiLinear, SlicedMultiLinear
 from .quant.exl3 import MAX_BSZN_GEMV_R
@@ -735,7 +735,7 @@ class SlidingAttention(Module):
                 g = outs[3] if len(outs) > 3 else None
                 return self.finish_qkv(outs[0], outs[1], outs[2], g, bsz, q_len, params)
 
-        # DFlash verify (R rows): same fused launch as the bsz==1 case above, generalized
+        # DFlash verify (R rows, REPORT-17): same fused launch as the bsz==1 case above, generalized
         # to R rows via exl3_dec_gemv_r_multi -- same trellis/suh/svh/K list and order as
         # exl3_dec_gemv_multi, so pick_ktw/kbs_of see the same strips_total and pick the identical
         # ktw/kbs the batch-1 launch uses. That's required for the block-reduce partition (and so the
@@ -1109,7 +1109,7 @@ class SlidingAttention(Module):
             # window run reaches the end of the buffer) and attend over the pages
             bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
 
-            # DFlash verify (R rows): a single paged_attn_triton_decode call over all
+            # DFlash verify (R rows, REPORT-17): a single paged_attn_triton_decode call over all
             # R rows at once tiles/splits the KV span from the batch's (single) cache_seqlens and
             # q_len, which is not necessarily the same tiling a batch-1 call would use for each
             # row's own (shorter) span -- unverified, and the one dimension this session's kernel
@@ -1125,19 +1125,31 @@ class SlidingAttention(Module):
                 1 < seqlen <= MAX_BSZN_GEMV_R and params.get("dflash_verify") and
                 os.environ.get("EXL3_VERIFY_ATTN_LOOP", os.environ.get("EXL3_DEC_MOE_UNION", "0")) != "0"
             ):
-                outs = []
-                for i in range(seqlen):
-                    outs.append(paged_attn_triton_decode(
-                        q[:, i:i + 1], k[:, i:i + 1], v[:, i:i + 1], k_pages, v_pages, bt,
-                        cache_seqlens + i,
+                if os.environ.get("EXL3_VERIFY_ATTN_ROWS", "1") != "0" and q.shape[0] == 1 and bt.shape[0] == 1:
+                    # one append + one attention launch, bitwise the R batch-1 calls below
+                    o = paged_attn_triton_decode_rows(
+                        q, k, v, k_pages, v_pages, bt, cache_seqlens,
                         causal = causal,
                         softmax_scale = self.sm_scale,
                         window_size = (sw, 0),
                         softcap = self.logit_softcapping,
                         sinks = self.sinks,
                         max_kv_len = S,
-                    ))
-                o = torch.cat(outs, dim = 1)
+                    )
+                else:
+                    outs = []
+                    for i in range(seqlen):
+                        outs.append(paged_attn_triton_decode(
+                            q[:, i:i + 1], k[:, i:i + 1], v[:, i:i + 1], k_pages, v_pages, bt,
+                            cache_seqlens + i,
+                            causal = causal,
+                            softmax_scale = self.sm_scale,
+                            window_size = (sw, 0),
+                            softcap = self.logit_softcapping,
+                            sinks = self.sinks,
+                            max_kv_len = S,
+                        ))
+                    o = torch.cat(outs, dim = 1)
             else:
                 o = paged_attn_triton_decode(
                     q, k, v, k_pages, v_pages, bt, cache_seqlens,

@@ -1090,6 +1090,7 @@ def paged_attn_triton_decode(
     n_kv_heads_override: int | None = None,
     num_warps: int = 4,
     num_stages: int = 2,
+    split_batch: int | None = None,     # batch size the split count is derived from (default: bsz)
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
@@ -1172,7 +1173,8 @@ def paged_attn_triton_decode(
         if dev not in _decode_sm_count:
             _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
         target = 2 * _decode_sm_count[dev]
-        num_splits = max(1, min(target // programs, triton.cdiv(max_k_len, 4 * block_n), 128))
+        programs_split = programs if split_batch is None else programs // bsz * split_batch
+        num_splits = max(1, min(target // programs_split, triton.cdiv(max_k_len, 4 * block_n), 128))
     split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
 
     if num_splits > 1:
@@ -1210,6 +1212,48 @@ def paged_attn_triton_decode(
                 num_warps=4, num_stages=1,
             )
     return out
+
+
+_rows_arange = {}
+
+
+def paged_attn_triton_decode_rows(
+    q: torch.Tensor,                # [1, R, n_q_heads, head_dim]
+    k: torch.Tensor,                # [1, R, n_kv_heads, head_dim]
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,      # [1, pages]
+    cache_seqlens: torch.Tensor,    # [1]
+    **kw,
+) -> torch.Tensor:
+    """R rows of a verify block in ONE attention launch (plus one append launch), bitwise equal to R
+    batch-1 paged_attn_triton_decode calls with cache_seqlens + i. Row i becomes batch entry i of a
+    q_len 1 call with its own seqlen (cache_seqlens + i), sharing the sequence's pages. The split count
+    is the one a batch-1 call would pick (split_batch = 1), so every row sees the same tiling and the
+    same reduction order. All rows' K/V are appended first (the batch-1 loop appends row i before
+    attending, and row i never reads past cache_seqlens + i + 1, so the extra rows are masked)."""
+    _, R, n_q_heads, head_dim = q.shape
+    n_kv_heads = k.shape[2]
+    dev = q.device
+    ar = _rows_arange.get((dev, R))
+    if ar is None:
+        ar = _rows_arange[(dev, R)] = torch.arange(R, dtype = torch.int32, device = dev)
+    seqs = cache_seqlens.to(torch.int32) + ar
+    bt = block_table.expand(R, -1).contiguous()
+    num_pages_per_seq = bt.shape[1]
+    update_block_d = triton.next_power_of_2(head_dim)
+    with torch.cuda.device(dev):
+        _paged_kv_update_kernel[(R, n_kv_heads, triton.cdiv(head_dim, update_block_d))](
+            k.reshape(R, 1, n_kv_heads, head_dim), v.reshape(R, 1, n_kv_heads, head_dim), k_cache, v_cache, bt, seqs,
+            num_pages_per_seq, 1, n_kv_heads, k_cache.shape[1], head_dim, update_block_d,
+            num_warps = 2, num_stages = 3,
+        )
+    o = paged_attn_triton_decode(
+        q.reshape(R, 1, n_q_heads, head_dim), None, None, k_cache, v_cache, bt, seqs,
+        pre_appended_len = 1, split_batch = 1, **kw,
+    )
+    return o.view(1, R, n_q_heads, head_dim)
 
 
 def fn_triton_paged_attn_decode(args: AttnArgs) -> torch.Tensor | None:

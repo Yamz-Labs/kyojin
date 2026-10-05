@@ -45,8 +45,14 @@ def l2norm_fwd_kernel1(
     tl.store(rstd + i_t, b_rstd)
 
 
+# One fixed launch config (8 rows per program, 8 warps = one row per warp). The sum over D = 128 rounds differently for other (BT, num_warps)
+# (1 ulp bf16 on about 4 elements in a million), so a timing-picked config made the result depend on which autotune run filled the cache.
+# The pinned config is the one that cache held on the test box; gdn_pf.l2norm_strided uses the same (BT, num_warps) and is bitwise equal to this kernel.
+L2_BT, L2_WARPS = 8, 8
+
+
 @triton.autotune(
-    configs=[triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST],
+    configs=[triton.Config({"BT": L2_BT}, num_warps=L2_WARPS)],
     key=["D", "NB"],
     **autotune_cache_kwargs,
 )

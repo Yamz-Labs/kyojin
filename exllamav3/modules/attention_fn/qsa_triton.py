@@ -250,12 +250,122 @@ def _qsa_sparse_split_kernel(
         tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
 
+@triton.jit
+def _qsa_pipe_load(indices, block_table, k_cache, v_cache, batch, kv_head, K_pad, num_pages_per_seq, n0, n_end,
+                   offs_d, n_kv_heads: tl.constexpr, page_size: tl.constexpr, head_dim: tl.constexpr,
+                   BLOCK_N: tl.constexpr, PAGED: tl.constexpr):
+    """One BLOCK_N tile of the gather: index list, page translation, K^T and V tiles (fp16 cache). Masked
+    lanes read nothing; the values are the ones the plain kernel loads."""
+    offs_n = n0 + tl.arange(0, BLOCK_N)
+    idx = tl.load(indices + batch * K_pad + offs_n, mask = offs_n < n_end, other = -1)
+    valid_n = (idx >= 0) & (offs_n < n_end)
+    idx_c = tl.where(valid_n, idx, 0)
+    if PAGED:
+        phys = tl.load(block_table + batch * num_pages_per_seq + idx_c // page_size, mask = valid_n, other = 0)
+        tok = phys * page_size + idx_c % page_size
+    else:
+        tok = idx_c
+    k_ptrs = k_cache + ((tok[None, :] * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
+    k_tile = tl.load(k_ptrs, mask = valid_n[None, :], other = 0.0)
+    v_ptrs = v_cache + ((tok[:, None] * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
+    v_tile = tl.load(v_ptrs, mask = valid_n[:, None], other = 0.0)
+    return k_tile, v_tile, valid_n
+
+
+@triton.jit(do_not_specialize = ["k_len", "num_pages_per_seq", "num_splits", "split_len"])
+def _qsa_sparse_split_pipe_kernel(
+    q, k_cache, v_cache, block_table, indices, partial_o, partial_ml,
+    k_len, num_pages_per_seq, num_splits, split_len,
+    k_scales, v_scales, h32,      # dead (fp16 cache only), kept so the launch signature matches
+    n_q_heads: tl.constexpr, n_kv_heads: tl.constexpr, page_size: tl.constexpr, head_dim: tl.constexpr,
+    K_pad: tl.constexpr, scale: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
+    PAGED: tl.constexpr = 1, QCK: tl.constexpr = 0, QCV: tl.constexpr = 0,
+):
+    """_qsa_sparse_split_kernel with the next tile's gather loads issued before the current tile's
+    arithmetic (software pipelined, fp16 cache). The per-tile operation order (scores, online softmax, P.V,
+    tile after tile) is the plain kernel's, so partial_o / partial_ml are bit-identical."""
+    pid = tl.program_id(0)
+    split = tl.program_id(1)
+    group_size = n_q_heads // n_kv_heads
+    h_blocks = tl.cdiv(group_size, BLOCK_H)
+    h_block = pid % h_blocks
+    bh = pid // h_blocks
+    batch = bh // n_kv_heads
+    kv_head = bh - batch * n_kv_heads
+    rows = tl.arange(0, BLOCK_H)
+    row_h_local = h_block * BLOCK_H + rows
+    q_head = kv_head * group_size + row_h_local
+    valid_row = row_h_local < group_size
+    offs_d = tl.arange(0, head_dim)
+    q_base = (batch * n_q_heads + q_head) * head_dim
+    q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask = valid_row[:, None], other = 0.0)
+    n_start = split * split_len
+    n_end = tl.minimum(n_start + split_len, k_len)
+    m = tl.full((BLOCK_H,), -float("inf"), tl.float32)
+    l = tl.full((BLOCK_H,), 0.0, tl.float32)
+    acc = tl.zeros((BLOCK_H, head_dim), tl.float32)
+
+    k_cur, v_cur, valid_cur = _qsa_pipe_load(indices, block_table, k_cache, v_cache, batch, kv_head, K_pad,
+        num_pages_per_seq, n_start, n_end, offs_d, n_kv_heads, page_size, head_dim, BLOCK_N, PAGED)
+    for n0 in range(n_start, n_end, BLOCK_N):
+        k_nxt, v_nxt, valid_nxt = _qsa_pipe_load(indices, block_table, k_cache, v_cache, batch, kv_head, K_pad,
+            num_pages_per_seq, n0 + BLOCK_N, n_end, offs_d, n_kv_heads, page_size, head_dim, BLOCK_N, PAGED)
+        scores = tl.dot(q_tile, k_cur) * scale
+        valid = valid_row[:, None] & valid_cur[None, :]
+        scores = tl.where(valid, scores, -float("inf"))
+        m_new = tl.maximum(m, tl.max(scores, axis = 1))
+        m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
+        p = tl.exp(scores - m_exp[:, None])
+        p = tl.where(valid, p, 0.0)
+        alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
+        l = l * alpha + tl.sum(p, axis = 1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v_cur.dtype), v_cur)
+        m = m_new
+        k_cur = k_nxt
+        v_cur = v_nxt
+        valid_cur = valid_nxt
+
+    if split < num_splits:
+        po_base = (pid * num_splits + split) * BLOCK_H * head_dim
+        tl.store(partial_o + po_base + rows[:, None] * head_dim + offs_d[None, :], acc)
+        ml_base = (pid * num_splits + split) * BLOCK_H * 2
+        tl.store(partial_ml + ml_base + rows * 2, m)
+        tl.store(partial_ml + ml_base + rows * 2 + 1, l)
+
+
+import os
+# software-pipelined gather split kernel (fp16 cache), 8 warps; EXL3_QSA_PIPE=1 enables it (default off: no served gain measured)
+QSA_PIPE = os.environ.get("EXL3_QSA_PIPE", "0") not in ("", "0")
+QSA_PIPE_NW = 8
+_QSA_BN = int(os.environ.get("EXL3_QSA_BN", "32"))
+_QSA_NW = int(os.environ.get("EXL3_QSA_NW", "4"))
+_QSA_NS = int(os.environ.get("EXL3_QSA_NS", "1"))
+
 _sm_counts = {}
 
 def _get_sms(dev):
     if dev.index not in _sm_counts:
         _sm_counts[dev.index] = torch.cuda.get_device_properties(dev.index).multi_processor_count
     return _sm_counts[dev.index]
+
+
+# the split count sets the reduction tree (partials per row, then the combine). It used to depend on R
+# (programs = R * kv_heads * h_blocks), so a batched verify launch (R = 2..8) reduced a different tree than the R = 1
+# launch of plain decode: one fp16 step apart. For R <= ROWINV_MAX the plan is computed as if R = 1 (row-invariant:
+# every row runs the same operation order as the single-row launch). EXL3_QSA_ROWINV=0 restores the old plan.
+ROWINV = {"on": os.environ.get("EXL3_QSA_ROWINV", "1") not in ("", "0"), "max_rows": 8}
+
+
+def qsa_split_plan(R: int, programs_per_row: int, K_pad: int, BLOCK_N: int, sms: int, rowinv: bool | None = None):
+    """(splits, split_len) of the gathered sparse launch. Pure integer arithmetic (CPU-checkable)."""
+    if rowinv is None:
+        rowinv = ROWINV["on"]
+    eff_rows = 1 if (rowinv and R <= ROWINV["max_rows"]) else R
+    programs = eff_rows * programs_per_row
+    splits = max(1, min(2 * sms // programs, -(-K_pad // (4 * BLOCK_N)), 128))
+    per_split = -(-K_pad // splits)
+    split_len = -(-per_split // BLOCK_N) * BLOCK_N
+    return splits, split_len
 
 
 def qsa_sparse_attend_rows(
@@ -290,7 +400,7 @@ def qsa_sparse_attend_rows(
         h32 = q
     group = H // kvh
     BLOCK_H = 16
-    BLOCK_N = 32
+    BLOCK_N = _QSA_BN
     h_blocks = triton.cdiv(group, BLOCK_H)
     programs = R * kvh * h_blocks
     K_pad = indices.shape[1]
@@ -300,9 +410,7 @@ def qsa_sparse_attend_rows(
         and indices.is_contiguous() and k_scales.is_contiguous() and v_scales.is_contiguous()
     assert not paged or (block_table.is_contiguous() and block_table.shape[0] == R)
 
-    splits = max(1, min(2 * _get_sms(dev) // programs, -(-K_pad // (4 * BLOCK_N)), 128))
-    per_split = -(-K_pad // splits)
-    split_len = -(-per_split // BLOCK_N) * BLOCK_N
+    splits, split_len = qsa_split_plan(R, kvh * h_blocks, K_pad, BLOCK_N, _get_sms(dev))
     partial_o = torch.empty((programs * splits * BLOCK_H * hd,), dtype = torch.float, device = dev)
     partial_ml = torch.empty((programs * splits * BLOCK_H * 2,), dtype = torch.float, device = dev)
     o = torch.empty((R, H, hd), dtype = torch.half, device = dev)
@@ -310,7 +418,8 @@ def qsa_sparse_attend_rows(
     # Triton JIT launches on the CURRENT device; with a model split across GPUs this
     # layer's device need not be current
     with torch.cuda.device(dev):
-        _qsa_sparse_split_kernel[(programs, splits)](
+        use_pipe = QSA_PIPE and k_bits == 0 and v_bits == 0 and BLOCK_N == 32
+        (_qsa_sparse_split_pipe_kernel if use_pipe else _qsa_sparse_split_kernel)[(programs, splits)](
             q, k, v, block_table if paged else indices, indices, partial_o, partial_ml,
             K_pad, block_table.shape[1] if paged else 0, splits, split_len,
             k_scales, v_scales, h32,
@@ -318,7 +427,7 @@ def qsa_sparse_attend_rows(
             head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
             BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
             QCK = k_bits, QCV = v_bits,
-            num_warps = 4, num_stages = 2,
+            num_warps = QSA_PIPE_NW if use_pipe else _QSA_NW, num_stages = _QSA_NS,
         )
         _paged_attn_decode_combine_kernel[(programs,)](
             partial_o, partial_ml, o, h32, splits, partial_ml,

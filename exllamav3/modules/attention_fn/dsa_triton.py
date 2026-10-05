@@ -1727,7 +1727,7 @@ def _dsa_dec_fast_cfg(R = 1):
     if v == "0":
         return None
     if v == "1":
-        # microbench (scratch/decattn2/report.md): at R >= 2 (MTP verify, ~94 % of the
+        # test box microbench (scratch/decattn2/report.md): at R >= 2 (MTP verify, ~94 % of the
         # served decode calls) BH 32 x DT 256 halves the redundant QK of the 64 x 128 dt tile,
         # 12 splits + pipelined index chain + num_stages 2: 0.091 -> 0.057 ms. R = 1: no
         # variant beats dt (all within +-5 %), so R = 1 keeps it

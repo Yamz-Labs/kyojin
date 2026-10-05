@@ -102,6 +102,8 @@ def prepare(block, device):
     m = _LAYER_RX.search(block.key or "")
     if not path or m is None:
         return
+    if (block.key or "").split(".")[0] == "mtp" or ".mtp." in block.key:
+        return  # MTP drafter block (key mtp.layers.N reuses trunk numbers): never edited
     spec, r, per_dev = _load(path, source)
     L = int(m.group(1))  # from the key: MTP blocks reuse layer_idx 0..n but keep their checkpoint layer number
     if L >= spec["n_layers"]:
@@ -127,29 +129,43 @@ try:
     import triton.language as tl
 
     @triton.jit
-    def _project_kernel(y_ptr, r_ptr, w, H: tl.constexpr):
+    def _project_kernel(y_ptr, r_ptr, w, H: tl.constexpr, BLOCK: tl.constexpr):
+        # BLOCK = next power of two >= H (tl.arange needs one); lanes >= H are masked (hidden 2560 for Qwen)
         row = tl.program_id(0).to(tl.int64)
-        offs = tl.arange(0, H)
-        y = tl.load(y_ptr + row * H + offs)
-        r = tl.load(r_ptr + offs)
+        offs = tl.arange(0, BLOCK)
+        m = offs < H
+        y = tl.load(y_ptr + row * H + offs, mask = m, other = 0.0)
+        r = tl.load(r_ptr + offs, mask = m, other = 0.0)
         d = tl.sum(y.to(tl.float32) * r, axis = 0)
-        tl.store(y_ptr + row * H + offs, (y.to(tl.float32) - (w * d) * r).to(y.dtype))
+        tl.store(y_ptr + row * H + offs, (y.to(tl.float32) - (w * d) * r).to(y.dtype), mask = m)
 except ImportError:
     triton = None
+
+def _block(h: int) -> int:
+    return 1 << (h - 1).bit_length()
+
 
 _USE_TRITON = triton is not None and os.environ.get("EXL3_ABLIT_TORCH", "0") == "0"
 
 
 def warmup(device, hidden = None):
     """Compile the fused kernel for both dtypes now, so no JIT happens inside a graph capture."""
+    global _USE_TRITON
     hidden = hidden or HIDDEN_WARM
     if _USE_TRITON:
-        for dt in (torch.float32, torch.float16):
-            y = torch.zeros(1, hidden, dtype = dt, device = device)
-            _project_kernel[(1,)](y, torch.zeros(hidden, dtype = torch.float32, device = device), 0.0, H = hidden)
+        try:
+            for dt in (torch.float32, torch.float16):
+                y = torch.zeros(1, hidden, dtype = dt, device = device)
+                _project_kernel[(1,)](y, torch.zeros(hidden, dtype = torch.float32, device = device), 0.0, H = hidden, BLOCK = _block(hidden))
+        except Exception as e:  # compile failure: the torch path is equivalent (mv + addr_), just slower
+            _USE_TRITON = False
+            print(f" -- ablit runtime: triton projection kernel failed to compile for hidden {hidden} ({e!r}); using the torch path", file = sys.stderr, flush = True)
 
 
 HIDDEN_WARM = 4096
+
+
+ROW_MODE = None  # measurement aid, off by default: None = every row; ("from", k) = rows >= k only; "last" = in a multi-row forward only the last row
 
 
 def project(y: torch.Tensor, w: float, r32: torch.Tensor, r16: torch.Tensor) -> torch.Tensor:
@@ -158,8 +174,12 @@ def project(y: torch.Tensor, w: float, r32: torch.Tensor, r16: torch.Tensor) -> 
         return y
     h = r32.shape[0]
     y2 = y.view(-1, h)
+    if ROW_MODE is not None and y2.shape[0] > 1:
+        y2 = y2[ROW_MODE[1]:] if isinstance(ROW_MODE, tuple) else y2[-1:]
+        if y2.shape[0] == 0:
+            return y
     if _USE_TRITON and y2.is_contiguous():
-        _project_kernel[(y2.shape[0],)](y2, r32, w, H = h)
+        _project_kernel[(y2.shape[0],)](y2, r32, w, H = h, BLOCK = _block(h))
     elif y2.dtype == torch.float32:
         d = torch.mv(y2, r32)
         y2.addr_(d, r32, alpha = -w)

@@ -12,6 +12,15 @@ from dataclasses import dataclass
 from ..util.device_copy import to_device
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
+
+
+def _pad_rows(y):
+    """router logits GEMM input at a row pitch that is not a multiple of 2 KiB (same values; a no-op when not a hazard)."""
+    if y.dim() == 2:
+        from .quant.exl3 import pad_copy_in
+        return pad_copy_in(y, y.shape[1])
+    return y
+
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 
 ROUTING_CACHE_ROWS = 128
@@ -102,7 +111,16 @@ _HIP_PREFILL_MAX_ROWS = 2048
 _HIP_PREFILL_MAX_EXPERT_ROWS = _HIP_PREFILL_MAX_ROWS * _HIP_ROUTER_TOP_K
 
 
+# EXL3_MOE_VALU=1: the VALU decode matvec (K2/K4 experts) serves every row count 1..8 through the grouped/dedup
+# launches, one reduction order for all of them: plain decode (R=1) and verify rounds (R>1) give identical bits. It
+# therefore bypasses the batch-1 fused kernel, the union path and the prefill-kernel yield below. Default off.
+_MOE_VALU = os.environ.get("EXL3_MOE_VALU", "0") != "0"
+_MOE_VALU_MAX_ROWS = 8
+
+
 def _hip_grouped_rows_eligible(rows: int, prefill_available: bool = True) -> bool:
+    if _MOE_VALU and rows <= _MOE_VALU_MAX_ROWS:
+        return 1 <= rows <= min(_HIP_GROUPED_MAX_ROWS, _MOE_VALU_MAX_ROWS)
     # Yield to the expert-grouped prefill kernel once it claims this row count,
     # otherwise the per-(row,expert) decode kernel would take it first and
     # re-read duplicate expert weights. When no prefill kernel serves this model
@@ -189,7 +207,7 @@ def _hip_router_buffers(cfg, rows):
     )
 
 def _routing_std_torch(cfg, y, params, include_bias = False):
-    router_logits = torch.matmul(y, cfg.gate_tensor)
+    router_logits = torch.matmul(_pad_rows(y), cfg.gate_tensor)
     router_logits_f = router_logits.float()
     if include_bias and cfg.router_bias is not None:
         router_logits_f = router_logits_f + cfg.router_bias.float()
@@ -257,7 +275,7 @@ def routing_std(bsz, cfg, y, params):
     else:
         activate_all_experts = params.get("activate_all_experts")
         if activate_all_experts:
-            router_logits = torch.matmul(y, cfg.gate_tensor)
+            router_logits = torch.matmul(_pad_rows(y), cfg.gate_tensor)
             routing_weights = torch.softmax(router_logits, dim = -1)
             selected_experts = (
                 torch.arange(start = 0, end = cfg.num_experts, dtype = torch.long, device = y.device)
@@ -302,9 +320,9 @@ def routing_std_bias(bsz, cfg, y, params):
         )
         return cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
     if cfg.router_bias is not None:
-        router_logits = torch.addmm(cfg.router_bias, y, cfg.gate_tensor)
+        router_logits = torch.addmm(cfg.router_bias, _pad_rows(y), cfg.gate_tensor)
     else:
-        router_logits = torch.matmul(y, cfg.gate_tensor)
+        router_logits = torch.matmul(_pad_rows(y), cfg.gate_tensor)
     if params.get("activate_all_experts"):
         routing_weights = torch.softmax(router_logits.float(), dim = -1).half()
         selected_experts = (
@@ -320,7 +338,7 @@ def routing_std_bias(bsz, cfg, y, params):
 # TODO: Optimize top_k groups (for DS3)
 def routing_ds3(bsz, cfg, y, params):
     activate_all_experts = params.get("activate_all_experts")
-    router_logits = torch.matmul(y, cfg.gate_tensor)
+    router_logits = torch.matmul(_pad_rows(y), cfg.gate_tensor)
 
     scores = router_logits.sigmoid()
     scores_for_choice = scores.view(-1, cfg.num_experts)
@@ -435,9 +453,9 @@ def routing_dots(bsz, cfg, y, params):
             # cold at E=288 prefill, bit-exact (scratch/pfbig1/mb_dense.py)
             if cfg.gate_tensor_t is None:
                 cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-            logits = torch.matmul(y, cfg.gate_tensor_t.T)
+            logits = torch.matmul(_pad_rows(y), cfg.gate_tensor_t.T)
         else:
-            logits = torch.matmul(y, cfg.gate_tensor)
+            logits = torch.matmul(_pad_rows(y), cfg.gate_tensor)
         scores = torch.sigmoid(logits.float())
         if params.get("activate_all_experts"):
             routing_weights = scores
@@ -471,7 +489,7 @@ def routing_dots(bsz, cfg, y, params):
     else:
         activate_all_experts = params.get("activate_all_experts")
         if activate_all_experts:
-            router_logits = torch.matmul(y, cfg.gate_tensor)
+            router_logits = torch.matmul(_pad_rows(y), cfg.gate_tensor)
             routing_weights = router_logits.sigmoid().float()
             if cfg.e_score_correction_bias is not None:
                 routing_weights = routing_weights + cfg.e_score_correction_bias.unsqueeze(0).float()

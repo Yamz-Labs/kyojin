@@ -56,7 +56,9 @@ class InferParams:
         # Stream an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) from disk with
         # per-forward row gathers instead of loading the whole table into system RAM (tens of
         # GB). Set before loading the model
-        self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # None (env unset): NGramEmbedding picks RAM when the host has room for the table, else disk
+        _ns = os.environ.get("EXL3_NGRAM_STREAM")
+        self.ngram_stream_from_disk = None if _ns is None else _ns != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         from ..ext import exllamav3_ext as ext

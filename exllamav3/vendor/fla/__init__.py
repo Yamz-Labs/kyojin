@@ -15,6 +15,7 @@ import torch
 
 from .utils import input_guard
 from .l2norm import l2norm_fwd
+from . import gdn_pf as _gdn_pf
 from .cumsum import chunk_local_cumsum
 from .gdn_chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -70,6 +71,11 @@ def chunk_gated_delta_rule(
         q, _ = l2norm_fwd(q)
         k, _ = l2norm_fwd(k)
     g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2)
+    if os.environ.get("EXL3_GDN_FUSE", "0") == "1":   # hand-written HIP chunk kernel (gdn_fused.py), bitwise equal, default off
+        from .gdn_fused import chunk_gdn_fused
+        res = chunk_gdn_fused(q, k, v, g, beta, scale, initial_state, output_final_state, chunk_size)
+        if res is not None:
+            return res[0].to(q.dtype), res[1]
     # WY representation: fused kkt + solve_tril + recompute_w_u. u is the new v
     w, u, _ = chunk_gated_delta_rule_fwd_intra(k = k, v = v, g = g, beta = beta, chunk_size = chunk_size)
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
@@ -80,6 +86,36 @@ def chunk_gated_delta_rule(
     )
     o = chunk_fwd_o(q = q, k = k, v = v_new, h = h, g = g, scale = scale, chunk_size = chunk_size)
     return o.to(q.dtype), final_state
+
+
+def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False):
+    """chunk_gated_delta_rule(use_qk_l2norm_in_kernel=True, chunk_size=64) for q, k, v given as (possibly strided) views of the conv
+    output; g (fp32) and beta (bf16) contiguous. Bitwise equal to the guarded entry; no copies of q, k, v when the views are plain
+    token-pitch slices."""
+    if not (_gdn_pf.strided_ok(q) and _gdn_pf.strided_ok(k) and q.shape[-1] == 128 and q.dtype == torch.bfloat16):
+        return chunk_gated_delta_rule(q, k, v, g=g, beta=beta, scale=scale, initial_state=initial_state,
+                                      output_final_state=output_final_state, use_qk_l2norm_in_kernel=True)
+    g = g.contiguous(); beta = beta.contiguous()
+    if initial_state is not None:
+        initial_state = initial_state.contiguous()
+    chunk_size = 64
+    if scale is None:
+        scale = k.shape[-1] ** -0.5
+    with torch.cuda.device(q.device.index):
+        qn = _gdn_pf.l2norm_strided(q)
+        kn = _gdn_pf.l2norm_strided(k)
+        g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2)
+        if os.environ.get("EXL3_GDN_FUSE", "0") == "1":
+            from .gdn_fused import chunk_gdn_fused
+            res = chunk_gdn_fused(qn, kn, v, g, beta, scale, initial_state, output_final_state, chunk_size)
+            if res is not None:
+                return res[0].to(qn.dtype), res[1]
+        v = v.contiguous()
+        w, u, _ = chunk_gated_delta_rule_fwd_intra(k = kn, v = v, g = g, beta = beta, chunk_size = chunk_size)
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            k = kn, w = w, u = u, g = g, initial_state = initial_state, output_final_state = output_final_state, chunk_size = chunk_size)
+        o = chunk_fwd_o(q = qn, k = kn, v = v_new, h = h, g = g, scale = scale, chunk_size = chunk_size)
+        return o.to(qn.dtype), final_state
 
 
 @input_guard

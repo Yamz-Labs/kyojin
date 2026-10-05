@@ -3,6 +3,10 @@ import logging
 import os
 import time
 import torch
+try:
+    from ..modules.moe_fused import check_barrier as _moe_fused_check   # fused MoE half-layer grid barrier: raise if it ever timed out
+except Exception:                                                    # noqa: BLE001
+    _moe_fused_check = None
 from ..model.model import Model
 from ..cache.cache import Cache
 from ..cache.recurrent import RecurrentCache
@@ -226,7 +230,7 @@ class Generator:
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
-        # Cost-model gate: skip the drafter forward (and the R-row verify) whenever the
+        # REPORT-28 cost-model gate: skip the drafter forward (and the R-row verify) whenever the
         # measured speculative rate would not beat plain decode. Opt-in: EXL3_SPEC_GATE=1
         self.spec_gate = SpecGate() if (draft_model is not None and
                                         os.environ.get("EXL3_SPEC_GATE", "0") != "0") else None
@@ -240,6 +244,8 @@ class Generator:
             max_chunk_size = model.caps.get("prefill_chunk_size", 2048)
         if os.environ.get("EXL3_PREFILL_CHUNK"):
             max_chunk_size = int(os.environ["EXL3_PREFILL_CHUNK"])
+        if max_chunk_size > 65535:
+            raise ValueError(f"prefill chunk of {max_chunk_size} rows is not supported: a forward is limited to 65535 rows (mixer kernel grid.y); lower EXL3_PREFILL_CHUNK / max_chunk_size")
         self.max_chunk_size = max_chunk_size
 
         # Job queues
@@ -507,6 +513,12 @@ class Generator:
 
     @torch.inference_mode
     def iterate(self) -> list[dict]:
+        results = self._iterate_inner()
+        if _moe_fused_check is not None:
+            _moe_fused_check(self.model)
+        return results
+
+    def _iterate_inner(self) -> list[dict]:
         """
         Performs inference on available jobs.
 
@@ -766,8 +778,50 @@ class Generator:
         return self.draft_ids_pinned[:, :window]
 
 
+    def _flush_mtp_defer(self, job, with_tail: bool):
+        """EXL3_PF_DEFER: run the draft prefill chunks that Job.prefill stashed instead of running them before the first
+        token. with_tail also writes the draft K/V row of the last prompt token (token L-1 paired with the hidden state
+        of L-2): the normal first draft round writes that row itself, a deferred first round (plain target step) does not."""
+        chunks = job.mtp_defer
+        job.mtp_defer = None
+        if not chunks:
+            return
+        for ids, params in chunks:
+            self.draft_model.prefill(ids, params)
+        if with_tail and job.mtp_defer_carry is not None:
+            seq = job.sequences[0]
+            pos = job.mtp_defer_end
+            self.draft_model.prefill(seq.sequence_ids.torch_slice(pos, pos + 1), {
+                "attn_mode": "flash_attn",
+                "block_table": seq.block_index_tensor,
+                "cache": self.draft_cache,
+                "cache_seqlens": torch.tensor([pos], dtype = torch.int32),
+                "target_hidden": job.mtp_defer_carry,
+                "indexed_embeddings": job.embeddings,
+                "kv_only": True,
+            })
+
+
+    def _mtp_defer_gate(self) -> bool:
+        """True when the coming round must be a plain target step (first token without the draft prefill).
+        Otherwise flushes whatever is pending and returns False. Called at the top of the MTP draft round."""
+        pend = [j for j in self.active_jobs if j.is_prefill_done() and getattr(j, "mtp_defer", None)]
+        if not pend:
+            return False
+        rows = sum(c[0].shape[-1] for j in pend for c in j.mtp_defer)
+        if len(self.active_jobs) == 1 and not pend[0].mtp_defer_plain and \
+                rows >= int(os.environ.get("EXL3_PF_DEFER_MIN", "1024")):
+            pend[0].mtp_defer_plain = True
+            return True
+        for j in pend:
+            self._flush_mtp_defer(j, with_tail = j.mtp_defer_plain)
+        return False
+
+
     def iterate_draftmodel_mtp_gen(self, results: list):
 
+        if self._mtp_defer_gate():
+            return None
         self._draft_conf_round = None
 
         # Get shape of active batch
@@ -1233,7 +1287,7 @@ class Generator:
             "positions": positions,
             "recurrent_history": draft_tokens is not None,
             "pinned_staging": True,
-            # marks a real DFlash verify forward (R rows, target model), as opposed to
+            # REPORT-17: marks a real DFlash verify forward (R rows, target model), as opposed to
             # any other multi-row call with rows in the same 2..MAX_BSZN range -- prefill routes
             # 2-8 tokens to plenty of individual MoE experts, and the draft model's own forward
             # has draft_tokens is None too. The four R-row fast paths (block_sparse_mlp.py's MoE
@@ -1923,7 +1977,7 @@ def _pt():
 
 class SpecGate:
     """
-    Cost-model gate for speculative decoding. Keeps EMAs of the plain step time, the
+    Cost-model gate for speculative decoding (REPORT-28). Keeps EMAs of the plain step time, the
     speculative round time and the tokens a round yields, and speculates only while
     tokens_per_round / t_round >= 1 / t_plain. In plain mode it probes one speculative round after
     `probe` plain steps; a failed probe doubles the interval (up to probe_max), a successful one

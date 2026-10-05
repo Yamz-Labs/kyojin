@@ -23,7 +23,7 @@ from .block_sparse_mlp_routing import (
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
     _HIP_ROUTER_HIDDEN, _HIP_ROUTER_EXPERTS, _HIP_ROUTER_TOP_K,
     _HIP_GROUPED_MAX_ROWS, _HIP_PREFILL_MIN_ROWS, _HIP_PREFILL_MAX_ROWS, _HIP_PREFILL_MAX_EXPERT_ROWS,
-    _hip_grouped_rows_eligible, _hip_prefill_rows_eligible, _prepare_hip_router_gate_t,
+    _hip_grouped_rows_eligible, _hip_prefill_rows_eligible, _prepare_hip_router_gate_t, _MOE_VALU,
 )
 
 # Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned
@@ -78,11 +78,15 @@ def _hip_wmma_workspace(device, assignments: int, hidden: int, interm: int, expe
     if ws is None or any(a < b for a, b in zip(ws["cap"], need)):
         cap = tuple(max(a, b) for a, b in zip(ws["cap"], need)) if ws is not None else need
         a, h, i, e = cap
+        # The grouped GEMM's last tile of an expert reads/writes up to a tile (<= 128 rows) past the
+        # last assignment row: a tight tail faults when the allocator places the buffer at a segment end
+        # (seen on Qwen3.8-Flash-Next once the surrounding temporaries stopped padding the pool)
+        slack = 128 * max(h, i)
         _hip_wmma_ws[device] = None
         ws = {
             "cap": cap,
-            "gu_had": torch.empty((2 * a * h,), dtype = torch.half, device = device),
-            "gu_out": torch.empty((2 * a * i,), dtype = torch.half, device = device),
+            "gu_had": torch.empty((2 * a * h + slack,), dtype = torch.half, device = device),
+            "gu_out": torch.empty((2 * a * i + slack,), dtype = torch.half, device = device),
             "offsets": torch.empty((e + 1,), dtype = torch.long, device = device),
             "inverse": torch.empty((a,), dtype = torch.long, device = device),
             "tiles": torch.empty((a // 64 + e + 1,), dtype = torch.int, device = device),
@@ -560,6 +564,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return [[g + u, d]]
 
 
+    def _hip_k3_prefill_selected(self, rows: int) -> bool:
+        """Dispatch switch between the legacy K=3 prefill kernel (exl3_moe_gfx12_k3_prefill, 17..2048 rows) and the
+        grouped WMMA GEMM (mpw2) for layers whose experts are all K=3. Read per call (one process can flip it).
+        EXL3_HIP_GROUPED_MOE_PREFILL: 1 = always legacy (the earlier default), 0 = never legacy,
+        unset / auto = mpw2 wherever it is eligible, legacy only below the WMMA row threshold (verify rows with
+        EXL3_HIP_PREFILL_MIN_ROWS=2, rows 17..31) or when MPW_KERN=1 pins the old grouped GEMM.
+        Both kernels are equally accurate against a float64 reference; mpw2 is 2.6x faster per layer."""
+        v = os.environ.get("EXL3_HIP_GROUPED_MOE_PREFILL", "auto")
+        if v == "0": return False
+        if v == "1": return True
+        return not (
+            self.support_hip_wmma and rows >= _HIP_WMMA_MIN_ROWS and
+            os.environ.get("EXL3_MOE_WMMA", "1") != "0" and os.environ.get("MPW_KERN", "2") != "1"
+        )
+
     def _ensure_hip_prefill_buffers(self, num_tokens):
         """Allocate the gfx12 prefill workspace sized to the actual chunk so chunk512
         serving never reserves the full 2048-row envelope. Grows only if a larger
@@ -793,7 +812,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
             # Codebook: exl3_dec_moe takes one flag for all three projections (the kernel is
             # templated on the codebook, not per projection), so the layer needs a uniform one.
-            # mul1 and mcg both decode; anything else leaves the fused path off.
+            # mul1 and mcg both decode (REPORT-21); anything else leaves the fused path off.
             if cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)):
                 self.dec_moe_mcg = bool(cbs[0][0])
             self.support_dec_moe = self.support_dec_moe and self.dec_moe_mcg is not None
@@ -802,7 +821,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.dec_moe_act = g_tensor_cache.get(
                     self.device, (self.num_experts_per_tok, self.intermediate_size_padded), torch.half, "dec_moe_act")
                 self.dec_shf_setup()
-                # R-row union MoE (exl3_dec_moe_union): shared, per-device
+                # R-row union MoE (REPORT-16/17, exl3_dec_moe_union): shared, per-device
                 # workspace (like dec_workspace) sized for the worst case (MAX_BSZN rows, this
                 # layer's topk/H/I) and reused across layers -- forward calls are stream-ordered
                 # so a later layer never races an earlier one's still-in-flight kernel.
@@ -827,8 +846,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 multi.K in (2, 2.5, 3, 4) and (multi.mul1 != multi.mcg)
                 for multi in (self.multi_gate, self.multi_up, self.multi_down)
             ) and self.multi_gate.K == self.multi_up.K
-            # Codebook: mpw_gemm is templated on it and takes one flag for all three projections,
-            # so the layer needs a uniform codebook. Unknown (neither mul1 nor mcg,
+            # Codebook: mpw_gemm is templated on it and takes one flag for all three projections
+            # (REPORT-22), so the layer needs a uniform codebook. Unknown (neither mul1 nor mcg,
             # or mixed) leaves the path off.
             wmma_cbs = {(m.mul1, m.mcg) for m in (self.multi_gate, self.multi_up, self.multi_down)}
             if len(wmma_cbs) == 1:
@@ -1334,7 +1353,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if os.environ.get("BSZ_DEBUG"):
             print(f"[bsz_debug] layer={self.key} bsz={bsz} union={os.environ.get('EXL3_DEC_MOE_UNION')}")
         bc_sh_exp = False
-        # R-row union MoE with the unique-expert table built on device (no host sync),
+        # REPORT-28: R-row union MoE with the unique-expert table built on device (no host sync),
         # fed by the batched router -- independent of EXL3_DEC_MOE_UNION's bit-exact per-row loops
         union_dev = os.environ.get("EXL3_DEC_MOE_UNION_DEV", "0") != "0"
         # V2 selects the device-built unique-expert table without enabling the legacy
@@ -1407,7 +1426,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # gfx11.5 batch-1 fused decode (exl3_dec_moe): two launches for the whole routed sum
         elif (
-            bsz == 1 and self.support_dec_moe and self.tp_mode is None and
+            bsz == 1 and self.support_dec_moe and self.tp_mode is None and not (_MOE_VALU and self.support_hip_grouped) and
             y.dtype == torch.half and y.is_contiguous() and
             selected_experts.dtype == torch.long and routing_weights.dtype == torch.half and
             selected_experts.numel() == self.num_experts_per_tok and
@@ -1487,15 +1506,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 return res
             final_hidden_states = self.dec_moe_out.view(eshape)
 
-        # R-row union decode (exl3_dec_moe_union), DFlash verify: bit-exact vs
-        # bsz independent batch-1 exl3_dec_moe calls under shared routing --
+        # R-row union decode (REPORT-16/17, exl3_dec_moe_union), DFlash verify: bit-exact vs
+        # bsz independent batch-1 exl3_dec_moe calls under shared routing (REPORT-16 Sec 1) --
         # each unique expert across the bsz rows' picks is decoded once and applied to every row
         # that picked it in the exact batch-1 per-row arithmetic order. Opt-in (default off):
-        # Measured: no clear speed win yet at R=1 or R=6-8 (host-side unique/assign
+        # REPORT-16 measured no clear speed win yet at R=1 or R=6-8 (host-side unique/assign
         # build dominates), only R=2..5; EXL3_DEC_MOE_UNION=1 to use it anyway (e.g. to get a
         # bit-exact verify path even before that's fixed).
         elif (
             1 < bsz <= MAX_BSZN and self.support_dec_moe and self.tp_mode is None and
+            not (_MOE_VALU and self.support_hip_grouped and bsz <= 8) and
             hasattr(ext, "exl3_dec_moe_union") and
             (union_dev or union_v2 or os.environ.get("EXL3_DEC_MOE_UNION", "0") != "0") and params.get("dflash_verify") and
             y.dtype == torch.half and y.is_contiguous() and
@@ -1591,7 +1611,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             _hip_prefill_rows_eligible(bsz) and
             y.dtype == torch.half and y.is_contiguous() and
             selected_experts.is_contiguous() and routing_weights.is_contiguous() and
-            os.environ.get("EXL3_HIP_GROUPED_MOE_PREFILL", "1") != "0" and
+            self._hip_k3_prefill_selected(bsz) and
             os.environ.get("EXL3_GEMV", "1") != "0" and
             not params.get("activate_all_experts") and
             not params.get("reconstruct") and not params.get("autosplit_measure")
@@ -1987,7 +2007,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Shared experts
         if self.shared_experts and not bc_sh_exp:
-            y = self.shared_experts.forward(x, params)
+            y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
             if pre_norm_reduce:
                 params["backend"].all_reduce(y, True)
             if self.shared_experts_post_norm:
@@ -2013,7 +2033,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return final_hidden_states
 
 
-    def dec_norm_route(self, norm, xa: torch.Tensor, r: torch.Tensor, params: dict):
+    def dec_norm_route(self, norm, xa: torch.Tensor, r: torch.Tensor, params: dict, rows: int = 1):
         """Batch-1 decode: MLP pre-norm (r += xa, y = norm(r)) fused with the router in one
         exl3_dec_router_norm launch. Returns y (fp16), routing left in params["dec_routed"]; None
         when the fused path does not apply (the caller then runs the norm itself)."""
@@ -2024,7 +2044,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.routing_fn is routing_dots and self.routing_gate is not None and
             self.router_pre_norm is None and self.routed_pre_norm is None and self.latent_in is None and
             self.routing_device is None and not self.alt_residual_channel and self.cpu_split_first is None and
-            xa.numel() == self.hidden_size and r.numel() == self.hidden_size and
+            xa.numel() == rows * self.hidden_size and r.numel() == rows * self.hidden_size and
             xa.dtype in (torch.half, torch.float) and r.dtype == torch.float and
             xa.is_contiguous() and r.is_contiguous() and
             not norm.span_heads and norm.groups == 1 and
@@ -2032,11 +2052,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             norm.key not in params.get("export_state_norm_keys", ())
         ):
             return None
-        y = getattr(self, "dec_norm_y", None)
-        if y is None or y.device != xa.device:
-            y = self.dec_norm_y = torch.empty((1, self.hidden_size), dtype = torch.half, device = xa.device)
+        buf = "dec_norm_y" if rows == 1 else "dec_norm_y_rows"
+        y = getattr(self, buf, None)
+        if y is None or y.device != xa.device or y.shape[0] != rows:
+            y = torch.empty((rows, self.hidden_size), dtype = torch.half, device = xa.device)
+            setattr(self, buf, y)
         cfg = self.routing_cfg
-        if not _dec_router_ok(1, cfg, y, params):
+        if not _dec_router_ok(1, cfg, y[:1], params):
             return None
         from .quant.exl3 import dec_workspace
         bias = getattr(cfg, "dec_bias", False)
@@ -2046,10 +2068,19 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             cfg.dec_bias = bias
         scratch, counters = dec_workspace(xa.device)
         scale = cfg.routed_scaling_factor if cfg.routed_scaling_factor is not None else 1.0
-        ext.exl3_dec_router_norm(xa.view(1, -1), r.view(1, -1), norm.weight, norm.rms_norm_eps, norm.constant_bias,
-                                 norm.constant_scale, y, cfg.gate_tensor, bias, cfg.selected_experts_bsz1,
-                                 cfg.routing_weights_bsz1, scratch, counters, float(scale))
-        params["dec_routed"] = (cfg.selected_experts_bsz1, cfg.routing_weights_bsz1)
+        if rows == 1:
+            sel, wts = cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+        else:
+            # One launch for all rows (grid.y = row): each row is bitwise the single-row launch
+            sel = getattr(self, "dec_sel_rows", None)
+            if sel is None or sel.shape[0] != rows or sel.device != xa.device:
+                sel = self.dec_sel_rows = torch.empty((rows, self.num_experts_per_tok), dtype = torch.long, device = xa.device)
+                self.dec_wts_rows = torch.empty((rows, self.num_experts_per_tok), dtype = torch.half, device = xa.device)
+            wts = self.dec_wts_rows
+        ext.exl3_dec_router_norm(xa.view(rows, -1), r.view(rows, -1), norm.weight, norm.rms_norm_eps, norm.constant_bias,
+                                 norm.constant_scale, y, cfg.gate_tensor, bias, sel,
+                                 wts, scratch, counters, float(scale))
+        params["dec_routed"] = (sel, wts)
         return y.view(xa.shape)
 
 
@@ -2058,7 +2089,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         literal batch-1 exl3_dec_router_norm launch (same kernel, same args, just row j's data),
         so row j of the returned y and of dec_routed's (selected, weights) is bit-identical to
         what plain batch-1 decode would produce stepping through row j alone -- this is what
-        A review found missing: the row-invariance probe exercised
+        REPORT-16 Sec 6 found missing: that report's row-invariance probe exercised
         exl3_dec_router (unfused), not the exl3_dec_router_norm/dec_norm_route path real decode
         actually takes, which is why it saw a k-order mismatch and (for one cell) a 1.22e-4
         weight mismatch -- neither is possible here, since this never runs a second, independent
@@ -2073,7 +2104,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # dec_norm_route's raw-buffer return is consumed immediately by the caller either way.
             return self.dec_norm_route(norm, xa[0], r[0], params)
         # R>1 (DFlash verify): gated by the same flag as the union MoE kernel it feeds, so
-        # EXL3_DEC_MOE_UNION=0 reproduces the exact pre-union behavior (generic norm+router,
+        # EXL3_DEC_MOE_UNION=0 reproduces the exact pre-REPORT-17 behavior (generic norm+router,
         # dedup MoE) for a clean A/B against it -- R sequential kernel launches here is a real
         # per-layer cost even though it's bit-exact, not a free win to force on unconditionally.
         # Also refuse above MAX_BSZN: prefill calls this with R = chunk size (hundreds+), where
@@ -2086,6 +2117,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             r.view(R, -1)
         except RuntimeError:
             return None
+        if os.environ.get("EXL3_DEC_NORM_ROUTE_ROWS", "1") != "0":
+            # One launch (grid.y = row), bitwise the R single-row launches below. None when the fused
+            # path does not apply: the caller then runs the generic norm + router.
+            return self.dec_norm_route(norm, xa.view(R, -1), r.view(R, -1), params, R)
         ys, sels, wtss = [], [], []
         for i in range(R):
             sub = dict(params)

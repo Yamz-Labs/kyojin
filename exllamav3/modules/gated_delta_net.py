@@ -8,6 +8,7 @@ from . import Module, Linear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
+from .quant.exl3 import row_pad_pitch as _row_pad_pitch
 
 _MIDCKPT_STREAM = None  # EXL3_MIDCHUNK_CKPT=2 side stream for the checkpoint D2H
 from ..cache import Cache
@@ -18,6 +19,13 @@ import os
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+_QKVZ_DEC_MULTI = os.environ.get("EXL3_GDN_QKVZ_MULTI", "1") != "0"   # (qkv+z one launch)
+# EXL3_QWD_AB (default 0 until proven) folds the fp16 b / a projections, and with a bf16 dt_bias / fp32 a_log also
+# gated_delta_net_fused_op_2 (beta, g), into the qkv|z launch as extra blocks (bit-identical to the separate launches);
+# EXL3_QWD_AB_FIRST=1 puts those blocks first in the grid
+_QWD_AB_FLAGS = 1 if os.environ.get("EXL3_QWD_AB_FIRST", "0") != "0" else 0
+def _qwd_ab_on() -> bool:   # read per call so a served A/B run can flip it (serve_ab arm switch)
+    return os.environ.get("EXL3_QWD_AB", "0") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
 from .gated_delta_net_fn import causal_conv1d_update, gated_delta_rule_fn
 from ..cache.recurrent import (
@@ -82,6 +90,9 @@ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, las
     layers = [module.tp_recurrent_lookup[cache_id] for module in recurrent_modules]
     _dispatch_rewind_jobs(_collect_rewind_jobs(layers, slot, last_history, num_tokens))
 
+
+_ABCAT = os.environ.get("EXL3_QWD4_ABCAT", "1") != "0"
+QWD3 = {"skip": 0}   # harness-only kill test: 1 = reuse the last b / a outputs (skip the skinny launches), 2 = also reuse beta / g. NOT bit-identical, never committed.
 
 class GDNState:
 
@@ -898,6 +909,105 @@ class GatedDeltaNet(Module):
             core_attn_out, core_attn_out_f, qkv_xh, o_xh,
         )
 
+    def _dec_qkvz_linears(self):
+        """(qkv_proj, z_proj) when one exl3_dec_gemv_multi launch can replace their two forwards (same K, mcg and
+        input width, no bias), else None. one launch instead of two, one grid of both matrices."""
+        lins = getattr(self, "_dec_qkvz", False)
+        if lins is False:
+            from .mla_attn import dec_proj_ok, dec_proj_shapes
+            lins = None
+            if self.qkv_proj is not None and self.z_proj is not None and self.qkvz_proj is None:
+                cand = (self.qkv_proj, self.z_proj)
+                if all(dec_proj_ok(l) for l in cand) and dec_proj_shapes(cand):
+                    lins = cand
+            self._dec_qkvz = lins
+        return lins
+
+    def project_qkvz_dec(self, x: torch.Tensor, params: dict, bsz: int, seqlen: int):
+        """Decode qkv + z in ONE exl3_dec launch (both Hadamard stages inside): batch 1, or the R-row verify
+        launch (dflash_verify). Returns (qkv, z) with the Linears' shapes and dtype, or None to fall back."""
+        rows = bsz * seqlen
+        if rows > 8 or x.dtype != torch.half or "capture" in params or "ovr" in params or not x.is_contiguous():
+            return None
+        if rows > 1 and not (params.get("dflash_verify") and os.environ.get("EXL3_VERIFY_GEMV_R", "0") != "0"
+                             and hasattr(ext, "exl3_dec_gemv_r_multi")):
+            return None
+        lins = self._dec_qkvz_linears()
+        if lins is None or x.shape[-1] != lins[0].in_features:
+            return None
+        from .mla_attn import dec_proj_multi
+        qkv, z = dec_proj_multi(lins, x, rows)
+        return (qkv.view(bsz, seqlen, -1), z.view(bsz, seqlen, -1))
+
+
+    def _ab_cat(self, x: torch.Tensor, params: dict, bsz: int, seqlen: int):
+        """decode b and a skinny projections in ONE launch (ext.skinny_cat_w, same per-column reduction order as the two
+        separate skinny launches, bit-identical). Returns (b, a) fp32 [bsz, seqlen, heads] or None to fall back. EXL3_QWD4_ABCAT=0 = off."""
+        ok = getattr(self, "_ab_cat_ok_v", None)
+        if ok is None:
+            mods = (self.b_proj, self.a_proj)
+            ok = (hasattr(ext, "skinny_cat_w") and not self.kda and
+                  all(m is not None and m.quant_type == "fp16" and type(m.inner).__name__ == "LinearFP16" and m.inner.bias is None and
+                      m.inner._pinned_store is None and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 and
+                      m.softcap == 0.0 and m.out_features == m.out_features_unpadded and m.out_features == self.num_v_heads and
+                      m.inner.weight.is_contiguous() and m.inner.weight.dtype == torch.half and m.inner.out_dtype == torch.float for m in mods))
+            self._ab_cat_ok_v = ok
+        if not ok or bsz * seqlen != 1 or x.dtype != torch.half or not x.is_contiguous() or "capture" in params or "ovr" in params:
+            return None
+        h = self.num_v_heads
+        b = torch.empty((bsz, seqlen, h), dtype = torch.float, device = x.device)
+        a = torch.empty((bsz, seqlen, h), dtype = torch.float, device = x.device)
+        ext.skinny_cat_w(x.view(1, -1), [self.b_proj.inner.weight, self.a_proj.inner.weight], [b.view(1, h), a.view(1, h)])
+        return b, a
+
+    def _qwd_ab_ok(self) -> bool:
+        ok = getattr(self, "_qwd_ab_ok_v", None)
+        if ok is None:
+            lins = self._dec_qkvz_linears()
+            mods = (self.b_proj, self.a_proj)
+            ok = (lins is not None and hasattr(ext, "exl3_dec_gemv_x") and not self.kda and
+                  all(m is not None and m.quant_type == "fp16" and type(m.inner).__name__ == "LinearFP16" and m.inner.bias is None and
+                      m.inner._pinned_store is None and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 and
+                      m.softcap == 0.0 and m.out_features == m.out_features_unpadded and m.out_features == self.num_v_heads and
+                      m.inner.weight.is_contiguous() and m.inner.weight.dtype == torch.half and
+                      m.inner.weight.shape[0] == lins[0].in_features and m.inner.out_dtype == torch.float for m in mods) and
+                  int(round(lins[0].inner.K * 2)) == 10 and lins[0].inner.in_features // 128 <= 64)
+            self._qwd_ab_ok_v = ok
+        return ok
+
+    def project_qkvz_ab_dec(self, x: torch.Tensor, params: dict, bsz: int, seqlen: int):
+        """qkv + z + b + a (+ beta / g) in ONE launch (exl3_dec_gemv_x), batch 1 only. Returns (qkv, z, b, a, None, None) with b, a fp32
+        [bsz, seqlen, num_v_heads], or (qkv, z, None, None, beta, g) when the gate math rides along, or None to fall back."""
+        if bsz * seqlen != 1 or x.dtype != torch.half or "capture" in params or "ovr" in params or not x.is_contiguous():
+            return None
+        if not self._qwd_ab_ok():
+            return None
+        lins = self._dec_qkvz_linears()
+        if x.shape[-1] != lins[0].in_features:
+            return None
+        from .quant.exl3 import dec_workspace
+        scratch, counters = dec_workspace(x.device)
+        outs = [torch.empty((1, l.inner.out_features), dtype = l.inner.default_out_dtype, device = x.device) for l in lins]
+        h = self.num_v_heads
+        gate = h % 16 == 0 and self.dt_bias.dtype == torch.bfloat16 and self.a_log.dtype == torch.float and \
+               self.dt_bias.is_contiguous() and self.a_log.is_contiguous() and self.dt_bias.numel() == h and self.a_log.numel() == h
+        if gate:
+            o1 = torch.empty((1, h), dtype = torch.bfloat16, device = x.device)
+            o2 = torch.empty((1, h), dtype = torch.float, device = x.device)
+            gargs = [self.dt_bias, self.a_log]
+        else:
+            o1 = torch.empty((1, h), dtype = torch.float, device = x.device)
+            o2 = torch.empty((1, h), dtype = torch.float, device = x.device)
+            gargs = []
+        ext.exl3_dec_gemv_x(
+            x.reshape(1, -1), [l.inner.trellis for l in lins], [l.inner.suh for l in lins], [l.inner.svh for l in lins],
+            outs, scratch, counters, [float(l.inner.K) for l in lins], bool(lins[0].inner.mcg), _QWD_AB_FLAGS,
+            [self.b_proj.inner.weight, self.a_proj.inner.weight], [o1, o2], gargs, float(self.beta_scale))
+        qkv, z = outs[0].view(bsz, seqlen, -1), outs[1].view(bsz, seqlen, -1)
+        if gate:
+            return (qkv, z, None, None, o1.view(bsz, seqlen, -1), o2.view(bsz, seqlen, -1))
+        return (qkv, z, o1.view(bsz, seqlen, -1), o2.view(bsz, seqlen, -1), None, None)
+
     def project_qkvz_sliced(self, x: torch.Tensor, bsz: int, seqlen: int) -> tuple:
         """qkv and z projections as one sliced mgemm (fp32 outputs, like the Linears); m <= 32"""
         mq = self.multi_qkvz
@@ -962,6 +1072,26 @@ class GatedDeltaNet(Module):
             qkv_xh, z_xh, o_xh,
         )
 
+
+    def _pfe_f16_out(self, m, x: torch.Tensor, params: dict, env: str) -> bool:
+        # EXL3_PFE_QKVZ / EXL3_PFE_OPROJ (default 1): request this projection's output in fp16 instead of fp32.
+        # Where the fp32 output is an fp16 GEMM plus a widen (_f32_via_f16, HIP reconstruct path) the fp16
+        # buffer holds the same values and the consumer widens in-kernel: drops the widen copy, bit-exact
+        if os.environ.get(env, "1") != "1" or "capture" in params or "quant_preserve" in params:
+            return False
+        from .quant import exl3 as _exl3
+        rows = x.numel() // x.shape[-1]
+        if not (_exl3._f32_via_f16 and rows >= _exl3._f32_via_f16_min_rows):
+            return False
+        if type(m.inner).__name__ != "LinearEXL3" or m.inner.bias is not None:
+            return False
+        if rows <= _exl3.AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct \
+                or params.get("reconstruct"):
+            return False
+        return (
+            not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 and m.softcap == 0.0 and
+            m.out_features == m.out_features_unpadded
+        )
 
     def _kda_qkv_f16(self, x: torch.Tensor) -> bool:
         # EXL3_KDA_QKV_F16=1 (default): take qkv_proj's output in fp16 instead of fp32. On HIP the fp32 output
@@ -1427,27 +1557,62 @@ class GatedDeltaNet(Module):
                 else:
                     g = -decay * torch.where(gf > 20.0, gf, torch.log1p(torch.exp(gf)))
         else:
-            if getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
+            # EXL3_QWG_ABFIRST=1 runs the two skinny b / a projections before qkv / z (independent kernels, bit-exact)
+            ab_first = os.environ.get("EXL3_QWG_ABFIRST", "0") == "1"
+            if ab_first:
+                b = self.b_proj.forward(x, params)
+                a = self.a_proj.forward(x, params)
+            qzab = self.project_qkvz_ab_dec(x, params, bsz, seqlen) if (_QKVZ_DEC_MULTI and not ab_first and _qwd_ab_on()) else None
+            qz = None if qzab is not None else (self.project_qkvz_dec(x, params, bsz, seqlen) if _QKVZ_DEC_MULTI else None)
+            if qzab is not None:
+                qkv, z, b, a, beta_ab, g_ab = qzab
+            elif qz is not None:
+                qkv, z = qz
+            elif getattr(self, "multi_qkvz", None) is not None and bsz * seqlen <= 32:
                 qkv, z = self.project_qkvz_sliced(x, bsz, seqlen)
             else:
-                qkv = self.qkv_proj.forward(x, params)
-                z = self.z_proj.forward(x, params)
+                qkv_dt = torch.half if self._pfe_f16_out(self.qkv_proj, x, params, "EXL3_PFE_QKVZ") else None
+                z_dt = torch.half if self._pfe_f16_out(self.z_proj, x, params, "EXL3_PFE_QKVZ") else None
+                qkv = self.qkv_proj.forward(x, params, qkv_dt)
+                z = self.z_proj.forward(x, params, z_dt)
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
-            b = self.b_proj.forward(x, params)
-            a = self.a_proj.forward(x, params)
+            if not ab_first and qzab is None:
+                _c = getattr(self, "_qd3_ba", None)
+                if QWD3["skip"] and _c is not None and _c[0] == x.shape:
+                    b, a = _c[1], _c[2]
+                else:
+                    ba = self._ab_cat(x, params, bsz, seqlen) if QWD3.get("abcat", _ABCAT) else None
+                    if ba is not None:
+                        b, a = ba
+                    else:
+                        b = self.b_proj.forward(x, params)
+                        a = self.a_proj.forward(x, params)
+                    self._qd3_ba = (x.shape, b, a)
 
-            mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
+            # EXL3_GDN_FUSED_CAST=1 (default): the conv casts the fp16 transposed view in-kernel (bit-equal),
+            # replacing two full passes (strided cast + transpose copy) over qkv
+            if os.environ.get("EXL3_GDN_FUSED_CAST", "1") != "0":
+                mixed_qkv = qkv.transpose(1, 2)
+            else:
+                mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
 
-            beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
-            g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
-
-            ext.gated_delta_net_fused_op_2(
-                b, a,
-                self.dt_bias,
-                self.a_log,
-                beta, g,
-                self.beta_scale
-            )
+            if qzab is not None and beta_ab is not None:
+                beta, g = beta_ab, g_ab
+            else:
+                _c = getattr(self, "_qd3_bg", None)
+                if QWD3["skip"] >= 2 and _c is not None and _c[0] == x.shape:
+                    beta, g = _c[1], _c[2]
+                else:
+                    beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
+                    g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
+                    ext.gated_delta_net_fused_op_2(
+                        b, a,
+                        self.dt_bias,
+                        self.a_log,
+                        beta, g,
+                        self.beta_scale
+                    )
+                    self._qd3_bg = (x.shape, beta, g)
 
         # Mid-chunk recurrent checkpoints (EXL3_MIDCHUNK_CKPT, set by the job via params): split conv + KDA
         # core at the given rows, chaining conv state and S, and save the state at each split row
@@ -1502,11 +1667,20 @@ class GatedDeltaNet(Module):
         if lr_gaf is not None:
             core_attn_out = self._kda_gb_norm(core_attn_out, lr_gaf, params)
         else:
-            core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
+            o_pitch = 0
+            _pad_ok = getattr(ext.gated_rms_norm, "pad_ok", None)
+            if _pad_ok is not None and not self.kda and not self.norm.gate_first and \
+                    _pad_ok(core_attn_out, self.norm.weight, self.norm.out_dtype or torch.half, z, self.norm.groups,
+                            1 if self.norm.gate_activation == "sigmoid" else 0):
+                o_pitch = _row_pad_pitch(self.o_proj, self.num_v_heads * self.v_head_dim,
+                                         core_attn_out.numel() // (self.num_v_heads * self.v_head_dim), params)
+            core_attn_out = self.norm.forward(core_attn_out, params, gate = z, out_pitch = o_pitch)
         core_attn_out = core_attn_out.view(bsz, seqlen, self.num_v_heads * self.v_head_dim)
 
-        # Output projection
-        x = self.o_proj.forward(core_attn_out, params)
+        # Output projection (fp16 when the block's residual apply reads fp16: params["pfe_y_half"])
+        o_dt = torch.half if params.get("pfe_y_half") and \
+            self._pfe_f16_out(self.o_proj, core_attn_out, params, "EXL3_PFE_OPROJ") else None
+        x = self.o_proj.forward(core_attn_out, params, o_dt)
 
         # TP reduction
         if self.tp_reduce:

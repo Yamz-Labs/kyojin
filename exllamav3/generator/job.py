@@ -9,6 +9,7 @@ import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
 import random
+import logging
 import time
 from ..ext import exllamav3_ext as ext
 from .loop_detect import LoopDetector
@@ -308,6 +309,8 @@ class Job:
         # Recurrent state
         self.recurrent_state = None
         self.last_recurrent_checkpoint_pos = None
+        self.roll_ckpt = os.environ.get("EXL3_ROLL_CKPT", "0") == "1"
+        self.roll_key = None
 
         # Loop detector
         self.loop_detector = None
@@ -323,6 +326,12 @@ class Job:
 
         # MTP state
         self.mtp_last_hidden = None
+        # EXL3_PF_DEFER: draft prefill chunks stashed by prefill() and run after the first token
+        # (generator._flush_mtp_defer); end = position of the last prompt token, carry = hidden state before it
+        self.mtp_defer = None
+        self.mtp_defer_plain = False
+        self.mtp_defer_end = 0
+        self.mtp_defer_carry = None
 
 
     def get_pinned_logit_mask(self):
@@ -940,6 +949,8 @@ class Job:
             # An MTP draft carry refers to the pre-rewind context; drop it so drafting pauses until the next
             # target forward (or replay prefill) provides a fresh one. Signal the generator that any in-flight
             # draft verification window must be abandoned.
+            if self.mtp_defer:
+                self.generator._flush_mtp_defer(self, with_tail = self.mtp_defer_plain)
             self.mtp_last_hidden = None
             self.checkpoint_rewound = True
             off_tokens = self.held_tokens.slice(len(self.checkpoint["held_tokens"]), None)
@@ -1230,15 +1241,8 @@ class Job:
             # recurrent checkpoint of plain max_chunk_size chunking
             chunk = self.generator.max_chunk_size
             big = int(os.environ.get("EXL3_PREFILL_BIG_CHUNK", "4096"))
-            # EXL3_PREFILL_BIG_CHUNK_MAXPOS (default 0 = off): from this kv position on, plain chunks again (smaller
-            # workspace, lower peak GPU/unified memory at very long context); the cached big-chunk workspace is
-            # released once per job at the switch
-            maxpos = int(os.environ.get("EXL3_PREFILL_BIG_CHUNK_MAXPOS", "0"))
-            if maxpos and big > chunk and seq.kv_position >= maxpos:
-                big = chunk
-                if not getattr(self, "_big_chunk_released", False):
-                    self._big_chunk_released = True
-                    torch.cuda.empty_cache()
+            if big > 65535:
+                raise ValueError(f"EXL3_PREFILL_BIG_CHUNK={big}: a forward is limited to 65535 rows (mixer kernel grid.y)")
             remaining = len(seq.sequence_ids) - 1 - seq.kv_position
             big_tail = big > chunk and big % chunk == 0 and self.big_tail_enabled()
             if big_tail:
@@ -1499,10 +1503,22 @@ class Job:
                     # block, so it is deliberately not touched
                     if self.generator.mtp_draft and os.environ.get("EXL3_PF_SKIP", "0") == "1":
                         draft_params["kv_only"] = True
-                    self.generator.draft_model.prefill(
-                        input_ids = prefill_ids,
-                        params = draft_params
-                    )
+                    # EXL3_PF_DEFER=1: single sequence MTP prefill stashes the draft chunks; the generator runs them
+                    # after the first token (first round is a plain target step). Flushed at job end and on rewind,
+                    # so the draft cache stays complete for prefix reuse
+                    if self.generator.mtp_draft and os.environ.get("EXL3_PF_DEFER", "0") == "1" and \
+                            len(self.sequences) == 1 and self.generator.spec_gate is None:
+                        draft_params["kv_only"] = True
+                        if self.mtp_defer is None:
+                            self.mtp_defer = []
+                        self.mtp_defer.append((prefill_ids.clone(), draft_params))
+                        self.mtp_defer_end = prefill_end
+                        self.mtp_defer_carry = seq.mtp_carry_hidden
+                    else:
+                        self.generator.draft_model.prefill(
+                            input_ids = prefill_ids,
+                            params = draft_params
+                        )
 
                 # Atomic MM prefill may have extended the forward pass past prefill_end, advancing any
                 # recurrent state beyond the chunk boundary. The extension is processed again by the
@@ -1603,6 +1619,12 @@ class Job:
 
 
     def deallocate_pages(self):
+        if self.mtp_defer:
+            try:
+                self.generator._flush_mtp_defer(self, with_tail = self.mtp_defer_plain)
+            except Exception as e:  # cleanup must not raise: the draft cache only loses accept depth on reuse
+                logging.warning("EXL3_PF_DEFER flush failed: %r", e)
+            self.mtp_defer = None
         self.free_recurrent_state()
         for seq in self.sequences:
             if seq.allocated_pages is not None:
@@ -1675,6 +1697,11 @@ class Job:
         seq_pos = seq.kv_position if pos is None else pos
         if override_interval:
             return seq_pos % override_interval == 0
+        # EXL3_ROLL_CKPT=1 (default off): while decoding, every page boundary is a checkpoint candidate; the
+        # previous rolling one is dropped when the next lands (see maybe_stash_recurrent), so a follow-up turn
+        # resumes at the last full page of the reply instead of the last 2048-grid checkpoint
+        if self.roll_ckpt and pos is None and seq_pos >= len(seq.input_ids):
+            return seq_pos % PAGE_SIZE == 0
         elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
             return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
         else:
@@ -1716,6 +1743,15 @@ class Job:
 
             page = seq.allocated_pages[last_page]
             assert page.kv_position == PAGE_SIZE
+            if self.roll_ckpt and interval is None and seq.kv_position >= len(seq.input_ids):
+                if self.roll_key is not None and self.roll_key != page.phash:
+                    cache.drop(self.roll_key)
+                    self.roll_key = None
+                grid = (seq.kv_position - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
+                if not grid and page.phash not in cache:
+                    self.roll_key = page.phash
+                cache.put(page.phash, self.recurrent_state)
+                return
             cache.put(page.phash, self.recurrent_state)
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk

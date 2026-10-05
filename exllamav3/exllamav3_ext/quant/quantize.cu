@@ -137,8 +137,8 @@ enum { QT_BASE = 0, QT_OPTIMIZED = 1, QT_RDNA = 2 };
 // falls back to base where it has no instance); EXL3_QT_OPTIMIZED=1/0 keeps its old meaning.
 // On ROCm the grouped kernel is the default for K = 2..3, the dense specialization for K = 4..5.
 // All are measured bit-identical to the base kernel on gfx1151. K = 4 routes to dense because the
-// grouped kernel only matches base there while dense is ~2.5-3x base (K = 2..3 and
-// K = 5).
+// grouped kernel only matches base there while dense is ~2.5-3x base (REPORT-10; K = 2..3 and
+// K = 5 measured in REPORT-09/REPORT-10).
 static int quantize_tiles_mode(int major, int minor, int K, int cb, int L)
 {
     if (const char* env = std::getenv("EXL3_QT_KERNEL"))

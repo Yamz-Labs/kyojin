@@ -95,6 +95,17 @@ class RecurrentCache(OrderedDict):
             self.update_total_size()
 
 
+    def drop(self, key) -> None:
+        """Remove one checkpoint (rolling-checkpoint cleanup)."""
+        popped = self.pop(key, None)
+        if popped is None:
+            return
+        note_freed(popped["checkpoint_size"])
+        if self.model.loaded_tp:
+            self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
+        self.update_total_size()
+
+
     def prune_stranded(self) -> int:
         """
         Drop all checkpoints whose anchor page chain has been broken by KV eviction. A stranded checkpoint can

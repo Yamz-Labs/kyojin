@@ -37,6 +37,167 @@ _EXL3_GEMV_HIP_MMODE2_VARIANTS = frozenset({
 
 no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"
 
+# row-padded activations for the prefill GEMMs. An fp16 row of K = 6144 is 12288 B; at that pitch the
+# rocBLAS GEMM reads A at about half rate (out_proj 50 % of peak in place). One extra 128 B per row runs the same
+# product, bit-exact, at 87-90 %. Keep PAD_ELEMS and the K rule in step with exllamav3_ext/pad_pitch.h.
+_PAD_HIP = torch.version.hip is not None
+PAD_ELEMS = 64
+PAD_MIN_ROWS = 1024          # the fused reconstruct path (no input Hadamard launch) starts at 1024 rows
+
+def _pad_view_ok(x: torch.Tensor) -> bool:
+    """x is one (rows, k) matrix with columns contiguous and a single row pitch >= k (leading dims collapsible)."""
+    if x.dim() < 2 or x.stride(-1) != 1:
+        return False
+    k = x.shape[-1]
+    if x.stride(-2) < k:
+        return False
+    for i in range(x.dim() - 3, -1, -1):
+        if x.shape[i + 1] != 1 and x.stride(i) != x.stride(i + 1) * x.shape[i + 1]:
+            return False
+    return True
+
+# Consumer-side padding: a producer we do not own hands a contiguous x whose pitch is a hazard; copy it once into a padded
+# buffer (one read + one write of x, bit-exact) before the GEMM. EXL3_PAD_COPY=0 turns it off (read per call).
+def pad_copy_in(x: torch.Tensor, k: int) -> torch.Tensor:
+    """x is (rows, k) fp16 contiguous with a hazard pitch: return a (rows, k) view at row pitch k + PAD_ELEMS, else x."""
+    if (not _PAD_HIP or x.dtype not in (torch.half, torch.bfloat16) or x.dim() != 2 or (k * 2) % 4096 != 0 or x.shape[0] < PAD_MIN_ROWS
+            or not x.is_contiguous() or x.data_ptr() % 16 != 0 or os.environ.get("EXL3_PAD_COPY", "1") == "0" or os.environ.get("EXL3_OPROJ_PAD", "1") == "0"):
+        return x
+    pitch = k + PAD_ELEMS
+    buf = torch.empty((x.shape[0], pitch), dtype = x.dtype, device = x.device)
+    y = buf[:, :k]
+    ext.pad_copy(x, y, pitch)
+    return y
+
+def _pad_eligible(lin, k: int, rows: int, params: dict) -> bool:
+    """One predicate for producer and consumer: this linear can take a row-padded input of k columns."""
+    if not _PAD_HIP or rows < PAD_MIN_ROWS or k % 128 != 0:
+        return False
+    inner = getattr(lin, "inner", lin)
+    if type(inner).__name__ != "LinearEXL3" or inner.in_features != k or inner.out_features % 128 != 0:
+        return False
+    if no_fused_reconstruct or inner.config.infer_params.no_reconstruct or inner.bias is not None:
+        return False
+    if any(p in params for p in ("capture", "quant_preserve", "ovr", "reconstruct")):
+        return False
+    if getattr(lin, "lora_a_tensors", None):
+        return False
+    if getattr(lin, "pre_scale", 1.0) != 1.0 or getattr(lin, "post_scale", 1.0) != 1.0 or getattr(lin, "softcap", 0.0) != 0.0:
+        return False
+    return True
+
+def row_pad_pitch(lin, k: int, rows: int, params: dict) -> int:
+    """Row pitch (elements) a producer should give the activation of `lin` (0 = leave it contiguous).
+    EXL3_OPROJ_PAD=0 turns it off (read per call)."""
+    if os.environ.get("EXL3_OPROJ_PAD", "1") == "0" or (k * 2) % 1024 != 0:
+        return 0
+    return k + PAD_ELEMS if _pad_eligible(lin, k, rows, params) else 0
+
+# hadP: prefill reconstruct cache. A long prefill runs as several row-chunks, and every
+# LinearEXL3 reconstructs its (rows-independent!) fp16 weight once per chunk, so the
+# same weight is rebuilt once per chunk: 2x at 4K, N-chunk-times beyond. The reconstruct
+# is a pure function of the trellis, so keeping the fp16 result and reusing it on the next
+# chunk is bit-exact. LRU with a byte budget (EXL3_HAD_PF_FAST_MB, default 2048): the
+# unique fp16 weight set of GLM-5.3-Flash is 14.4 GB and cannot all be held.
+# EXL3_HAD_PF_FAST=0 (default) leaves the code path untouched.
+# EXL3_HAD_PF_FAST_PRIORITY=1 (default) admits a weight only if its measured cost per
+# written MB (_had_cost_per_mb, filled in by the unit benchmark) is at or above the best
+# cost-per-byte the budget can still afford, so a small budget buys the shapes the kernel
+# is worst at rather than an arbitrary LRU slice.
+# NOTE: the knobs are read per call, not at import: the A/B harness (glm_base --ab-sets)
+# flips os.environ between variants inside one process, so an import-time read would
+# silently measure the base arm four times.
+def had_pf_fast():
+    return os.environ.get("EXL3_HAD_PF_FAST", "0") != "0"
+
+
+def _had_budget_bytes():
+    return int(os.environ.get("EXL3_HAD_PF_FAST_MB", "2048")) << 20
+
+
+def _had_priority():
+    return os.environ.get("EXL3_HAD_PF_FAST_PRIORITY", "1") != "0"
+
+
+_had_cache: dict = {}
+_had_cache_bytes = 0
+_had_cache_clock = 0
+# hit/miss counters: the A/B must be able to prove the cache actually engaged. A knob read
+# at import time while the harness flips os.environ at runtime produced four identical
+# "cache" arms before this was added; the count is the cheap guard against that class of
+# silent no-op.
+_had_stats = {"hit": 0, "miss": 0, "recon": 0}
+# measured reconstruct cost in us per fp16 MB written, per (k, n); from mb_had.py
+_had_cost_per_mb: dict = {
+    (4096, 24576): 6.96, (8192, 4096): 7.38, (4096, 12288): 6.95, (12288, 4096): 7.30,
+    (4096, 2048): 6.20, (2048, 4096): 6.32, (4096, 1536): 6.51, (1536, 16384): 7.58,
+    (4096, 512): 9.77, (16384, 4096): 7.18, (1536, 4096): 6.51, (4096, 4096): 7.74,
+}
+
+
+def _had_cache_get(inner, n_offset, n):
+    """Return the cached fp16 weight for this (trellis, n_offset, n) if it is resident."""
+    global _had_cache_clock
+    _had_cache_clock += 1
+    key = (inner.trellis.data_ptr(), float(inner.K), bool(inner.mcg), bool(inner.mul1),
+           int(n_offset), int(n))
+    e = _had_cache.get(key)
+    if e is None:
+        _had_stats["miss"] += 1
+        return None
+    e[1] = _had_cache_clock
+    _had_stats["hit"] += 1
+    return e[0]
+
+
+def _had_cache_admit(inner, n_offset, n):
+    """Decide whether to keep this weight, given the budget. Returns the LRU clock value to
+    stamp on the new entry, or None.
+
+    A plain LRU is wrong here: one 4K prefill walks all 255 weights in the same order and
+    does it twice, so under a 2 GB budget an LRU filled by the first (largest) weights
+    evicts everything before it is ever reused. Instead admit by *value per byte* -- once the
+    budget is actually short, a shape joins only if its measured reconstruct cost per fp16
+    MB is at least as good as the weakest shape already resident, so a small budget buys
+    exactly the shapes the kernel is worst at. The ordering deliberately does NOT bind
+    while the budget has room (see the comment below): that would cap large budgets too.
+
+    Admission is sticky: a shape already resident stays resident, and the first call of a
+    new shape does not pay anything.
+    """
+    global _had_cache_bytes, _had_cache_clock
+    nbytes = inner.in_features * n * 2
+    budget = _had_budget_bytes()
+    if nbytes > budget:
+        return None
+    cost = _had_cost_per_mb.get((inner.in_features, n))
+    # Value-ordering is a *scarcity* policy, so it must only bind once the budget is
+    # actually short. Applied unconditionally it also throttles a large budget: the first
+    # weak shape to be admitted becomes the floor and every worse shape is refused for the
+    # rest of the session, which capped a 24 GB budget at 10.9 GB resident / 104 hits.
+    if _had_priority() and cost is not None and _had_cache \
+            and _had_cache_bytes + nbytes > budget * 0.95:
+        costs = [_had_cost_per_mb[e[3]] for e in _had_cache.values() if e[3] in _had_cost_per_mb]
+        if costs and cost < min(costs):
+            return None
+    while _had_cache and _had_cache_bytes + nbytes > budget:
+        oldest = min(_had_cache.items(), key=lambda kv: kv[1][1])[0]
+        _had_cache_bytes -= _had_cache.pop(oldest)[2]
+    return _had_cache_clock
+
+
+def _had_cache_put(inner, n_offset, n, w, clock):
+    global _had_cache_bytes
+    nbytes = inner.in_features * n * 2
+    key = (inner.trellis.data_ptr(), float(inner.K), bool(inner.mcg), bool(inner.mul1),
+           int(n_offset), int(n))
+    if clock is None:
+        return
+    # entry: [w, clock, nbytes, (in_features, n)] -- a list, not a tuple: the LRU stamp
+    # (element 1) is updated in place on every hit.
+    _had_cache[key] = [w, clock, nbytes, (int(inner.in_features), int(n))]
+    _had_cache_bytes += nbytes
+
 # gfx1151: hipblaslt has no good fp16-in/fp32-out kernel. For a [2048,2560]@[2560,10240] it
 # picks Cijk_..._HSS_MT64x32x8 and runs at 6.2 TFLOP/s, where the identical GEMM with an fp16
 # output runs at 34 (the card's practical peak). The gated-delta-net projections all declare
@@ -68,6 +229,23 @@ def dec_workspace(device: torch.device):
     return ws
 
 
+# specrow1: wide-N R-row GEMV (lm_head, N=248320: R*kbs*N partial sums > DEC_SCRATCH_FLOATS even at R=2) used to fall back to
+# R batch-1 launches, each re-reading the whole weight (R x 1.36 ms). A dedicated scratch lets one gemv_r launch carry all rows
+# (same kernel, same per-row reduction order, so bit-exact). Counters are shared (R * ceil(N/512) <= 3880 <= 4096 for R <= 8).
+# Mutable at run time for one-load A/B: set WIDE_R["on"].
+WIDE_R = {"on": os.environ.get("EXL3_VERIFY_WIDE_R", "1") != "0"}
+WIDE_SCRATCH_FLOATS = 16 << 20
+_wide_scratch: dict = {}
+
+
+def wide_scratch(device: torch.device):
+    key = str(device)
+    t = _wide_scratch.get(key)
+    if t is None:
+        t = _wide_scratch[key] = torch.zeros(WIDE_SCRATCH_FLOATS, dtype = torch.float, device = device)
+    return t
+
+
 def dec_supported(inner) -> bool:
     """True when a LinearEXL3 can run the exl3_dec kernels (mul1 codebook, supported K, shapes)."""
     return (
@@ -84,7 +262,7 @@ def dec_moe_supported(inner) -> bool:
     """True when a LinearEXL3 can feed the fused routed-MoE decode (exl3_dec_moe / _union).
 
     Same as dec_supported() except that both codebooks qualify: the MoE kernels decode the mcg
-    codebook as well as mul1 in current packs (GLM-5.3-Flash's published packs are all mcg), while
+    codebook as well as mul1 since REPORT-21 (GLM-5.3-Flash's published packs are all mcg), while
     the dense exl3_dec_gemv route stays mul1-only.
     """
     return (
@@ -223,15 +401,20 @@ class LinearEXL3:
         # of a wider tensor) would be silently misread as interleaved garbage. Producers are
         # responsible for contiguity (a silent copy here would hide a hot-path inefficiency
         # and break CUDA-graph address stability)
-        assert x.is_contiguous(), f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
+        if not x.is_contiguous():
+            # a producer's row-padded output (row_pad_pitch): same product, bit-exact, GEMM reads it at full rate.
+            # Only the reconstruct + hgemm path takes a pitch (hgemm checks the view against its storage)
+            assert _pad_view_ok(x) and _pad_eligible(self, x.shape[-1], x.numel() // x.shape[-1], params), \
+                f"LinearEXL3 {self.key}: non-contiguous input {tuple(x.shape)}"
+            return self.reconstruct_hgemm(x, out_dtype)
 
         reconstruct = params.get("reconstruct")
         if not reconstruct:
             rows = x.numel() // x.shape[-1]
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
-                if rows == 1 and self.dec_ok:
+                if rows == 1 and self.dec_ok and not params.get("moe_valu"):
                     return self.dec_gemv(x, out_dtype)
-                # R-row DFlash verify: same kernel family as dec_gemv, one weight
+                # R-row DFlash verify (REPORT-17): same kernel family as dec_gemv, one weight
                 # tile decode shared across rows -- see exl3_dec_gemv_r's docstring for why this
                 # is bit-exact vs R independent dec_gemv calls. Opt-in (EXL3_DEC_MOE_UNION, the
                 # same flag dec_norm_route_r/the union MoE branch use, so one flag controls the
@@ -243,7 +426,7 @@ class LinearEXL3:
                     hasattr(ext, "exl3_dec_gemv_r") and
                     (VERIFY_FUSE["on"] or
                      os.environ.get("EXL3_VERIFY_GEMV_R", os.environ.get("EXL3_DEC_MOE_UNION", "0")) != "0") and
-                    params.get("dflash_verify") and
+                    params.get("dflash_verify") and not params.get("moe_valu") and
                     x.is_contiguous()
                 ):
                     return self.dec_gemv_r(x, rows, out_dtype)
@@ -282,7 +465,7 @@ class LinearEXL3:
 
 
     def dec_gemv_r(self, x: torch.Tensor, rows: int, out_dtype):
-        """R-row decode GEMV (exl3_dec_gemv_r): one launch, each weight tile decoded
+        """R-row decode GEMV (exl3_dec_gemv_r, REPORT-17): one launch, each weight tile decoded
         once and applied to every row -- bit-exact vs R independent dec_gemv calls, see the
         kernel's own docstring. Reuses the global dec_workspace() scratch/counters: this call
         never runs concurrently (same stream) with a bsz==1 dec_gemv call reading the same
@@ -293,7 +476,24 @@ class LinearEXL3:
         if x.dtype != torch.half:
             x = x.half()
         scratch, counters = dec_workspace(x.device)
-        if self.K >= DEC_GEMV_R_LOOP_MIN_K:
+        loop = self.K >= DEC_GEMV_R_LOOP_MIN_K
+        if not loop:
+            try:
+                ext.exl3_dec_gemv_r(x.view(rows, self.in_features), self.trellis, self.suh, self.svh,
+                                    y.view(rows, self.out_features), scratch, counters, self.K)
+            except RuntimeError as e:
+                # The R-row partial sums of a very wide N (lm_head) can exceed the shared scratch; the
+                # size check runs before any launch, so fall back to the batch-1 loop (same order)
+                if "scratch too small" not in str(e): raise
+                loop = True
+                if WIDE_R["on"] and rows <= 8:
+                    try:
+                        ext.exl3_dec_gemv_r(x.view(rows, self.in_features), self.trellis, self.suh, self.svh,
+                                            y.view(rows, self.out_features), wide_scratch(x.device), counters, self.K)
+                        loop = False
+                    except RuntimeError as e2:
+                        if "scratch too small" not in str(e2): raise
+        if loop:
             # reference path: R batch-1 launches, bit-identical to gemv_r. gemv_r lost at K >= 5 only
             # while its 2-deep tile ring spilled; with ring 1 at RM > 1 it wins (GLM lm_head K 5,
             # N 154880: R 2 1.80 vs 3.56 ms, R 4 1.81 vs 7.12 ms, tools/glm/gemv_r_bench.py)
@@ -301,9 +501,6 @@ class LinearEXL3:
             for r in range(rows):
                 ext.exl3_dec_gemv(x2[r:r + 1], self.trellis, self.suh, self.svh,
                                   y2[r:r + 1], scratch, counters, self.K)
-        else:
-            ext.exl3_dec_gemv_r(x.view(rows, self.in_features), self.trellis, self.suh, self.svh,
-                                y.view(rows, self.out_features), scratch, counters, self.K)
         if self.bias is not None:
             y += self.bias
         return y
@@ -346,6 +543,31 @@ class LinearEXL3:
         return expanded.contiguous().to(device)
 
 
+    def _had_weight(self, w, n_offset, n):
+        """reconstruct_had_slice into w, or reuse the cached fp16 weight for this
+        (trellis, n_offset, n). The reconstruct is a pure function of the trellis and
+        does not depend on the row count, so a hit is bit-exact. Returns the tensor to
+        hand to hgemm_recon (a resident cache entry, or w after a fresh reconstruct)."""
+        if not had_pf_fast():
+            ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh if n_offset == 0
+                                      else self.svh[n_offset:], self.K, self.mcg, self.mul1, n_offset)
+            return w
+        hit = _had_cache_get(self, n_offset, n)
+        if hit is not None:
+            return hit
+        _had_stats["recon"] += 1
+        clock = _had_cache_admit(self, n_offset, n)
+        if clock is None:
+            ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh if n_offset == 0
+                                      else self.svh[n_offset:], self.K, self.mcg, self.mul1, n_offset)
+            return w
+        # admitted: the caller allocates a fresh w per call, so w itself can be the resident
+        # entry (no copy) -- nothing else holds a reference to it
+        ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh if n_offset == 0
+                                  else self.svh[n_offset:], self.K, self.mcg, self.mul1, n_offset)
+        _had_cache_put(self, n_offset, n, w, clock)
+        return w
+
     def reconstruct_hgemm(self, x: torch.Tensor, out_dtype):
 
         shape = x.shape
@@ -379,7 +601,7 @@ class LinearEXL3:
         use_fused = self._fused_reconstruct and rows >= 1024
 
         if use_fused:
-            xh = x
+            xh = pad_copy_in(x, self.in_features)
         else:
             xh = torch.empty_like(x)
             ext.had_r_128(x, xh, self.suh, None, 1.0)
@@ -387,7 +609,7 @@ class LinearEXL3:
         if self.out_features <= MAX_RECONSTRUCT_SLICE_N:
             w = torch.empty((self.in_features, self.out_features), dtype = torch.half, device = self.trellis.device)
             if use_fused:
-                ext.reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
+                w = self._had_weight(w, 0, self.out_features)
             else:
                 ext.reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
             # EXL3_PF_MSPLIT=<rows> (default 0 = off): run big prefill GEMMs as row blocks. Same kernel
@@ -407,8 +629,7 @@ class LinearEXL3:
                 numel = self.in_features * (n_end - n_start)
                 w = w_[:numel].view(self.in_features, n_end - n_start)
                 if use_fused:
-                    ext.reconstruct_had_slice(
-                        w, self.trellis, self.suh, self.svh[n_start:], self.K, self.mcg, self.mul1, n_start)
+                    w = self._had_weight(w, n_start, n_end - n_start)
                 else:
                     ext.reconstruct_slice(w, self.trellis, self.K, self.mcg, self.mul1, n_start)
                 ext.hgemm_recon(xh, w, y_[:, n_start:n_end])

@@ -46,6 +46,8 @@ Memory: GLM at `-c 131072` leaves about 10 GiB free on a 128 GB machine. Close b
 
 MiMo: `hf download yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz --local-dir ./mimo-pack`, then `python tools/mimo/serve.py --model ./mimo-pack --port 8000 -c 131072`. Speculative decoding (DFlash, 4 bpw drafter, confidence-truncated drafts) is on by default: the server uses the pack's `drafter/` directory (or `$MIMO_DRAFTER`, or `--drafter <dir>`). Without a drafter it logs one line and decodes plain. Set `MIMO_SPEC=0` in the lane script (`tools/lanes/serve_mimo.sh`) or pass `--no-dflash` to `serve.py` for plain decode. Greedy output under speculation is not token-identical to plain decode: near-tied logits can flip under the batched verify. A loaded drafter costs 2 to 4 % prefill. Details: `tools/mimo/SERVE.md`.
 
+Qwen3.8-Flash-Next (125B MoE, 6B active): `hf download yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz --local-dir ./qwen-pack`, then `python tools/qwen/serve.py --model ./qwen-pack --port 8000 -c 131072`. Speculative decoding is on by default and returns the same tokens as plain decoding. The pack needs about 113 GiB of the 128 GB; start to ready takes about 90 s once the pack is in the page cache. Details: `tools/qwen/SERVE.md`.
+
 ## Measured numbers
 One machine: Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB LPDDR5X, ROCm. Other GPUs are untested.
 

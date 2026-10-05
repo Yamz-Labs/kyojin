@@ -289,6 +289,123 @@ void mpw_reduce_had_kernel
 }
 
 // ---------------------------------------------------------------------------------------------
+// Glue v2 (EXL3_MPW_GLUE=1, default off). Same per-element arithmetic as the kernels above, same
+// output bytes. Two changes: (1) the top_k index chain (inverse_order -> selected -> table pointer
+// -> data) is fetched ONCE per wave, lane k holding pick k, and broadcast with shuffles, instead of
+// a serial dependent load chain per pick; (2) the picks are unrolled so loads of different picks
+// are in flight together. Gather also serves gate and up from one wave (shares the A row and the
+// index chain). Needs top_k <= 32 (host check) and projections == 2.
+#define MPW_GLUE_TK_MAX 32
+
+__device__ __forceinline__ int64_t mpw_bcast64(int64_t v, int k)
+{
+    const int lo = __shfl((int) (uint32_t) v, k, 32);
+    const int hi = __shfl((int) (uint32_t) ((uint64_t) v >> 32), k, 32);
+    return (int64_t) (((uint64_t) (uint32_t) hi << 32) | (uint64_t) (uint32_t) lo);
+}
+
+__global__ __launch_bounds__(256)
+void mpw_gather_had2_kernel
+(
+    const half* __restrict__ A,
+    half* __restrict__ out,
+    const int64_t* __restrict__ selected,
+    const int64_t* __restrict__ inverse_order,
+    const int64_t* __restrict__ suh_0,
+    const int64_t* __restrict__ suh_1,
+    int assignments,
+    int top_k,
+    int width
+)
+{
+    const int blocks = width / 128;
+    const int rows = assignments / top_k;
+    const int64_t job = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (job >= (int64_t) rows * blocks) return;
+    const int t = threadIdx.x & 31;
+    const int blk = job % blocks;
+    const int64_t r = job / blocks;
+    int64_t slot_l = 0, p0_l = 0, p1_l = 0;
+    if (t < top_k)
+    {
+        const int64_t orig = r * top_k + t;
+        slot_l = inverse_order[orig];
+        const int64_t e = selected[orig];
+        p0_l = suh_0[e];
+        p1_l = suh_1[e];
+    }
+    const half4 v0 = ((const half4*) (A + r * width + blk * 128))[t];
+    #pragma unroll 5
+    for (int k = 0; k < top_k; ++k)
+    {
+        const int64_t slot = mpw_bcast64(slot_l, k);
+        const half* s0 = (const half*) mpw_bcast64(p0_l, k);
+        const half* s1 = (const half*) mpw_bcast64(p1_l, k);
+        half4 va = v0, vb = v0;
+        mpw_had_h(va, s0 + blk * 128, nullptr, t);
+        mpw_had_h(vb, s1 + blk * 128, nullptr, t);
+        ((half4*) (out + (int64_t) slot * width + blk * 128))[t] = va;
+        ((half4*) (out + ((int64_t) assignments + slot) * width + blk * 128))[t] = vb;
+    }
+}
+
+template <int TK>
+__global__ __launch_bounds__(256)
+void mpw_reduce_had2_kernel
+(
+    const float* __restrict__ sorted_rows,
+    const int64_t* __restrict__ selected,
+    const float* __restrict__ weights,
+    const int64_t* __restrict__ inverse_order,
+    const int64_t* __restrict__ svh_table,
+    float* __restrict__ output,
+    int rows,
+    int width
+)
+{
+    const int blocks = width / 128;
+    const int64_t job = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5);
+    if (job >= (int64_t) rows * blocks) return;
+    const int t = threadIdx.x & 31;
+    const int blk = job % blocks;
+    const int64_t row = job / blocks;
+    int64_t slot_l = 0, p_l = 0;
+    float w_l = 0.f;
+    if (t < TK)
+    {
+        const int64_t orig = row * TK + t;
+        slot_l = inverse_order[orig];
+        p_l = svh_table[selected[orig]];
+        w_l = weights[orig];
+    }
+    float4 fv[TK];
+    #pragma unroll
+    for (int k = 0; k < TK; ++k)
+    {
+        const int64_t slot = mpw_bcast64(slot_l, k);
+        fv[k] = ((const float4*) (sorted_rows + slot * width + blk * 128))[t];
+    }
+    float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
+    #pragma unroll
+    for (int k = 0; k < TK; ++k)
+    {
+        const float w = __shfl(w_l, k, 32);
+        const half* svh = (const half*) mpw_bcast64(p_l, k);
+        float v0 = fv[k].x, v1 = fv[k].y, v2 = fv[k].z, v3 = fv[k].w;
+        float s0 = v0 + v1, d0 = v0 - v1, s1 = v2 + v3, d1 = v2 - v3;
+        float h0 = s0 + s1, h1 = d0 + d1, h2 = s0 - s1, h3 = d0 - d1;
+        shuffle_had_f4x32(h0, h1, h2, h3, t);
+        const half4 sc = ((const half4*) (svh + blk * 128))[t];
+        const float r = mpw::HAD_SCALE * w;
+        sum.x += h0 * r * __low2float(sc.x);
+        sum.y += h1 * r * __high2float(sc.x);
+        sum.z += h2 * r * __low2float(sc.y);
+        sum.w += h3 * r * __high2float(sc.y);
+    }
+    ((float4*) (output + row * width + blk * 128))[t] = sum;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Grouped GEMM: blockIdx.x = 128-column block, blockIdx.y = tile slot, blockIdx.z = projection
 
 // Fragment loads (LDM): 0 = each lane reads its full 16-k row (lanes 16-31 re-read lanes 0-15's
@@ -327,7 +444,8 @@ void mpw_gemm_kernel
     void* __restrict__ C,
     int64_t c_proj_stride,
     int size_k,
-    int size_n
+    int size_n,
+    int a_ld                        // A row pitch in elements (>= size_k); the old mpw kernel needs a_ld == size_k
 )
 {
 #if defined(EXL3_HIP_WMMA_GFX115)
@@ -582,7 +700,7 @@ void mpw_gemm_kernel
 }
 
 // ---------------------------------------------------------------------------------------------
-// mpw2 grouped GEMM (MPW_KERN=2, default). Measured on mpw_gemm (gemm_bench): a fixed
+// mpw2 grouped GEMM (MPW_KERN=2, default). Measured on mpw_gemm (gemm_bench, HANDOFF step 7): a fixed
 // per-tile cost of ~7.7 ms per 4096x2048 launch at 8 rows/expert and no overlap of WMMA with the rest.
 // On gfx1151 WMMA, trellis-decode VALU and permlanes share the SIMD, so time >= WMMA + decode: the decode
 // alone is ~3 ms per 4096x2048 call (no-decode ablation), paid once per m-tile. mpw2 changes the data flow:
@@ -659,7 +777,8 @@ void mpw2_gemm_kernel
     void* __restrict__ C,
     int64_t c_proj_stride,
     int size_k,
-    int size_n
+    int size_n,
+    int a_ld                        // A row pitch in elements (>= size_k); the old mpw kernel needs a_ld == size_k
 )
 {
 #if defined(EXL3_HIP_WMMA_GFX115)
@@ -682,7 +801,7 @@ void mpw2_gemm_kernel
     const int rows = (int) min((int64_t) MT, expert_offsets[expert + 1] - row0);
     const int proj = blockIdx.z;
     const uint32_t* B32 = (const uint32_t*) (proj ? B_table_1 : B_table_0)[expert];
-    A += proj * a_proj_stride + row0 * size_k;
+    A += proj * a_proj_stride + row0 * a_ld;
 
     const int n0 = blockIdx.x * NT;
     const size_t slice_stride = (size_t) (size_n / 16) * TWORDS;
@@ -699,8 +818,12 @@ void mpw2_gemm_kernel
 
     const int a_r = t >> 2;                         // + i * (THREADS / 4)
     const int a_c = t & 3;                          // 16-byte chunk (8 k)
-    const half* a_src = A + (int64_t) a_r * size_k + a_c * 8;
-    const uint32_t* w_src = B32 + (size_t) (n0 / 16 + warp * NW) * TWORDS;   // NW adjacent tiles: contiguous
+    const half* a_src = A + (int64_t) a_r * a_ld + a_c * 8;
+    // Tail block (size_n not a multiple of NT): waves past the last n-tile read the last valid NW tiles
+    // (duplicate, never stored: the epilogue skips them), so no trellis read leaves the tensor.
+    const int ntile_n = size_n / 16;
+    const int first_tile = min(n0 / 16 + warp * NW, ntile_n - NW);
+    const uint32_t* w_src = B32 + (size_t) first_tile * TWORDS;   // NW adjacent tiles: contiguous
 
     uint4 ra[PF][ALOADS];
     uint32_t rw[PF][WL];
@@ -712,7 +835,7 @@ void mpw2_gemm_kernel
         #pragma unroll
         for (int i = 0; i < ALOADS; ++i)
             r[i] = a_r + i * (THREADS / 4) < rows
-                ? *((const uint4*) (a_src + (int64_t) i * (THREADS / 4) * size_k + k0))
+                ? *((const uint4*) (a_src + (int64_t) i * (THREADS / 4) * a_ld + k0))
                 : make_uint4(0, 0, 0, 0);
     };
     auto load_w = [&] (int it, uint32_t* r)
@@ -805,7 +928,8 @@ void mpw2_gemm_kernel
                 if (i >= nrg) continue;
                 const int r = i * 16 + (lane & 15);
                 HipFp16x16 af;
-                if constexpr (OPT & 2)
+                if constexpr (DBG & 8) af = bf[s * NW];     // bench only: A operand from registers (no LDS read)
+                else if constexpr (OPT & 2)
                 {
                     ((uint4*) &af)[0] = *((const uint4*) (sh_a[cur] + mpw2_a_off(r, s * 2 + (lane >> 4))));
                     ((uint4*) &af)[1] = *((const uint4*) (sh_a[cur] + mpw2_a_off(r, s * 2 + ((lane >> 4) ^ 1))));
@@ -843,6 +967,12 @@ void mpw2_gemm_kernel
         load_w(it + PF, rw[ws]);
         if (it + 1 < iters) store_a((it + 1) & 1, ra[as]);
         load_a(it + 1 + PF, ra[as]);
+        if constexpr (OPT & 256)
+        {
+            // OPT bit 8: waves whose n-tiles all lie past size_n (tail block) skip decode and WMMA: their
+            // results are never stored (the epilogue skips them), so the output is unchanged. Wave-uniform.
+            if (n0 + warp * NW * 16 >= size_n) return;
+        }
         HipFp16x16 bf[KS * NW];
         decode(bf);
         mma(it & 1, bf);
@@ -872,6 +1002,7 @@ void mpw2_gemm_kernel
         #pragma unroll
         for (int j = 0; j < NW; ++j)
         {
+            if (n0 + (warp * NW + j) * 16 >= size_n) continue;      // tail block: tile past size_n (wave-uniform)
             const int col = n0 + (warp * NW + j) * 16 + (lane & 15);
             #pragma unroll
             for (int r = 0; r < 8; ++r)
@@ -914,7 +1045,8 @@ void mpw2x_gemm_kernel
     void* __restrict__ C,
     int64_t c_proj_stride,
     int size_k,
-    int size_n
+    int size_n,
+    int a_ld                        // A row pitch in elements (>= size_k); the old mpw kernel needs a_ld == size_k
 )
 {
 #if defined(EXL3_HIP_WMMA_GFX115)
@@ -937,7 +1069,7 @@ void mpw2x_gemm_kernel
     const int rows = (int) min((int64_t) MT, expert_offsets[expert + 1] - row0);
     const int proj = blockIdx.z;
     const uint32_t* B32 = (const uint32_t*) (proj ? B_table_1 : B_table_0)[expert];
-    A += proj * a_proj_stride + row0 * size_k;
+    A += proj * a_proj_stride + row0 * a_ld;
 
     const int n0 = blockIdx.x * NT;
     const size_t slice_stride = (size_t) (size_n / 16) * TWORDS;
@@ -954,8 +1086,10 @@ void mpw2x_gemm_kernel
 
     const int a_r = t >> 2;                         // + i * (THREADS / 4)
     const int a_c = t & 3;                          // 16-byte chunk (8 k)
-    const half* a_src = A + (int64_t) a_r * size_k + a_c * 8;
-    const uint32_t* w_src = B32 + (size_t) (n0 / 16 + warp * NW) * TWORDS;   // NW adjacent tiles: contiguous
+    const half* a_src = A + (int64_t) a_r * a_ld + a_c * 8;
+    const int ntile_n = size_n / 16;                // tail block: clamp like mpw2_gemm_kernel (duplicate, never stored)
+    const int first_tile = min(n0 / 16 + warp * NW, ntile_n - NW);
+    const uint32_t* w_src = B32 + (size_t) first_tile * TWORDS;   // NW adjacent tiles: contiguous
 
     uint4 ra[PF][ALOADS];
     uint32_t rw[PF][WL];
@@ -967,7 +1101,7 @@ void mpw2x_gemm_kernel
         #pragma unroll
         for (int i = 0; i < ALOADS; ++i)
             r[i] = a_r + i * (THREADS / 4) < rows
-                ? *((const uint4*) (a_src + (int64_t) i * (THREADS / 4) * size_k + k0))
+                ? *((const uint4*) (a_src + (int64_t) i * (THREADS / 4) * a_ld + k0))
                 : make_uint4(0, 0, 0, 0);
     };
     auto load_w = [&] (int it, uint32_t* r)
@@ -1182,6 +1316,7 @@ void mpw2x_gemm_kernel
         #pragma unroll
         for (int j = 0; j < NW; ++j)
         {
+            if (n0 + (warp * NW + j) * 16 >= size_n) continue;      // tail block: tile past size_n (wave-uniform)
             const int col = n0 + (warp * NW + j) * 16 + (lane & 15);
             #pragma unroll
             for (int r = 0; r < 8; ++r)
@@ -1220,12 +1355,12 @@ inline int mpw_kern(int64_t assignments, int64_t experts)
     return e ? atoi(e) : 2;
 }
 
-// MPW_NW (mpw2 only): n-tiles per wave, 2 (default, needs N % 256 == 0, else 1) or 1
+// MPW_NW (mpw2 only): n-tiles per wave, 2 (default, needs N % 32 == 0, else 1) or 1
 inline int mpw_nw(int size_n)
 {
     const char* e = getenv("MPW_NW");
     const int nw = e ? atoi(e) : 2;
-    return (nw == 2 && size_n % 256 == 0) ? 2 : 1;
+    return (nw == 2 && size_n % 32 == 0) ? 2 : 1;      // NW 2 pairs n-tiles; the tail block is handled in-kernel
 }
 
 inline int mpw_mt(int kern)
@@ -1242,10 +1377,12 @@ void launch_gemm_cb
     float K, dim3 grid, hipStream_t stream,
     const half* A, int64_t a_proj_stride, const int64_t* offsets, const int* tiles,
     const int* num_tiles, const int64_t* t0, const int64_t* t1, void* C, int64_t c_proj_stride,
-    int size_k, int size_n, int kern
+    int size_k, int size_n, int kern, int a_ld
 )
 {
-    #define MPW_ARGS A, a_proj_stride, offsets, tiles, num_tiles, t0, t1, C, c_proj_stride, size_k, size_n
+    TORCH_CHECK(a_ld >= size_k && (a_ld * 2) % 16 == 0, "exl3_moe_prefill_wmma: A pitch must be >= K and 16-byte aligned");
+    TORCH_CHECK(a_ld == size_k || kern == 2, "exl3_moe_prefill_wmma: padded A pitch needs the mpw2 kernel");
+    #define MPW_ARGS A, a_proj_stride, offsets, tiles, num_tiles, t0, t1, C, c_proj_stride, size_k, size_n, a_ld
     const char* ldm_env = getenv("MPW_LDM");   // read per launch: A/B harnesses flip it in-process
     const int ldm = ldm_env ? atoi(ldm_env) : 1;   // LDM=1 default: +3.4% e2e prefill@4K (HANDOFF step 2)
     const int k2 = (int) (K * 2.0f + 0.5f);
@@ -1254,15 +1391,21 @@ void launch_gemm_cb
         // grid.x arrives for NT = 128; mpw2 blocks span 128 * NW columns
         const int mt = mpw_mt(kern);
         const int nw = mpw_nw(size_n);
-        grid.x = size_n / (128 * nw);
+        grid.x = CEIL_DIVIDE(size_n, 128 * nw);        // last block may be a tail (mpw2_gemm_kernel clamps it)
+        TORCH_CHECK(size_n % 16 == 0, "exl3_moe_prefill_wmma: size_n must be a multiple of 16");
         const char* pf_env = getenv("MPW_PF");
         const int pf = pf_env ? atoi(pf_env) : 4;
         const char* dbg_env = getenv("MPW_DBG");
         const int dbg = dbg_env ? atoi(dbg_env) : 0;
+        // The kernel's NW template argument must equal nw: grid.x = size_n / (128 * nw) blocks of 128 * NW
+        // columns. NW 2 with nw 1 (size_n % 256 != 0, e.g. Qwen3.8 gate/up N = 640) reads trellis tiles and
+        // writes C columns past size_n.
         #define MPW2_L(b, h, M, P, W, D) \
-            { mpw2_gemm_kernel<b, h, OUT_FP32, CB, 1, M, P, W, D><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
+            { TORCH_CHECK((W) == nw, "exl3_moe_prefill_wmma: mpw2 NW ", W, " != grid NW ", nw); \
+              mpw2_gemm_kernel<b, h, OUT_FP32, CB, 1, M, P, W, D><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
         #define MPW2_V(V, M, P, W) \
-            { mpw2_gemm_kernel<2, false, OUT_FP32, CB, 1, M, P, W, 0, 2><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
+            { TORCH_CHECK((W) == nw, "exl3_moe_prefill_wmma: mpw2 NW ", W, " != grid NW ", nw); \
+              mpw2_gemm_kernel<2, false, OUT_FP32, CB, 1, M, P, W, 0, 2><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
         // EXL3_MPW2X=<OPT> (default 0 = off): mpw2x candidate (K 2, MT 128, NW 2 only), EXL3_MPW2X_PF=2|1.
         // Read per launch like MPW_LDM (A/B harnesses flip it in-process). Unknown values fall through.
         {
@@ -1278,11 +1421,56 @@ void launch_gemm_cb
                 #undef MPW2X
             }
         }
-        if (k2 == 4)
+        // EXL3_PF7_OPT=<opt> (default 0 = off), EXL3_PF7_PF=1..4: production-class MT 128 NW 2 kernel for any K with
+        // an explicit OPT mask (bits 0/1 direct LDS fragment reads, bit 2 2-bit mul1 decode, bit 8 tail-wave skip).
+        // Bit-exact against OPT 0 / 2: same index arithmetic, same summation order.
+        {
+            const char* poe = getenv("EXL3_PF7_OPT");
+            const int po = poe ? atoi(poe) : 0;
+            if (po && nw == 2 && mt == 128)
+            {
+                const char* ppe = getenv("EXL3_PF7_PF");
+                const int pp = ppe ? atoi(ppe) : 2;
+                #define PF7O(b, h, O, P) if (po == O && pp == P) \
+                    { mpw2_gemm_kernel<b, h, OUT_FP32, CB, 1, 128, P, 2, 0, O><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
+                #define PF7K(b, h) PF7O(b, h, 3, 2) PF7O(b, h, 3, 4) PF7O(b, h, 259, 2) PF7O(b, h, 259, 4) \
+                                   PF7O(b, h, 2, 2) PF7O(b, h, 2, 4) PF7O(b, h, 258, 2) PF7O(b, h, 258, 4) \
+                                   PF7O(b, h, 6, 2) PF7O(b, h, 6, 4) PF7O(b, h, 262, 2) PF7O(b, h, 262, 4)
+                switch (k2)
+                {
+                    case 4: PF7K(2, false) break;
+                    case 5: PF7K(2, true) break;
+                    case 6: PF7K(3, false) break;
+                    case 7: PF7K(3, true) break;
+                    case 8: PF7K(4, false) break;
+                    default: break;
+                }
+                #undef PF7K
+                #undef PF7O
+            }
+        }
+        // EXL3_PF7_DBG=<1..7> (bench only, default 0): the production K 2 kernel with the DBG ablation bits
+        // (1 no decode, 2 no WMMA, 4 no weight loads). Same index arithmetic as DBG 0 (the bits only drop work).
+        {
+            const char* pde = getenv("EXL3_PF7_DBG");
+            const int pd = pde ? atoi(pde) : 0;
+            if (pd && k2 == 4 && nw == 2 && mt == 128)
+            {
+                #define PF7D(D) if (pd == D) \
+                    { mpw2_gemm_kernel<2, false, OUT_FP32, CB, 1, 128, 2, 2, D, 2><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
+                PF7D(1) PF7D(2) PF7D(3) PF7D(4) PF7D(5) PF7D(6) PF7D(7) PF7D(8) PF7D(9) PF7D(12) PF7D(13)
+                #undef PF7D
+            }
+        }
+        if (k2 == 4 && nw == 2)                      // variants are NW 2 shapes; nw 1 takes MPW2_K below
         {
             switch (mpw_variant())
             {
-                case 1: MPW2_V(1, 128, 2, 2)
+                case 1:
+                    // pf7: tail-wave skip (OPT bit 8) when size_n is not a multiple of 256 (Qwen gate/up N = 640)
+                    if (size_n % 256 && !getenv("EXL3_PF7_OFF"))
+                    { mpw2_gemm_kernel<2, false, OUT_FP32, CB, 1, 128, 2, 2, 0, 258><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
+                    MPW2_V(1, 128, 2, 2)
                 case 2: MPW2_V(2, 128, 3, 2)
                 case 3: MPW2_V(3, 128, 1, 2)
                 case 4: MPW2_V(4, 64, 4, 2)
@@ -1309,6 +1497,22 @@ void launch_gemm_cb
             if (pf == 2) MPW2_L(2, false, 64, 2, 2, 0)
             if (ldm == 0)
             { mpw2_gemm_kernel<2, false, OUT_FP32, CB, 0, 64, 4, 2, 0><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
+        }
+        // pf7: 3-bit experts (MiMo mixed layers) get the direct-LDS fragment reads (OPT bits 0/1) that K 2 already had
+        if (k2 == 6 && nw == 2 && mt == 128 && dbg == 0 && !getenv("EXL3_PF7_OFF"))
+        {
+            if (size_n % 256)
+            { mpw2_gemm_kernel<3, false, OUT_FP32, CB, 1, 128, 2, 2, 0, 259><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
+            { mpw2_gemm_kernel<3, false, OUT_FP32, CB, 1, 128, 2, 2, 0, 3><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
+        }
+        // 4-bit experts (Qwen3.8 K4 layers) take the same direct-LDS + tail-wave-skip variant as the 3-bit block
+        // above (measured bit-identical to the default instance, +2 % prefill; the instance is already compiled for the
+        // EXL3_PF7_OPT override)
+        if (k2 == 8 && nw == 2 && mt == 128 && dbg == 0 && !getenv("EXL3_PF7_OFF"))
+        {
+            if (size_n % 256)
+            { mpw2_gemm_kernel<4, false, OUT_FP32, CB, 1, 128, 2, 2, 0, 259><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
+            { mpw2_gemm_kernel<4, false, OUT_FP32, CB, 1, 128, 2, 2, 0, 3><<<grid, mpw2::THREADS, 0, stream>>>(MPW_ARGS); return; }
         }
         switch (k2)
         {
@@ -1355,15 +1559,16 @@ void launch_gemm
     float K, dim3 grid, hipStream_t stream,
     const half* A, int64_t a_proj_stride, const int64_t* offsets, const int* tiles,
     const int* num_tiles, const int64_t* t0, const int64_t* t1, void* C, int64_t c_proj_stride,
-    int size_k, int size_n, bool mcg, int kern
+    int size_k, int size_n, bool mcg, int kern, int a_ld = 0
 )
 {
+    if (a_ld == 0) a_ld = size_k;
     if (mcg)
         launch_gemm_cb<OUT_FP32, 1>(K, grid, stream, A, a_proj_stride, offsets, tiles, num_tiles,
-                                    t0, t1, C, c_proj_stride, size_k, size_n, kern);
+                                    t0, t1, C, c_proj_stride, size_k, size_n, kern, a_ld);
     else
         launch_gemm_cb<OUT_FP32, 2>(K, grid, stream, A, a_proj_stride, offsets, tiles, num_tiles,
-                                    t0, t1, C, c_proj_stride, size_k, size_n, kern);
+                                    t0, t1, C, c_proj_stride, size_k, size_n, kern, a_ld);
 }
 
 inline int tile_slots(int assignments, int experts, int kern)
@@ -1456,10 +1661,22 @@ void exl3_moe_prefill_wmma
     mpw_metadata_kernel<<<CEIL_DIVIDE(assignments, 256), 256, 0, stream>>>
     ((const int64_t*) expert_count.data_ptr(), ord, offs, inv, tl, tc, (int) experts, assignments, mpw_mt(kern));
 
+    const char* glue_env = getenv("EXL3_MPW_GLUE");   // read per launch (A/B harnesses flip it in-process)
+    const bool glue2 = glue_env && glue_env[0] == '1' && top_k >= 1 && top_k <= MPW_GLUE_TK_MAX;
+    if (glue2)
+    {
+        const int64_t g2jobs = (int64_t) (assignments / top_k) * (H / 128);
+        mpw_gather_had2_kernel<<<CEIL_DIVIDE(g2jobs, 8), 256, 0, stream>>>
+        ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
+         assignments, top_k, H);
+    }
+    else
+    {
     const int64_t gjobs = (int64_t) 2 * (assignments / top_k) * (H / 128);
     mpw_gather_had_kernel<<<CEIL_DIVIDE(gjobs, 8), 256, 0, stream>>>
     ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
      assignments, top_k, H, 2);
+    }
 
     launch_gemm<false>((float) K_gu, dim3(I / mpw::NT, slots, 2), stream,
         (const half*) gu_had.data_ptr(), (int64_t) assignments * H, offs, tl, tc,
@@ -1471,12 +1688,18 @@ void exl3_moe_prefill_wmma
          (float) act_limit);
 
     // down_out = gu_had workspace viewed fp32 (same byte count): the down GEMM writes fp32 rows
-    // so the weighted reduce consumes fp32 end to end (2x output bytes vs fp16)
+    // so the weighted reduce consumes fp32 end to end (2x output bytes vs fp16; cost in REPORT-10c)
     launch_gemm<true>((float) K_down, dim3(H / mpw::NT, slots, 1), stream,
         (const half*) gu_out.data_ptr(), 0, offs, tl, tc,
         P(down_trellis), P(down_trellis), down_out.data_ptr(), 0, I, H, mcg, kern);
 
     const int64_t rjobs = (int64_t) rows * (H / 128);
+#define MPW_RED2(TKV) mpw_reduce_had2_kernel<TKV><<<CEIL_DIVIDE(rjobs, 8), 256, 0, stream>>> \
+    ((const float*) down_out.data_ptr(), sel, (const float*) weights.data_ptr(), inv, P(down_svh), \
+     (float*) output.data_ptr(), rows, H)
+    if (glue2 && top_k == 10) { MPW_RED2(10); }
+    else if (glue2 && top_k == 8) { MPW_RED2(8); }
+    else
     mpw_reduce_had_kernel<<<CEIL_DIVIDE(rjobs, 8), 256, 0, stream>>>
     ((const float*) down_out.data_ptr(), sel, (const float*) weights.data_ptr(), inv, P(down_svh),
      (float*) output.data_ptr(), rows, top_k, H);
@@ -1498,10 +1721,16 @@ void exl3_moe_prefill_gemm_test
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    const int rows = A.size(0);
+    // EXL3_GEMMTEST_Z=2 (bench only) = gate/up form: A and C hold 2 projections of rows each, grid.z = 2.
+    // A may be a row-strided view (stride(1) == 1, pitch = stride(0) >= K, 16-byte aligned): the A row pitch bench.
+    const char* ze = getenv("EXL3_GEMMTEST_Z");
+    const int nz = (ze && atoi(ze) == 2) ? 2 : 1;
+    TORCH_CHECK(A.dim() == 2 && A.stride(1) == 1 && A.size(0) % nz == 0, "A must be row-strided [nz * rows, K]");
+    const int rows = A.size(0) / nz;
     const int size_k = A.size(1);
+    const int a_ld = (int) A.stride(0);
     const int64_t experts = trellis_table.numel();
-    TORCH_CHECK(C.size(0) == rows && C.size(1) == n_size, "C shape");
+    TORCH_CHECK(C.size(0) == rows * nz && C.size(1) == n_size && C.is_contiguous(), "C shape");
     TORCH_CHECK(size_k % (mpw::KS * 16) == 0 && n_size % mpw::NT == 0, "unsupported shape");
     const int kern = mpw_kern(rows, experts);
     const int slots = tile_slots(rows, experts, kern);
@@ -1513,11 +1742,11 @@ void exl3_moe_prefill_gemm_test
     ((const int64_t*) expert_count.data_ptr(), nullptr, offs, nullptr, tl, tc, (int) experts, rows, mpw_mt(kern));
     const int64_t* tt = (const int64_t*) trellis_table.data_ptr();
     if (C.dtype() == at::kFloat)
-        launch_gemm<true>((float) K, dim3(n_size / mpw::NT, slots, 1), stream,
-            (const half*) A.data_ptr(), 0, offs, tl, tc, tt, tt, C.data_ptr(), 0, size_k, n_size, false, kern);
+        launch_gemm<true>((float) K, dim3(n_size / mpw::NT, slots, nz), stream,
+            (const half*) A.data_ptr(), (int64_t) rows * a_ld, offs, tl, tc, tt, tt, C.data_ptr(), (int64_t) rows * n_size, size_k, n_size, false, kern, a_ld);
     else
-        launch_gemm<false>((float) K, dim3(n_size / mpw::NT, slots, 1), stream,
-            (const half*) A.data_ptr(), 0, offs, tl, tc, tt, tt, C.data_ptr(), 0, size_k, n_size, false, kern);
+        launch_gemm<false>((float) K, dim3(n_size / mpw::NT, slots, nz), stream,
+            (const half*) A.data_ptr(), (int64_t) rows * a_ld, offs, tl, tc, tt, tt, C.data_ptr(), (int64_t) rows * n_size, size_k, n_size, false, kern, a_ld);
     cuda_check(hipPeekAtLastError());
 }
 

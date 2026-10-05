@@ -6,7 +6,7 @@ import os as _os
 _f32_via_f16 = _os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
 _f32_via_f16_min_rows = int(_os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "32"))
 # gfx1151 decode: fp16-out torch.matmul at M <= 8 lands on a single-workgroup hipBLAS tile (GLM-5.3
-# indexer wk/weights_proj: 108-154 us for 1 MB); ext.hgemm takes the multi-CU skinny
+# indexer wk/weights_proj: 108-154 us for 1 MB, REPORT-31); ext.hgemm takes the multi-CU skinny
 # split-K GEMV first (M <= 8, N <= 128) and falls back to the same GEMM otherwise
 _hip = bool(torch.version.hip)
 _f16_small_m_hgemm = _os.environ.get("EXL3_HIP_F16_SMALL_M_HGEMM", "1") != "0" and bool(torch.version.hip)
@@ -103,7 +103,10 @@ class LinearFP16:
                 and weight.is_contiguous() and x.is_contiguous()):
             # prefill: ext.hgemm's tuned rocBLAS path (see hgemm.cu dtune); torch's hipBLASLt
             # default is 1.3-1.8x slower on these small-K / small-N shapes
-            ext.hgemm(x, weight, y)
+            # skinny-N projections (indexer wk / weights_proj, kv_a) collapse to ~20 % of peak when the row pitch is a
+            # multiple of 4 KiB (hidden 4096 = 8192 B); one padded copy of x runs the same product bit-exactly 3-4x faster
+            from .exl3 import pad_copy_in
+            ext.hgemm(pad_copy_in(x, x.shape[1]), weight, y)
         elif dtype == x.dtype and not (_f16_small_m_hgemm and x.dtype == torch.half and x.shape[0] <= 8):
             torch.matmul(x, weight, out = y)
         elif (_f32_via_f16 and dtype == torch.float and x.dtype == torch.half

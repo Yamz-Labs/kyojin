@@ -6,11 +6,13 @@
 #include <c10/hip/HIPGuard.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <cstdint>
+#include <limits>
 #include <cstdlib>
 
 #include "fused_elt.cuh"
 #include "util.h"
 #include "util.cuh"
+#include "pad_pitch.h"
 
 // Arithmetic mirrors the ATen kernels the fallback chains launch (no fast-math intrinsics):
 //   sigmoid(x) = 1 / (1 + expf(-x)), silu(x) = x / (1 + expf(-x)), mean = sum * (1 / N)
@@ -48,13 +50,17 @@ void fused_gated_rms_norm_kernel
     const float constant_bias,
     const int w_groups,
     const bool gate_first,
-    const int gate_act
+    const int gate_act,
+    const size_t ypitch,
+    const int hpt
 )
 {
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * (GN_THREADS / 32) + (threadIdx.x >> 5);
     if (row >= rows) return;
     const size_t off = (size_t) row * dim;
+    // y token rows may sit at a padded pitch (ypitch != 0): row = token * hpt + head
+    const size_t yoff = ypitch ? pad_norm_off((size_t) row, hpt, ypitch, dim) : off;
 
     float ni[GN_MAX];
     float gt[GN_MAX];
@@ -104,8 +110,8 @@ void fused_gated_rms_norm_kernel
             float h = ni[j] * r;
             h = h * wf;
             if (!gate_first) h = h * gt[j];
-            if (Y_F32) ((float*) y)[off + i] = h;
-            else ((half*) y)[off + i] = __float2half_rn(h);
+            if (Y_F32) ((float*) y)[yoff + i] = h;
+            else ((half*) y)[yoff + i] = __float2half_rn(h);
         }
     }
 }
@@ -120,7 +126,9 @@ void fused_gated_rms_norm
     double constant_bias,
     int64_t w_groups,
     bool gate_first,
-    int64_t gate_act
+    int64_t gate_act,
+    int64_t y_pitch,
+    int64_t hpt
 )
 {
     const at::Device device = x.device();
@@ -132,10 +140,22 @@ void fused_gated_rms_norm
     TORCH_CHECK(w.dtype() == at::kBFloat16 || w.dtype() == at::kFloat, "fused_gated_rms_norm: w must be bf16/f32");
     TORCH_CHECK(g.dtype() == at::kBFloat16 || g.dtype() == at::kFloat || g.dtype() == at::kHalf,
                 "fused_gated_rms_norm: g must be bf16/f32/f16");
-    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && g.is_contiguous() && w.is_contiguous(),
+    TORCH_CHECK(x.is_contiguous() && g.is_contiguous() && w.is_contiguous(),
                 "fused_gated_rms_norm: tensors must be contiguous");
     const int dim = x.size(-1);
     const int rows = x.numel() / dim;
+    if (y_pitch == 0)
+    {
+        TORCH_CHECK(y.is_contiguous(), "fused_gated_rms_norm: tensors must be contiguous");
+    }
+    else
+    {
+        // padded y: [tokens, y_pitch] storage, hpt heads of dim per token, columns contiguous
+        TORCH_CHECK(hpt >= 1 && rows % hpt == 0 && y.stride(-1) == 1 && y_pitch >= hpt * dim && y_pitch <= std::numeric_limits<int>::max(),
+                    "fused_gated_rms_norm: bad padded y");
+        TORCH_CHECK(pad_view_fits(y.storage_offset(), rows / hpt, y_pitch, hpt * dim, (int64_t) (y.storage().nbytes() / y.element_size())),
+                    "fused_gated_rms_norm: padded y outside its storage");
+    }
     TORCH_CHECK(dim <= 32 * GN_MAX && dim % 128 == 0, "fused_gated_rms_norm: dim must be <= 512 and a multiple of 128");
     TORCH_CHECK(y.numel() == x.numel() && g.numel() == x.numel() && w_groups >= 1 && w.numel() == w_groups * dim,
                 "fused_gated_rms_norm: shape mismatch");
@@ -147,7 +167,7 @@ void fused_gated_rms_norm
     const int blocks = (rows + GN_THREADS / 32 - 1) / (GN_THREADS / 32);
     #define GN_LAUNCH(GT, WF, YF) fused_gated_rms_norm_kernel<GT, WF, YF><<<blocks, GN_THREADS, 0, stream>>>( \
         (const uint16_t*) x.data_ptr(), w.data_ptr(), y.data_ptr(), g.data_ptr(), rows, dim, \
-        (float) eps, (float) constant_bias, (int) w_groups, gate_first, (int) gate_act)
+        (float) eps, (float) constant_bias, (int) w_groups, gate_first, (int) gate_act, (size_t) y_pitch, (int) (hpt < 1 ? 1 : hpt))
     #define GN_W(GT) \
         if      ( wf &&  yf) GN_LAUNCH(GT, true,  true);  \
         else if ( wf && !yf) GN_LAUNCH(GT, true,  false); \
@@ -158,6 +178,108 @@ void fused_gated_rms_norm
     else              { GN_W(0) }
     #undef GN_W
     #undef GN_LAUNCH
+    cuda_check(hipPeekAtLastError());
+}
+
+// ------------------------------------------------------------------------------------------------
+// out[row, col] = x * sigmoid(g) at a padded row pitch. One thread per half2 pair (k even: a pair never straddles a row).
+
+#define MSP_THREADS 256
+
+__global__ __launch_bounds__(MSP_THREADS)
+void mul_sigmoid_pad_kernel
+(
+    const half* __restrict__ x,
+    const half* __restrict__ g,
+    half* __restrict__ out,
+    const size_t numel,
+    const size_t k,
+    const size_t pitch
+)
+{
+    const size_t idx = (size_t) blockIdx.x * MSP_THREADS + threadIdx.x;
+    if (idx >= numel / 2) return;
+    const half2 x2 = ((const half2*) x)[idx];
+    const half2 g2 = ((const half2*) g)[idx];
+    const half s0 = __float2half_rn(fe_sigmoid(__half2float(__low2half(g2))));
+    const half s1 = __float2half_rn(fe_sigmoid(__half2float(__high2half(g2))));
+    const half r0 = __float2half_rn(__half2float(__low2half(x2)) * __half2float(s0));
+    const half r1 = __float2half_rn(__half2float(__high2half(x2)) * __half2float(s1));
+    *((half2*) (out + pad_flat_off(2 * idx, k, pitch))) = __halves2half2(r0, r1);
+}
+
+void mul_sigmoid_pad
+(
+    const at::Tensor& x,
+    const at::Tensor& g,
+    at::Tensor& out,
+    int64_t pitch
+)
+{
+    const at::Device device = x.device();
+    c10::cuda::OptionalCUDAGuard device_guard(device);
+    hipStream_t stream = c10::hip::getCurrentHIPStream(device.index()).stream();
+
+    TORCH_CHECK(x.dtype() == at::kHalf && g.dtype() == at::kHalf && out.dtype() == at::kHalf, "mul_sigmoid_pad: fp16 tensors");
+    TORCH_CHECK(x.sizes() == g.sizes() && x.numel() == out.numel(), "mul_sigmoid_pad: shape mismatch");
+    TORCH_CHECK(x.is_contiguous() && g.is_contiguous(), "mul_sigmoid_pad: x and g must be contiguous");
+    const int64_t k = x.size(-1);
+    TORCH_CHECK(k >= 2 && k % 2 == 0 && pitch % 2 == 0, "mul_sigmoid_pad: k and pitch must be even");
+    TORCH_CHECK(out.stride(-1) == 1 && ((uintptr_t) out.data_ptr()) % 4 == 0, "mul_sigmoid_pad: out columns contiguous, 4-byte aligned");
+    const int64_t rows = x.numel() / k;
+    TORCH_CHECK(pad_view_fits(out.storage_offset(), rows, pitch, k, (int64_t) (out.storage().nbytes() / sizeof(at::Half))),
+                "mul_sigmoid_pad: out outside its storage");
+    if (rows == 0) return;
+    const size_t numel = x.numel();
+    const size_t blocks = (numel / 2 + MSP_THREADS - 1) / MSP_THREADS;
+    mul_sigmoid_pad_kernel<<<blocks, MSP_THREADS, 0, stream>>>(
+        (const half*) x.data_ptr(), (const half*) g.data_ptr(), (half*) out.data_ptr(), numel, (size_t) k, (size_t) pitch);
+    cuda_check(hipPeekAtLastError());
+}
+
+// ------------------------------------------------------------------------------------------------
+// row-padded copy, one thread per 16-byte chunk (8 two-byte elements; pad_copy_ok guarantees no row straddle).
+
+#define PCP_THREADS 256
+
+__global__ __launch_bounds__(PCP_THREADS)
+void pad_copy_kernel
+(
+    const uint4* __restrict__ x,
+    uint16_t* __restrict__ out,
+    const size_t chunks,
+    const size_t k,
+    const size_t pitch
+)
+{
+    const size_t idx = (size_t) blockIdx.x * PCP_THREADS + threadIdx.x;
+    if (idx >= chunks) return;
+    *((uint4*) (out + pad_flat_off(8 * idx, k, pitch))) = x[idx];
+}
+
+void pad_copy
+(
+    const at::Tensor& x,
+    at::Tensor& out,
+    int64_t pitch
+)
+{
+    const at::Device device = x.device();
+    c10::cuda::OptionalCUDAGuard device_guard(device);
+    hipStream_t stream = c10::hip::getCurrentHIPStream(device.index()).stream();
+
+    TORCH_CHECK(x.element_size() == 2 && out.dtype() == x.dtype(), "pad_copy: 2-byte elements, same dtype");
+    TORCH_CHECK(x.is_contiguous() && ((uintptr_t) x.data_ptr()) % 16 == 0, "pad_copy: x must be contiguous, 16-byte aligned");
+    const int64_t k = x.size(-1);
+    TORCH_CHECK(out.stride(-1) == 1 && ((uintptr_t) out.data_ptr()) % 16 == 0, "pad_copy: out columns contiguous, 16-byte aligned");
+    TORCH_CHECK(pad_copy_ok(k, pitch, out.storage_offset()), "pad_copy: k, pitch or offset not a multiple of 8");
+    TORCH_CHECK(x.numel() == out.numel(), "pad_copy: shape mismatch");
+    const int64_t rows = x.numel() / k;
+    TORCH_CHECK(pad_view_fits(out.storage_offset(), rows, pitch, k, (int64_t) (out.storage().nbytes() / 2)), "pad_copy: out outside its storage");
+    if (rows == 0) return;
+    const size_t chunks = (size_t) x.numel() / 8;
+    const size_t blocks = (chunks + PCP_THREADS - 1) / PCP_THREADS;
+    pad_copy_kernel<<<blocks, PCP_THREADS, 0, stream>>>((const uint4*) x.data_ptr(), (uint16_t*) out.data_ptr(), chunks, (size_t) k, (size_t) pitch);
     cuda_check(hipPeekAtLastError());
 }
 

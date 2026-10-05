@@ -31,6 +31,7 @@
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemm.cuh"
 #include "quant/exl3_gemv.cuh"
+#include "quant/exl3_moe_fused_api.h"
 #include "quant/exl3_gemv_int8.cuh"
 #include "quant/exl3_moe_prefill.cuh"
 #include "cpu/moe_mul1.h"
@@ -96,6 +97,7 @@
 #include "quant/quantize.cuh"
 #include "quant/hadamard.cuh"
 #include "quant/exl3_gemv.cuh"
+#include "quant/exl3_moe_fused_api.h"
 #include "quant/exl3_gemv_int8.cuh"
 #include "quant/exl3_dec.cuh"
 #include "quant/exl3_moe_prefill.cuh"
@@ -345,6 +347,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemv_supported", &exl3_gemv_supported, "exl3_gemv_supported");
     m.def("exl3_gemv_wmma_family", &exl3_gemv_wmma_family, "exl3_gemv_wmma_family");
+    m.def("exl3_moe_fused_half", &exl3_moe_fused_half, "exl3_moe_fused_half");
+    m.def("exl3_moe_valu_override", &exl3_moe_valu_override, "exl3_moe_valu_override");
+    m.def("exl3_moe_fused_supported", &exl3_moe_fused_supported, "exl3_moe_fused_supported");
+    m.def("exl3_moe_fused_ws_offsets", &exl3_moe_fused_ws_offsets, "exl3_moe_fused_ws_offsets");
+    m.def("exl3_moe_fused_grid", &exl3_moe_fused_grid, "exl3_moe_fused_grid");
+    m.def("exl3_moe_fused_tile_test", &exl3_moe_fused_tile_test, "exl3_moe_fused_tile_test");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_gfx12_k3", &exl3_moe_gfx12_k3, "exl3_moe_gfx12_k3");
     m.def("exl3_dec_gemv", &exl3_dec_gemv, "exl3_dec_gemv",
@@ -397,6 +405,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_dec_router_rows", &exl3_dec_router_rows, "exl3_dec_router_rows");
     m.def("exl3_dec_rms_norm", &exl3_dec_rms_norm, "exl3_dec_rms_norm");
     m.def("fused_gated_rms_norm", &fused_gated_rms_norm, "fused_gated_rms_norm");
+    m.def("mul_sigmoid_pad", &mul_sigmoid_pad, "mul_sigmoid_pad");
+    m.def("pad_copy", &pad_copy, "pad_copy");
     m.def("fused_silu_mul", &fused_silu_mul, "fused_silu_mul");
     m.def("skinny_set_onepass", &skinny_set_onepass, "skinny_set_onepass");
     m.def("kda_gate", &kda_gate, "kda_gate");

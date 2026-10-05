@@ -9,6 +9,40 @@ from ..ext import exllamav3_ext as ext
 from . import Module
 from .quant.exl3_lib.ngram_codec import ROW_DIM, mul1_codebook, dequant_rows, words_per_row
 
+
+_MADV_POPULATE_READ = 22
+_MADV_PAGEOUT = 21
+
+
+def process_swap_bytes() -> int | None:
+    """VmSwap of this process in bytes, None when unknown"""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSwap:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def _madvise_range(tensor: torch.Tensor, advice: int, byte_start: int = 0, byte_len: int | None = None, chunk: int = 1 << 30) -> int:
+    """madvise a byte range of a CPU tensor in chunks of at most `chunk` bytes. Returns byte_len, -1 when madvise is unavailable or failed"""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno = True)
+    page = os.sysconf("SC_PAGE_SIZE")
+    total = tensor.numel() * tensor.element_size()
+    byte_len = total - byte_start if byte_len is None else min(byte_len, total - byte_start)
+    base = tensor.data_ptr() + byte_start
+    lo = base - base % page
+    hi = base + byte_len
+    while lo < hi:
+        n = min(chunk, hi - lo)
+        if libc.madvise(ctypes.c_void_p(lo), ctypes.c_size_t(n), advice) != 0:
+            return -1
+        lo += n
+    return byte_len
+
 """
 Hashed n-gram embedding table (Qwen3.8-Flash-Next ple_embedding and kin): maps each token position
 to (ngram_size - 1) * heads_per_ngram hash-table rows and concatenates them into one feature vector.
@@ -212,7 +246,14 @@ class NGramEmbedding(Module):
         stream_from_disk = self.stream_from_disk
         if stream_from_disk is None:
             infer_params = getattr(self.config, "infer_params", None)
-            stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else True
+            stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else None
+        if stream_from_disk is None:
+            # Auto: per-token row preads cost ~0.8 ms of GPU idle per decode token (tokplan1), so hold
+            # the table in RAM when it fits with a wide margin; otherwise stream from disk
+            from ..util.memory import host_memory_available
+            avail = host_memory_available()
+            tbl = self.num_rows * (words_per_row(self.K) * 2 if quantized else ROW_DIM * 2)
+            stream_from_disk = avail is None or avail < tbl + (48 << 30)
         if stream_from_disk:
             self.mode = "trellis_disk" if quantized else "fp16_disk"
             self.handles = [stc.get_tensor_handle(k) for k in keys]
@@ -258,6 +299,33 @@ class NGramEmbedding(Module):
                 self.rows_per_shard = self.num_rows
             if not quantized:
                 self._row_dtype = self.tables[0].dtype
+        if not getattr(NGramEmbedding, "_mode_logged", False):
+            NGramEmbedding._mode_logged = True
+            from ..util.memory import host_memory_available
+            av = host_memory_available()
+            print(f"[ngram] table mode {self.mode}: {self.num_rows} rows, host MemAvailable "
+                  f"{'?' if av is None else f'{av / 2**30:.1f}'} GiB at load (RAM mode needs table + 48 GiB; "
+                  f"disk mode = every prefill chunk reads its rows from the file, a busy disk or a cold page cache stalls it)",
+                  flush=True)
+
+    def ensure_resident(self, min_swap_bytes: int = 64 << 20) -> dict:
+        """RAM modes only. The table is anonymous host memory that the kernel may have swapped out during the load (the weights
+        take most of the RAM): every later row lookup that lands on a swapped page then waits for a disk read. If this process has
+        more than min_swap_bytes in swap, read the whole table back in (MADV_POPULATE_READ). Contents are unchanged"""
+        info = {"mode": self.mode, "swap_before": process_swap_bytes(), "populated": 0, "seconds": 0.0}
+        if self.tables is None or info["swap_before"] is None or info["swap_before"] < min_swap_bytes:
+            return info
+        import time
+        t0 = time.perf_counter()
+        for t in self.tables:
+            n = _madvise_range(t, _MADV_POPULATE_READ)
+            if n < 0:
+                info["error"] = "madvise(MADV_POPULATE_READ) failed"
+                break
+            info["populated"] += n
+        info["seconds"] = round(time.perf_counter() - t0, 2)
+        info["swap_after"] = process_swap_bytes()
+        return info
 
     @override
     def unload(self):
@@ -277,7 +345,7 @@ class NGramEmbedding(Module):
     @override
     def get_tensors(self):
         # The table is never resident as a whole in the general case; export/compile of this
-        # module is handled by the conversion pipeline (util/convert_ngram.py), not here
+        # module is handled at conversion time, not here
         return {}
 
     @override

@@ -20,6 +20,9 @@ namespace cg = cooperative_groups;
 #include "../util.h"
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
+#if defined(USE_ROCM)
+#include "exl3_moe_valu.cuh"   // VALU grouped-MoE decode matvec, opt-in EXL3_MOE_VALU=1 (K2 and K4 experts)
+#endif
 #include "exl3_devctx.cuh"
 #include <cstdio>
 #include <cstring>
@@ -675,6 +678,37 @@ static void launch_moe_grouped_one
 
 // K (the experts' trellis bitrate, integer or half-integer) is a template parameter of the
 // grouped GEMV, so the entry point dispatches on it; MOE_CFG stays the runtime knob it always was.
+// EXL3_MOE_VALU=1: VALU decode matvec (exl3_moe_valu.cuh) for K2/K4 experts instead of the WMMA body. Default off.
+static int g_moe_valu_override = -1;   // test hook (exl3_moe_valu_override): -1 = env, 0/1 = forced
+static inline bool moe_valu_enabled()
+{
+    if (g_moe_valu_override >= 0) return g_moe_valu_override != 0;
+    static const bool on = [] { const char* e = getenv("EXL3_MOE_VALU"); return e && atoi(e) != 0; }();
+    return on;
+}
+void exl3_moe_valu_override(int64_t v) { g_moe_valu_override = (int) v; }
+
+template <int K, bool FP32, bool TWO>
+static void launch_moe_valu
+(
+    const half* A, const int64_t* selected, const MoeDedup* dd,
+    const int64_t* t0, const int64_t* t1, void* C,
+    int size_k, int size_n, int experts, int assignments, hipStream_t stream
+)
+{
+    constexpr int W = EXL3_MOE_VALU_W;
+    const dim3 grid(mv::grid_x(size_n / 16, W), assignments, TWO ? 2 : 1);
+    const bool deep = mv::chunk(size_k / 16) >= 5;   // register ring of 5 slices, else 3
+    const int64_t* sel = dd ? dd->sorted_expert : selected;
+    const int* gs = dd ? dd->group_start : nullptr;
+    const int* ng = dd ? dd->num_groups : nullptr;
+#define MV_LAUNCH(DD, VU) \
+    moe_valu_kernel<K, FP32, DD, TWO, VU><<<grid, W * 32, 0, stream>>>(A, sel, gs, ng, t0, t1, C, size_k, size_n, experts, assignments)
+    if (dd) { if (deep) MV_LAUNCH(true, 5); else MV_LAUNCH(true, 3); }
+    else    { if (deep) MV_LAUNCH(false, 5); else MV_LAUNCH(false, 3); }
+#undef MV_LAUNCH
+}
+
 template <int K, bool HALF, bool FP32, bool TWO>
 static void launch_moe_grouped
 (
@@ -683,6 +717,14 @@ static void launch_moe_grouped
     int size_k, int size_n, int experts, int assignments, hipStream_t stream
 )
 {
+    if constexpr (!HALF && (K == 2 || K == 4))
+    {
+        if (moe_valu_enabled() && size_k % 16 == 0 && size_n % 32 == 0)
+        {
+            launch_moe_valu<K, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream);
+            return;
+        }
+    }
     dim3 grid(size_n / 32, assignments, TWO ? 2 : 1);
     switch (moe_decode_cfg())
     {
