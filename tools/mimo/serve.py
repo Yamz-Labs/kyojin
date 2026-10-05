@@ -77,56 +77,96 @@ def _json_value(raw: str) -> Any:
 # ---------------------------------------------------------------------------- completion parsing
 
 _NAME_RE = re.compile(r"<function=([^\s>]+)\s*>")
+_FUNC_RE = re.compile(r"<function=([^\s>]+)\s*>(.*?)(?:</function>|(?=<function=)|\Z)", re.S)
 _PARAM_RE = re.compile(r"<parameter=([^\s>]+)\s*>(.*?)</parameter>", re.S)
 
 
-def _xml_params(raw: str) -> dict[str, Any] | None:
-    """MiMo's template teaches <parameter=key>value</parameter>: map it to a dict (object/array values parsed as JSON, the rest kept as text)."""
+def _schema_types(tools: list[dict[str, Any]] | None, name: str) -> dict[str, Any]:
+    """Property schemas of the declared tool `name` ({} when unknown)."""
+    for tool in tools or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        if fn.get("name") == name:
+            params = fn.get("parameters") or fn.get("input_schema") or {}
+            props = params.get("properties") if isinstance(params, dict) else None
+            return props if isinstance(props, dict) else {}
+    return {}
+
+
+def _coerce(value: str, schema: Any) -> Any:
+    """XML parameter text -> typed value. Strings stay strings unless the schema asks for another type."""
+    kind = schema.get("type") if isinstance(schema, dict) else None
+    kinds = kind if isinstance(kind, list) else [kind]
+    if "string" in kinds and len(kinds) == 1:
+        return value
+    parsed = _json_value(value)
+    if parsed is value:  # not JSON
+        return value
+    if isinstance(parsed, (dict, list)):
+        return parsed
+    # scalars: only when the schema declares a non-string type, else keep the text (e.g. "007", "true" as a name)
+    if kinds != [None] and any(k in kinds for k in ("integer", "number", "boolean", "null")):
+        return parsed
+    return value
+
+
+def _xml_params(raw: str, props: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """MiMo's template teaches <parameter=key>value</parameter>: map it to a dict."""
     found = _PARAM_RE.findall(raw)
-    vals = {k: v.strip() for k, v in found}
-    return {k: (j if isinstance(j := _json_value(v), (dict, list)) else v) for k, v in vals.items()} if vals else None
+    if not found:
+        return None
+    props = props or {}
+    return {k: _coerce(v.strip("\n") if props.get(k, {}).get("type") == "string" else v.strip(), props.get(k))
+            for k, v in found}
 
 
-def parse_completion(text: str) -> dict[str, Any]:
-    """Split MiMo <think> blocks and <tool_call><function=NAME>{json}</function></tool_call>
-    blocks into OpenAI message fields."""
+def _parse_call(name: str, body: str, tools: list[dict[str, Any]] | None) -> dict[str, Any]:
+    args_text = body.split("</function>")[0].strip()
+    args: Any = {}
+    if args_text:
+        args = _json_value(args_text)
+        if isinstance(args, str):  # not JSON: try the XML parameter form
+            xml = _xml_params(args_text, _schema_types(tools, name))
+            if xml is not None:
+                args = xml
+    # A malformed body is passed through raw (never silently turned into {} and executed):
+    # the client fails json.loads and reports the error back to the model.
+    arguments = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else args_text
+    return {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+            "function": {"name": name, "arguments": arguments}}
+
+
+def parse_completion(text: str, tools: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Split MiMo <think> blocks and <tool_call><function=NAME>...</function></tool_call>
+    blocks into OpenAI message fields. A block body is JSON or <parameter=k>v</parameter> XML;
+    one block may hold several <function=...> elements. An unterminated trailing <tool_call>
+    (generation cut off) is dropped from the content and yields no call."""
     calls: list[dict[str, Any]] = []
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
+
+    def prose(chunk: str) -> None:
+        if "<think>" in chunk:
+            before, after = chunk.split("<think>", 1)
+            content_parts.append(before)
+            thinking, _, chunk = after.partition("</think>")
+            reasoning_parts.append(thinking)
+        content_parts.append(chunk)
+
     # A bare "</think>" with no opener is left as literal content: MiMo's template never ends the
     # generation prompt inside a think block (it emits "<think></think>" for enable_thinking=false),
     # so the streamed and non-streamed paths classify the same text identically.
     cursor = 0
     pattern = re.compile(re.escape(TOOL_OPEN) + r"(.*?)" + re.escape(TOOL_CLOSE), re.S)
     for match in pattern.finditer(text):
-        visible = text[cursor:match.start()]
-        if "<think>" in visible:
-            before, after = visible.split("<think>", 1)
-            content_parts.append(before)
-            thinking, _, visible = after.partition("</think>")
-            reasoning_parts.append(thinking)
-        content_parts.append(visible)
-        body = match.group(1)
-        name_match = _NAME_RE.search(body)
-        if not name_match:
-            continue
-        args_text = body[name_match.end():]
-        args_text = args_text.split("</function>")[0].strip()
-        args = _json_value(args_text) if args_text else {}
-        if isinstance(args, str) and (xml := _xml_params(args_text)) is not None:
-            args = xml
-        calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                      "function": {"name": name_match.group(1),
-                                   "arguments": args_text if isinstance(args, str)
-                                   else json.dumps(args, ensure_ascii=False)}})
-        cursor = match.end()
+        prose(text[cursor:match.start()])
+        cursor = match.end()  # always advance: a nameless block must not leak or duplicate text
+        for fn in _FUNC_RE.finditer(match.group(1)):
+            calls.append(_parse_call(fn.group(1), fn.group(2), tools))
     tail = text[cursor:]
-    if "<think>" in tail:
-        before, after = tail.split("<think>", 1)
-        content_parts.append(before)
-        thinking, _, tail = after.partition("</think>")
-        reasoning_parts.append(thinking)
-    content_parts.append(tail)
+    open_at = tail.find(TOOL_OPEN)
+    if open_at >= 0 and tail[open_at + len(TOOL_OPEN):].lstrip().startswith("<function="):
+        tail = tail[:open_at]  # cut-off call: do not leak raw XML; prose that merely mentions the tag stays
+    prose(tail)
     message: dict[str, Any] = {"role": "assistant", "content": "".join(content_parts)}
     reasoning = "".join(reasoning_parts)
     if reasoning:
@@ -489,7 +529,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     await flush(False)
                 text, _ = stop_text(text, body["_stop"])
                 await flush(True)
-                message = parse_completion(text)
+                message = parse_completion(text, body.get("tools"))
                 if "tool_calls" in message:
                     await response.write(sse(event({"tool_calls": [
                         dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
@@ -527,7 +567,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             cancel.set()
             raise
         text, _ = stop_text(raw, body["_stop"])
-        message = parse_completion(text)
+        message = parse_completion(text, body.get("tools"))
         finish = finish_for(message, text)
         return web.json_response({
             "id": request_id, "object": "chat.completion", "created": created, "model": model_id,
