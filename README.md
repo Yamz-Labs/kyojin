@@ -30,12 +30,12 @@ rocm-sdk init                              # expands the devel headers (about 12
 export EXL3_ROCM_SDK=$(rocm-sdk path --root)   # or the path of your own devel tree
 source tools/strix_halo/env.sh             # run from the repository root; sets LD_PRELOAD and PYTHONPATH (torch needs it to import)
 ./build.sh                                 # compiles the extension for gfx1151 into the repo root (exllamav3_ext*.so)
-bash tools/strix_halo/env.sh --check       # prints versions, runs a small GPU matmul
+bash tools/strix_halo/env.sh --check       # prints versions, runs a small GPU matmul (needs a free GPU)
 hf download yamz-labs/GLM-5.3-Flash-EXL3-Yamz --local-dir ./glm-pack
 python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
 curl http://localhost:8000/v1/models
 ```
-Run `source tools/strix_halo/env.sh` again in every new shell before serving.
+In every new shell, before serving: activate the venv, run `export EXL3_ROCM_SDK=$(rocm-sdk path --root)` again, then `source tools/strix_halo/env.sh`. Without the export, `env.sh` falls back to a system ROCm that may not match the wheel (`undefined symbol: hsa_ext_image_create_v2`).
 Status: build and MiMo serving were verified from a fresh clone on a second Strix Halo machine (build in 8 to 10 minutes). Both published packs were checked there against `SHA256SUMS` and served (one chat request each); `env.sh --check` has not been run there yet. The first request after a build is slow while the kernels warm up.
 
 First GLM launch: the server tunes its dense GEMM kernels before it opens the port. This takes about 10 minutes, and the port stays closed during that time (the log prints a progress line every 30 seconds). The next one or two launches can repeat it for the shapes still missing; later launches start fast.
@@ -48,7 +48,7 @@ Memory: GLM at `-c 131072` leaves about 10 GiB free on a 128 GB machine. Close b
 
 MiMo: `hf download yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz --local-dir ./mimo-pack`, then `python tools/mimo/serve.py --model ./mimo-pack --port 8000 -c 131072`. Speculative decoding (DFlash, 4 bpw drafter, confidence-truncated drafts) is on by default: the server uses the pack's `drafter/` directory (or `$MIMO_DRAFTER`, or `--drafter <dir>`). Without a drafter it logs one line and decodes plain. Set `MIMO_SPEC=0` in the lane script (`tools/lanes/serve_mimo.sh`) or pass `--no-dflash` to `serve.py` for plain decode. Greedy output under speculation is not token-identical to plain decode: near-tied logits can flip under the batched verify. A loaded drafter costs 2 to 4 % prefill. Details: `tools/mimo/SERVE.md`.
 
-Qwen3.8-Flash-Next (125B MoE, 6B active): `hf download yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz --local-dir ./qwen-pack`, then `python tools/qwen/serve.py --model ./qwen-pack --port 8000 -c 131072`. Speculative decoding is on by default and returns the same tokens as plain decoding. The pack needs about 113 GiB of the 128 GB; start to ready takes about 90 s once the pack is in the page cache. Details: `tools/qwen/SERVE.md`.
+Qwen3.8-Flash-Next (125B MoE, 6B active): `hf download yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz --local-dir ./qwen-pack`, then `python tools/qwen/serve.py --model ./qwen-pack --port 8000 -c 131072`. Speculative decoding is on by default and returns the same tokens as plain decoding. The pack needs about 113 GiB of the 128 GB; start to ready takes about 90 s once the pack is in the page cache; the very first start reads 95 GB from disk and can take 7 to 8 minutes. Details: `tools/qwen/SERVE.md`.
 
 ## Measured numbers
 One machine: Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB LPDDR5X, ROCm. Other GPUs are untested.
