@@ -96,4 +96,10 @@ The CUDA build is the upstream one and is unchanged. Install a CUDA 12.4 or newe
 ## Credits and licence
 ExLlamaV3 by turboderp (MIT, `LICENSE` unchanged). ROCm decode path for gfx12 from sdougbrown/exllamav3; first gfx1151 port from vcruz305/exllamav3-amd. `exllamav3/vendor/fla` is flash-linear-attention (MIT). GLM-5.3-Flash is by Z.ai, MiMo-V2.6-Flash by Xiaomi; check each base licence before redistributing weights. Additions: MIT. This project is not affiliated with Z.ai, Xiaomi or turboderp.
 
+## Thanks
+To the people who test Kyojin on their own machines and take the time to write precise reports:
+[@felladrin](https://github.com/felladrin) (install, HIP runtime lookup, MiMo finish reason, client disconnects),
+[@dturini12](https://github.com/dturini12) (streaming API), [@morrisfamily](https://github.com/morrisfamily) (benchmarks),
+[@nobert](https://github.com/nobert) (metrics endpoint). Reports and pull requests are welcome.
+
 News and benchmarks: [@YamzLabs on X](https://x.com/YamzLabs).
