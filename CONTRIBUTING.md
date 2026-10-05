@@ -32,7 +32,7 @@ pip install pytest
 for t in tests/test_ablit_runtime_cpu.py tests/test_uncensor_bundled_cpu.py tools/glm/test_serve.py tools/mimo/test_serve.py tools/mimo/test_toolcalls.py; do PYTHONPATH=. pytest -q $t; done
 ```
 
-`tools/glm/test_serve.py` takes a few minutes. If it hangs, look for a stale lock file at `~/.cache/torch_extensions/*/exllamav3_ext/lock` and remove it. GPU tests under `tests/` need a built extension and a free GPU; say in the pull request whether you ran them.
+If a test or the build hangs, look for a stale lock file at `~/.cache/torch_extensions/*/exllamav3_ext/lock` and remove it. GPU tests under `tests/` need a built extension and a free GPU; say in the pull request whether you ran them.
 
 ## Pull requests
 

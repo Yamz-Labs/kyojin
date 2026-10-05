@@ -88,7 +88,7 @@ The engine can project one fixed direction out of the residual stream at run tim
 pip install pytest
 for t in tests/test_ablit_runtime_cpu.py tests/test_uncensor_bundled_cpu.py tools/glm/test_serve.py tools/mimo/test_serve.py tools/mimo/test_toolcalls.py; do PYTHONPATH=. pytest -q $t; done
 ```
-Run each file separately because two files share a name (`test_serve.py`). These tests need no GPU and no built extension. Last run (CPU only, clean clone and venv): 3, 16, 7 of 8, 13 and 15 passed (`tools/glm/test_serve.py` takes a few minutes; its one failure, `test_dense_tune_path_follows_the_cpp_tuner`, needs the built extension). GPU tests need a built extension and a free GPU.
+Run each file separately because two files share a name (`test_serve.py`). These tests need no GPU and no built extension. Last run (CPU only, clean clone and venv): 3, 16, 13, 13 and 15 passed. GPU tests need a built extension and a free GPU.
 
 ## Build on CUDA
 The CUDA build is the upstream one and is unchanged. Install a CUDA 12.4 or newer build of PyTorch, then `pip install -r requirements.txt && pip install .`. `README.upstream.md` has the full upstream guide (wheels, PyPI, uv, Windows, architecture list, conversion tool, examples). `README.strix-halo.md` has the kernel notes and benchmark harnesses.
