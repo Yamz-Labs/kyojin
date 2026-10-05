@@ -367,6 +367,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                     "total_tokens": prompt_tokens + completion_tokens}
 
+        def finish_for(message: dict[str, Any], raw: str) -> str:
+            # A reply cut by max_tokens is "length", not "stop" (clients use it to tell a truncated answer).
+            finish = message.pop("finish_reason", "stop")
+            if finish == "stop" and engine.count_tokens(raw) >= body.get("max_tokens", 4096):
+                finish = "length"
+            return finish
+
         def timings() -> dict[str, Any]:
             # llama.cpp names: the swap orchestrator reads cache_n as the verdict of a KV restore
             st = getattr(engine, "last_stats", None) or {}
@@ -417,7 +424,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             if "tool_calls" in message:
                 await response.write(sse(event({"tool_calls": [
                     dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
-            await response.write(sse(event({}, message.get("finish_reason", "stop")) |
+            await response.write(sse(event({}, finish_for(message, text)) |
                                      {"usage": usage(text), "timings": timings()}))
             await response.write(b"data: [DONE]\n\n")
             await response.write_eof()
@@ -426,7 +433,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         raw = "".join([d async for d in deltas()])
         text, _ = stop_text(raw, body["_stop"])
         message = parse_completion(text)
-        finish = message.pop("finish_reason", "stop")
+        finish = finish_for(message, text)
         return web.json_response({
             "id": request_id, "object": "chat.completion", "created": created, "model": model_id,
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],

@@ -188,6 +188,29 @@ class ServeTests(unittest.TestCase):
         self.assertEqual("".join(d.get("reasoning_content", "") for d in deltas), "")
         self.assertEqual("".join(d.get("content", "") for d in deltas), "</think>answer")
 
+    def test_finish_reason_length_at_max_tokens(self):
+        """A reply cut by max_tokens reports "length", streaming and not; a short reply stays "stop"."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def call(output, max_tokens, stream):
+            app = serve.create_app(FakeEngine(output), "m", TEMPLATE)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": stream, "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "hi"}]})
+            if stream:
+                raw = (await r.read()).decode()
+                out = [json.loads(l[6:]) for l in raw.split("\n") if l.startswith("data: {")][-1]
+            else:
+                out = await r.json()
+            await client.close()
+            return out["choices"][0]["finish_reason"]
+
+        for stream in (False, True):
+            self.assertEqual(run(call("one two three four", 4, stream)), "length")
+            self.assertEqual(run(call("one two", 4, stream)), "stop")
+
     def test_stop_string_cuts_stream(self):
         from aiohttp.test_utils import TestClient, TestServer
         engine = FakeEngine("alpha STOP beta")
