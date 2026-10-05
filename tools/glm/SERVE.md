@@ -36,22 +36,26 @@ wins): `EXL3_MOE_UNION_V2=1`, `EXL3_MOE_CFG=2`, `EXL3_HIP_PREFILL_MIN_ROWS=2`,
 `Generator.MTP_FUSE_CATCHUP = 2`. There is no `--temperature`/seed handling beyond the
 request body.
 
-### Optional MTP sidecar (higher draft acceptance)
+### MTP sidecar (higher draft acceptance)
 
-The published pack stores the MTP `eh_proj` at 2 bits. An unquantized copy raises draft
-acceptance (about +0.08) and decode speed (about +5 %), but the pack does not ship it and
-the server runs fine without it. If `EXL3_MTP_EH_FP16` is not set, the server uses
-`~/models/glm53-mtp-eh-proj-bf16.safetensors` when that file exists and otherwise starts
-without it, with one log line. To add it, extract it once from the official GLM-5.3
-checkpoint (BF16 `eh_proj`, about 64 MiB), then point the server at it:
+The pack stores the MTP `eh_proj` at 2 bits. The pack also ships an unquantized copy,
+`mtp_eh_proj.st` (BF16, 64 MiB), and the server loads it automatically: no flag, no variable.
+It is a normal safetensors file with a `.st` extension, so no weight loader indexes it as
+model weights. It only changes the draft; target token ids stay equal. Measured on the card
+protocol (3 prompts, 400 tokens, greedy, Ryzen AI Max+ 395, MTP 2): 26.7 -> 31.6 tok/s.
+
+Source order, one log line says which one was used:
+
+1. `EXL3_MTP_EH_FP16=<path>` (a path that does not exist stops the load with an error; `0` turns the sidecar off)
+2. `mtp_eh_proj.st` in the folder given by `--model`
+3. `~/models/glm53-mtp-eh-proj-bf16.safetensors` (older location)
+4. none: the server runs without it, with lower draft acceptance (one log line)
+
+To build it yourself from the official GLM-5.3 checkpoint:
 
 ```bash
-python tools/glm/mtp_eh_sidecar.py <official GLM-5.3 checkpoint dir> ~/models/glm53-mtp-eh-proj-bf16.safetensors
-# or any path, with: EXL3_MTP_EH_FP16=<path> python tools/glm/serve.py ...
+python tools/glm/mtp_eh_sidecar.py <official GLM-5.3 checkpoint dir> <model folder>/mtp_eh_proj.st
 ```
-
-An explicit `EXL3_MTP_EH_FP16=<path>` that does not exist stops the load with an error;
-`EXL3_MTP_EH_FP16=0` turns the sidecar off.
 
 ## Endpoints
 

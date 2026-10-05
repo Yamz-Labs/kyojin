@@ -21,6 +21,9 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
 EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
+# Name inside the model folder. Not *.safetensors, so the weight loader never indexes it as model weights
+# (same layout trick as uncensor_direction.st); the file is a normal safetensors file.
+EH_SIDECAR_IN_PACK = "mtp_eh_proj.st"
 SPEED_ENV = {
     "EXL3_MOE_CFG": "2",
     "EXL3_HIP_PREFILL_MIN_ROWS": "2",
@@ -36,7 +39,7 @@ SPEED_ENV = {
     "EXL3_PREFILL_BIG_CHUNK_MAXPOS": "32768",  # mem512k1: plain chunks beyond 32K depth, lower peak memory at 512K ctx
     # 27/09 acceptaudit2 WIN: unquantized MTP eh_proj (td205 stores it at 2 bpw, cos 0.79):
     # served accept +0.077 +- 0.008 (n=24), target ids 24/24 equal, serve_accept decode +4.8 %.
-    # The published pack does not ship the sidecar: it is optional (see apply_eh_sidecar_default()).
+    # The pack ships the sidecar as mtp_eh_proj.st; loaded by default (see apply_eh_sidecar_default()).
     # 27/09 verifyfuse1 WIN: R-row verify linears in one launch (Hadamards in-kernel):
     # served R=2 round -3.04 +- 0.20 ms, +6.7 % t/s; R=1 bitwise, R=2 greedy 64/64.
     "EXL3_VERIFY_FUSE": "1",
@@ -70,23 +73,31 @@ SPEED_ENV = {
     "EXL3_PF_SKIP": "1",
 }
 
-def apply_eh_sidecar_default() -> str:
-    """Use the optional unquantized MTP eh_proj sidecar only when it exists.
+def apply_eh_sidecar_default(model_dir: str | None = None) -> str:
+    """Pick the optional unquantized MTP eh_proj sidecar and log which source is used.
 
-    An explicit EXL3_MTP_EH_FP16 is never touched (a wrong path still fails loudly at load).
-    Otherwise the default path is used if the file is there, and the server starts without it
-    (one log line) if not: the sidecar only raises draft acceptance, it is not needed to run.
-    Returns the outcome: "explicit", "default" or "absent".
+    Order: explicit EXL3_MTP_EH_FP16 (never touched; "0" = off; a wrong path still fails loudly at load)
+    > EH_SIDECAR_IN_PACK inside the model folder > the old default path under ~/models > absent.
+    The sidecar only raises draft acceptance, the server runs without it.
+    Returns the source: "explicit", "pack", "default" or "absent".
     """
     if "EXL3_MTP_EH_FP16" in os.environ:
+        print(f"serve: MTP eh_proj sidecar: EXL3_MTP_EH_FP16={os.environ['EXL3_MTP_EH_FP16']} (explicit)", flush=True)
         return "explicit"
+    if model_dir:
+        path = Path(model_dir).expanduser() / EH_SIDECAR_IN_PACK
+        if path.is_file():
+            os.environ["EXL3_MTP_EH_FP16"] = str(path)
+            print(f"serve: MTP eh_proj sidecar: {path} (model folder)", flush=True)
+            return "pack"
     path = os.path.expanduser(EH_SIDECAR_DEFAULT)
     if os.path.isfile(path):
         os.environ["EXL3_MTP_EH_FP16"] = path
+        print(f"serve: MTP eh_proj sidecar: {path} (default path)", flush=True)
         return "default"
-    print(f"serve: no MTP eh_proj sidecar at {EH_SIDECAR_DEFAULT}: running without it "
-          "(draft acceptance is a little lower). To add it: python tools/glm/mtp_eh_sidecar.py "
-          "<official GLM-5.3 checkpoint dir> <out.safetensors>, then set EXL3_MTP_EH_FP16=<out.safetensors>.",
+    print(f"serve: MTP eh_proj sidecar: none ({EH_SIDECAR_IN_PACK} not in the model folder, nothing at "
+          f"{EH_SIDECAR_DEFAULT}): running without it, draft acceptance is lower. To add it: python "
+          "tools/glm/mtp_eh_sidecar.py <official GLM-5.3 checkpoint dir> <model folder>/" + EH_SIDECAR_IN_PACK,
           flush=True)
     return "absent"
 
@@ -713,7 +724,7 @@ def main() -> None:
     for key, value in SPEED_ENV.items():
         os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
-    apply_eh_sidecar_default()
+    apply_eh_sidecar_default(args.model)
     engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft)
     template = Path(args.chat_template or Path(args.model) / "chat_template.jinja").expanduser().read_text(encoding="utf-8")
     print(mem_line("loaded"), flush=True)

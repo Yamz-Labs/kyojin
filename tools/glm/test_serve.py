@@ -33,26 +33,35 @@ def run(coro):
 class ServeTests(unittest.TestCase):
     template = "{% for m in messages %}<|im_start|>{{ m.role }}: {{ m.content }}<|im_end|>{% endfor %}{% if tools %}TOOLS={{ tools|length }}{% endif %}"
 
-    def test_eh_sidecar_default_is_optional(self):
+    def test_eh_sidecar_source_order(self):
         import os, tempfile
         from unittest import mock
         with tempfile.TemporaryDirectory() as home:
+            pack = Path(home) / "pack"
+            pack.mkdir()
             with mock.patch.dict(os.environ, {"HOME": home}):
                 os.environ.pop("EXL3_MTP_EH_FP16", None)
-                # fresh install: no file -> variable stays unset, no FileNotFoundError at load
-                self.assertEqual(serve.apply_eh_sidecar_default(), "absent")
+                # nothing anywhere: variable stays unset, no FileNotFoundError at load
+                self.assertEqual(serve.apply_eh_sidecar_default(str(pack)), "absent")
                 self.assertNotIn("EXL3_MTP_EH_FP16", os.environ)
-                # file present at the default path -> used
-                path = Path(home) / "models" / "glm53-mtp-eh-proj-bf16.safetensors"
-                path.parent.mkdir()
-                path.write_bytes(b"x")
-                self.assertEqual(serve.apply_eh_sidecar_default(), "default")
-                self.assertEqual(os.environ["EXL3_MTP_EH_FP16"], str(path))
-                # explicit value (even a missing file) is never touched
-                os.environ["EXL3_MTP_EH_FP16"] = "/nope/x.safetensors"
-                self.assertEqual(serve.apply_eh_sidecar_default(), "explicit")
-                self.assertEqual(os.environ["EXL3_MTP_EH_FP16"], "/nope/x.safetensors")
+                # old default path only
+                old = Path(home) / "models" / "glm53-mtp-eh-proj-bf16.safetensors"
+                old.parent.mkdir()
+                old.write_bytes(b"x")
+                self.assertEqual(serve.apply_eh_sidecar_default(str(pack)), "default")
+                self.assertEqual(os.environ["EXL3_MTP_EH_FP16"], str(old))
+                # file in the model folder wins over the old path
+                os.environ.pop("EXL3_MTP_EH_FP16")
+                (pack / serve.EH_SIDECAR_IN_PACK).write_bytes(b"x")
+                self.assertEqual(serve.apply_eh_sidecar_default(str(pack)), "pack")
+                self.assertEqual(os.environ["EXL3_MTP_EH_FP16"], str(pack / "mtp_eh_proj.st"))
+                # explicit value (even a missing file, even "0") is never touched
+                for value in ("/nope/x.safetensors", "0"):
+                    os.environ["EXL3_MTP_EH_FP16"] = value
+                    self.assertEqual(serve.apply_eh_sidecar_default(str(pack)), "explicit")
+                    self.assertEqual(os.environ["EXL3_MTP_EH_FP16"], value)
         self.assertNotIn("EXL3_MTP_EH_FP16", serve.SPEED_ENV)
+        self.assertFalse(serve.EH_SIDECAR_IN_PACK.endswith(".safetensors"))
 
     def test_stream_engine_error_still_ends_with_finish_reason(self):
         from aiohttp.test_utils import TestClient, TestServer

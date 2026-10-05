@@ -42,7 +42,7 @@ First GLM launch: the server tunes its dense GEMM kernels before it opens the po
 
 GLM reasons at maximum effort by default. With a small `max_tokens`, the reasoning can use the whole budget: `content` is then empty and `finish_reason` is `length`. Send `"reasoning_effort": "low"` in the request (or start the server with `--default-reasoning-effort low`), or allow at least 1000 tokens. The server defaults to greedy sampling when a request gives no temperature; set the sampling values of the model card in your client, or with `--default-temperature` and `--default-top-p`.
 
-Optional for GLM: an unquantized MTP `eh_proj` sidecar raises draft acceptance (about +5 % decode). The pack does not ship it and the server starts without it (one log line). To add it, see "Optional MTP sidecar" in `tools/glm/SERVE.md`.
+GLM: the pack ships `mtp_eh_proj.st`, an unquantized MTP `eh_proj` (64 MiB). The server loads it automatically from the model folder; it raises draft acceptance and decode speed (26.7 -> 31.6 tok/s greedy on the card protocol). Details in `tools/glm/SERVE.md`.
 
 Memory: GLM at `-c 131072` leaves about 10 GiB free on a 128 GB machine. Close browsers and other large processes first, or use a smaller `-c`.
 
