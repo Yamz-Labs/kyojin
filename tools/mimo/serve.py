@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """msrv -- OpenAI-compatible server for MiMo-V2.6 EXL3 with DFlash drafting + SpecGate.
 
-The HTTP/streaming layer is adapted from tools/glm/serve.py (glm-serve); the engine wiring is
+The HTTP/streaming layer is adapted from tools/glm/serve.py (the GLM server); the engine wiring is
 adapted from scripts/dflash-bench.py so the served decode path is the measured one (plain ~30 t/s,
 DFlash with a 4 bpw EXL3 drafter and confidence-truncated draft length).
 
@@ -32,8 +32,8 @@ DEFAULT_MODEL = os.path.expanduser("~/models/mimo26-exl3")
 DEFAULT_MODEL_ID = "MiMo-2.6-EXL3"
 DEFAULT_CTX = 4096
 DEFAULT_NDT = 7
-# Sampling used when a request omits temperature/top_p. The client sends neither on the main agent loop, so
-# a plain-greedy default makes the lane loop; the lane launcher passes the model-card values (T1.0, top_p 0.95).
+# Sampling used when a request omits temperature/top_p. Agent clients often send neither, so
+# a plain-greedy default makes the lane loop; the lane launchers pass the model-card values (T1.0, top_p 0.95).
 SERVE_DEFAULTS: dict[str, float] = {"temperature": 0.0, "top_p": 1.0}
 # The template uses a zero-width space inside the tag so plain prose does not trigger tools.
 TOOL_OPEN = "<tool_call>"
@@ -705,6 +705,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--no-uncensor", action="store_true", help="ignore a bundled uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--drafter", default=None,
                         help="drafter directory (default: $MIMO_DRAFTER, <model>/drafter, then <model>-drafter)")
@@ -727,6 +728,8 @@ def main() -> None:
     parser.add_argument("--default-temperature", type=float, default=0.0, help="used when a request omits temperature")
     parser.add_argument("--default-top-p", type=float, default=1.0, help="used when a request omits top_p")
     args = parser.parse_args()
+    if args.no_uncensor:
+        os.environ["EXL3_ABLIT_RUNTIME"] = "off"
     SERVE_DEFAULTS.update(temperature=args.default_temperature, top_p=args.default_top_p)
 
     torch.set_grad_enabled(False)
