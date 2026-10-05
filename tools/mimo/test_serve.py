@@ -47,6 +47,40 @@ TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|i
 
 class ServeTests(unittest.TestCase):
 
+    def test_reply_budget_is_clamped_to_the_context_room(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Spy(FakeEngine):
+            ctx = 20
+            num_draft = 1
+
+            async def generate(self, prompt: str, **kwargs):
+                self.kwargs = kwargs
+                async for piece in super().generate(prompt, **kwargs):
+                    yield piece
+
+        engine = Spy("one two")
+
+        async def post(content, **extra):
+            client = TestClient(TestServer(serve.create_app(engine, "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "messages": [{"role": "user", "content": content}], **extra})
+            status = r.status
+            await r.read()
+            await client.close()
+            return status
+
+        # room = ctx - prompt - 1 slot - 1 draft token
+        self.assertEqual(run(post("a b c d", max_completion_tokens=32768)), 200)
+        used = engine.count_tokens(engine.prompts[-1])
+        self.assertEqual(engine.kwargs["max_tokens"], 20 - used - 1 - 1)
+        self.assertEqual(run(post("a b c d", max_tokens=3)), 200)
+        self.assertEqual(engine.kwargs["max_tokens"], 3)
+        engine.kwargs = None
+        self.assertEqual(run(post(" ".join("w" * 30))), 400)
+        self.assertIsNone(engine.kwargs)
+
     def test_template_rendering(self):
         out = serve.render_prompt(TEMPLATE, [{"role": "user", "content": "hi"}],
                                   [{"type": "function"}])

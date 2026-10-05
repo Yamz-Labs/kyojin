@@ -150,8 +150,21 @@ def token_limit(body: dict[str, Any], default: int = 4096) -> int:
     for key in ("max_completion_tokens", "max_tokens"):
         value = body.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-            return value
-    return default
+            return min(value, body.get("_room") or value)
+    return min(default, body.get("_room") or default)
+
+
+def reply_room(engine: Any, prompt_tokens: int) -> int | None:
+    """Tokens a reply may still use: server context minus prompt, one slot and the speculative window.
+    None when the engine does not report a context (fake engines). A prompt with no room is refused,
+    as the cache cannot hold it (the engine would otherwise fail the job with an assertion)."""
+    ctx = getattr(engine, "ctx", None)
+    if not ctx:
+        return None
+    room = ctx - prompt_tokens - 1 - getattr(engine, "num_draft", 0)
+    if room < 1:
+        raise web.HTTPBadRequest(reason=f"prompt is {prompt_tokens} tokens, the server context is {ctx}")
+    return room
 
 
 def sse(data: dict[str, Any], event: str | None = None) -> bytes:
@@ -220,6 +233,8 @@ class ResidentEngine:
         elif self.generator.draft_calibrator is not None:
             self.load_prior(self.generator.draft_calibrator)
         self.Job = Job
+        self.ctx = ctx or config_max_position(self.config)
+        self.num_draft = self.ndt
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
@@ -344,6 +359,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             body["_reset_gate"] = bool(getattr(app["engine"], "reset_gate_per_request", False))
             prompt = render_prompt(template, body["messages"], body.get("tools"))
             prompt_tokens = engine.count_tokens(prompt)
+            body["_room"] = reply_room(engine, prompt_tokens)
             body["_prompt"] = prompt
             for key in ("temperature", "top_p"):  # absent or explicit null -> lane default
                 if body.get(key) is None:
@@ -494,6 +510,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             if n_predict <= 0:
                 n_predict = 128
             n_predict = min(n_predict, 8192)
+            room = reply_room(engine, engine.count_tokens(prompt))
+            if room:
+                n_predict = min(n_predict, room)
             stops = body.get("stop", [])
             job = {"_prompt": prompt, "max_tokens": n_predict,
                    "temperature": float(body.get("temperature", SERVE_DEFAULTS["temperature"])),

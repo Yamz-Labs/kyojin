@@ -200,8 +200,21 @@ def token_limit(body: dict[str, Any], default: int = 4096) -> int:
     for key in ("max_completion_tokens", "max_tokens"):
         value = body.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
-            return value
-    return default
+            return min(value, body.get("_room") or value)
+    return min(default, body.get("_room") or default)
+
+
+def reply_room(engine: Any, prompt_tokens: int) -> int | None:
+    """Tokens a reply may still use: server context minus prompt, one slot and the speculative window.
+    None when the engine does not report a context (fake engines). A prompt with no room is refused,
+    as the cache cannot hold it (the engine would otherwise fail the job with an assertion)."""
+    ctx = getattr(engine, "ctx", None)
+    if not ctx:
+        return None
+    room = ctx - prompt_tokens - 1 - getattr(engine, "num_draft", 0)
+    if room < 1:
+        raise web.HTTPBadRequest(reason=f"prompt is {prompt_tokens} tokens, the server context is {ctx}")
+    return room
 
 
 def sse(data: dict[str, Any], event: str | None = None) -> bytes:
@@ -225,11 +238,13 @@ class ResidentEngine:
         torch.set_grad_enabled(False)
         self.torch = torch
         self.Job = Job
+        self.num_draft = num_draft
         self.config = Config.from_directory(model_path)
         self.model = Model.from_config(self.config)
         self.tokenizer = Tokenizer.from_config(self.config)
         max_position = int(self.config.config_dict.get("max_position_embeddings") or self.config.config_dict.get("text_config", {}).get("max_position_embeddings") or 32768)
         ctx = min(max_position, max_ctx)
+        self.ctx = ctx
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
                            max_history=max_history)
         self.model.load(device="cuda:0", progressbar=False)
@@ -460,6 +475,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             body["_stop"] = [stops] if isinstance(stops, str) else list(stops)
             prompt = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
             prompt_tokens = engine.count_tokens(prompt)
+            body["_room"] = reply_room(engine, prompt_tokens)
             body["_prompt"] = prompt
             for key in ("temperature", "top_p"):
                 if body.get(key) is None:
@@ -606,6 +622,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             if n_predict <= 0:
                 n_predict = 128
             n_predict = min(n_predict, 8192)
+            room = reply_room(engine, engine.count_tokens(prompt))
+            if room:
+                n_predict = min(n_predict, room)
             stops = body.get("stop", [])
             job = {"_prompt": prompt, "max_tokens": n_predict,
                    "temperature": float(body.get("temperature", 0.0)),
