@@ -54,6 +54,56 @@ class ServeTests(unittest.TestCase):
                 self.assertEqual(os.environ["EXL3_MTP_EH_FP16"], "/nope/x.safetensors")
         self.assertNotIn("EXL3_MTP_EH_FP16", serve.SPEED_ENV)
 
+    def test_stream_engine_error_still_ends_with_finish_reason(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Boom(FakeEngine):
+            async def generate(self, prompt: str, **kwargs):
+                yield "partial "
+                raise RuntimeError("kaput")
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Boom("x"), "m", self.template)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            raw = (await r.read()).decode()
+            await client.close()
+            return raw
+
+        raw = run(check())
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"))
+        chunks = [json.loads(l[6:]) for l in raw.split("\n") if l.startswith("data: {")]
+        self.assertTrue(any("kaput" in c.get("error", {}).get("message", "") for c in chunks))
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "error")
+
+    def test_max_completion_tokens_is_honored(self):
+        self.assertEqual(serve.token_limit({"max_completion_tokens": 7, "max_tokens": 9}), 7)
+        self.assertEqual(serve.token_limit({"max_tokens": 9}), 9)
+        self.assertEqual(serve.token_limit({"max_tokens": None}), 4096)
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Spy(FakeEngine):
+            async def generate(self, prompt: str, **kwargs):
+                self.kwargs = kwargs
+                async for piece in super().generate(prompt, **kwargs):
+                    yield piece
+
+        engine = Spy("one two three four")
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(engine, "m", self.template)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "max_completion_tokens": 4, "messages": [{"role": "user", "content": "hi"}]})
+            body = await r.json()
+            await client.close()
+            return body
+
+        body = run(check())
+        self.assertEqual(engine.kwargs["max_tokens"], 4)
+        self.assertEqual(body["choices"][0]["finish_reason"], "length")
+
     def test_template_rendering(self):
         out = serve.render_prompt(self.template, [{"role": "user", "content": "hi"}], [{"type": "function"}])
         self.assertEqual(out, "<|im_start|>user: hi<|im_end|>TOOLS=1")

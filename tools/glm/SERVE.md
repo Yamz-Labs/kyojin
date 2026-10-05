@@ -67,7 +67,7 @@ Honored:
   because the GLM template iterates them as a dict.
 - `tools` — passed to the template verbatim (no server-side validation).
 - `stream` (bool) — SSE or a single JSON body.
-- `max_tokens` (default **4096**), `temperature` (default **0.0** → greedy),
+- `max_completion_tokens` or `max_tokens` (the first wins; default **4096**), `temperature` (default **0.0** → greedy),
   `top_p` (default 1.0), `stop` (string or array; also fed to EXL3 as stop conditions).
 - `model` — must equal `--model-id` if present, else 400.
 - `clear_thinking` — forwarded to the template as a Jinja variable.
@@ -89,6 +89,8 @@ name is emitted); frames are:
 4. a final frame with an empty delta, `finish_reason` (`tool_calls` or `stop`) and
    `usage: {prompt_tokens, completion_tokens, total_tokens}`;
 5. `data: [DONE]`.
+
+If the engine fails mid-stream, the server sends a frame `{"error": {"message": ...}}`, a final frame with `finish_reason: "error"`, then `data: [DONE]`.
 
 Every frame carries `id`, `object: chat.completion.chunk`, `created`, `model`.
 

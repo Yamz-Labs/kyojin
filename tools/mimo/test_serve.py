@@ -211,6 +211,59 @@ class ServeTests(unittest.TestCase):
             self.assertEqual(run(call("one two three four", 4, stream)), "length")
             self.assertEqual(run(call("one two", 4, stream)), "stop")
 
+    def test_stream_engine_error_still_ends_with_finish_reason(self):
+        """An engine failure mid-stream ends with an error frame, finish_reason and [DONE], not a dropped connection."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Boom(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                yield "partial "
+                raise RuntimeError("kaput")
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Boom("x"), "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            raw = (await r.read()).decode()
+            await client.close()
+            return raw
+
+        raw = run(check())
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"))
+        chunks = [json.loads(l[6:]) for l in raw.split("\n") if l.startswith("data: {")]
+        self.assertTrue(any("kaput" in c.get("error", {}).get("message", "") for c in chunks))
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "error")
+
+    def test_max_completion_tokens_is_honored(self):
+        """The newer OpenAI field sets the budget (and the "length" verdict) like max_tokens."""
+        self.assertEqual(serve.token_limit({"max_completion_tokens": 7, "max_tokens": 9}), 7)
+        self.assertEqual(serve.token_limit({"max_tokens": 9}), 9)
+        self.assertEqual(serve.token_limit({"max_tokens": None}), 4096)
+        self.assertEqual(serve.token_limit({}), 4096)
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Spy(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                self.kwargs = kwargs
+                async for piece in super().generate(prompt, **kwargs):
+                    yield piece
+
+        engine = Spy("one two three four")
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(engine, "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "max_completion_tokens": 4, "messages": [{"role": "user", "content": "hi"}]})
+            body = await r.json()
+            await client.close()
+            return body
+
+        body = run(check())
+        self.assertEqual(engine.kwargs["max_tokens"], 4)
+        self.assertEqual(body["choices"][0]["finish_reason"], "length")
+
     def test_stop_string_cuts_stream(self):
         from aiohttp.test_utils import TestClient, TestServer
         engine = FakeEngine("alpha STOP beta")

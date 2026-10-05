@@ -422,6 +422,18 @@ class HttpTests(unittest.TestCase):
         self.assertIn("kaput", body["error"]["message"])
 
 
+    def test_stream_engine_error_still_ends_with_finish_reason(self):
+        class Boom(FakeEngine):
+            async def generate(self, prompt, **kw):
+                yield "abc "
+                raise RuntimeError("kaput")
+        _, raw = self.chat(Boom(""), {"messages": [{"role": "user", "content": "hi"}]}, stream=True)
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"))
+        ev = sse_events(raw)
+        self.assertIn("kaput", [e for e in ev if "error" in e][0]["error"]["message"])
+        self.assertEqual(ev[-1]["choices"][0]["finish_reason"], "error")
+
+
 class MiscTests(unittest.TestCase):
     def test_sse_framing_and_stop_text(self):
         self.assertEqual(serve.sse({"a": 1}), b'data: {"a":1}\n\n')

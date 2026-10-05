@@ -1094,6 +1094,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 job["cancel"].set()
                 try:
                     await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    # End the stream the OpenAI way: a bare drop makes clients report "stream ended without finish_reason".
+                    await response.write(sse(event({}, "error")))
+                    await response.write(b"data: [DONE]\n\n")
                     await response.write_eof()
                 except ConnectionError:
                     pass

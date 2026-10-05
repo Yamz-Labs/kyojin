@@ -195,6 +195,15 @@ def stop_text(text: str, stop: list[str]) -> tuple[str, str | None]:
     return text[:pos], match
 
 
+def token_limit(body: dict[str, Any], default: int = 4096) -> int:
+    """Reply token budget: max_completion_tokens (newer OpenAI field) wins over max_tokens."""
+    for key in ("max_completion_tokens", "max_tokens"):
+        value = body.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+            return value
+    return default
+
+
 def sse(data: dict[str, Any], event: str | None = None) -> bytes:
     prefix = f"event: {event}\n" if event else ""
     return (prefix + f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n").encode()
@@ -421,7 +430,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         store.busy = True
                     async for delta in engine.generate(
                         body["_prompt"],
-                        max_tokens=body.get("max_tokens", 4096), temperature=body.get("temperature", 0.0),
+                        max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
                         top_p=body.get("top_p", 1.0), stop=body.get("_stop", [])):
                         out.put_nowait(delta)
                     out.put_nowait(None)
@@ -485,7 +494,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         def finish_for(message: dict[str, Any], raw: str) -> str:
             # A reply cut by max_tokens is "length", not "stop" (clients use it to tell a truncated answer).
             finish = message.pop("finish_reason", "stop")
-            if finish == "stop" and engine.count_tokens(raw) >= body.get("max_tokens", 4096):
+            if finish == "stop" and engine.count_tokens(raw) >= token_limit(body):
                 finish = "length"
             return finish
 
@@ -525,20 +534,33 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     done = pos + len(tag)
                     mode = {"</think>": "content", "<think>": "reasoning", TOOL_OPEN: "tool"}[tag]
 
-            await response.write(sse(event({"role": "assistant", "content": ""})))
-            async for delta in deltas():
-                text += delta
-                await flush(False)
-            text, _ = stop_text(text, body["_stop"])
-            await flush(True)
-            message = parse_completion(text)
-            if "tool_calls" in message:
-                await response.write(sse(event({"tool_calls": [
-                    dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
-            await response.write(sse(event({}, finish_for(message, text[len(prefix):])) |
-                                     {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
-            await response.write(b"data: [DONE]\n\n")
-            await response.write_eof()
+            try:
+                await response.write(sse(event({"role": "assistant", "content": ""})))
+                async for delta in deltas():
+                    text += delta
+                    await flush(False)
+                text, _ = stop_text(text, body["_stop"])
+                await flush(True)
+                message = parse_completion(text)
+                if "tool_calls" in message:
+                    await response.write(sse(event({"tool_calls": [
+                        dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
+                await response.write(sse(event({}, finish_for(message, text[len(prefix):])) |
+                                         {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
+                await response.write(b"data: [DONE]\n\n")
+                await response.write_eof()
+            except (ConnectionResetError, asyncio.CancelledError):
+                raise                                                # client left: nothing to send
+            except Exception as exc:                                   # noqa: BLE001
+                # Fail inside the stream, but still end it the OpenAI way: clients such as OpenCode report
+                # "stream ended without finish_reason" and retry when the connection just drops.
+                try:
+                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await response.write(sse(event({}, "error")))
+                    await response.write(b"data: [DONE]\n\n")
+                    await response.write_eof()
+                except ConnectionError:
+                    pass
             return response
 
         raw = "".join([d async for d in deltas()])
