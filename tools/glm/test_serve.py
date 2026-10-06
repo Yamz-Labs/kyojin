@@ -362,6 +362,56 @@ class ServeTests(unittest.TestCase):
         self.assertEqual(v["llamacpp:requests_deferred"], 0)
         self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0)  # fake engine: no get_cache_stats
 
+    def test_stream_handler_finishes_after_stream(self):
+        """After a streamed reply the handler returns; it must not fall into the non-stream path
+        and wait forever on an empty queue."""
+        from aiohttp.test_utils import TestClient, TestServer
+        engine = FakeEngine("hello there")
+        app = serve.create_app(engine, "m", self.template)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            resp = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            await resp.read()
+            await asyncio.sleep(0.2)
+            pending = [t for t in asyncio.all_tasks()
+                       if "_handle_request" in repr(t.get_coro()) and not t.done()]
+            await client.close()
+            return pending
+
+        self.assertEqual(run(check()), [])
+
+    def test_cancelled_request_does_not_recount_previous_stats(self):
+        """An engine that returns on cancel without publishing stats leaves the previous request's
+        last_stats behind; the worker clears it before each job so nothing is counted twice."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class CancelEngine(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                if "cancelled" in prompt:
+                    return
+                    yield
+                async for d in super().generate(prompt, **kwargs):
+                    yield d
+
+        engine = CancelEngine("hello there")
+        app = serve.create_app(engine, "m", self.template)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            for text in ("one two", "cancelled"):
+                await client.post("/v1/chat/completions", json={
+                    "model": "m", "messages": [{"role": "user", "content": text}]})
+            text = await (await client.get("/metrics")).text()
+            await client.close()
+            return text
+
+        v = metrics_samples(run(check()))
+        self.assertEqual(v["llamacpp:tokens_predicted_total"], 4)  # one request, not two
+
     def test_two_queued_requests_are_both_counted(self):
         """Back-to-back requests each get their own timings handed over by the worker, so both are
         counted in full even though engine.last_stats is a single shared attr reset per job."""

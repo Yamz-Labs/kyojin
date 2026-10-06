@@ -494,6 +494,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 async with lock:
                     if store is not None:
                         store.busy = True
+                    engine.last_stats = {}  # a cancelled or failed job must not re-count the previous one
                     async for delta in engine.generate(
                         body["_prompt"],
                         max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
@@ -662,6 +663,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     await response.write_eof()
                 except ConnectionError:
                     pass
+            return response
 
         try:
             raw = "".join([d async for d in deltas()])
