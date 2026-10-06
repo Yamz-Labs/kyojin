@@ -280,6 +280,44 @@ class ListenerTest(unittest.TestCase):
         self.assertEqual(codes, [503] * 8)
 
 
+class ForkTest(unittest.TestCase):
+    def test_forked_child_does_not_keep_the_port(self):
+        import os
+        import time
+        t = tracker(["a"])
+        t.serve("127.0.0.1", 0)
+        port = t.server.port
+        pid = os.fork()
+        if pid == 0:                                                # child: lives on while the parent hands the port over
+            time.sleep(3)
+            os._exit(0)
+        try:
+            t.release_port()
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", port))
+            s.listen(1)
+            s.close()
+        finally:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+
+
+class LoadSignatureTest(unittest.TestCase):
+    """The keyword the servers pass must exist on every load path they call (read from source: no torch here)."""
+
+    def test_callback_reaches_load_paths(self):
+        root = TOOLS.parent / "exllamav3"
+        model = (root / "model" / "model.py").read_text()
+        self.assertIn("callback: Callable[[int, int], None] | None = None", model)
+        self.assertIn("self._load_single(progressbar, device, self.config, self.modules, verbose, callback)", model)
+        self.assertIn("def load(self, *args, **kwargs):", model)                  # load() forwards to load_gen
+        ls = (root / "model" / "model_ls.py").read_text()
+        self.assertIn("verbose: bool,\n        callback = None", ls)
+        init = (root / "model_init.py").read_text()
+        self.assertEqual(init.count("**kwargs\n"), 3)                             # signature + the two loads
+
+
 class WiringTest(unittest.TestCase):
     """The three servers call the same helper, in the right order, with stage names the lists declare."""
 

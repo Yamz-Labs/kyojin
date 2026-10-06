@@ -171,6 +171,9 @@ class _EarlyServer:
 
         self.httpd = Server((host, port), Handler)
         self.port = self.httpd.server_address[1]
+        # A fork-without-exec child would keep the listening socket open after close() and block the real bind.
+        sock = self.httpd.socket
+        os.register_at_fork(after_in_child=lambda: sock.close())
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True, name="startup-health")
         self.thread.start()
 

@@ -401,6 +401,7 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
     class (15 shapes). Warm-up has just logged every shape it met, so cross those shapes with all
     classes 256..4096 and pay the tuning here. A cached key costs one GEMM. Tuned winners are
     bit-exact with the default path, so outputs do not change. Returns (keys, seconds)."""
+    startup_health.stage("dense GEMM tuning")   # entered even when nothing is left to tune: a clean stage list
     path = dense_tune_path()
     if os.environ.get("EXL3_DENSE_GEMM_TUNE", "1") == "0" or not path.exists():
         return 0, 0.0
@@ -418,7 +419,6 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
             have.add((f[0], int(f[1]), int(f[2]), int(f[3]), int(f[4]), int(f[5])))
             tag = f[0]   # the last line carries the running library's tag (the C++ side appends)
     # Keys the C++ tuner already holds cost nothing to skip: no buffers, no GEMM.
-    startup_health.stage("dense GEMM tuning")
     todo = [(n, k, ldn, f32, mc) for n, k, ldn, f32 in sorted(shapes) for mc in sorted(classes)
             if (tag, n, k, mc, ldn, f32) not in have]
     print(f"serve: dense GEMM prime: {len(todo)} of {len(shapes) * len(classes)} keys missing", flush=True)
