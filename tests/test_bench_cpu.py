@@ -171,3 +171,43 @@ def test_table_reports_medians_not_means(server, monkeypatch, tmp_path):
     assert "| Prefill, ~1000 tokens (median of 3) | 200.0 tok/s |" in md, md
     for cat in bench.DECODE_PROMPTS:
         assert f"(median of 3) | 20.0 tok/s |" in [line[line.index("(median"):] for line in md.splitlines() if line.startswith(f"| Decode, {cat},")][0]
+
+
+def test_json_block_matches_the_table(server, monkeypatch, tmp_path):
+    # Unequal runs, so the JSON must carry the median (not the mean) and every run; "code" never gives a rate.
+    def prefill(base, model, text):
+        salt = text[1:text.index("]")]
+        return (300, 1.0) if salt.endswith("warm") else (1000, [100.0, 200.0, 600.0][int(salt.rsplit("-", 1)[1])])
+
+    def decode(base, model, prompt, max_tokens):
+        if prompt in bench.DECODE_PROMPTS["code"]:
+            return None
+        return next([10.0, 20.0, 60.0][p.index(prompt)] for p in bench.DECODE_PROMPTS.values() if prompt in p)
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text(" ".join(f"w{i}" for i in range(9000)))
+    monkeypatch.setattr(bench, "prefill", prefill)
+    monkeypatch.setattr(bench, "decode", decode)
+    monkeypatch.setattr(bench, "gpu_name", lambda: "gfx-test")
+    monkeypatch.setattr(bench, "rocm_version", lambda: "rocm-test")
+    argv = ["bench.py", "--base", server, "--model", MODEL, "--corpus", str(corpus)]
+    outs = []
+    for extra in ([], ["--json"]):
+        monkeypatch.setattr(sys, "argv", argv + extra)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            bench.main()
+        outs.append(out.getvalue())
+    plain, with_json = outs
+    assert "```json" not in plain
+    assert with_json.startswith(plain.rstrip("\n"))          # the Markdown block itself is unchanged
+    d = json.loads(re.search(r"```json\n(.*)\n```", with_json, re.S).group(1))
+    assert (d["model"], d["gpu_target"], d["rocm"], d["server"]) == (MODEL, "gfx-test", "rocm-test", server)
+    assert d["prefill"] == {"prompt_tokens": 1000, "max_tokens": 1, "temperature": 0, "tok_s": 200.0, "runs": [100.0, 200.0, 600.0]}
+    assert d["decode"]["prose"] == d["decode"]["chat"] == {"max_tokens": 128, "temperature": 0, "tok_s": 20.0, "runs": [10.0, 20.0, 60.0]}
+    assert d["decode"]["code"] == {"max_tokens": 128, "temperature": 0, "tok_s": None, "runs": []}
+    # the table shows the same medians
+    assert "| Prefill, ~1000 tokens (median of 3) | 200.0 tok/s |" in plain
+    for cat in ("prose", "chat"):
+        assert f"| Decode, {cat}, 128 tokens, temperature 0 (median of 3) | 20.0 tok/s |" in plain
+    assert "| Decode, code, 128 tokens, temperature 0 (median of 0) | n/a tok/s |" in plain
