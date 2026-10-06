@@ -47,7 +47,8 @@ top-level config does not carry `max_position_embeddings` — the GLM fix.
   accumulate when a request completes; `requests_processing`, `requests_deferred` and
   `kv_cache_usage_ratio` are read live. `spec_decode_num_drafts_total` counts the engine's
   decode steps (one verification round each while speculating), an upper bound when
-  `--spec-gate` falls back to plain.
+  `--spec-gate` falls back to plain. A request cancelled mid-stream is not counted in this
+  first version.
 
 ## SpecGate across mixed requests — decision
 

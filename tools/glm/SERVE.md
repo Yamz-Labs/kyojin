@@ -67,7 +67,7 @@ Prometheus text (llama.cpp `llamacpp:*` names) for scraping. Counters accumulate
 request completes; `requests_processing`, `requests_deferred` and `kv_cache_usage_ratio`
 are read live. `spec_decode_num_drafts_total` is derived from the accepted+rejected draft
 token counts divided by `--num-draft` (exact except for a final MTP window truncated by
-`max_tokens`).
+`max_tokens`). A request cancelled mid-stream is not counted in this first version.
 
 ### `POST /v1/chat/completions`
 
