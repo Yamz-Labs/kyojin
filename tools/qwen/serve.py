@@ -1698,14 +1698,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.sessions < 1:
         parser.error("--sessions must be at least 1")
-    # measured with --ndt 3: greedy output equal to a solo run at 2 sessions (8 verify rows) with --cache-bits 0; not at
-    # 4 sessions (16 rows), and not at 2 sessions with the 8-bit cache
+    # measured with --ndt 3: greedy output equal to a solo run on two short prompts at 2 sessions with --cache-bits 0; not at
+    # 4 sessions, and not at 2 sessions with the 8-bit cache. Equality at N > 1 is not guaranteed for either cache width:
+    # the split layout of the decode attention kernel depends on the batch
     if args.draft_policy != "off" and args.sessions * (args.ndt + 1) > 8:
         print(f"qserve: WARNING --sessions {args.sessions} x (--ndt {args.ndt} + 1) = {args.sessions * (args.ndt + 1)} verify rows "
               "is past 8: greedy output may differ from the same request run alone", flush=True)
-    if args.sessions > 1 and args.cache_bits:
-        print(f"qserve: WARNING --sessions {args.sessions} with --cache-bits {args.cache_bits}: greedy output may differ from the "
-              "same request run alone (--cache-bits 0 keeps it equal at 2 sessions)", flush=True)
+    if args.sessions > 1:
+        print(f"qserve: WARNING --sessions {args.sessions}: greedy output is not guaranteed equal to the same request run alone, "
+              "with either cache width (the 16-bit cache stayed equal on two short prompts; the attention kernel splits its "
+              "work by batch)", flush=True)
 
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
