@@ -266,9 +266,10 @@ class QSAIndexer(Module):
     # element is computed by the same MMA sequence whatever the tile, so the scores are bit-identical
     SCORE_CFG = os.environ.get("EXL3_QSA_SCORE_CFG", "")
     # ROCm has no dsa_topk_tile / dsa_topk_merge_tiles: its one-block-per-row top-k scans a row three times, and
-    # beyond ~32K pools the row no longer stays cache resident (about 10x the cost per column at 64K pools). N > 0 runs
-    # the top-k in tiles of N pools (a multiple of 128 is best, 16384 measured) through that same kernel and merges the
-    # per-tile candidates in torch under the kernel's own total order. 0 = one full-width pass
+    # beyond ~32K pools the row no longer stays cache resident (about 10x the cost per column at 64K pools). N > 0 never
+    # lets that kernel see a row wider than N pools: a longer selection is cut into equal tiles of at most N pools (a
+    # multiple of 128), each run through the same kernel, and the candidates are merged in torch under the kernel's own
+    # total order. Rows up to N pools stay one pass. 0 = always one full-width pass
     TOPK_TILE = int(os.environ.get("EXL3_QSA_TOPK_TILE", 0))
     # Row count up to which the plane-update workspaces come from g_tensor_cache (decode-class
     # calls: MTP verify, bsz > 1 fallbacks, where allocation latency matters); prefill chunks
@@ -318,7 +319,7 @@ class QSAIndexer(Module):
         kp = -(-k_sel // 32) * 32
         tiled_topk = hasattr(ext, "dsa_topk_tile") and hasattr(ext, "dsa_topk_merge_tiles")
         torch_merge = not tiled_topk and self.TOPK_TILE > 0
-        t_tile = self.TOPK_TILE if torch_merge else self.SEL_TILE
+        t_tile = self.TOPK_TILE // 128 * 128 if torch_merge else self.SEL_TILE
         if block_table is not None:
             t_tile = max(epp, t_tile // epp * epp)   # tiles must start on a pool page
         # Fixed score-row stride for every tile: it is a constexpr of the scoring kernel, so a
@@ -371,8 +372,10 @@ class QSAIndexer(Module):
             elif torch_merge:
                 cand = []
                 tile_idx = torch.empty((rows, kp), dtype = torch.int32, device = dev)
-                for t0 in range(0, T_slab, t_tile):
-                    t1 = min(t0 + t_tile, T_slab)
+                n_tiles = -(-T_slab // t_tile)
+                w = -(-(-(-T_slab // n_tiles)) // 128) * 128   # equal tiles, 128 aligned
+                for t0 in range(0, T_slab, w):
+                    t1 = min(t0 + w, T_slab)
                     sc = tile_scores(q_slab, rows, t0, t1)
                     ext.dsa_topk(sc, tile_idx, min(k_sel, t1 - t0), None, 0)
                     cand.append(tile_candidates(sc, tile_idx, t0))
