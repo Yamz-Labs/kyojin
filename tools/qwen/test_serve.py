@@ -367,6 +367,85 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(with_client(Slow("x"), fn), [200] * 4)
         self.assertEqual(Slow.peak, 1)
 
+    def test_sessions_run_together_and_reject_rebuilds(self):
+        class Slow(FakeEngine):
+            sessions = 2
+            active = peak = 0
+
+            async def generate(self, prompt, **kw):
+                Slow.active += 1
+                Slow.peak = max(Slow.peak, Slow.active)
+                await asyncio.sleep(0.05)
+                yield "x"
+                Slow.active -= 1
+
+        async def fn(client):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            rs = await asyncio.gather(*[client.post("/v1/chat/completions", json=body) for _ in range(4)])
+            bad = [await client.post("/v1/chat/completions", json=body | flag) for flag in ({"speculative": False}, {"cache_prompt": False})]
+            bad.append(await client.post("/completion", json={"prompt": "hi", "cache_prompt": False}))
+            bad.append(await client.post("/v1/completions", json={"prompt": "hi", "cache_prompt": False}))
+            return [r.status for r in rs], [r.status for r in bad]
+        self.assertEqual(with_client(Slow("x"), fn), ([200] * 4, [400] * 4))
+        self.assertEqual(Slow.peak, 2)
+
+    def test_sessions_accept_speculative_false_without_a_drafter(self):
+        class Plain(FakeEngine):
+            sessions, spec_on = 2, False
+
+        async def fn(client):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            ok = await client.post("/v1/chat/completions", json=body | {"speculative": False})
+            cold = await client.post("/v1/chat/completions", json=body | {"cache_prompt": False})
+            return ok.status, cold.status
+        self.assertEqual(with_client(Plain("x"), fn), (200, 400))
+
+    def test_sessions_keep_their_own_stats(self):
+        class PerPrompt(FakeEngine):
+            sessions = 2
+
+            async def generate(self, prompt, stats=None, **kw):
+                await asyncio.sleep(0.05)
+                stats.update(new_tokens=len(prompt), prompt_tokens=1, eos_reason="stop_token")
+                yield "x"
+
+        async def fn(client):
+            bodies = [{"model": "m", "messages": [{"role": "user", "content": "a" * n}]} for n in (10, 200)]
+            rs = await asyncio.gather(*[client.post("/v1/chat/completions", json=b) for b in bodies])
+            return [(await r.json())["usage"]["completion_tokens"] for r in rs]
+        a, b = with_client(PerPrompt("x"), fn)
+        self.assertEqual(b - a, 190)
+
+    def test_slot_action_waits_for_running_requests(self):
+        order = []
+
+        class Store:
+            busy = False
+
+            def save(self, name):
+                order.append("save")
+                return {"saved": name}
+
+        class Slow(FakeEngine):
+            sessions = 2
+
+            async def generate(self, prompt, **kw):
+                await asyncio.sleep(0.2)
+                order.append("generated")
+                yield "x"
+
+        eng = Slow("x")
+        eng.slot_store = Store()
+
+        async def fn(client):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            req = asyncio.ensure_future(client.post("/v1/chat/completions", json=body))
+            await asyncio.sleep(0.05)
+            save = await client.post("/slots/0?action=save", json={"filename": "a.bin"})
+            return (await req).status, save.status
+        self.assertEqual(with_client(eng, fn), (200, 200))
+        self.assertEqual(order, ["generated", "save"])
+
     def test_client_disconnect_cancels_the_job(self):
         class Endless(FakeEngine):
             stopped = False
