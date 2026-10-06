@@ -38,16 +38,21 @@ class StubGenerator:
     """Emits `per_iter` tokens per iterate() call from model(context) -> token id (0 = eos)."""
 
     def __init__(self, model, per_iter=3):
-        self.model, self.per_iter, self.job, self.out = model, per_iter, None, []
+        self.model, self.per_iter, self.job, self.out, self.serial = model, per_iter, None, [], 0
+        self.active_jobs, self.pending_jobs = [], []
 
     def enqueue(self, job):
         self.job, self.out = job, []
+        self.active_jobs[:] = [job]
+        job.serial_number, self.serial = self.serial, self.serial + 1
+        return job.serial_number
 
     def num_remaining_jobs(self):
         return 1 if self.job is not None else 0
 
     def cancel(self, job):
         self.job = None
+        self.active_jobs[:] = []
 
     def iterate(self):
         j, toks, eos, reason = self.job, [], False, None
@@ -61,11 +66,12 @@ class StubGenerator:
             if len(self.out) >= j.max_new:
                 eos, reason = True, "max_new_tokens"
                 break
-        ev = {"job": j, "token_ids": torch.tensor(toks), "text": "".join("</think>" if t == CLOSE else f"<{t}>" for t in toks)}
+        ev = {"job": j, "serial": j.serial_number, "token_ids": torch.tensor(toks), "text": "".join("</think>" if t == CLOSE else f"<{t}>" for t in toks)}
         if eos:
             ev |= {"eos": True, "eos_reason": reason, "new_tokens": len(self.out), "prompt_tokens": len(j.ids),
                    "cached_tokens": 0}
             self.job = None
+            self.active_jobs[:] = []
         return [ev]
 
 
@@ -260,6 +266,257 @@ class GuardEngineTests(unittest.TestCase):
     def test_real_job_accepts_seed(self):
         src = (Path(__file__).resolve().parents[2] / "exllamav3" / "generator" / "job.py").read_text()
         self.assertTrue(re.search(r"seed: int = None", src) and "random.Random(seed)" in src)
+
+
+class MultiStubGenerator(StubGenerator):
+    """StubGenerator with several jobs at once: each iterate() steps every job, like a batched decode."""
+
+    def __init__(self, model, per_iter=3, requeue_at=None):
+        super().__init__(model, per_iter)
+        self.jobs, self.peak, self.requeue_at = {}, 0, requeue_at
+
+    @property
+    def active_jobs(self):
+        return list(self.jobs)
+
+    @active_jobs.setter
+    def active_jobs(self, _):
+        pass
+
+    def enqueue(self, job):
+        job.serial_number = self.serial
+        if job.seed == 0:   # like Job.prepare_for_queue's fit check: the serial is set, then the enqueue fails
+            raise AssertionError("job does not fit")
+        self.jobs[job] = []
+        self.serial += 1
+        return job.serial_number
+
+    def num_remaining_jobs(self):
+        return len(self.jobs)
+
+    def cancel(self, job):
+        self.jobs.pop(job, None)
+
+    def iterate(self):
+        self.peak = max(self.peak, len(self.jobs))
+        evs = []
+        for j in list(self.jobs):
+            self.job, self.out = j, self.jobs[j]
+            evs += StubGenerator.iterate(self)
+            if self.job is None:
+                del self.jobs[j]
+            elif self.requeue_at and len(self.out) >= self.requeue_at and not getattr(j, "rq", False):
+                # a requeue that hands back another Job object with the same serial (Generator.prepare_for_requeue reuses
+                # the object; routing by serial must not depend on that)
+                rq = object.__new__(StubJob)
+                rq.__dict__.update(j.__dict__, ids=j.ids + self.out, max_new=j.max_new - len(self.out), rq=True)
+                del self.jobs[j]
+                self.jobs[rq] = []
+        self.job = None
+        return evs
+
+
+class SessionTests(unittest.TestCase):
+    @staticmethod
+    def seeded(ctx, job):
+        n = len(ctx) - 3
+        return 10_000 * job.seed + 200 + n if n < 30 else 0
+
+    def run_two(self, cancel_first_after=None, requeue_at=None):
+        e = make_engine(self.seeded, per_iter=2)
+        e.generator = MultiStubGenerator(self.seeded, per_iter=2, requeue_at=requeue_at)
+
+        async def one(seed, cancel):
+            st, n = {}, 0
+            async for _ in e.generate("p", stats=st, sampling={"temperature": 0}, stop=[], max_tokens=600, seed=seed,
+                                      loop_guard=False, cancel=cancel):
+                n += 1
+                if cancel_first_after and seed == 1 and n == cancel_first_after:
+                    cancel.set()
+            # generate() returns only after its cancels ran: no job of this request may be left at this point
+            self.assertFalse([j for j in e.generator.jobs if j.seed == seed])
+            return st.get("token_ids")
+
+        async def both():
+            # a lost route waits forever: fail instead of hanging
+            return await asyncio.wait_for(asyncio.gather(one(1, asyncio.Event()), one(2, asyncio.Event())), 10)
+        return asyncio.run(both()), e.generator
+
+    def test_concurrent_requests_get_their_own_tokens(self):
+        (a, b), gen = self.run_two()
+        self.assertEqual(a, [10_200 + i for i in range(30)])
+        self.assertEqual(b, [20_200 + i for i in range(30)])
+        self.assertEqual(gen.peak, 2)
+        self.assertEqual(gen.jobs, {})
+
+    def test_requeued_job_keeps_its_stream(self):
+        (a, b), gen = self.run_two(requeue_at=10)
+        self.assertEqual(a, [10_200 + i for i in range(30)])
+        self.assertEqual(b, [20_200 + i for i in range(30)])
+
+    def test_cancel_after_requeue_reaches_the_new_job(self):
+        (a, b), gen = self.run_two(cancel_first_after=8, requeue_at=4)
+        self.assertIsNone(a)
+        self.assertEqual(b, [20_200 + i for i in range(30)])
+        self.assertEqual(gen.jobs, {})
+
+    def test_failed_enqueue_does_not_cancel_the_job_that_reuses_its_serial(self):
+        e = make_engine(self.seeded, per_iter=2)
+        e.generator = MultiStubGenerator(self.seeded, per_iter=2)
+
+        async def one(seed):
+            st = {}
+            try:
+                async for _ in e.generate("p", stats=st, sampling={"temperature": 0}, stop=[], max_tokens=600, seed=seed,
+                                          loop_guard=False):
+                    pass
+            except AssertionError:
+                return "failed"
+            return st.get("token_ids")
+
+        async def both():
+            return await asyncio.wait_for(asyncio.gather(one(0), one(2)), 10)
+        failed, b = asyncio.run(both())
+        self.assertEqual(failed, "failed")
+        self.assertEqual(b, [20_200 + i for i in range(30)])
+
+    def test_stopped_driver_fails_the_request_instead_of_hanging(self):
+        e = make_engine(self.seeded, per_iter=1)
+        e.generator = MultiStubGenerator(self.seeded, per_iter=1)
+
+        async def go():
+            n = 0
+            async for _ in e.generate("p", stats={}, sampling={"temperature": 0}, stop=[], max_tokens=600, seed=1,
+                                      loop_guard=False):
+                n += 1
+                if n == 2:
+                    e._driver.cancel()
+        with self.assertRaisesRegex(RuntimeError, "driver has stopped"):
+            asyncio.run(asyncio.wait_for(go(), 10))
+
+    def poisoned_engine(self, poison, once):
+        """Engine whose generator hands back one event the driver cannot route (`poison(ev)` damages it), or raises."""
+        class Poison(MultiStubGenerator):
+            hit = False
+            cleared = 0
+
+            def iterate(self):
+                evs = super().iterate()
+                if evs and not Poison.hit and evs[0]["job"].seed == 1 and len(self.jobs.get(evs[0]["job"], ())) >= 4:
+                    Poison.hit = True
+                    poison(evs[0])
+                return evs
+
+            def clear_queue(self):
+                Poison.cleared += 1
+                self.jobs.clear()
+
+        e = make_engine(self.seeded, per_iter=2)
+        e.generator = Poison(self.seeded, per_iter=2)
+        return e
+
+    @staticmethod
+    async def one(e, seed):
+        st = {}
+        try:
+            async for _ in e.generate("p", stats=st, sampling={"temperature": 0}, stop=[], max_tokens=600, seed=seed,
+                                      loop_guard=False):
+                pass
+        except Exception as exc:                                      # noqa: BLE001
+            return exc
+        return st.get("token_ids")
+
+    def test_event_without_serial_fails_only_its_request_and_the_server_keeps_serving(self):
+        e = self.poisoned_engine(lambda ev: ev.pop("serial"), True)
+
+        async def go():
+            a, b = await asyncio.wait_for(asyncio.gather(self.one(e, 1), self.one(e, 2)), 10)
+            later = await asyncio.wait_for(self.one(e, 3), 10)
+            return a, b, later
+        a, b, later = asyncio.run(go())
+        self.assertIsInstance(a, KeyError)
+        self.assertEqual(b, [20_200 + i for i in range(30)])        # the other session is not touched
+        self.assertEqual(later, [30_200 + i for i in range(30)])    # a later request on the same driver succeeds
+        self.assertEqual(e.generator.jobs, {})
+
+    def test_event_with_no_job_either_fails_every_request_but_not_the_driver(self):
+        e = self.poisoned_engine(lambda ev: (ev.pop("serial"), ev.pop("job")), True)
+
+        async def go():
+            a, b = await asyncio.wait_for(asyncio.gather(self.one(e, 1), self.one(e, 2)), 10)
+            later = await asyncio.wait_for(self.one(e, 3), 10)
+            return a, b, later
+        a, b, later = asyncio.run(go())
+        self.assertIsInstance(a, KeyError)
+        self.assertIsInstance(b, KeyError)
+        self.assertEqual(later, [30_200 + i for i in range(30)])
+
+    def test_crashed_driver_is_replaced_by_the_next_request(self):
+        e = self.poisoned_engine(lambda ev: None, True)
+        real = e.generator.num_remaining_jobs
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 6:            # outside the executor calls: nothing in the loop catches it
+                raise ValueError("boom")
+            return real()
+        e.generator.num_remaining_jobs = flaky
+
+        async def go():
+            a = await asyncio.wait_for(self.one(e, 1), 10)
+            later = await asyncio.wait_for(self.one(e, 3), 10)
+            return a, later
+        a, later = asyncio.run(go())
+        self.assertIsInstance(a, RuntimeError)
+        self.assertIn("driver has stopped", str(a))
+        self.assertEqual(later, [30_200 + i for i in range(30)])
+
+    def test_shutdown_still_fails_waiting_requests_and_returns(self):
+        e = make_engine(self.seeded, per_iter=1)
+        e.generator = MultiStubGenerator(self.seeded, per_iter=1)
+
+        async def go():
+            first = asyncio.ensure_future(self.one(e, 1))
+            while not any(e.generator.jobs.values()):  # a request is decoding
+                await asyncio.sleep(0)
+            e._driver.cancel()
+            r = await asyncio.wait_for(first, 10)
+            late = await asyncio.wait_for(self.one(e, 2), 10)
+            return r, late
+        r, late = asyncio.run(go())
+        for res in (r, late):
+            self.assertIsInstance(res, RuntimeError)
+            self.assertIn("driver has stopped", str(res))        # cancelled: not restarted
+
+    def test_shutdown_while_a_command_runs_fails_it_and_asyncio_run_returns(self):
+        import threading
+        e = make_engine(self.seeded, per_iter=1)
+        e.generator = MultiStubGenerator(self.seeded, per_iter=1)
+        started, release = threading.Event(), threading.Event()
+
+        def slow():
+            started.set()
+            release.wait(5)
+            return "late"
+
+        async def go():
+            cmd = asyncio.ensure_future(e.run_exclusive(slow))
+            while not started.is_set():
+                await asyncio.sleep(0.005)
+            e._driver.cancel()
+            try:
+                await asyncio.wait_for(cmd, 5)
+            finally:
+                release.set()
+        with self.assertRaisesRegex(RuntimeError, "driver has stopped"):
+            asyncio.run(go())
+
+    def test_cancel_leaves_the_other_session_running(self):
+        (a, b), gen = self.run_two(cancel_first_after=3)
+        self.assertIsNone(a)
+        self.assertEqual(b, [20_200 + i for i in range(30)])
+        self.assertEqual(gen.jobs, {})
 
 
 class HttpFieldTests(unittest.TestCase):

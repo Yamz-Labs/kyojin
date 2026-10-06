@@ -276,6 +276,15 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(ev[-1]["usage"]["completion_tokens"], 7)
         self.assertIn("timings", ev[-1])
 
+    def test_parallel_tool_calls_one_stream_message_each(self):
+        eng = FakeEngine("</think>\n\n" + CALL + "\n" + CALL + "\n" + CALL)
+        st, raw = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}], "tools": TOOLS}, stream=True)
+        msgs = [e["choices"][0]["delta"]["tool_calls"] for e in sse_events(raw) if e["choices"][0]["delta"].get("tool_calls")]
+        self.assertEqual([len(m) for m in msgs], [1, 1, 1])
+        self.assertEqual([m[0]["index"] for m in msgs], [0, 1, 2])
+        for m in msgs:
+            json.loads(m[0]["function"]["arguments"])
+
     def test_stream_length(self):
         eng = FakeEngine("abc", {"new_tokens": 2, "eos_reason": "max_new_tokens"})
         _, raw = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}]}, stream=True)
@@ -365,6 +374,85 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(with_client(Slow("x"), fn), [200] * 4)
         self.assertEqual(Slow.peak, 1)
 
+    def test_sessions_run_together_and_reject_rebuilds(self):
+        class Slow(FakeEngine):
+            sessions = 2
+            active = peak = 0
+
+            async def generate(self, prompt, **kw):
+                Slow.active += 1
+                Slow.peak = max(Slow.peak, Slow.active)
+                await asyncio.sleep(0.05)
+                yield "x"
+                Slow.active -= 1
+
+        async def fn(client):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            rs = await asyncio.gather(*[client.post("/v1/chat/completions", json=body) for _ in range(4)])
+            bad = [await client.post("/v1/chat/completions", json=body | flag) for flag in ({"speculative": False}, {"cache_prompt": False})]
+            bad.append(await client.post("/completion", json={"prompt": "hi", "cache_prompt": False}))
+            bad.append(await client.post("/v1/completions", json={"prompt": "hi", "cache_prompt": False}))
+            return [r.status for r in rs], [r.status for r in bad]
+        self.assertEqual(with_client(Slow("x"), fn), ([200] * 4, [400] * 4))
+        self.assertEqual(Slow.peak, 2)
+
+    def test_sessions_accept_speculative_false_without_a_drafter(self):
+        class Plain(FakeEngine):
+            sessions, spec_on = 2, False
+
+        async def fn(client):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            ok = await client.post("/v1/chat/completions", json=body | {"speculative": False})
+            cold = await client.post("/v1/chat/completions", json=body | {"cache_prompt": False})
+            return ok.status, cold.status
+        self.assertEqual(with_client(Plain("x"), fn), (200, 400))
+
+    def test_sessions_keep_their_own_stats(self):
+        class PerPrompt(FakeEngine):
+            sessions = 2
+
+            async def generate(self, prompt, stats=None, **kw):
+                await asyncio.sleep(0.05)
+                stats.update(new_tokens=len(prompt), prompt_tokens=1, eos_reason="stop_token")
+                yield "x"
+
+        async def fn(client):
+            bodies = [{"model": "m", "messages": [{"role": "user", "content": "a" * n}]} for n in (10, 200)]
+            rs = await asyncio.gather(*[client.post("/v1/chat/completions", json=b) for b in bodies])
+            return [(await r.json())["usage"]["completion_tokens"] for r in rs]
+        a, b = with_client(PerPrompt("x"), fn)
+        self.assertEqual(b - a, 190)
+
+    def test_slot_action_waits_for_running_requests(self):
+        order = []
+
+        class Store:
+            busy = False
+
+            def save(self, name):
+                order.append("save")
+                return {"saved": name}
+
+        class Slow(FakeEngine):
+            sessions = 2
+
+            async def generate(self, prompt, **kw):
+                await asyncio.sleep(0.2)
+                order.append("generated")
+                yield "x"
+
+        eng = Slow("x")
+        eng.slot_store = Store()
+
+        async def fn(client):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            req = asyncio.ensure_future(client.post("/v1/chat/completions", json=body))
+            await asyncio.sleep(0.05)
+            save = await client.post("/slots/0?action=save", json={"filename": "a.bin"})
+            return (await req).status, save.status
+        self.assertEqual(with_client(eng, fn), (200, 200))
+        self.assertEqual(order, ["generated", "save"])
+
     def test_client_disconnect_cancels_the_job(self):
         class Endless(FakeEngine):
             stopped = False
@@ -439,6 +527,171 @@ class HttpTests(unittest.TestCase):
         ev = sse_events(raw)
         self.assertIn("kaput", [e for e in ev if "error" in e][0]["error"]["message"])
         self.assertEqual(ev[-1]["choices"][0]["finish_reason"], "error")
+
+
+class LogprobsTests(unittest.TestCase):
+    ENTRIES = [(-0.5, [(1, -0.5), (9, -1.5)]), (-2.0, [(2, -0.25), (3, -2.0)]), None]
+
+    def engine(self):
+        eng = FakeEngine("abc", {"new_tokens": 3, "prompt_tokens": 2, "eos_reason": "stop_token", "token_ids": [1, 2, 3],
+                                 "logprobs": self.ENTRIES})
+        eng.token_str = lambda i: f"t{i}"
+        return eng
+
+    def post(self, path, payload):
+        async def fn(client):
+            r = await client.post(path, json={"model": "m"} | payload)
+            return r.status, await r.json()
+        return with_client(self.engine(), fn)
+
+    def test_completions_shape_and_request(self):
+        eng = self.engine()
+
+        async def fn(client):
+            r = await client.post("/v1/completions", json={"model": "m", "prompt": "hi", "max_tokens": 3, "logprobs": 2})
+            return r.status, await r.json()
+        st, body = with_client(eng, fn)
+        self.assertEqual(st, 200)
+        self.assertEqual(eng.calls[0][1]["logprobs"], 2)
+        lp = body["choices"][0]["logprobs"]
+        self.assertEqual(lp["tokens"], ["t1", "t2", "t3"])
+        self.assertEqual(lp["token_ids"], [1, 2, 3])
+        self.assertEqual(lp["token_logprobs"], [-0.5, -2.0, None])
+        self.assertEqual(lp["top_logprobs"][0], {"t1": -0.5, "t9": -1.5})
+        self.assertEqual(lp["top_logprobs_ids"][1], [[2, -0.25], [3, -2.0]])
+        self.assertEqual(lp["text_offset"], [0, 2, 4])
+
+    def test_chat_shape(self):
+        st, body = self.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}],
+                                                      "logprobs": True, "top_logprobs": 2})
+        self.assertEqual(st, 200)
+        c = body["choices"][0]["logprobs"]["content"]
+        self.assertEqual([x["token_id"] for x in c], [1, 2, 3])
+        self.assertEqual(c[0]["logprob"], -0.5)
+        self.assertEqual([t["token_id"] for t in c[0]["top_logprobs"]], [1, 9])
+        self.assertIsNone(c[2]["logprob"])
+
+    def test_off_by_default_and_bad_values(self):
+        st, body = self.post("/v1/completions", {"prompt": "hi"})
+        self.assertEqual(st, 200)
+        self.assertIsNone(body["choices"][0]["logprobs"])
+        for path, extra in (("/v1/completions", {"prompt": "hi", "logprobs": 21}),
+                            ("/v1/completions", {"prompt": "hi", "logprobs": -1}),
+                            ("/v1/completions", {"prompt": "hi", "logprobs": 2, "stream": True}),
+                            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}], "logprobs": True, "top_logprobs": 25}),
+                            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}], "top_logprobs": 3}),
+                            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}], "logprobs": 5})):
+            self.assertEqual(self.post(path, extra)[0], 400, (path, extra))
+
+    def stop_engine(self):
+        eng = FakeEngine("", {"new_tokens": 0, "prompt_tokens": 2, "eos_reason": "stop_token", "token_ids": [],
+                              "logprobs": [(-0.1, [(151645, -0.1), (9, -2.5)])], "logprob_token_ids": [151645]})
+        eng.token_str = lambda i: f"t{i}"
+        return eng
+
+    def test_stop_token_position_is_scored(self):
+        """max_tokens=1 and the model's argmax is the stop token: no content, finish_reason stop, logprobs present."""
+        async def comp(client):
+            r = await client.post("/v1/completions", json={"model": "m", "prompt": "hi", "max_tokens": 1, "logprobs": 2})
+            return r.status, await r.json()
+        st, body = with_client(self.stop_engine(), comp)
+        ch = body["choices"][0]
+        self.assertEqual((st, ch["text"], ch["finish_reason"]), (200, "", "stop"))
+        self.assertEqual(ch["logprobs"]["token_ids"], [151645])
+        self.assertEqual(ch["logprobs"]["top_logprobs_ids"], [[[151645, -0.1], [9, -2.5]]])
+
+        async def chat(client):
+            r = await client.post("/v1/chat/completions", json={"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                                                                 "max_tokens": 1, "logprobs": True, "top_logprobs": 2})
+            return r.status, await r.json()
+        st, body = with_client(self.stop_engine(), chat)
+        ch = body["choices"][0]
+        self.assertEqual((st, ch["finish_reason"]), (200, "stop"))
+        self.assertEqual([x["token_id"] for x in ch["logprobs"]["content"]], [151645])
+        self.assertEqual([t["token_id"] for t in ch["logprobs"]["content"][0]["top_logprobs"]], [151645, 9])
+
+    def test_stop_logprobs_from_event(self):
+        import torch
+        ev = {"eos_reason": "stop_token", "eos_triggering_token_id": 5, "stop_token_prob": torch.tensor([[0.5]]),
+              "stop_token_top_k_tokens": torch.tensor([[[5, 8]]]), "stop_token_top_k_probs": torch.tensor([[[0.5, 0.25]]])}
+        e = serve.QwenEngine._stop_logprobs(ev)
+        self.assertAlmostEqual(e[0], -0.6931471805599453, places=6)
+        self.assertEqual([a for a, _ in e[1]], [5, 8])
+        self.assertIsNone(serve.QwenEngine._stop_logprobs({"eos_reason": "max_new_tokens"}))
+        self.assertIsNone(serve.QwenEngine._stop_logprobs({"eos_reason": "stop_token"}))
+
+    def test_event_logprobs(self):
+        import torch
+        ev = {"token_probs": torch.tensor([[0.5, 0.25]]), "top_k_tokens": torch.tensor([[[7, 8], [4, 5]]]),
+              "top_k_probs": torch.tensor([[[0.5, 0.25], [0.5, 0.25]]])}
+        out = serve.QwenEngine._event_logprobs(ev, 2)
+        self.assertAlmostEqual(out[0][0], -0.6931471805599453, places=6)
+        self.assertEqual([a for a, _ in out[1][1]], [4, 5])
+        self.assertEqual(serve.QwenEngine._event_logprobs({}, 2), [None, None])
+
+
+class ReplyRoomTests(unittest.TestCase):
+    """The reply budget must never make Job.prepare ask for more pages than the page table holds."""
+
+    @staticmethod
+    def pages_needed(x, new_tokens, draft):
+        """Job.prepare for one sequence without an explicit requeue budget: max_rq = new + 1 + draft; pagetable.Sequence.prepare."""
+        max_len = x + new_tokens + 1 + draft
+        return (max_len + 255) // 256
+
+    def test_room_is_exactly_the_largest_that_fits(self):
+        for ctx in (4096, 4097, 4351, 131072, 272384, 98305):
+            pages = ctx // 256                       # PageTable.max_pages = cache.max_num_tokens // PAGE_SIZE
+            for draft in (0, 1, 3, 4):
+                for x in (1, 255, 256, 257, 1000, ctx - 300, ctx - 5, ctx - 4):
+                    room = serve.reply_room(ctx, x, draft)
+                    if room < 1:
+                        self.assertGreater(self.pages_needed(x, 1, draft), pages, (ctx, draft, x))
+                        continue
+                    self.assertLessEqual(self.pages_needed(x, room, draft), pages, (ctx, draft, x))      # fits
+                    self.assertGreater(self.pages_needed(x, room + 1, draft), pages, (ctx, draft, x))     # one more does not
+
+    def test_old_rule_overflowed_at_the_page_boundary(self):
+        ctx, x, draft = 131072, 1000, 3
+        old = ctx - x - 1
+        self.assertGreater(self.pages_needed(x, old, draft), ctx // 256)
+        self.assertEqual(serve.reply_room(ctx, x, draft), old - draft)
+        self.assertEqual(serve.reply_room(ctx, x, 0), old)           # no speculation: nothing lost
+
+    def test_draft_window_only_when_speculating(self):
+        class E:
+            ndt, draft_model = 3, object()
+        self.assertEqual(serve.draft_window(E()), 3)
+        self.assertEqual(serve.draft_window(E(), False), 0)
+        self.assertEqual(serve.draft_window(FakeEngine("x")), 0)
+
+    def test_http_clip_and_400(self):
+        class E(FakeEngine):
+            ctx, ndt, draft_model = 4096, 3, object()
+        eng = E("x")
+        words = lambda n: "w " * n
+
+        async def fn(client):
+            out = []
+            for n, mt in ((100, 100000), (4096 - 4 - 3, 10), (4096, 10)):
+                r = await client.post("/v1/completions", json={"model": "m", "prompt": words(n), "max_tokens": mt})
+                out.append((r.status, await r.json()))
+            return out
+        res = with_client(eng, fn)
+        self.assertEqual(res[0][0], 200)
+        self.assertEqual(eng.calls[0][1]["max_tokens"], 4096 - eng.count_tokens(words(100)) - 1 - 3)
+        self.assertEqual(res[2][0], 400)
+        self.assertEqual(res[2][1]["error"]["type"], "invalid_request_error")
+        self.assertIn("context length exceeded", res[2][1]["error"]["message"])
+
+    def test_completions_honours_speculative_false(self):
+        eng = FakeEngine("x")
+
+        async def fn(client):
+            await client.post("/v1/completions", json={"model": "m", "prompt": "hi", "speculative": False})
+            await client.post("/v1/completions", json={"model": "m", "prompt": "hi"})
+        with_client(eng, fn)
+        self.assertEqual([c[1]["speculative"] for c in eng.calls], [False, True])
 
 
 class MiscTests(unittest.TestCase):

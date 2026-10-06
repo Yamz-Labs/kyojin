@@ -22,7 +22,7 @@ template <class S7, bool TM, int OCC, int INL, int ABL = 0> int grid7()
         int nb = 0, dev = 0; hipGetDevice(&dev);
         hipDeviceProp_t prop; hipGetDeviceProperties(&prop, dev);
         cuda_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&nb, (OCC ? (const void*) mf9::moe_fused9o_kernel<S7, TM, (bool) INL, ABL> : (const void*) mf9::moe_fused9_kernel<S7, TM, (bool) INL, ABL>), mf::THREADS, 0));
-        return (OCC == 3 ? 1 : OCC == 2 ? 2 : std::max(1, nb)) * prop.multiProcessorCount;   // OCC 2: forced two blocks per WGP (the occupancy API reports one); OCC 3: one block per WGP, half the VGPR / LDS free for other GPU clients
+        return (OCC == 3 ? 1 : (OCC == 2 || OCC == 4) ? 2 : std::max(1, nb)) * prop.multiProcessorCount;   // OCC 2: forced two blocks per WGP (the occupancy API reports one); OCC 4: two blocks per WGP as six stage launches without any grid barrier; OCC 3: one block per WGP, half the VGPR / LDS free for other GPU clients
     }();
     return G;
 }
@@ -60,8 +60,21 @@ template <class S7, bool TM, int OCC, int INL, int ABL = 0> void launch7(const a
     p.dots = (float*) (wb + off[1]); p.post = (float*) (wb + off[2]); p.mixed = (half*) (wb + off[3]); p.scores = (half*) (wb + off[4]);
     p.sgl = (float*) (wb + off[5]); p.gu = (half*) (wb + off[6]); p.dn = (float*) (wb + off[7]); p.ydbg = (float*) (wb + off[8]); p.seldbg = (int*) (wb + off[9]);
     p.rms_eps = (float) rms_eps;
-    if (OCC) { mf9::moe_fused9o_kernel<S7, TM, (bool) INL, ABL><<<p.G, mf::THREADS, 0, stream>>>(p, vmask); }
-    else { mf9::moe_fused9_kernel<S7, TM, (bool) INL, ABL><<<p.G, mf::THREADS, 0, stream>>>(p, vmask); }
+    if constexpr (OCC == 4)
+    {
+        static_assert(!TM && INL == 1, "split launches: no timing build, inline phases");
+        mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 0><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
+        mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 1><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
+        mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 2><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
+        mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 3><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
+        mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 4><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
+        mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 5><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
+    }
+    else
+    {
+        if (OCC) { mf9::moe_fused9o_kernel<S7, TM, (bool) INL, ABL><<<p.G, mf::THREADS, 0, stream>>>(p, vmask); }
+        else { mf9::moe_fused9_kernel<S7, TM, (bool) INL, ABL><<<p.G, mf::THREADS, 0, stream>>>(p, vmask); }
+    }
     cuda_check(hipPeekAtLastError());
 }
 }  // namespace
@@ -81,6 +94,7 @@ void mf9_half(at::Tensor& x, const at::Tensor& fn, const at::Tensor& fn_scale, c
 #define L7A(SH, TMV, OCCV, INLV, ABLV) launch7<SH, TMV, OCCV, INLV, ABLV>(x, fn, fn_scale, upt, up_scale, w_h, router, sgate, wt, svt, ws, rms_eps, (int) native, R, (int) (variant & 0xffff), stream)
 #define L7(SH, TMV, OCCV, INLV) launch7<SH, TMV, OCCV, INLV>(x, fn, fn_scale, upt, up_scale, w_h, router, sgate, wt, svt, ws, rms_eps, (int) native, R, (int) (variant & 0xffff), stream)
 #define X7(SH) if (Match7<SH>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) { \
+        if (variant & 0x100000) { TORCH_CHECK((variant & 0x1f0000) == 0x160000 && !timing, "mf9: split launches (0x100000) need variant 0x160000 and no timing"); L7(SH, false, 4, 1); return; }   /* six stage launches, no grid barrier */ \
         if ((variant & 0x80000) && (variant & 0x70000) == 0x60000) { if (timing) L7(SH, true, 3, 1); else L7(SH, false, 3, 1); return; }   /* one block per WGP */ \
         const int occ = (variant & 0x40000) ? 2 : ((variant & 0x10000) != 0), inl = (variant & 0x20000) != 0; \
         if (timing) { if (occ == 2) { if (inl) L7(SH, true, 2, 1); else L7(SH, true, 2, 0); } else if (occ) { if (inl) L7(SH, true, 1, 1); else L7(SH, true, 1, 0); } else { if (inl) L7(SH, true, 0, 1); else L7(SH, true, 0, 0); } return; } \
@@ -90,6 +104,7 @@ void mf9_half(at::Tensor& x, const at::Tensor& fn, const at::Tensor& fn_scale, c
     // the shapes of K3 / K4 routed packs and K4 / K5 shared experts carry the served variant only (two blocks per WGP, forced inline, no timing build)
 #define X9D(SH) if (Match7<SH>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) { \
         TORCH_CHECK((variant & 0x70000) == 0x60000, "mf9: this shape is instantiated for the default variant 0x60000 only"); \
+        if (variant & 0x100000) { TORCH_CHECK((variant & 0x1f0000) == 0x160000 && !timing, "mf9: split launches (0x100000) need variant 0x160000 and no timing"); L7(SH, false, 4, 1); return; }   /* split launches */ \
         const bool one = (variant & 0x80000) != 0;   /* one block per WGP, same kernel and arithmetic */ \
         if (timing) { if (one) L7(SH, true, 3, 1); else L7(SH, true, 2, 1); return; } \
         if (one) L7(SH, false, 3, 1); else L7(SH, false, 2, 1); return; }

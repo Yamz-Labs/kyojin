@@ -251,5 +251,32 @@ __global__ __launch_bounds__(THREADS) void moe_fused9_kernel(Params p, int vm) {
 template <class S, bool TM, bool INL, int ABL = 0>
 __global__ __launch_bounds__(THREADS) __attribute__((amdgpu_num_vgpr(192))) void moe_fused9o_kernel(Params p, int vm) { body9<S, TM, INL, ABL>(p, vm); }
 
+// Split launches. The same phases and the same block partition as body9 (G = two blocks per WGP), but every grid barrier is a kernel boundary,
+// so no block ever waits for another one and residency does not matter (a desktop client sharing the iGPU cannot stall or corrupt the step).
+// Stage 0 dots | 1 finalize | 2 router | 3 top-k + gate/up | 4 down | 5 combine. The top-k result crosses the boundaries through seldbg (selected experts and weights, written by block 0 of stage 3).
+template <class S, bool INL, int ABL, int STAGE>
+__device__ __forceinline__ void body9s(const Params& p, int vm)
+{
+    static_assert(INL, "split launches exist for the forced-inline phases only");
+    __shared__ Smem<S> s;
+    uint32_t sink = 0;
+    if constexpr (STAGE == 0) { if (vm & V_T0) touch_static<S>(p, vm, sink); ph_dots9<S>(p, s, vm, sink); }
+    if constexpr (STAGE == 1) ph_finalize9<S, false>(p, s);
+    if constexpr (STAGE == 2) ph_router9<S>(p, s);
+    if constexpr (STAGE == 3)
+    {
+        ph_topk9<S>(p, s, vm);
+        if (blockIdx.x == 0 && threadIdx.x < p.R * S::TOPK) p.seldbg[threadIdx.x] = s.sel[threadIdx.x];
+        if (blockIdx.x == 0 && threadIdx.x < p.R * S::TOPK) p.seldbg[64 + threadIdx.x] = (int) __half_as_ushort(s.wt[threadIdx.x]);
+        if (vm & V_TDOWN) touch_down<S>(p, s, sink);
+        ph_gateup9<S, ABL>(p, s);
+    }
+    if constexpr (STAGE == 4) { topk_restore9<S>(p, s); ph_down9<S, ABL>(p, s); }
+    if constexpr (STAGE == 5) { topk_restore9<S>(p, s); ph_combine9<S>(p, s); }
+    asm volatile("" :: "v"(sink));
+}
+template <class S, bool INL, int ABL, int STAGE>
+__global__ __launch_bounds__(THREADS) __attribute__((amdgpu_num_vgpr(192))) void moe_fused9s_kernel(Params p, int vm) { body9s<S, INL, ABL, STAGE>(p, vm); }
+
 }  // namespace mf9
 #endif

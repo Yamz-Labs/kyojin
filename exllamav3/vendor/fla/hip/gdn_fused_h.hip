@@ -47,6 +47,9 @@ typedef uint32_t v8u __attribute__((ext_vector_type(8)));
 #ifndef OST
 #define OST 0    // 1: o tile staged through LDS (sW) and written as 16 B vectors, full 256 B rows (same bits; replaces 2 B stores of 32 B row pieces)
 #endif
+#ifndef CKPT
+#define CKPT 0   // 1: two extra kernel arguments (hc, ckpt_chunk, hc2, ckpt_chunk2): the state after a given chunk is also written to hc / hc2 (same bits as ht would hold there)
+#endif
 #ifndef PF1
 #define PF1 0    // 1: phase 1 writes its LDS tiles directly after a barrier at the top of the chunk (no register staging across a barrier; same bits)
 #endif
@@ -133,7 +136,11 @@ extern "C" __global__ __launch_bounds__(256) void gdn_fused_h_o(
     const uint16_t* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const float* __restrict__ g, const uint16_t* __restrict__ beta, const uint16_t* __restrict__ A,
     uint16_t* __restrict__ o, const float* __restrict__ h0, float* __restrict__ ht, float scale, int T, int H, int HV, int PV,
-    uint16_t* __restrict__ dw, uint16_t* __restrict__ du, uint16_t* __restrict__ dvn, uint16_t* __restrict__ dh)
+    uint16_t* __restrict__ dw, uint16_t* __restrict__ du, uint16_t* __restrict__ dvn, uint16_t* __restrict__ dh
+#if CKPT
+    , float* __restrict__ hc, int ckpt_chunk, float* __restrict__ hc2, int ckpt_chunk2
+#endif
+    )
 {
     __shared__ __attribute__((aligned(16))) uint16_t sW[BT * LDR];   // w [token][kdim]
     __shared__ __attribute__((aligned(16))) uint16_t sX[KD * LDT];   // kb^T [kdim][token], then q [token][kdim]
@@ -491,6 +498,21 @@ extern "C" __global__ __launch_bounds__(256) void gdn_fused_h_o(
                 if (!(ABL & 16)) h[kt] = wmma(ld16(sY, 16 * kt + ll, LDT, 16 * j), vg[j], h[kt]);
             SBAR(2);
         }
+#if CKPT
+        // mid-chunk checkpoints (EXL3_PF_NO_TAIL): the state after chunk ckpt_chunk - 1 (= row 64 * ckpt_chunk), layout of ht
+        if (hc && i_t + 1 == ckpt_chunk)
+            #pragma unroll
+            for (int kt = 0; kt < 8; ++kt)
+                #pragma unroll
+                for (int r = 0; r < 8; ++r)
+                    hc[IX_S(i_nh, 16 * kt + 2 * r + half, col)] = h[kt][r];
+        if (hc2 && i_t + 1 == ckpt_chunk2)
+            #pragma unroll
+            for (int kt = 0; kt < 8; ++kt)
+                #pragma unroll
+                for (int r = 0; r < 8; ++r)
+                    hc2[IX_S(i_nh, 16 * kt + 2 * r + half, col)] = h[kt][r];
+#endif
     }
 
     if (ABL & 256) { if (sink == 0x9e3779b9u && tid == 0) o[0] = 0; }   // keeps the ablated o path alive

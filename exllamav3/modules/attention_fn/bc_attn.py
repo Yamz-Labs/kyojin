@@ -716,6 +716,18 @@ def build_bc_attn(module, layer):
             layer.raw_k.device == torch.device(m.device)
         ))
     ):
+        if _bc_trace:
+            print(" -- BC-attn why2:", dict(en=bc_attn_enable, qsa=bool(_qsa_module_eligible(m)),
+                  q=getattr(m.q_proj, "quant_type", None), qbc=getattr(getattr(m.q_proj, "inner", None), "bc", None) is not None,
+                  o=getattr(m.o_proj, "quant_type", None), obc=getattr(getattr(m.o_proj, "inner", None), "bc", None) is not None,
+                  k=getattr(m.k_proj, "quant_type", None), kbc=getattr(getattr(m.k_proj, "inner", None), "bc", None) is not None,
+                  mkv=m.multi_kv is not None, vd=getattr(m, "v_head_dim", None), hd=m.head_dim,
+                  gate=(m.headwise_gate, m.full_gate, getattr(m, "interleaved_gate", False)),
+                  qn=type(m.q_norm).__name__, kn=type(getattr(m, "k_norm", None)).__name__, vn=type(m.v_norm).__name__))
+            print(f" -- BC-attn why: module_eligible={bool(_module_eligible(m))} layer={type(layer).__name__}"
+                  f" compand={getattr(layer, 'compand_a', None)} qk_dev={getattr(getattr(layer, 'qk', None), 'device', None)}"
+                  f" k_dev={getattr(getattr(layer, 'k', None), 'device', None)} m_dev={m.device}"
+                  f" raw_k_dev={getattr(getattr(layer, 'raw_k', None), 'device', None)}")
         _trace_build(m, None, "attn")
         return None
     if isinstance(layer, CacheLayer_quant):

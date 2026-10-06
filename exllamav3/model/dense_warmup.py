@@ -24,6 +24,29 @@ def _dense_linears(model):
     return list(seen.values())
 
 
+def seed_dense_tune(seed=None, path=None) -> int:
+    """Append the shipped tuned solutions (dense_gemm_tune_seed.txt: Qwen shapes at row classes 4352..8192, the classes
+    a merged last prefill chunk reaches) to the dense-GEMM tune file for the keys it does not hold yet. Call before the first
+    dense GEMM of the process (the C++ tuner reads the file once). Returns the number of lines added."""
+    from pathlib import Path
+    seed = Path(seed) if seed else Path(__file__).with_name("dense_gemm_tune_seed.txt")
+    if not seed.exists():
+        return 0
+    if path is None:
+        path = os.environ.get("EXL3_DENSE_GEMM_TUNE_FILE") or os.path.join(os.environ.get("HOME", "/tmp"), ".cache/exllamav3/dense_gemm_tune.txt")
+    path = Path(path)
+    key = lambda ln: tuple(ln.split()[:6])
+    have = set()
+    if path.exists():
+        have = {key(l) for l in path.read_text().splitlines() if len(l.split()) == 7}
+    new = [l for l in seed.read_text().splitlines() if len(l.split()) == 7 and key(l) not in have]
+    if new:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write("\n".join(new) + "\n")
+    return len(new)
+
+
 @torch.inference_mode()
 def warm_dense_gemm(models, max_rows: int = 4096, log=print) -> dict:
     """models: iterable of Model (target, draft). max_rows: largest prefill chunk in tokens. Returns stats."""

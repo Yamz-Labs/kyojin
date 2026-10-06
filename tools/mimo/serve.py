@@ -204,7 +204,7 @@ def reply_room(engine: Any, prompt_tokens: int) -> int | None:
     ctx = getattr(engine, "ctx", None)
     if not ctx:
         return None
-    room = ctx - prompt_tokens - 1 - getattr(engine, "num_draft", 0)
+    room = ctx // 256 * 256 - prompt_tokens - 1 - getattr(engine, "num_draft", 0)   # page table = ctx // 256 pages of 256 tokens
     if room < 1:
         raise web.HTTPBadRequest(reason=f"prompt is {prompt_tokens} tokens, the server context is {ctx}")
     return room
@@ -559,8 +559,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 await flush(True)
                 message = parse_completion(text, body.get("tools"))
                 if "tool_calls" in message:
-                    await response.write(sse(event({"tool_calls": [
-                        dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
+                    for n, call in enumerate(message["tool_calls"]):   # one stream message per call (clients that read one call per message)
+                        await response.write(sse(event({"tool_calls": [dict(call, index=n)]})))
                 await response.write(sse(event({}, finish_for(message, text)) |
                                          {"usage": usage(text), "timings": timings()}))
                 await response.write(b"data: [DONE]\n\n")

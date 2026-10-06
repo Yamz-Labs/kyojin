@@ -217,9 +217,12 @@ def _routing_std_torch(cfg, y, params, include_bias = False):
         ).expand(y.shape[0], -1)
         routing_weights = torch.softmax(router_logits_f, dim = -1)
     else:
-        top_v, selected_experts = torch.topk(
-            router_logits_f, cfg.num_experts_per_tok, dim = -1
-        )
+        # torch.topk breaks ties between equal logits in an arbitrary, run-dependent order (and may pick a different
+        # expert at the k-th place); fp16 router logits tie often. A stable descending sort keeps the lowest expert
+        # index first among equals, so identical inputs give identical routing. Same values and softmax otherwise.
+        top_v, selected_experts = torch.sort(router_logits_f, dim = -1, descending = True, stable = True)
+        top_v = top_v[:, :cfg.num_experts_per_tok]
+        selected_experts = selected_experts[:, :cfg.num_experts_per_tok].contiguous()
         routing_weights = torch.softmax(top_v, dim = -1)
     if cfg.per_expert_scale is not None:
         routing_weights = routing_weights * cfg.per_expert_scale.float()[selected_experts]

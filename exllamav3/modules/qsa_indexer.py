@@ -727,6 +727,15 @@ class QSAIndexer(Module):
             from .attention_fn.qsa_prefill_hip import qsa_prefill_hip
             o = qsa_prefill_hip(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
             return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+        if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and os.environ.get("EXL3_QSA_PF_DEQ", "1") == "1" and qc is not None
+                and qc[2] == 8 and qc[3] == 8 and bsz == 1 and seq >= 64 and seq <= 4096 * 4
+                and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
+                and q_rows.dtype == torch.half and _pf_hip_ready()):
+            # stage the used pages as rotated-domain fp16 (one elementwise pass), run the proven fp16 HIP kernel on q rotated by H32/sqrt(32), rotate the output back
+            from .attention_fn.qdeq_triton import qsa_prefill_q8
+            n_used = (int(cache_seqlens_cpu.max().item()) + seq + page_size - 1) // page_size
+            o = qsa_prefill_q8(q_rows, qk, sk, qv, sv, indices, attn.sm_scale, block_table[0], n_used, page_size)
+            return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
         o = qsa_sparse_attend_rows(
             q_rows,
             k_arg, v_arg, indices, attn.sm_scale,

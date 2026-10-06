@@ -37,14 +37,14 @@ def gdn_kkt_solve(k, g, beta, chunk_size=64):
     return A
 
 
-def chunk_gdn_fused(q, k, v, g, beta, scale, initial_state, output_final_state, chunk_size=64):
+def chunk_gdn_fused(q, k, v, g, beta, scale, initial_state, output_final_state, chunk_size=64, ckpt=None):
     """Returns (o, final_state) or None when the caller must run the Triton chain."""
     if not gdn_fuse_ok(q, k, v, g, beta, initial_state, chunk_size):
         return None
     try:
         from .hip.gdn_fused_h_hip import chunk_gdn_fwd_fused_hip
         A = gdn_kkt_solve(k, g, beta, chunk_size)
-        return chunk_gdn_fwd_fused_hip(q, k, v, g, beta, A, scale, initial_state=initial_state, output_final_state=output_final_state)
+        return chunk_gdn_fwd_fused_hip(q, k, v, g, beta, A, scale, initial_state=initial_state, output_final_state=output_final_state, ckpt=ckpt)
     except Exception:
         _FAIL.append(1)
         return None

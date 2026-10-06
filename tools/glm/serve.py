@@ -399,11 +399,12 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
     class (15 shapes). Warm-up has just logged every shape it met, so cross those shapes with all
     classes 256..4096 and pay the tuning here. A cached key costs one GEMM. Tuned winners are
     bit-exact with the default path, so outputs do not change. Returns (keys, seconds)."""
-    import torch
-    from exllamav3.ext import exllamav3_ext as ext
     path = dense_tune_path()
     if os.environ.get("EXL3_DENSE_GEMM_TUNE", "1") == "0" or not path.exists():
         return 0, 0.0
+    # Imported after the early return, so a disabled tuner or a missing cache file needs no built extension.
+    import torch
+    from exllamav3.ext import exllamav3_ext as ext
     # Only the row classes a prefill chunk can reach (<= 4096); the cache file may hold bigger classes
     # from other runs, and sizing the buffers for them cost ~6 GB of GTT on a 128 GB box.
     max_class = int(os.environ.get("EXL3_SERVE_DTUNE_MAX_CLASS", "4096"))
@@ -640,8 +641,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 await flush(True)
                 message = parse_completion(text)
                 if "tool_calls" in message:
-                    await response.write(sse(event({"tool_calls": [
-                        dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
+                    for n, call in enumerate(message["tool_calls"]):   # one stream message per call (clients that read one call per message)
+                        await response.write(sse(event({"tool_calls": [dict(call, index=n)]})))
                 await response.write(sse(event({}, finish_for(message, text[len(prefix):])) |
                                          {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
                 await response.write(b"data: [DONE]\n\n")

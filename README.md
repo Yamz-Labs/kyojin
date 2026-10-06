@@ -36,6 +36,7 @@ python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
 curl http://localhost:8000/v1/models
 ```
 In every new shell, before serving: activate the venv, run `export EXL3_ROCM_SDK=$(rocm-sdk path --root)` again, then `source tools/strix_halo/env.sh`. Without the export, `env.sh` falls back to a system ROCm that may not match the wheel (`undefined symbol: hsa_ext_image_create_v2`).
+If a step fails, see [doc/troubleshooting.md](doc/troubleshooting.md).
 Status: build and MiMo serving were verified from a fresh clone on a second Strix Halo machine (build in 8 to 10 minutes). Both published packs were checked there against `SHA256SUMS` and served (one chat request each); `env.sh --check` has not been run there yet. The first request after a build is slow while the kernels warm up.
 
 First GLM launch: the server tunes its dense GEMM kernels before it opens the port. This takes about 10 minutes, and the port stays closed during that time (the log prints a progress line every 30 seconds). The next one or two launches can repeat it for the shapes still missing; later launches start fast.
@@ -88,7 +89,7 @@ The engine can project one fixed direction out of the residual stream at run tim
 pip install pytest
 for t in tests/test_ablit_runtime_cpu.py tests/test_uncensor_bundled_cpu.py tools/glm/test_serve.py tools/mimo/test_serve.py tools/mimo/test_toolcalls.py; do PYTHONPATH=. pytest -q $t; done
 ```
-Run each file separately because two files share a name (`test_serve.py`). These tests need no GPU and no built extension. Last run (CPU only, clean clone and venv): 3, 16, 7 of 8, 13 and 15 passed (`tools/glm/test_serve.py` takes a few minutes; its one failure, `test_dense_tune_path_follows_the_cpp_tuner`, needs the built extension). GPU tests need a built extension and a free GPU.
+Run each file separately because two files share a name (`test_serve.py`). These tests need no GPU and no built extension. GPU tests need a built extension and a free GPU.
 
 ## Build on CUDA
 The CUDA build is the upstream one and is unchanged. Install a CUDA 12.4 or newer build of PyTorch, then `pip install -r requirements.txt && pip install .`. `README.upstream.md` has the full upstream guide (wheels, PyPI, uv, Windows, architecture list, conversion tool, examples). `README.strix-halo.md` has the kernel notes and benchmark harnesses.
@@ -97,6 +98,9 @@ The CUDA build is the upstream one and is unchanged. Install a CUDA 12.4 or newe
 ExLlamaV3 by turboderp (MIT, `LICENSE` unchanged). ROCm decode path for gfx12 from sdougbrown/exllamav3; first gfx1151 port from vcruz305/exllamav3-amd. `exllamav3/vendor/fla` is flash-linear-attention (MIT). GLM-5.3-Flash is by Z.ai, MiMo-V2.6-Flash by Xiaomi; check each base licence before redistributing weights. Additions: MIT. This project is not affiliated with Z.ai, Xiaomi or turboderp.
 
 ## Thanks
+To [@felladrin](https://github.com/felladrin) for the first community contributions: CPU tests for the bench tool,
+the troubleshooting page, a faster GLM start, and field notes on running Kyojin in containers.
+
 To the people who test Kyojin on their own machines and take the time to write precise reports:
 [@felladrin](https://github.com/felladrin) (install, HIP runtime lookup, MiMo finish reason, client disconnects),
 [@dturini12](https://github.com/dturini12) (streaming API), [@morrisfamily](https://github.com/morrisfamily) (benchmarks),

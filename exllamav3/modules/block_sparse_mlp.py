@@ -115,6 +115,43 @@ def _scatter_expert_count(flat_expert_local: torch.Tensor, num_bins: int) -> tor
     return expert_count
 
 
+# EXL3_MOE_ALIGN_CHUNK (default 4096, 0 = off): a prefill chunk of more than this many rows runs the grouped
+# expert GEMM as ONE launch whose per-expert row lists are laid out exactly like the chunk-by-chunk path:
+# every (expert, sub-chunk) segment starts on an even row (the GEMM result of a row depends on its row parity
+# inside the expert list), so the output is bit-identical to running the sub-chunks one after the other.
+_MOE_ALIGN_CHUNK = int(os.environ.get("EXL3_MOE_ALIGN_CHUNK", "4096"))
+
+
+def _aligned_expert_layout(flat: torch.Tensor, num_tokens: int, top_k: int, num_experts: int, chunk: int):
+    """flat: (num_tokens * top_k) int64 expert ids, slot = token * top_k + k. Returns (order, sel_flat, dummy_tokens):
+    order lists the assignment slots grouped by expert, each (expert, chunk of `chunk` tokens) segment in slot order
+    and padded to an even length with dummy slots; sel_flat is the expert id of every slot including the dummy ones
+    (slots >= num_tokens * top_k belong to dummy tokens num_tokens .. num_tokens + dummy_tokens - 1). No host sync."""
+    dev = flat.device
+    a0 = num_tokens * top_k
+    nc = (num_tokens + chunk - 1) // chunk
+    nseg = num_experts * nc
+    dummy_tokens = (nseg + top_k - 1) // top_k
+    total = a0 + dummy_tokens * top_k
+    key = flat * nc + torch.arange(a0, device = dev) // (top_k * chunk)
+    srt = key.argsort(stable = True)
+    kc = torch.bincount(key, minlength = nseg)
+    odd = kc & 1
+    padbefore = torch.cumsum(odd, 0) - odd
+    pos = torch.arange(a0, device = dev) + padbefore[key[srt]]
+    pad_pos = torch.cumsum(kc, 0) + padbefore
+    pad_pos = torch.where(odd == 1, pad_pos, torch.full_like(pad_pos, total))
+    pad_slot = a0 + padbefore
+    order = torch.arange(total + 1, device = dev)
+    order[pos] = srt
+    order[pad_pos] = pad_slot
+    sel_flat = torch.full((total + 1,), num_experts - 1, dtype = flat.dtype, device = dev)
+    sel_flat[:a0] = flat
+    sel_flat[torch.where(odd == 1, pad_slot, torch.full_like(pad_slot, total))] = \
+        torch.arange(nseg, device = dev) // nc
+    return order[:total], sel_flat[:total], dummy_tokens
+
+
 @dataclass
 class FusedBuffers:
     temp_state_g: torch.Tensor
@@ -1675,22 +1712,30 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # (fp16 weights rounded here were half the KLD gap vs the per-expert path)
             rw = routing_weights.float().contiguous()
             flat = sel.view(-1)
-            order = flat.argsort(stable = True)
+            dummy = 0
+            y_k, rw_k, sel_k = y, rw, sel
+            if _MOE_ALIGN_CHUNK and num_tokens > _MOE_ALIGN_CHUNK:
+                order, flat, dummy = _aligned_expert_layout(flat, num_tokens, top_k, self.num_experts, _MOE_ALIGN_CHUNK)
+                y_k = torch.cat((y, torch.zeros((dummy, y.shape[1]), dtype = y.dtype, device = y.device)))
+                rw_k = torch.cat((rw, torch.zeros((dummy, top_k), dtype = rw.dtype, device = rw.device)))
+                sel_k = flat.view(num_tokens + dummy, top_k)
+            else:
+                order = flat.argsort(stable = True)
             if _moe_sync_free_count():
                 expert_count = _scatter_expert_count(flat, self.num_experts + 1)
             else:
                 expert_count = torch.bincount(flat, minlength = self.num_experts + 1)
             if _HIP_WMMA_STATS is not None:
                 _HIP_WMMA_STATS.append((self.key, expert_count[:self.num_experts].cpu()))
-            ws = _hip_wmma_workspace(self.device, num_tokens * top_k, self.hidden_size,
+            assignments = (num_tokens + dummy) * top_k
+            ws = _hip_wmma_workspace(self.device, assignments, self.hidden_size,
                                      self.intermediate_size_padded, self.num_experts)
-            assignments = num_tokens * top_k
-            output = torch.empty((num_tokens, self.hidden_size), dtype = torch.float, device = y.device)
+            output = torch.empty((num_tokens + dummy, self.hidden_size), dtype = torch.float, device = y.device)
             gu_had = ws["gu_had"][:2 * assignments * self.hidden_size].view(2 * assignments, self.hidden_size)
             # down_out aliases gu_had: the gate/up input is dead once the gate/up GEMM has run
             down_out = ws["gu_had"][:2 * assignments * self.hidden_size].view(torch.float).view(assignments, self.hidden_size)
             ext.exl3_moe_prefill_wmma(
-                y, output, sel, rw, order, expert_count,
+                y_k, output, sel_k, rw_k, order, expert_count,
                 self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh, self.multi_gate.ptrs_svh,
                 self.multi_up.ptrs_trellis, self.multi_up.ptrs_suh, self.multi_up.ptrs_svh,
                 self.multi_down.ptrs_trellis, self.multi_down.ptrs_suh, self.multi_down.ptrs_svh,
@@ -1701,7 +1746,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 ws["offsets"], ws["inverse"][:assignments], ws["tiles"], ws["tile_count"],
                 float(self.act_limit), bool(self.wmma_mcg),
             )
-            final_hidden_states = output.view(eshape)
+            final_hidden_states = output[:num_tokens].view(eshape)
 
         # Torch/C++/fused path
         elif (

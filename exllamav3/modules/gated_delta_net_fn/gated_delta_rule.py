@@ -201,7 +201,8 @@ def gated_delta_rule_fn(
             if pf:
                 core_attn, new_state = chunk_gated_delta_rule_pf(
                     q[i:i + 1], k[i:i + 1], v[i:i + 1], g = g[i:i + 1], beta = beta[i:i + 1],
-                    initial_state = state, output_final_state = save_state)
+                    initial_state = state, output_final_state = save_state,
+                    ckpt = params.get("kda_ckpt") if bsz == 1 else None)
             else:
                 core_attn, new_state = chunk_gated_delta_rule(
                     q[i:i + 1], k[i:i + 1], v[i:i + 1],

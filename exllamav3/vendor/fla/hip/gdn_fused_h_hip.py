@@ -56,10 +56,12 @@ def _load(defs=""):
     return fn
 
 
-def chunk_gdn_fwd_fused_hip(q, k, v, g, beta, A, scale, initial_state=None, output_final_state=False, defs="", dbg=None, grid=None):
+def chunk_gdn_fwd_fused_hip(q, k, v, g, beta, A, scale, initial_state=None, output_final_state=False, defs="", dbg=None, grid=None, ckpt=None):
     """recompute_w_u + chunk_h + chunk_o in one kernel. q, k [B,T,H,128] bf16; v [B,T,HV,128] bf16; g [B,T,HV] fp32
     (chunk-local cumsum, log2 domain); beta [B,T,HV] bf16; A [B,T,HV,64] bf16 (solved kkt). Returns (o, final_state).
-    dbg: optional dict of bf16 buffers w, u, vn [T,HV,128] and h [NT,HV,128,128] (build with defs containing DBG=1)."""
+    dbg: optional dict of bf16 buffers w, u, vn [T,HV,128] and h [NT,HV,128,128] (build with defs containing DBG=1).
+    ckpt: optional dict or list of up to 2 dicts {"s": fp32 [B, HV, K, V] contiguous, "chunk": n}: the kernel (CKPT=1 build, a separate
+    code object; the default build is untouched) also writes the state after chunk n - 1 (row 64 n) to ckpt["s"] and sets ckpt["ok"]."""
     B, T, H, K = k.shape
     HV, V = v.shape[2], v.shape[-1]
     assert K == 128 and V == 128 and HV % H == 0
@@ -73,6 +75,13 @@ def chunk_gdn_fwd_fused_hip(q, k, v, g, beta, A, scale, initial_state=None, outp
     assert q.shape == k.shape and g.shape == (B, T, HV) and beta.shape == (B, T, HV) and A.shape == (B, T, HV, 64)
     if not defs and os.environ.get("EXL3_GDN_OST", "1") == "1":
         defs = "OST=1"   # EXL3_GDN_OST: o tile staged through LDS, 16 B row stores (same bits, see gdn_fused_h.hip)
+    cks = [] if ckpt is None else (list(ckpt) if isinstance(ckpt, (list, tuple)) else [ckpt])
+    assert len(cks) <= 2
+    cks = [c for c in cks if 0 < c["chunk"] <= (T + 63) // 64]
+    for c in cks:
+        assert c["s"].dtype == torch.float32 and c["s"].is_contiguous() and c["s"].shape == (B, HV, K, V)
+    if cks:
+        defs = (defs + " CKPT=1").strip()
     fn = _load(defs)
     o = torch.empty(B, T, HV, V, device=v.device, dtype=v.dtype)
     final_state = k.new_empty(B, HV, K, V, dtype=torch.float32) if output_final_state else None
@@ -86,6 +95,10 @@ def chunk_gdn_fwd_fused_hip(q, k, v, g, beta, A, scale, initial_state=None, outp
             ctypes.c_float(scale), ctypes.c_int(T), ctypes.c_int(H), ctypes.c_int(HV), ctypes.c_int(PV)]
     for n in ("w", "u", "vn", "h"):
         args.append(P(d[n].data_ptr() if n in d else 0))
+    if cks:
+        for i in range(2):
+            c = cks[i] if i < len(cks) else None
+            args += [P(0 if c is None else c["s"].data_ptr()), ctypes.c_int(-1 if c is None else c["chunk"])]
     params = (ctypes.c_void_p * len(args))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in args])
     stream = torch.cuda.current_stream().cuda_stream
     nwg = B * HV if grid is None else int(grid)   # grid < B * HV launches the first nwg heads only (timing experiments)
@@ -93,4 +106,6 @@ def chunk_gdn_fwd_fused_hip(q, k, v, g, beta, A, scale, initial_state=None, outp
     r = _state["lib"].hipModuleLaunchKernel(fn, nwg, 1, 1, 256, 1, 1, 0, stream, params, None)
     if r != 0:
         raise RuntimeError(f"gdn_fused_h_hip: launch failed ({r})")
+    for c in cks:
+        c["ok"] = True
     return o, final_state

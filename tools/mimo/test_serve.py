@@ -60,7 +60,7 @@ class ServeTests(unittest.TestCase):
         from aiohttp.test_utils import TestClient, TestServer
 
         class Spy(FakeEngine):
-            ctx = 20
+            ctx = 256 + 20   # the page table holds 256 tokens here: the 20 extra do not count
             num_draft = 1
 
             async def generate(self, prompt: str, **kwargs):
@@ -80,14 +80,14 @@ class ServeTests(unittest.TestCase):
             await client.close()
             return status
 
-        # room = ctx - prompt - 1 slot - 1 draft token
+        # room = whole pages of ctx - prompt - 1 slot - 1 draft token
         self.assertEqual(run(post("a b c d", max_completion_tokens=32768)), 200)
         used = engine.count_tokens(engine.prompts[-1])
-        self.assertEqual(engine.kwargs["max_tokens"], 20 - used - 1 - 1)
+        self.assertEqual(engine.kwargs["max_tokens"], 256 - used - 1 - 1)
         self.assertEqual(run(post("a b c d", max_tokens=3)), 200)
         self.assertEqual(engine.kwargs["max_tokens"], 3)
         engine.kwargs = None
-        self.assertEqual(run(post(" ".join("w" * 30))), 400)
+        self.assertEqual(run(post(" ".join("w" * 300))), 400)
         self.assertIsNone(engine.kwargs)
 
     def test_template_rendering(self):
@@ -209,6 +209,24 @@ class ServeTests(unittest.TestCase):
         self.assertEqual([c["choices"][0]["finish_reason"] for c in chunks][-1], "tool_calls")
         self.assertTrue(all(c["choices"][0]["finish_reason"] is None for c in chunks[:-1]))
         self.assertIn("usage", chunks[-1])
+
+    def test_stream_parallel_tool_calls_one_message_each(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        call = '<tool_call><function=get_weather>{"city": "Paris"}</function></tool_call>'
+        app = serve.create_app(FakeEngine("Sure." + call * 3), "m", TEMPLATE)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            response = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            raw = (await response.read()).decode()
+            await client.close()
+            return raw
+        chunks = [json.loads(l[6:]) for l in run(check()).split("\n") if l.startswith("data: {")]
+        msgs = [c["choices"][0]["delta"]["tool_calls"] for c in chunks if "tool_calls" in c["choices"][0]["delta"]]
+        self.assertEqual([len(m) for m in msgs], [1, 1, 1])
+        self.assertEqual([m[0]["index"] for m in msgs], [0, 1, 2])
 
     def test_stream_and_parse_agree_on_bare_think_close(self):
         """No implicit think turn: a bare </think> is literal content in both paths."""
