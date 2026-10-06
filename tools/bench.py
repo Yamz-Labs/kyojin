@@ -147,9 +147,34 @@ def rocm_version():
     return f"HIP {out} (PyTorch)" if out else "unknown"
 
 
+KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+
+
+def gfx_name(target_version):
+    """KFD gfx_target_version -> LLVM target name: 110501 -> gfx1151, 90010 -> gfx90a (minor and stepping are hex digits)."""
+    major, minor, stepping = target_version // 10000, target_version // 100 % 100, target_version % 100
+    return f"gfx{major}{minor:x}{stepping:x}"
+
+
+def kfd_gpu_target(nodes=KFD_NODES):
+    """GPU target from the kernel's KFD topology, which needs no ROCm tools. Returns an empty string when no GPU node is found."""
+    try:
+        dirs = sorted((d for d in Path(nodes).iterdir() if d.name.isdecimal()), key=lambda d: int(d.name))
+    except OSError:
+        return ""
+    for d in dirs:
+        try:
+            m = re.search(r"^gfx_target_version (\d+)$", (d / "properties").read_text(), re.M)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if m and int(m.group(1)):                       # CPU nodes report 0
+            return gfx_name(int(m.group(1)))
+    return ""
+
+
 def gpu_name():
     out = sh("rocminfo 2>/dev/null | grep -m1 -o 'gfx[0-9a-z]*'")
-    return out or "unknown"
+    return out or kfd_gpu_target() or "unknown"
 
 
 def main():
