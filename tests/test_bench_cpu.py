@@ -29,6 +29,7 @@ class MockOpenAI(BaseHTTPRequestHandler):
     content chunk per completion token, then a usage chunk. "mock_completion_tokens" in the request
     overrides the completion_tokens it reports."""
     protocol_version = "HTTP/1.1"
+    requests = []                                   # every request body, in order (reset per test by the server fixture)
 
     def log_message(self, *args):
         pass
@@ -46,6 +47,7 @@ class MockOpenAI(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        MockOpenAI.requests.append(req)
         prompt_tokens = len(req["messages"][-1]["content"].split())
         n = req.get("max_tokens", 16)
         if not req.get("stream"):
@@ -74,6 +76,7 @@ def server(monkeypatch):
     # intercept requests to the mock server, whatever ran earlier in the same session.
     monkeypatch.setattr(bench.urllib.request, "_opener",
                         bench.urllib.request.build_opener(bench.urllib.request.ProxyHandler({})))
+    monkeypatch.setattr(MockOpenAI, "requests", [])
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAI)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{httpd.server_address[1]}/v1"
@@ -135,3 +138,36 @@ def test_markdown_block(server, fake_clock, monkeypatch, tmp_path):
 
     for cat in bench.DECODE_PROMPTS:
         assert f"| Decode, {cat}, 16 tokens, temperature 0 (median of 3) | {1 / STEP:.1f} tok/s |" in md
+
+
+def test_requests_are_greedy(server, fake_clock):
+    bench.prefill(server, MODEL, "one two three")
+    bench.decode(server, MODEL, "hello", 4)
+    pre, dec = MockOpenAI.requests
+    assert pre["temperature"] == 0 and pre["max_tokens"] == 1
+    assert dec["temperature"] == 0 and dec["stream"] is True
+
+
+def test_table_reports_medians_not_means(server, monkeypatch, tmp_path):
+    # Three unequal runs per row, so the median (200, 20) and the mean (300, 30) differ.
+    def prefill(base, model, text):
+        salt = text[1:text.index("]")]
+        return (300, 1.0) if salt.endswith("warm") else (1000, [100.0, 200.0, 600.0][int(salt.rsplit("-", 1)[1])])
+
+    def decode(base, model, prompt, max_tokens):
+        return next([10.0, 20.0, 60.0][p.index(prompt)] for p in bench.DECODE_PROMPTS.values() if prompt in p)
+
+    corpus = tmp_path / "corpus.txt"
+    corpus.write_text(" ".join(f"w{i}" for i in range(9000)))
+    monkeypatch.setattr(bench, "prefill", prefill)
+    monkeypatch.setattr(bench, "decode", decode)
+    monkeypatch.setattr(bench, "gpu_name", lambda: "gfx-test")
+    monkeypatch.setattr(bench, "rocm_version", lambda: "rocm-test")
+    monkeypatch.setattr(sys, "argv", ["bench.py", "--base", server, "--model", MODEL, "--corpus", str(corpus)])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        bench.main()
+    md = out.getvalue()
+    assert "| Prefill, ~1000 tokens (median of 3) | 200.0 tok/s |" in md, md
+    for cat in bench.DECODE_PROMPTS:
+        assert f"(median of 3) | 20.0 tok/s |" in [line[line.index("(median"):] for line in md.splitlines() if line.startswith(f"| Decode, {cat},")][0]
