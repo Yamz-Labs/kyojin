@@ -614,6 +614,7 @@ class QwenEngine:
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
+        ndt = max(ndt, int(os.environ.get("QWSPEC_MAXD") or 0), int(os.environ.get("QWSPEC_FIXD") or 0))  # buffers fit the deepest draft
         self.model_path, self.ctx, self.ndt, self.draft_policy = model_path, ctx, ndt, draft_policy
         self.config = Config.from_directory(model_path)
         self.tokenizer = Tokenizer.from_config(self.config)
@@ -624,7 +625,7 @@ class QwenEngine:
         self.cache_bits = cache_bits
         from exllamav3 import CacheLayer_quant
         qkw = dict(layer_type=CacheLayer_quant, k_bits=cache_bits, v_bits=cache_bits) if cache_bits else {}
-        self.cache = Cache(self.model, max_num_tokens=ctx, max_history=3, **qkw)
+        self.cache = Cache(self.model, max_num_tokens=ctx, max_history=max(3, ndt), **qkw)
         if os.environ.get("EXL3_WARM_DENSE", "1") != "0":
             from exllamav3.model.dense_warmup import seed_dense_tune
             seed_dense_tune()
@@ -635,7 +636,7 @@ class QwenEngine:
         self.draft_model = self.draft_cache = None
         if draft_policy != "off":
             self.draft_model = Model.from_config(self.config, component="mtp")
-            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=3, **qkw)
+            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=max(3, ndt), **qkw)
             with Heartbeat("loading MTP drafter"):
                 self.draft_model.load(progressbar=False)
         self.vision = None
@@ -687,8 +688,11 @@ class QwenEngine:
         self.generator = self.Generator(**kw)
         if spec and self.draft_policy == "mix":
             import spec_policy  # tools/qwen/spec_policy.py: dynamic length + n-gram lookup, the shipped rule
+            thf, thv, maxd = spec_policy.env_defaults(self.ndt)   # 0.6 / 0.3 / ndt unless QWSPEC_THF / THV / MAXD are set
+            fx = os.environ.get("QWSPEC_FIXD")
             self.uninstall = spec_policy.install(self.generator, self.draft_model, self.model,
-                                                 0.6, 0.3, self.ndt, (2, 3, 5), {})
+                                                 thf, thv, maxd, (2, 3, 5), {},
+                                                 rule=spec_policy.rule_from_env(thf, thv, maxd), fixed=int(fx) if fx else None)
         self.spec_on = spec
         if self.slot_store is not None:
             self.slot_store.generator = self.generator
