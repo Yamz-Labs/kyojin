@@ -603,7 +603,7 @@ class QwenEngine:
     """Target model + MTP drafter + (optional) vision tower + one Generator."""
 
     def __init__(self, model_path: str, ctx: int, ndt: int = 3, draft_policy: str = "mix",
-                 vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 8):
+                 vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 0):
         # The measured Qwen serving configuration. Read at import time by the engine:
         # set before importing exllamav3. The caller's environment wins.
         for k, v in SERVE_ENV:
@@ -619,8 +619,8 @@ class QwenEngine:
         self.tokenizer = Tokenizer.from_config(self.config)
         self.eos = list(self.config.eos_token_id_list)
         self.model = Model.from_config(self.config)
-        # cache_bits 8 (default) = packed int8 K/V pages (about 40 % smaller than fp16), indexer planes stay fp16;
-        # 0 = the fp16 K/V pages (--cache-bits 0)
+        # cache_bits 0 (default) = the fp16 K/V pages; 8 (--cache-bits 8) = packed int8 K/V pages (2.6 GiB less at 256K), indexer
+        # planes stay fp16. The int8 pages are not row-invariant when several rows decode together, so they are opt-in.
         self.cache_bits = cache_bits
         from exllamav3 import CacheLayer_quant
         qkw = dict(layer_type=CacheLayer_quant, k_bits=cache_bits, v_bits=cache_bits) if cache_bits else {}
@@ -1512,8 +1512,8 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="pack directory")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="id shown by /v1/models and expected in requests")
     parser.add_argument("--ctx", "-c", type=int, default=65536, help="KV cache size in tokens (default 65536)")
-    parser.add_argument("--cache-bits", type=int, default=8, choices=(0, 8),
-                        help="bits per K/V element of the attention cache pages (8 = packed int8, the default, about 40 %% smaller; 0 = fp16)")
+    parser.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
+                        help="bits per K/V element of the attention cache pages (0 = fp16, the default; 8 = packed int8, about 40 %% smaller pages, saves 2.6 GiB at 256K, output not row-invariant for several rows)")
     parser.add_argument("--ndt", type=int, default=3, help="max draft tokens per round (default 3)")
     parser.add_argument("--draft-policy", choices=("mix", "mtp", "off"), default="mix",
                         help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, off = plain decode")
