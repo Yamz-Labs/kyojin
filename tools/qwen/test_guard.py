@@ -489,6 +489,29 @@ class SessionTests(unittest.TestCase):
             self.assertIsInstance(res, RuntimeError)
             self.assertIn("driver has stopped", str(res))        # cancelled: not restarted
 
+    def test_shutdown_while_a_command_runs_fails_it_and_asyncio_run_returns(self):
+        import threading
+        e = make_engine(self.seeded, per_iter=1)
+        e.generator = MultiStubGenerator(self.seeded, per_iter=1)
+        started, release = threading.Event(), threading.Event()
+
+        def slow():
+            started.set()
+            release.wait(5)
+            return "late"
+
+        async def go():
+            cmd = asyncio.ensure_future(e.run_exclusive(slow))
+            while not started.is_set():
+                await asyncio.sleep(0.005)
+            e._driver.cancel()
+            try:
+                await asyncio.wait_for(cmd, 5)
+            finally:
+                release.set()
+        with self.assertRaisesRegex(RuntimeError, "driver has stopped"):
+            asyncio.run(go())
+
     def test_cancel_leaves_the_other_session_running(self):
         (a, b), gen = self.run_two(cancel_first_after=3)
         self.assertIsNone(a)

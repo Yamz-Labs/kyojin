@@ -786,6 +786,11 @@ class QwenEngine:
                 fn, args, fut = self._cmds.pop(0)
                 try:
                     res = await loop.run_in_executor(None, fn, *args)
+                except asyncio.CancelledError:
+                    # shutdown while the command runs: it is no longer in self._cmds, so _drive cannot fail it
+                    if not fut.done():
+                        fut.set_exception(RuntimeError("the engine driver has stopped"))
+                    raise
                 except Exception as exc:                              # noqa: BLE001
                     if not fut.done():
                         fut.set_exception(exc)
