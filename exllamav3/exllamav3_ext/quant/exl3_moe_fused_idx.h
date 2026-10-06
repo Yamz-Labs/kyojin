@@ -38,6 +38,8 @@ struct QwenK4S5 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TO
 struct SmallK3S4 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 3, SB = 4; };
 struct SmallK3S5 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 3, SB = 5; };
 struct SmallK4S4 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 4, SB = 4; };
+struct QwenK6S6 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TOPK = 10, INTER = 640, RB = 6, SB = 6; };   // the MTP drafter layer of the public pack (routed K6, shared K6)
+struct SmallK6S6 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 6, SB = 6; };
 struct SmallK4S5 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 4, SB = 5; };
 
 template <class S>
@@ -70,7 +72,7 @@ struct Dm
     static_assert(NEXP % 32 == 0 && NEXP <= 1024, "top-k lanes");
     static_assert(TOPK >= 1 && TOPK <= 15, "combine uses wave <= TOPK, 16 waves");
     static_assert(MAXR * TOPK <= THREADS && MAXR * TOPK <= 40, "sort/group arrays");
-    static_assert((RB >= 2 && RB <= 5) && (SB >= 2 && SB <= 5), "K2, K3, K4, K5");
+    static_assert((RB >= 2 && RB <= 6) && (SB >= 2 && SB <= 6), "K2, K3, K4, K5, K6");
     static_assert(H >= 1 && H <= 4, "dred/rmr scratch");
     static_assert(LR % 1 == 0 && LR <= 1024, "t scratch");
     // dynamic-free LDS: A + A2 for MAXR rows of the larger of D / INTER
@@ -101,6 +103,24 @@ MF_FN int k5_rel(int t, int g)                                      { return 40 
 MF_FN int k5_i0(int t, int g)                                       { return k5_rel(t, g) / 32; }
 MF_FN int k5_i2(int t, int g)                                       { return (k5_rel(t, g) + 30) / 32; }
 MF_FN int k5_s2(int t, int g)                                       { return (k5_i2(t, g) + 1) * 32 - (k5_rel(t, g) + 31); }
+// K6 (and any K whose 4-value group spans <= 2 words, K5 / K6 / K8 style): lane (g8, t) is the engine's lane L = 4 g8 + t; its group g (values 4g .. 4g + 3, engine dq4<bits>)
+// starts at bit (8L + 4g + 257) bits - 16; relative to the first bit of the lane set's wrap word (global word bits g8 - 1, cyclic) that is
+// 8 bits t + 4 bits g + bits + 16 (256 bits = 8 tiles of 32 bits cancels). The group ends 3 bits + 16 bits later; both words of the funnel shift are local
+// indices 0 .. bits of {wrap, own0 .. own(bits-1)}. K6: 34 bits per group, the engine's alignment keeps it inside two words (checked on CPU for every lane).
+MF_FN int kn_rel(int bits, int t, int g)                            { return 8 * bits * t + 4 * bits * g + bits + 16; }
+MF_FN int kn_i0(int bits, int t, int g)                             { return kn_rel(bits, t, g) / 32; }
+MF_FN int kn_i2(int bits, int t, int g)                             { return (kn_rel(bits, t, g) + 3 * bits + 15) / 32; }
+MF_FN int kn_s2(int bits, int t, int g)                             { return (kn_i2(bits, t, g) + 1) * 32 - (kn_rel(bits, t, g) + 3 * bits + 16); }
+// the 8 trellis words (16 bit each, low half) of lane (g8, t) from its lane set w[0 .. bits] (wrap, own0 ..), in the order the decoder takes them
+template <class W> MF_FN void kn_words(int bits, const W (&w)[7], int t, unsigned (&v)[8])
+{
+    for (int g = 0; g < 2; ++g)
+    {
+        const unsigned long long m = ((unsigned long long) w[kn_i0(bits, t, g)] << 32) | (unsigned long long) w[kn_i2(bits, t, g)];
+        const int s2 = kn_s2(bits, t, g);
+        for (int j = 0; j < 4; ++j) v[4 * g + 3 - j] = (unsigned) (m >> (s2 + bits * j)) & 0xffffu;
+    }
+}
 MF_FN long own_i(int bits, int g8, int s, long ss)                  { return s * ss + (long) bits * g8; }
 MF_FN long wrp_i(int bits, int g8, int s, long ss)                  { return s * ss + (bits * g8 > 0 ? bits * g8 - 1 : tw(bits) - 1); }
 MF_FN long a_idx(int r, int k, int s)                               { return (long) r * (k / 2) + 8 * s; }  // u32 in the A staging buffer
