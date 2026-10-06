@@ -172,6 +172,8 @@ def dec_project_o_strided(o_proj, o: torch.Tensor, bsz: int, seqlen: int, num_he
     return y
 
 
+_kv_only_skip = os.environ.get("EXL3_PF_KV_ONLY_ATTN", "1") == "1"
+
 class Attention(Module):
 
     def __init__(
@@ -660,6 +662,8 @@ class Attention(Module):
             if self.tp_reduce:
                 params["backend"].all_reduce(x)
 
+        if x is None:
+            return None                          # kv_only, see decode_flash_attn
         return to2(x, out_dtype, self.out_dtype)
 
 
@@ -1286,6 +1290,11 @@ class Attention(Module):
 
         if qsa_sparse:
             qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
+            if params.get("kv_only") and _kv_only_skip:
+                # EXL3_PF_SKIP kv_only (the MTP draft prompt prefill): K/V and the indexer planes are written, the block's
+                # output is discarded by the caller, so the selection, the sparse attention and everything after it are skipped.
+                # EXL3_PF_KV_ONLY_ATTN=0 runs them again (same cache contents either way).
+                return None
             o = self.qsa_indexer.sparse_attend_verify(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
         else:
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
