@@ -6,6 +6,8 @@ from ...ext import exllamav3_ext as ext
 from ...util.tensor import g_tensor_cache
 import os
 from ...util import profile_opt
+from .. import row_split as _row_split
+_row_split.install()
 
 MAX_BSZN_GEMV_R = 8  # must match MOE_R_MAX in exllamav3_ext/quant/exl3_dec.cu
 # K >= this runs R batch-1 launches instead of one gemv_r launch (A/B knob; 99 = never loop)
