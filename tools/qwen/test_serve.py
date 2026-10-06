@@ -628,7 +628,7 @@ class ServeEnvDefaultsTest(unittest.TestCase):
         d = dict(serve.SERVE_ENV)
         for k in ("EXL3_PLE_HIP", "EXL3_DQ_HIP", "EXL3_GR_HIP", "EXL3_GDN_FUSE", "EXL3_PF_SKIP"):
             self.assertEqual(d[k], "1")
-        self.assertEqual(d["EXL3_PF_DEFER"], "1")
+        self.assertEqual(d["EXL3_PF_DEFER"], "0")
         self.assertEqual(d["EXL3_PREFILL_CHUNK"], "4096")
         self.assertEqual(len(d), len(serve.SERVE_ENV))          # no key twice
         saved = os.environ.get("EXL3_GDN_FUSE"); os.environ["EXL3_GDN_FUSE"] = "0"

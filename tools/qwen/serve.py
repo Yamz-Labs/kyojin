@@ -503,9 +503,9 @@ SERVE_ENV = (("EXL3_MOE_FUSED", "1"), ("EXL3_MOE_VALU", "1"), ("EXL3_VERIFY_ATTN
              ("EXL3_VERIFY_GEMV_R", "1"), ("EXL3_GEMV_R_DEC1", "1"), ("EXL3_MTP_FUSE_CATCHUP", "0"),
              ("EXL3_PLE_HIP", "1"), ("EXL3_DQ_HIP", "1"), ("EXL3_GR_HIP", "1"), ("EXL3_GDN_FUSE", "1"), ("EXL3_PF_SKIP", "1"),
              # 4096-row prefill chunks (one MoE pass per 4096 rows, no 2048 + 2048 + tail split below 4097 tokens) and the
-             # draft prefill deferred behind the first token (first round is a plain target step; flushed before the second round,
-             # at job end and on rewind, so the draft cache stays complete). 0 for either goes back.
-             ("EXL3_PREFILL_CHUNK", "4096"), ("EXL3_PF_DEFER", "1"),
+             # draft prefill run chunk by chunk with the target prefill (K/V and indexer planes only). EXL3_PF_DEFER=1 defers it behind the
+             # first token instead; that lands the whole draft prefill (2.4 s at 256K) inside the first decode steps. 0 for either goes back.
+             ("EXL3_PREFILL_CHUNK", "4096"), ("EXL3_PF_DEFER", "0"),
              # the last prefill chunk runs to the end of the prompt (a tail of up to 1024 rows beyond the 4096-row chunk is merged
              # into it) instead of a second forward pass that reads every expert again; the last-page recurrent state is written from
              # inside the chunk. 0 for EXL3_PF_NO_TAIL goes back. Tuned dense-GEMM solutions for the larger row classes ship in

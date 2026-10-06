@@ -50,7 +50,7 @@ Environment: the server sets the measured Qwen configuration with `setdefault` b
 `SERVE_ENV` in `serve.py`; the start-up log prints the effective `EXL3_*` / `MPW*` environment). It covers decode and
 verify (`EXL3_MOE_FUSED`, `EXL3_MOE_VALU`, `EXL3_VERIFY_*`, `EXL3_GEMV_R_DEC1`, `EXL3_MTP_FUSE_CATCHUP=0`), prefill
 (`EXL3_PLE_HIP`, `EXL3_DQ_HIP`, `EXL3_GR_HIP`, `EXL3_GDN_FUSE`, `EXL3_PF_SKIP`, `EXL3_PREFILL_CHUNK=4096`,
-`EXL3_PF_DEFER`, `EXL3_PF_GR_FUSE`, `EXL3_MPW_GLUE`), `EXL3_MOE_CFG=2`, `EXL3_HIP_PREFILL_MIN_ROWS=2`, `EXL3_QSA_ROWINV`, `EXL3_ROLL_CKPT` and the int8 mixer with group
+`EXL3_PF_DEFER=0` (the MTP draft prefill runs chunk by chunk with the target prefill; `1` defers it behind the first token), `EXL3_PF_GR_FUSE`, `EXL3_MPW_GLUE`), `EXL3_MOE_CFG=2`, `EXL3_HIP_PREFILL_MIN_ROWS=2`, `EXL3_QSA_ROWINV`, `EXL3_ROLL_CKPT` and the int8 mixer with group
 scales (`EXL3_GR_GS=1`; `hc_gs_sidecar.safetensors` in the model directory is picked up when present). Your own
 environment wins. The engine modules read several of these when they are imported, so the server refuses to start if
 `exllamav3` was imported before they were set.
