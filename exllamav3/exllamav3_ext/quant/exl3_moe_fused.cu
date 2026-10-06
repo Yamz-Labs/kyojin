@@ -102,7 +102,7 @@ template <class S> void mf_launch
 }
 }  // namespace
 
-#define MF_SHAPES(X) X(mf::QwenShape) X(mf::SmallTestShape) X(mf::SmallK3Shape) X(mf::QwenK3S4) X(mf::QwenK3S5) X(mf::QwenK4S4) X(mf::QwenK4S5) X(mf::SmallK3S4) X(mf::SmallK3S5) X(mf::SmallK4S4) X(mf::SmallK4S5)
+#define MF_SHAPES(X) X(mf::QwenShape) X(mf::SmallTestShape) X(mf::SmallK3Shape) X(mf::QwenK3S4) X(mf::QwenK3S5) X(mf::QwenK4S4) X(mf::QwenK4S5) X(mf::SmallK3S4) X(mf::SmallK3S5) X(mf::SmallK4S4) X(mf::SmallK4S5) X(mf::QwenK6S6) X(mf::SmallK6S6)
 
 bool exl3_moe_fused_supported(int64_t D, int64_t H, int64_t LR, int64_t NEXP, int64_t TOPK, int64_t INTER, int64_t RB, int64_t SB)
 {
@@ -193,6 +193,7 @@ void exl3_moe_fused_tile_test(const at::Tensor& A, const at::Tensor& B, at::Tens
     else if (bits == 3) ok = mf_tt_dispatch<3>(ks, cf, A, B, C, R, nt, (int) native, stream);
     else if (bits == 4) ok = mf_tt_dispatch<4>(ks, cf, A, B, C, R, nt, (int) native, stream);
     else if (bits == 5) ok = mf_tt_dispatch<5>(ks, cf, A, B, C, R, nt, (int) native, stream);
+    else if (bits == 6) ok = mf_tt_dispatch<6>(ks, cf, A, B, C, R, nt, (int) native, stream);
     TORCH_CHECK(ok, "tile test: (bits, K, output dtype) not instantiated");
 }
 #endif
