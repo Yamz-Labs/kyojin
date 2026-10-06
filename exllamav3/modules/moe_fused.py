@@ -19,9 +19,10 @@ from .hyperconnections import HyperConnection
 MAX_ROWS = 4
 
 
-# EXL3_MOE_FUSED9=<variant>: 0 off, 393216 (0x60000) = forced-inline phases + two blocks per WGP (core9), 917504 = same kernel, ONE block per WGP:
-# the grid barrier needs every block resident, and two 512-thread blocks fill a WGP's VGPR file exactly, so a desktop client on the same GPU can leave half the grid unscheduled. Runtime-mutable for one-load A/B.
-MF9 = {"variant": int(os.environ.get("EXL3_MOE_FUSED9", "917504"), 0), "timing": 0,   # timing 1 = phase stamps into seldbg (tests)
+# EXL3_MOE_FUSED9=<variant>: 0 off, 393216 (0x60000) = forced-inline phases + two blocks per WGP (core9), 917504 = same kernel, ONE block per WGP, 1441792 (0x160000, default) = same phases and block partition as 0x60000, but every grid barrier is a kernel boundary (six stage launches):
+# no block waits for another, so a desktop client on the GPU cannot stall it or change the output; 0.58 ms/token faster than 917504. 393216 / 917504 keep the barrier kernels.
+# The barrier kernels need every block resident, and two 512-thread blocks fill a WGP's VGPR file exactly, so a desktop client on the same GPU can leave half the grid unscheduled. Runtime-mutable for one-load A/B.
+MF9 = {"variant": int(os.environ.get("EXL3_MOE_FUSED9", "1441792"), 0), "timing": 0,   # timing 1 = phase stamps into seldbg (tests)
        # ballot top-k in the expert selection (variant bit 0x1000), bit-identical to the plain loop; EXL3_MOE_TK2=0 turns it off
        "tk2": os.environ.get("EXL3_MOE_TK2", "1") not in ("", "0")}
 

@@ -506,6 +506,11 @@ SERVE_ENV = (("EXL3_MOE_FUSED", "1"), ("EXL3_MOE_VALU", "1"), ("EXL3_VERIFY_ATTN
              # draft prefill deferred behind the first token (first round is a plain target step; flushed before the second round,
              # at job end and on rewind, so the draft cache stays complete). 0 for either goes back.
              ("EXL3_PREFILL_CHUNK", "4096"), ("EXL3_PF_DEFER", "1"),
+             # the last prefill chunk runs to the end of the prompt (a tail of up to 1024 rows beyond the 4096-row chunk is merged
+             # into it) instead of a second forward pass that reads every expert again; the last-page recurrent state is written from
+             # inside the chunk. 0 for EXL3_PF_NO_TAIL goes back. Tuned dense-GEMM solutions for the larger row classes ship in
+             # exllamav3/model/dense_gemm_tune_seed.txt.
+             ("EXL3_PF_NO_TAIL", "1"), ("EXL3_PF_TAIL_MERGE", "1024"),
              # the batched R-row sparse attention launch is row-invariant (the split plan no longer depends on R, see
              # qsa_split_plan; EXL3_QSA_ROWINV=0 goes back), so verify keeps ONE launch and speculative == plain bitwise above the
              # QSA sparse threshold (2051 tokens). The per-row fallback is EXL3_VERIFY_QSA_PROJ=1 EXL3_VERIFY_QSA_ATTN=all.
@@ -598,7 +603,7 @@ class QwenEngine:
     """Target model + MTP drafter + (optional) vision tower + one Generator."""
 
     def __init__(self, model_path: str, ctx: int, ndt: int = 3, draft_policy: str = "mix",
-                 vision: bool = True, max_chunk_size: int = 2048):
+                 vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 8):
         # The measured Qwen serving configuration. Read at import time by the engine:
         # set before importing exllamav3. The caller's environment wins.
         for k, v in SERVE_ENV:
@@ -614,7 +619,15 @@ class QwenEngine:
         self.tokenizer = Tokenizer.from_config(self.config)
         self.eos = list(self.config.eos_token_id_list)
         self.model = Model.from_config(self.config)
-        self.cache = Cache(self.model, max_num_tokens=ctx, max_history=3)
+        # cache_bits 8 (default) = packed int8 K/V pages (about 40 % smaller than fp16), indexer planes stay fp16;
+        # 0 = the fp16 K/V pages (--cache-bits 0)
+        self.cache_bits = cache_bits
+        from exllamav3 import CacheLayer_quant
+        qkw = dict(layer_type=CacheLayer_quant, k_bits=cache_bits, v_bits=cache_bits) if cache_bits else {}
+        self.cache = Cache(self.model, max_num_tokens=ctx, max_history=3, **qkw)
+        if os.environ.get("EXL3_WARM_DENSE", "1") != "0":
+            from exllamav3.model.dense_warmup import seed_dense_tune
+            seed_dense_tune()
         with Heartbeat("loading target model"):
             self.model.load(max_chunk_size=max_chunk_size, progressbar=False)
         from exllamav3.modules.hyperconnections import GS_STATS
@@ -622,7 +635,7 @@ class QwenEngine:
         self.draft_model = self.draft_cache = None
         if draft_policy != "off":
             self.draft_model = Model.from_config(self.config, component="mtp")
-            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=3)
+            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=3, **qkw)
             with Heartbeat("loading MTP drafter"):
                 self.draft_model.load(progressbar=False)
         self.vision = None
@@ -684,7 +697,9 @@ class QwenEngine:
         # dense GEMM warm-up at load (EXL3_WARM_DENSE=0 = off): the first request at a new row-count class
         # no longer pays the rocBLAS solution screening (0.15-4 s per shape).
         from exllamav3.model.dense_warmup import warm_dense_gemm
-        warm_dense_gemm([self.model, self.draft_model], max_rows=self.generator.max_chunk_size)
+        warm_dense_gemm([self.model, self.draft_model],
+                        max_rows=self.generator.max_chunk_size + (int(os.environ.get("EXL3_PF_TAIL_MERGE", "0"))
+                                                                  if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 0))
         ids = self.tokenizer.encode("<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
                                     add_bos=False, encode_special_tokens=True)
         job = self.Job(input_ids=ids, max_new_tokens=24, sampler=self._sampler({"temperature": 0.0}),
@@ -696,6 +711,9 @@ class QwenEngine:
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, add_bos=False, encode_special_tokens=True).numel())
+
+    def token_str(self, token_id: int) -> str:
+        return self.tokenizer.tokenizer.decode([int(token_id)], skip_special_tokens=False)
 
     def _sampler(self, s: dict[str, Any]):
         from exllamav3.generator.sampler import ArgmaxSampler, ComboSampler
@@ -736,7 +754,7 @@ class QwenEngine:
                         images: list[str] | None = None, speculative: bool = True, cache_prompt: bool = True,
                         cancel: asyncio.Event | None = None, seed: int | None = None, reasoning_first: bool = False,
                         thinking_budget: int | None = None, loop_guard: bool | None = None,
-                        loop_final: bool | None = None) -> AsyncIterator[str]:
+                        loop_final: bool | None = None, logprobs: int | None = None) -> AsyncIterator[str]:
         """Yield decoded text pieces. The caller serializes calls. Final stats land in self.last_stats.
 
         Final check (on with the guard, loop_final=False turns it off): when the turn ends normally and the visible text
@@ -746,7 +764,11 @@ class QwenEngine:
         Loop guard (default on, EXL3_LOOP_GUARD=0 or loop_guard=False turns it off): when the think block loops (or
         thinking_budget tokens are used) the job is cancelled and restarted from prompt + the thinking kept so far +
         "\n</think>\n\n", so the answer proceeds. A loop inside the answer ends the turn (finish_reason stop).
-        Nothing is changed while no loop is detected."""
+        Nothing is changed while no loop is detected.
+
+        logprobs (None = off, k = 0..20): per generated token the log-probability of the token and of the k most likely tokens,
+        taken from the model distribution before temperature and truncation. They land in last_stats["logprobs"], one entry
+        per entry of token_ids ((token_logprob, [(id, logprob), ...]), None for a token the guard forced)."""
         loop = asyncio.get_running_loop()
         self.last_stats = {}
         if cancel is not None and cancel.is_set():
@@ -770,6 +792,7 @@ class QwenEngine:
         if guard_on or budget:
             mon = LoopMonitor("think" if reasoning_first else "answer", close_id, budget, detect=guard_on)
         token_ids: list[int] = []          # everything streamed to the client, all segments
+        lps: list = []                     # parallel to token_ids when logprobs is asked
         fired: dict[str, Any] | None = None
         marks: list[tuple[int, int]] = [(0, 0)]   # (tokens, characters) streamed after each event of this segment
         chars = 0
@@ -788,7 +811,8 @@ class QwenEngine:
         while True:
             job = self.Job(input_ids=job_ids, max_new_tokens=max(max_tokens - generated + discount, 1),
                            sampler=self._sampler(sampling), stop_conditions=self.eos + list(stop),
-                           embeddings=embs or None, decode_special_tokens=True, seed=seed)
+                           embeddings=embs or None, decode_special_tokens=True, seed=seed,
+                           **({} if logprobs is None else {"return_probs": True, "return_top_tokens": logprobs}))
             self.generator.enqueue(job)
             seg: list[int] = []
             marks = [(0, 0)]
@@ -806,6 +830,8 @@ class QwenEngine:
                     t = ev.get("token_ids")
                     toks = t.flatten().tolist() if t is not None and t.numel() else []
                     token_ids += toks
+                    if logprobs is not None:
+                        lps += self._event_logprobs(ev, len(toks))
                     seg += toks
                     generated += len(toks)
                     if ev.get("text"):
@@ -824,8 +850,14 @@ class QwenEngine:
                         redo = True
                         break
                     if ev.get("eos"):
-                        self.last_stats = {k: v for k, v in ev.items() if k not in ("job", "token_ids", "text", "held")}
+                        self.last_stats = {k: v for k, v in ev.items() if k not in ("job", "token_ids", "text", "held") and not k.startswith("stop_token_")}
                         self.last_stats["token_ids"] = token_ids
+                        if logprobs is not None:
+                            self.last_stats["logprobs"] = lps
+                            stop_lp = self._stop_logprobs(ev)
+                            if stop_lp is not None:   # the sampled stop token: no content, but its position is scored
+                                self.last_stats["logprobs"] = lps + [stop_lp]
+                                self.last_stats["logprob_token_ids"] = token_ids + [int(ev["eos_triggering_token_id"])]
                         if fired:
                             self.last_stats.update(prompt_tokens=int(ids.numel()), new_tokens=generated,
                                                    cached_tokens=min(int(self.last_stats.get("cached_tokens", 0)), int(ids.numel())),
@@ -849,6 +881,8 @@ class QwenEngine:
                 discount += len(token_ids) - keep_tokens
                 del token_ids[keep_tokens:]
                 token_ids += close_seq
+                del lps[keep_tokens:]
+                lps += [None] * len(close_seq)
                 generated += len(close_seq)
                 chars += len(THINK_CLOSE_TEXT)
                 vis += THINK_CLOSE_TEXT
@@ -869,6 +903,8 @@ class QwenEngine:
             if hit["phase"] == "answer" or close_id is None:
                 self.last_stats = {"prompt_tokens": n_total, "new_tokens": generated, "cached_tokens": 0,
                                    "eos_reason": "loop_guard", "token_ids": token_ids, "loop_guard": fired}
+                if logprobs is not None:
+                    self.last_stats["logprobs"] = lps
                 return
             # think block: keep the thinking up to the cut (on an event boundary), force the close, restart from there
             keep_tokens, keep_chars = max(m for m in marks if m[0] <= hit["cut"])
@@ -880,6 +916,8 @@ class QwenEngine:
                 vis = vis[:chars]
             del token_ids[len(token_ids) - len(seg) + keep_tokens:]
             token_ids += close_seq
+            del lps[len(token_ids) - len(close_seq):]
+            lps += [None] * len(close_seq)
             generated += len(close_seq)
             chars += len(THINK_CLOSE_TEXT)
             vis += THINK_CLOSE_TEXT
@@ -889,16 +927,87 @@ class QwenEngine:
             if generated - discount >= max_tokens:
                 self.last_stats = {"prompt_tokens": n_total, "new_tokens": generated, "cached_tokens": 0,
                                    "eos_reason": "max_new_tokens", "token_ids": token_ids, "loop_guard": fired}
+                if logprobs is not None:
+                    self.last_stats["logprobs"] = lps
                 return
             extra = self.torch.tensor([seg[:keep_tokens] + close_seq], dtype=ids.dtype)
             job_ids = self.torch.cat([ids, extra.to(ids.device)], dim=-1)
             mon.start_phase("answer")
+
+    @staticmethod
+    def _stop_logprobs(ev: dict[str, Any]):
+        """Logprob entry of the stop token a stream event ended on (None when the event carries none)."""
+        if ev.get("stop_token_prob") is None or ev.get("eos_reason") != "stop_token":
+            return None
+        e = QwenEngine._event_logprobs({"token_probs": ev["stop_token_prob"], "top_k_tokens": ev.get("stop_token_top_k_tokens"),
+                                    "top_k_probs": ev.get("stop_token_top_k_probs")}, 1)[0]
+        return e
+
+    @staticmethod
+    def _event_logprobs(ev: dict[str, Any], n: int) -> list:
+        """(token_logprob, [(id, logprob), ...]) for the n tokens of a stream event."""
+        probs, ids, tops = ev.get("token_probs"), ev.get("top_k_tokens"), ev.get("top_k_probs")
+        if probs is None or probs.numel() != n:
+            return [None] * n
+        pl = probs.flatten().tolist()
+        il = ids.reshape(n, -1).tolist() if ids is not None else [[]] * n
+        tl = tops.reshape(n, -1).tolist() if tops is not None else [[]] * n
+        return [(math.log(max(pl[i], 1e-45)), [(a, math.log(max(b, 1e-45))) for a, b in zip(il[i], tl[i])]) for i in range(n)]
 
     def spec_stats(self) -> dict[str, Any]:
         return {"speculative": self.spec_on, "draft_policy": self.draft_policy if self.spec_on else "off", "ndt": self.ndt}
 
 
 # ---------------------------------------------------------------------------- HTTP
+
+
+MAX_TOP_LOGPROBS = 20
+
+
+def logprobs_arg(value: Any, top: Any = None, chat: bool = False) -> int | None:
+    """The k of a request's logprobs fields, None when off. Completions: logprobs = k (0..20). Chat: logprobs = true plus
+    top_logprobs = k (0..20, default 0)."""
+    if chat:
+        if value is None or value is False:
+            if top not in (None, 0):
+                raise BadRequest("top_logprobs needs logprobs = true")
+            return None
+        if value is not True:
+            raise BadRequest("logprobs must be boolean")
+        k = 0 if top is None else top
+    else:
+        if value is None:
+            return None
+        k = value
+    if not isinstance(k, int) or isinstance(k, bool) or not 0 <= k <= MAX_TOP_LOGPROBS:
+        raise BadRequest(f"top_logprobs must be an integer from 0 to {MAX_TOP_LOGPROBS}")
+    return k
+
+
+def format_logprobs(entries: list, token_ids: list[int], token_str, chat: bool) -> dict[str, Any]:
+    """OpenAI logprobs object for the generated tokens. Every token and candidate also carries its id. Values are natural
+    logs of the model distribution before temperature, top-k, top-p and min-p. A token the loop guard forced has none (null)."""
+    def tok(i: int) -> dict[str, Any]:
+        t = token_str(i)
+        return {"token": t, "bytes": list(t.encode("utf-8")), "token_id": int(i)}
+    if chat:
+        content = []
+        for tid, e in zip(token_ids, entries):
+            if e is None:
+                content.append(tok(tid) | {"logprob": None, "top_logprobs": []})
+            else:
+                content.append(tok(tid) | {"logprob": e[0], "top_logprobs": [tok(a) | {"logprob": b} for a, b in e[1]]})
+        return {"content": content}
+    toks, offs, pos = [], [], 0
+    for tid in token_ids:
+        t = token_str(tid)
+        toks.append(t)
+        offs.append(pos)
+        pos += len(t)
+    return {"tokens": toks, "token_ids": [int(t) for t in token_ids], "text_offset": offs,
+            "token_logprobs": [None if e is None else e[0] for e in entries],
+            "top_logprobs": [None if e is None else {token_str(a): b for a, b in e[1]} for e in entries],
+            "top_logprobs_ids": [None if e is None else [[int(a), b] for a, b in e[1]] for e in entries]}
 
 
 def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, Any] | None = None,
@@ -936,9 +1045,14 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                             stop=job["stop"], images=job["images"], speculative=job["speculative"],
                             cache_prompt=job["cache_prompt"], cancel=job["cancel"],
                             seed=job.get("seed"), reasoning_first=job.get("reasoning_first", False),
-                            thinking_budget=job.get("thinking_budget"), loop_guard=job.get("loop_guard"), loop_final=job.get("loop_final")):
+                            thinking_budget=job.get("thinking_budget"), loop_guard=job.get("loop_guard"), loop_final=job.get("loop_final"), logprobs=job.get("logprobs")):
                         out.put_nowait(delta)
-                    out.put_nowait(("done", dict(getattr(engine, "last_stats", None) or {})))
+                    done = dict(getattr(engine, "last_stats", None) or {})
+                    print(f"qserve: request prompt={int(done.get('prompt_tokens') or 0)} cached={int(done.get('cached_tokens') or 0)} "
+                          f"new={int(done.get('new_tokens') or 0)} prefill_s={float(done.get('time_prefill') or 0):.3f} "
+                          f"generate_s={float(done.get('time_generate') or 0):.3f} stop={done.get('eos_reason')}",
+                          file=sys.stderr, flush=True)
+                    out.put_nowait(("done", done))
             except Exception as exc:                                  # noqa: BLE001
                 out.put_nowait(exc)
             finally:
@@ -1000,7 +1114,10 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             raise BadRequest("loop_guard must be boolean")
         if body.get("loop_final") is not None and not isinstance(body["loop_final"], bool):
             raise BadRequest("loop_final must be boolean")
-        return {"seed": seed, "thinking_budget": budget, "loop_guard": body.get("loop_guard"), "loop_final": body.get("loop_final"), "prompt": prompt, "prompt_tokens": prompt_tokens, "max_tokens": max_tokens,
+        lp = logprobs_arg(body.get("logprobs"), body.get("top_logprobs"), chat=True)
+        if lp is not None and body.get("stream"):
+            raise BadRequest("logprobs are returned on non-streaming requests only")
+        return {"logprobs": lp, "seed": seed, "thinking_budget": budget, "loop_guard": body.get("loop_guard"), "loop_final": body.get("loop_final"), "prompt": prompt, "prompt_tokens": prompt_tokens, "max_tokens": max_tokens,
                 "sampling": sampling_from(body, defaults), "stop": stops, "images": images,
                 "speculative": body.get("speculative", True) is not False,
                 "cache_prompt": body.get("cache_prompt", True) is not False,
@@ -1144,6 +1261,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                    "usage": usage, "timings": timings}
         if job["return_token_ids"]:
             payload["token_ids"] = stats.get("token_ids", [])
+        if job["logprobs"] is not None:
+            payload["choices"][0]["logprobs"] = format_logprobs(
+                stats.get("logprobs", []), stats.get("logprob_token_ids", stats.get("token_ids", [])), engine.token_str, chat=True)
         return web.json_response(payload)
 
     async def apply_template(request: web.Request) -> web.Response:
@@ -1245,6 +1365,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 raise BadRequest("seed must be an integer")
             if body.get("loop_guard") is not None and not isinstance(body["loop_guard"], bool):
                 raise BadRequest("loop_guard must be boolean")
+            lp = logprobs_arg(body.get("logprobs"))
+            if lp is not None and body.get("stream"):
+                raise BadRequest("logprobs are returned on non-streaming requests only")
             prompt_tokens = engine.count_tokens(prompt)
             ctx = getattr(engine, "ctx", None)
             if ctx:
@@ -1252,7 +1375,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 if room < 1:
                     raise BadRequest(f"context length exceeded: prompt is {prompt_tokens} tokens, the server context is {ctx}")
                 max_tokens = min(max_tokens, room)
-            job = {"prompt": prompt, "max_tokens": max_tokens, "stop": stops, "images": [], "speculative": body.get("speculative", True) is not False, "seed": seed,
+            job = {"logprobs": lp, "prompt": prompt, "max_tokens": max_tokens, "stop": stops, "images": [], "speculative": body.get("speculative", True) is not False, "seed": seed,
                    "sampling": sampling_from(body, defaults), "cache_prompt": body.get("cache_prompt", True) is not False,
                    "loop_guard": body.get("loop_guard"), "cancel": asyncio.Event()}
         except json.JSONDecodeError as exc:
@@ -1337,7 +1460,11 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             return web.json_response({"error": {"message": f"{type(exc).__name__}: {exc}", "type": "server_error"}}, status=500)
         text, _ = stop_text(full, job["stop"])
         reason, usage = reason_usage(stats, text)
-        return web.json_response(chunk(text, reason) | {"object": "text_completion", "usage": usage})
+        out_ = chunk(text, reason) | {"object": "text_completion", "usage": usage}
+        if job["logprobs"] is not None:
+            out_["choices"][0]["logprobs"] = format_logprobs(
+                stats.get("logprobs", []), stats.get("logprob_token_ids", stats.get("token_ids", [])), engine.token_str, chat=False)
+        return web.json_response(out_)
 
     async def slots(_: web.Request) -> web.Response:
         return web.json_response(engine.slot_store.slots())
@@ -1385,6 +1512,8 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="pack directory")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="id shown by /v1/models and expected in requests")
     parser.add_argument("--ctx", "-c", type=int, default=65536, help="KV cache size in tokens (default 65536)")
+    parser.add_argument("--cache-bits", type=int, default=8, choices=(0, 8),
+                        help="bits per K/V element of the attention cache pages (8 = packed int8, the default, about 40 %% smaller; 0 = fp16)")
     parser.add_argument("--ndt", type=int, default=3, help="max draft tokens per round (default 3)")
     parser.add_argument("--draft-policy", choices=("mix", "mtp", "off"), default="mix",
                         help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, off = plain decode")
@@ -1409,7 +1538,8 @@ def main() -> None:
     t0 = time.time()
     print(f"qserve: starting, model={model_dir} ctx={args.ctx} draft_policy={args.draft_policy} "
           f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
-    engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision)
+    engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
+                        cache_bits=args.cache_bits)
     env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
     print(f"qserve: effective env {env}", flush=True)
     from exllamav3.generator.slot_store import SlotStore

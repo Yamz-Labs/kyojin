@@ -727,7 +727,13 @@ class Job:
                         "eos_triggering_token_id": stop_token,
                         "eos_triggering_token_str": id_to_piece[stop_token]
                     })
-                    pass
+                    # The stop token itself is not streamed as a token, but its probability and top candidates are reported
+                    # (the entry of the position where the stop token was sampled), so a client can score every position.
+                    if self.held_probs:
+                        r.update({ "stop_token_prob": self.held_probs.torch()[:, -1:].clone() })
+                    if self.held_k_tokens:
+                        r.update({ "stop_token_top_k_tokens": self.held_k_tokens.torch()[:, -1:].clone() })
+                        r.update({ "stop_token_top_k_probs": self.held_k_probs.torch()[:, -1:].clone() })
                 if eos_reason == "stop_string":
                     r.update({ "eos_triggering_string": stop_string })
 
@@ -1272,6 +1278,14 @@ class Job:
             if not (big_tail and prefill_end >= len(seq.sequence_ids) - 1):
                 prefill_end = (prefill_end // PAGE_SIZE) * PAGE_SIZE
             prefill_end = min(prefill_end, len(seq.sequence_ids) - 1)
+            # EXL3_PF_NO_TAIL=1 (GDN models): the last chunk runs to the end of the prompt even when that is not a page
+            # boundary (it would otherwise be a second forward pass re-reading every expert); the last-page recurrent
+            # checkpoint is written from inside the chunk (see no_tail_row below). EXL3_PF_TAIL_MERGE: extra rows beyond the
+            # chunk size a merged last chunk may take (default 0: only what fits in one chunk)
+            gdn_nt = self.gdn_no_tail_enabled()
+            if gdn_nt and seq.kv_position % PAGE_SIZE == 0 and \
+                    remaining <= chunk + int(os.environ.get("EXL3_PF_TAIL_MERGE", "0")):
+                prefill_end = len(seq.sequence_ids) - 1
 
             atomic_mm_prefill = bool(self.embeddings) and self.generator.model.caps.get("atomic_mm_prefill")
             mm_exact_chunks = bool(self.embeddings) and self.generator.model.caps.get("mm_exact_chunks")
@@ -1362,7 +1376,10 @@ class Job:
                 # (a 4K prompt ran 3840 + 255, the 255-row tail cost ~1 s); the chunk runs whole and the KDA
                 # kernel side-writes the last-page state as a second mid-chunk checkpoint (stash_midchunk)
                 # Chunks under 512 rows keep the cut: chunk_kda runs the fla chain there (no HIP side-write)
-                if big_tail and prefill_start < last_page_b < prefill_end and prefill_start % PAGE_SIZE == 0 and \
+                if gdn_nt and prefill_end == seqlen and prefill_start < last_page_b < prefill_end and \
+                        prefill_start % PAGE_SIZE == 0:
+                    no_tail_row = last_page_b - prefill_start
+                elif big_tail and prefill_start < last_page_b < prefill_end and prefill_start % PAGE_SIZE == 0 and \
                         prefill_end - prefill_start >= 512 and os.environ.get("EXL3_PF_NO_TAIL", "0") == "1":
                     no_tail_row = last_page_b - prefill_start
                 elif prefill_start < last_page_b <= prefill_end:
@@ -1451,19 +1468,22 @@ class Job:
                 # EXL3_MIDCHUNK_CKPT=1 (default off): a chunk that crosses a recurrent checkpoint boundary also
                 # saves the recurrent state at that boundary (KDA layers split conv + core there), stashed below
                 if self.recurrent_state is not None and not self.embeddings and \
-                        os.environ.get("EXL3_MIDCHUNK_CKPT", "0") in ("1", "2") and \
+                        (os.environ.get("EXL3_MIDCHUNK_CKPT", "0") in ("1", "2") or (gdn_nt and no_tail_row is not None)) and \
                         not self.generator.model.loaded_tp and prefill_start % PAGE_SIZE == 0:
-                    rows = [
-                        p - prefill_start
-                        for p in range(prefill_start + PAGE_SIZE, prefill_end, PAGE_SIZE)
-                        if self.is_checkpoint_boundary(pos = p)
-                    ]
-                    if no_tail_row is not None:
-                        rows = sorted(set(rows + [no_tail_row]))
+                    if gdn_nt:
+                        rows = [] if no_tail_row is None else [no_tail_row]
+                    else:
+                        rows = [
+                            p - prefill_start
+                            for p in range(prefill_start + PAGE_SIZE, prefill_end, PAGE_SIZE)
+                            if self.is_checkpoint_boundary(pos = p)
+                        ]
+                        if no_tail_row is not None:
+                            rows = sorted(set(rows + [no_tail_row]))
                     if rows:
                         params["checkpoint_rows"] = rows
-                        # 1: split conv + KDA core (reference), 2: in-kernel S side-write + async D2H
-                        params["midchunk_mode"] = int(os.environ["EXL3_MIDCHUNK_CKPT"])
+                        # 1: split conv + KDA core (reference), 2: in-kernel S side-write + async D2H (the only GDN mode)
+                        params["midchunk_mode"] = 2 if gdn_nt else int(os.environ["EXL3_MIDCHUNK_CKPT"])
                 if self.generator.mtp_draft:
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.
@@ -1670,6 +1690,29 @@ class Job:
                 f.attach(self)
                 f.reset()
                 f.is_active = f.trigger_token is None and not self.filters_suspended
+
+
+    def gdn_no_tail_enabled(self):
+        """
+        EXL3_PF_NO_TAIL=1 for GDN (non-KDA) recurrent models: text-only job, no TP, every recurrent layer a GatedDeltaNet (or the
+        Qwen PLE layer) with the fused HIP chain (EXL3_GDN_FUSE=1, EXL3_GDN_PF on), the only path that side-writes the mid-chunk state.
+        """
+        if os.environ.get("EXL3_PF_NO_TAIL", "0") != "1" or os.environ.get("EXL3_GDN_FUSE", "0") != "1" or \
+                os.environ.get("EXL3_GDN_PF", "1") != "1":
+            return False
+        if self.recurrent_state is None or self.embeddings:
+            return False
+        g = self.generator
+        ok = getattr(g, "_gdn_no_tail_ok", None)
+        if ok is None:
+            from ..modules.gated_delta_net import GatedDeltaNet
+            from ..modules.ple import PLELayer   # Qwen 3.8: one PLE layer also holds a recurrent state (it saves its own mid-chunk state)
+            rl = g.model.get_recurrent_layers()
+            ok = bool(rl) and not g.model.loaded_tp and \
+                all(isinstance(m, PLELayer) or (isinstance(m, GatedDeltaNet) and not m.kda) for m in rl) and \
+                any(isinstance(m, GatedDeltaNet) for m in rl)
+            g._gdn_no_tail_ok = ok
+        return ok
 
 
     def big_tail_enabled(self):

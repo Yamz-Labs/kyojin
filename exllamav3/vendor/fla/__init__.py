@@ -88,7 +88,7 @@ def chunk_gated_delta_rule(
     return o.to(q.dtype), final_state
 
 
-def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False):
+def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False, ckpt=None):
     """chunk_gated_delta_rule(use_qk_l2norm_in_kernel=True, chunk_size=64) for q, k, v given as (possibly strided) views of the conv
     output; g (fp32) and beta (bf16) contiguous. Bitwise equal to the guarded entry; no copies of q, k, v when the views are plain
     token-pitch slices."""
@@ -107,7 +107,7 @@ def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, 
         g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2)
         if os.environ.get("EXL3_GDN_FUSE", "0") == "1":
             from .gdn_fused import chunk_gdn_fused
-            res = chunk_gdn_fused(qn, kn, v, g, beta, scale, initial_state, output_final_state, chunk_size)
+            res = chunk_gdn_fused(qn, kn, v, g, beta, scale, initial_state, output_final_state, chunk_size, ckpt = ckpt)
             if res is not None:
                 return res[0].to(qn.dtype), res[1]
         v = v.contiguous()

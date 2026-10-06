@@ -435,6 +435,21 @@ class PLELayer(Module):
                 else:
                     conv_state[s, :, :win].copy_(conv_stream[i, :, -win:])
                     id_state[s, :ctx].copy_(history[i, -ctx:])
+            # EXL3_PF_NO_TAIL: the state after row r of this chunk (what stash() would hold if the forward had ended there) =
+            # conv columns [r, r + win) of the full conv stream and ids [r, r + ctx) of the history; the job stashes them
+            # (Job.stash_midchunk, 3-tuple form: pinned host copy + event)
+            rows = params.get("checkpoint_rows")
+            if rows and params.get("midchunk_mode") == 2 and not save_history and bsz == 1 and len(slots) == 1:
+                saved = params.setdefault("midchunk_states", {})
+                layer_instance = (self.layer_idx, params.get("layer_instance", 0))
+                for r in rows:
+                    if not 0 < r < seq:
+                        continue
+                    hs = torch.empty((conv_stream.shape[1], win), dtype = conv_stream.dtype, pin_memory = True)
+                    hs.copy_(conv_stream[0, :, r:r + win], non_blocking = True)
+                    ev = torch.cuda.Event()
+                    ev.record()
+                    saved.setdefault(r, {})[layer_instance] = (hs, history[0, r:r + ctx].clone(), ev)
         else:
             delta, _ = self.forward_streams(x, history, params)
         if os.environ.get("EXL3_PFE_PLE", "1") != "0":

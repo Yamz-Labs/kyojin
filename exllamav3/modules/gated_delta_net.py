@@ -1268,7 +1268,11 @@ class GatedDeltaNet(Module):
         """EXL3_MIDCHUNK_CKPT=2: one unsplit call; the HIP KDA kernel side-writes S at the checkpoint row, conv state
         there = the last cdim pre-conv inputs (bf16). Single row, rows % 64 == 0 only. Returns the ckpt dict or None."""
         rows = params.get("checkpoint_rows")
-        if not rows or params.get("midchunk_mode") != 2 or not self.kda or bsz != 1 or not save_state or save_history:
+        if not rows or params.get("midchunk_mode") != 2 or bsz != 1 or not save_state or save_history:
+            return None
+        # GDN (not KDA): only the fused HIP chain (EXL3_GDN_FUSE=1 + EXL3_GDN_PF=1, chunk path) side-writes the state
+        if not self.kda and (os.environ.get("EXL3_GDN_FUSE", "0") != "1" or os.environ.get("EXL3_GDN_PF", "1") != "1"
+                             or seqlen < self.num_v_heads):
             return None
         rows = sorted(set(int(r) for r in rows))
         cdim = self.conv_kernel_size

@@ -601,7 +601,7 @@ def _quant_cache_paged_one(source: torch.Tensor, packed: torch.Tensor, scales: t
     scales.reshape(-1, groups).index_copy_(0, destination_positions, q_scales)
 
 
-def quant_cache_paged(
+def _quant_cache_paged_torch(
     k_in: torch.Tensor, k_out: torch.Tensor, k_out_scales: torch.Tensor,
     v_in: torch.Tensor, v_out: torch.Tensor, v_out_scales: torch.Tensor,
     cache_seqlens: torch.Tensor, block_table: torch.Tensor, page_size: int,
@@ -828,3 +828,32 @@ class _BCNone:
     __slots__ = ()
     def __call__(self, *args: Any, **kwargs: Any) -> None:
         return None
+
+
+_QW_OFF = os.environ.get("EXL3_QWRITE_TRITON", "1") == "0"
+
+
+def quant_cache_paged(
+    k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
+    cache_seqlens, block_table, page_size, seq_len, compand_a = 0.0, in_contiguous = False,
+):
+    """Paged cache append: native Triton writer for the 8-bit layout, torch fallback otherwise."""
+    if (
+        not _QW_OFF and compand_a == 0.0 and seq_len > 0 and k_in.is_cuda and
+        k_out.ndim == 3 and v_out.ndim == 3 and k_out_scales.shape[-1] in (8, 16, 32, 64) and
+        k_out.shape[-1] == k_out_scales.shape[-1] * 8 and v_out.shape[-1] == k_out.shape[-1] and
+        v_out_scales.shape == k_out_scales.shape and
+        k_in.dtype == torch.float16 and v_in.dtype == torch.float16 and
+        k_in.is_contiguous() and v_in.is_contiguous() and page_size == 256 and
+        k_out.dtype == torch.int32 and v_out.dtype == torch.int32 and
+        k_out_scales.dtype == torch.float16 and v_out_scales.dtype == torch.float16 and
+        cache_seqlens.dtype == torch.int32 and block_table.dtype == torch.int32 and
+        k_in.shape == v_in.shape and k_in.numel() >= block_table.shape[0] * seq_len * (k_out_scales.shape[-1] * 32) and
+        (in_contiguous or k_in.numel() == k_out.shape[0] * page_size * k_out_scales.shape[-1] * 32)
+    ):
+        from .modules.attention_fn.qwrite_triton import quant_cache_paged8
+        quant_cache_paged8(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
+                           cache_seqlens, block_table, seq_len, in_contiguous)
+        return
+    _quant_cache_paged_torch(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
+                             cache_seqlens, block_table, page_size, seq_len, compand_a, in_contiguous)

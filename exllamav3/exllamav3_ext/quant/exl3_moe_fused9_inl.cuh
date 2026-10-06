@@ -328,6 +328,33 @@ __device__ __forceinline__ float tk2_value(const uint32_t ukey)
 }
 
 template <class S>
+__device__ __forceinline__ void ph_topk_tail9(const Params& p, Smem<S>& s)
+{
+    MF_DIMS
+    const int R = p.R;
+    const int NA = R * TOPK;
+    if (threadIdx.x < NA)
+    {
+        const int a = threadIdx.x, e = s.sel[a];
+        int pp = 0;
+        for (int b = 0; b < NA; ++b) { const int eb = s.sel[b]; pp += (eb < e) || (eb == e && b < a); }
+        s.sorted_e[pp] = e; s.sorted_a[pp] = a; s.tok[pp] = a / TOPK;
+    }
+    __syncthreads();
+    if (threadIdx.x < NA) s.head[threadIdx.x] = (threadIdx.x == 0 || s.sorted_e[threadIdx.x - 1] != s.sorted_e[threadIdx.x]) ? 1 : 0;
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        int g = 0;
+        for (int q = 0; q < NA; ++q) if (s.head[q]) s.gstart[g++] = q;
+        s.gstart[g] = NA; s.ngroups = g;
+        for (int u = 0; u < g; ++u) s.urows[u] = min(s.gstart[u + 1] - s.gstart[u], MAXR);
+        s.urows[g] = R;                       // the shared expert: R rows
+    }
+    __syncthreads();
+}
+
+template <class S>
 __device__ __forceinline__ void ph_topk9(const Params& p, Smem<S>& s, int vm = 0)
 {
     MF_DIMS
@@ -425,26 +452,20 @@ __device__ __forceinline__ void ph_topk9(const Params& p, Smem<S>& s, int vm = 0
         }
     }
     __syncthreads();
-    const int NA = R * TOPK;
-    if (threadIdx.x < NA)
+    ph_topk_tail9<S>(p, s);
+}
+
+// Split launches: the stages after the router re-enter here with s.sel / s.wt reloaded from seldbg (block 0 of the top-k stage wrote them)
+template <class S>
+__device__ __forceinline__ void topk_restore9(const Params& p, Smem<S>& s)
+{
+    if (threadIdx.x < p.R * S::TOPK)
     {
-        const int a = threadIdx.x, e = s.sel[a];
-        int pp = 0;
-        for (int b = 0; b < NA; ++b) { const int eb = s.sel[b]; pp += (eb < e) || (eb == e && b < a); }
-        s.sorted_e[pp] = e; s.sorted_a[pp] = a; s.tok[pp] = a / TOPK;
+        s.sel[threadIdx.x] = p.seldbg[threadIdx.x];
+        s.wt[threadIdx.x] = __ushort_as_half((unsigned short) p.seldbg[64 + threadIdx.x]);
     }
     __syncthreads();
-    if (threadIdx.x < NA) s.head[threadIdx.x] = (threadIdx.x == 0 || s.sorted_e[threadIdx.x - 1] != s.sorted_e[threadIdx.x]) ? 1 : 0;
-    __syncthreads();
-    if (threadIdx.x == 0)
-    {
-        int g = 0;
-        for (int q = 0; q < NA; ++q) if (s.head[q]) s.gstart[g++] = q;
-        s.gstart[g] = NA; s.ngroups = g;
-        for (int u = 0; u < g; ++u) s.urows[u] = min(s.gstart[u + 1] - s.gstart[u], MAXR);
-        s.urows[g] = R;                       // the shared expert: R rows
-    }
-    __syncthreads();
+    ph_topk_tail9<S>(p, s);
 }
 
 template <class S, int ABL>
