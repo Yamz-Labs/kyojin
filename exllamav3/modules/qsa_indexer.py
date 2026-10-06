@@ -72,6 +72,24 @@ def _pf_hip_ready() -> bool:
     return _PF_HIP["ok"]
 
 
+def tile_candidates(scores, tile_idx, t0):
+    """One tile's top-k as composite int64 keys: the top-k kernel's 16-bit order key (topk_key) above, 0xFFFFFFFF - global
+    index below, -1 for padding and -inf scores (the kernel's own validity test). scores (R, W) fp16 view, tile_idx (R, kp)
+    int32 local indices (-1 padded) as the kernel wrote them, t0 the tile's first pool."""
+    li = tile_idx.long()
+    bits = torch.gather(scores, 1, li.clamp(min = 0)).view(torch.int16).to(torch.int32) & 0xFFFF
+    key = torch.where(bits >= 0x8000, ~bits & 0xFFFF, bits | 0x8000).long()
+    return torch.where((li >= 0) & (key > 0x03FF), (key << 32) | (0xFFFFFFFF - (li + t0)), -1)
+
+
+def merge_candidates(cand, k):
+    """Top-k of the concatenated tile candidates under (score descending, index ascending), the single-pass kernel's order,
+    returned as ascending global indices, -1 padded: (R, k) int32. Valid keys are unique, so the selection is exact."""
+    top = torch.topk(torch.cat(cand, dim = 1), k, dim = 1, largest = True, sorted = False).values
+    gi = torch.where(top >= 0, 0xFFFFFFFF - (top & 0xFFFFFFFF), 0x7FFFFFFF).sort(dim = 1).values
+    return torch.where(gi == 0x7FFFFFFF, -1, gi).to(torch.int32)
+
+
 class QSAIndexer(Module):
 
     def __init__(
@@ -357,15 +375,8 @@ class QSAIndexer(Module):
                     t1 = min(t0 + t_tile, T_slab)
                     sc = tile_scores(q_slab, rows, t0, t1)
                     ext.dsa_topk(sc, tile_idx, min(k_sel, t1 - t0), None, 0)
-                    li = tile_idx.long()
-                    bits = torch.gather(sc, 1, li.clamp(min = 0)).view(torch.int16).to(torch.int32) & 0xFFFF
-                    # the kernel's order key (topk_key) and its validity test (key above the -inf key)
-                    key = torch.where(bits >= 0x8000, ~bits & 0xFFFF, bits | 0x8000).long()
-                    cand.append(torch.where((li >= 0) & (key > 0x03FF),
-                                            (key << 32) | (0xFFFFFFFF - (li + t0)), -1))
-                top = torch.topk(torch.cat(cand, dim = 1), k_sel, dim = 1, largest = True, sorted = False).values
-                gi = torch.where(top >= 0, 0xFFFFFFFF - (top & 0xFFFFFFFF), 0x7FFFFFFF).sort(dim = 1).values
-                pool_idx[:, :k_sel] = torch.where(gi == 0x7FFFFFFF, -1, gi).to(torch.int32)
+                    cand.append(tile_candidates(sc, tile_idx, t0))
+                pool_idx[:, :k_sel] = merge_candidates(cand, k_sel)
                 pool_idx[:, k_sel:] = -1
             else:
                 # Tiled: each tile's local top-k becomes candidate slot 1 next to the running set
