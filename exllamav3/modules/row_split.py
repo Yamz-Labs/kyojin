@@ -1,4 +1,5 @@
-"""Row split of the speculative verify (EXL3_VERIFY_ROW_SPLIT=1, default off).
+"""Row split of the speculative verify (EXL3_VERIFY_ROW_SPLIT, default off): 1 = split the dense GEMV and hc-mixer launches here and the MoE
+in moe_fused.py; 2 = split only the MoE, the GEMV and hc mixer take 5..8 rows natively (see MODE below).
 
 Several verify kernels have a fast path for up to 4 rows (one-pass hc mixer: GRR_MAX_RT = 4) or are fast only up to
 4 rows (exl3_dec_gemv_r / _multi: the 8-row instantiation costs about 4x per row). With 5..8 rows (one sequence,
@@ -11,7 +12,14 @@ import os
 from ..ext import exllamav3_ext as ext
 
 CHUNK = 4
-ON = os.environ.get("EXL3_VERIFY_ROW_SPLIT", "0") != "0"
+# "1": the GEMV and hc-mixer launches are split here into <= 4-row launches; "2": only the MoE is split (moe_fused.py), the GEMV and hc mixer
+# take 5..8 rows natively (EXL3_GEMV_R_RPB=4 EXL3_GEMV_R_CHUNK_FAST=1 EXL3_GR_MIX_Q8_MAXR=8, one launch, bit-identical)
+MODE = os.environ.get("EXL3_VERIFY_ROW_SPLIT", "0")
+ON = MODE == "1"
+if MODE == "2":
+    # read by the extension at launch (GEMV) or at the first hc-mixer call; the caller's own values win
+    for _k, _v in (("EXL3_GEMV_R_RPB", "4"), ("EXL3_GEMV_R_CHUNK_FAST", "1"), ("EXL3_GR_MIX_Q8_MAXR", "8")):
+        os.environ.setdefault(_k, _v)
 _installed = False
 
 

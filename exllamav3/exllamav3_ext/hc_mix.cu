@@ -2295,6 +2295,19 @@ static bool gr_q8_onepass()
     return v == 1;
 }
 
+// Largest R that takes the group launch (groups of GRR_MAX_RT rows, one weight pass per group, each group bit-identical to a
+// 1..4 row call): EXL3_GR_MIX_Q8_MAXR, default GRR_MAX_RT; 8 makes the 5..8 row verify cost one more group instead of the per-row launches.
+static int gr_q8_maxrows()
+{
+    static int v = -1;
+    if (v < 0)
+    {
+        const char* e = getenv("EXL3_GR_MIX_Q8_MAXR");
+        v = e ? std::max(GRR_MAX_RT, std::min(8, atoi(e))) : GRR_MAX_RT;
+    }
+    return v;
+}
+
 void gr_mix_q8
 (
     const at::Tensor& streams,           // (R, H, D) float
@@ -2359,7 +2372,7 @@ void gr_mix_q8
 
     const at::cuda::OptionalCUDAGuard device_guard(device);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    if (R <= GRR_MAX_RT && gr_q8_onepass())     // measured domain: decode / MTP verify rows; larger R keeps the old launch
+    if (R <= gr_q8_maxrows() && gr_q8_onepass())     // measured domain: decode / MTP verify rows; larger R keeps the old launch
     {
         grr_launch
         (
