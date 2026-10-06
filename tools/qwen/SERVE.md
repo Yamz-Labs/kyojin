@@ -90,7 +90,7 @@ The port answers from the first second, while the model is still loading. `GET /
 (plus the fields listed above) when the server is ready, and while it loads:
 
 ```json
-503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 5,
+503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 5)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 5,
      "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
 ```
 

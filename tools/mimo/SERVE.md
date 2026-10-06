@@ -40,7 +40,7 @@ top-level config does not carry `max_position_embeddings` — the GLM fix.
   `stop` (string or list), `temperature`, `top_p`, `max_completion_tokens` or `max_tokens` (the first wins; default 4096). A reply cut by the limit reports `finish_reason: "length"`. An engine failure mid-stream ends with an `error` frame, `finish_reason: "error"` and `[DONE]`. Tool calls are emitted only
   once the XML block closes, so a client never sees half a JSON payload.
 - `GET /v1/models` — one entry, `MiMo-2.6-EXL3`.
-- `GET /health` — `{"status","model","generator","spec_gate"}`; with the gate on, `spec_gate`
+- `GET /health` — `{"status","model","generator","spec_gate"}` once ready (load progress while starting: see below); with the gate on, `spec_gate`
   carries the live counters `n_spec n_plain n_off n_shadow n_probe_fail t_plain t_spec
   tok_round`. Useful while tuning.
 
@@ -50,7 +50,7 @@ The port answers from the first second, while the model is still loading. `GET /
 (plus the fields listed above) when the server is ready, and while it loads:
 
 ```json
-503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 3,
+503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 3)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 3,
      "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
 ```
 
@@ -83,8 +83,7 @@ models:
 cost measurements (`t_plain`, `t_spec`) and the probe outcome. The shadow-probe re-entry path
 re-calibrates within a few plain steps when the next request's acceptance differs, which is what
 makes a code request followed by a chat request safe. Verified on GPU: 6 alternating code/chat
-requests in one process, gate counters and served output both sane
-(`scratch/msrv/health_after.json`).
+requests in one process, gate counters and served output both sane.
 
 `--spec-gate-reset-per-request` builds a fresh `SpecGate` per request instead. It costs the first
 few steps of every request (the gate skips the first two speculative rounds and then probes), so
