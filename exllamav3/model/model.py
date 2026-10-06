@@ -381,7 +381,7 @@ class Model(Model_TPMixin, Model_LSMixin):
                 "Cannot specify reserve_per_device or use_per_device when loading to single device."
             assert not tensor_p, \
                 "Cannot use tensor_p when loading to single device."
-            self._load_single(progressbar, device, self.config, self.modules, verbose)
+            self._load_single(progressbar, device, self.config, self.modules, verbose, callback)
             self.output_device = self.modules[-1].device
 
         # Use/reserve

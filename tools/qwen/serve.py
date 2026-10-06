@@ -36,6 +36,8 @@ from aiohttp import web
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+sys.path.append(str(HERE.parent))
+import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 
 
 def _load_mimo():
@@ -628,26 +630,30 @@ class QwenEngine:
         if os.environ.get("EXL3_WARM_DENSE", "1") != "0":
             from exllamav3.model.dense_warmup import seed_dense_tune
             seed_dense_tune()
+        startup_health.stage("target weights")
         with Heartbeat("loading target model"):
-            self.model.load(max_chunk_size=max_chunk_size, progressbar=False)
+            self.model.load(max_chunk_size=max_chunk_size, progressbar=False, callback=startup_health.load_callback())
         from exllamav3.modules.hyperconnections import GS_STATS
         print("qserve: hc mixer sites by code source", dict(GS_STATS), flush=True)
         self.draft_model = self.draft_cache = None
         if draft_policy != "off":
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx, max_history=3, **qkw)
+            startup_health.stage("drafter weights")
             with Heartbeat("loading MTP drafter"):
-                self.draft_model.load(progressbar=False)
+                self.draft_model.load(progressbar=False, callback=startup_health.load_callback())
         self.vision = None
         if vision:
             try:
                 self.vision = Model.from_config(self.config, component="vision")
+                startup_health.stage("vision tower")
                 with Heartbeat("loading vision tower"):
-                    self.vision.load(progressbar=False)
+                    self.vision.load(progressbar=False, callback=startup_health.load_callback())
             except Exception as exc:                                  # noqa: BLE001
                 self.vision = None
                 print(f"qserve: vision tower not loaded ({exc!r}); image input disabled", flush=True)
         self.supports_vision = self.vision is not None
+        startup_health.stage("engine setup")
         self._ngram_resident()
         self.generator = self.uninstall = None
         self.spec_on = self.draft_model is not None
@@ -1504,6 +1510,27 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
 # ---------------------------------------------------------------------------- main
 
 
+def load_all(args: argparse.Namespace):
+    """Everything before the port opens: template, defaults, engine, slot store, warm-up."""
+    model_dir = str(Path(args.model).expanduser())
+    template = (Path(model_dir) / "chat_template.jinja").read_text(encoding="utf-8")
+    defaults = load_defaults(model_dir, args)
+    t0 = time.time()
+    print(f"qserve: starting, model={model_dir} ctx={args.ctx} draft_policy={args.draft_policy} "
+          f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
+    engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
+                        cache_bits=args.cache_bits)
+    env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
+    print(f"qserve: effective env {env}", flush=True)
+    from exllamav3.generator.slot_store import SlotStore
+    engine.slot_store = SlotStore(engine.generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
+                                  args.slot_save_path, args.model_id)
+    startup_health.stage("warm-up")
+    with Heartbeat("warm-up (first decode steps)"):
+        engine.warmup()
+    return engine, template, defaults, model_dir, t0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(allow_abbrev=False, description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1532,26 +1559,21 @@ def main() -> None:
 
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
-    model_dir = str(Path(args.model).expanduser())
-    template = (Path(model_dir) / "chat_template.jinja").read_text(encoding="utf-8")
-    defaults = load_defaults(model_dir, args)
-    t0 = time.time()
-    print(f"qserve: starting, model={model_dir} ctx={args.ctx} draft_policy={args.draft_policy} "
-          f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
-    engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
-                        cache_bits=args.cache_bits)
-    env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
-    print(f"qserve: effective env {env}", flush=True)
-    from exllamav3.generator.slot_store import SlotStore
-    engine.slot_store = SlotStore(engine.generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
-                                  args.slot_save_path, args.model_id)
-    with Heartbeat("warm-up (first decode steps)"):
-        engine.warmup()
+    # /health answers 503 with the load progress from here until READY (stdlib listener on the same port).
+    stages = ["target weights"] + (["drafter weights"] if args.draft_policy != "off" else []) \
+        + (["vision tower"] if not args.no_vision else []) + ["engine setup", "warm-up"]
+    startup_health.start("qwen", stages, args.host, args.port)
+    try:
+        engine, template, defaults, model_dir, t0 = load_all(args)
+    except BaseException as exc:                                  # noqa: BLE001
+        startup_health.abort(f"{type(exc).__name__}: {exc}")
+        raise
     app = create_app(engine, args.model_id, template, defaults, args.default_max_tokens)
 
     async def serve() -> None:
         runner = web.AppRunner(app)
         await runner.setup()
+        startup_health.finish()                                   # free the early listener's port, then bind
         await web.TCPSite(runner, args.host, args.port).start()
         print(f"qserve: READY on http://{args.host}:{args.port}  model={args.model_id} ctx={args.ctx} "
               f"speculative={engine.spec_on} vision={engine.supports_vision} (start-up {time.time() - t0:.0f} s)",
