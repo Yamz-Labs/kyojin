@@ -247,6 +247,11 @@ class QSAIndexer(Module):
     # Scorer launch shape "block_m,block_n,num_warps,num_stages" (unset = the scorer's own default). Every output
     # element is computed by the same MMA sequence whatever the tile, so the scores are bit-identical
     SCORE_CFG = os.environ.get("EXL3_QSA_SCORE_CFG", "")
+    # ROCm has no dsa_topk_tile / dsa_topk_merge_tiles: its one-block-per-row top-k scans a row three times, and
+    # beyond ~32K pools the row no longer stays cache resident (about 10x the cost per column at 64K pools). N > 0 runs
+    # the top-k in tiles of N pools (a multiple of 128 is best, 16384 measured) through that same kernel and merges the
+    # per-tile candidates in torch under the kernel's own total order. 0 = one full-width pass
+    TOPK_TILE = int(os.environ.get("EXL3_QSA_TOPK_TILE", 0))
     # Row count up to which the plane-update workspaces come from g_tensor_cache (decode-class
     # calls: MTP verify, bsz > 1 fallbacks, where allocation latency matters); prefill chunks
     # allocate per call, the static cache being meant for small buffers only
@@ -293,14 +298,15 @@ class QSAIndexer(Module):
         k_pad = out_rows.shape[1]
         k_sel = self.block_topk
         kp = -(-k_sel // 32) * 32
-        t_tile = self.SEL_TILE
+        tiled_topk = hasattr(ext, "dsa_topk_tile") and hasattr(ext, "dsa_topk_merge_tiles")
+        torch_merge = not tiled_topk and self.TOPK_TILE > 0
+        t_tile = self.TOPK_TILE if torch_merge else self.SEL_TILE
         if block_table is not None:
             t_tile = max(epp, t_tile // epp * epp)   # tiles must start on a pool page
         # Fixed score-row stride for every tile: it is a constexpr of the scoring kernel, so a
         # stride that followed the visible length recompiled it at every new 128-pool boundary
         s_stride = -(-t_tile // 128) * 128
         s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile")
-        tiled_topk = hasattr(ext, "dsa_topk_tile") and hasattr(ext, "dsa_topk_merge_tiles")
 
         cfg = {}
         if self.SCORE_CFG:
@@ -341,9 +347,26 @@ class QSAIndexer(Module):
             q_slab = q_rows[r0 : r1]
             if T_slab <= 0:
                 pool_idx.fill_(-1)
-            elif T_slab <= t_tile or not tiled_topk:
+            elif T_slab <= t_tile or (not tiled_topk and not torch_merge):
                 sc = tile_scores(q_slab, rows, 0, T_slab)
                 ext.dsa_topk(sc, pool_idx, min(k_sel, T_slab), None, 0)
+            elif torch_merge:
+                cand = []
+                tile_idx = torch.empty((rows, kp), dtype = torch.int32, device = dev)
+                for t0 in range(0, T_slab, t_tile):
+                    t1 = min(t0 + t_tile, T_slab)
+                    sc = tile_scores(q_slab, rows, t0, t1)
+                    ext.dsa_topk(sc, tile_idx, min(k_sel, t1 - t0), None, 0)
+                    li = tile_idx.long()
+                    bits = torch.gather(sc, 1, li.clamp(min = 0)).view(torch.int16).to(torch.int32) & 0xFFFF
+                    # the kernel's order key (topk_key) and its validity test (key above the -inf key)
+                    key = torch.where(bits >= 0x8000, ~bits & 0xFFFF, bits | 0x8000).long()
+                    cand.append(torch.where((li >= 0) & (key > 0x03FF),
+                                            (key << 32) | (0xFFFFFFFF - (li + t0)), -1))
+                top = torch.topk(torch.cat(cand, dim = 1), k_sel, dim = 1, largest = True, sorted = False).values
+                gi = torch.where(top >= 0, 0xFFFFFFFF - (top & 0xFFFFFFFF), 0x7FFFFFFF).sort(dim = 1).values
+                pool_idx[:, :k_sel] = torch.where(gi == 0x7FFFFFFF, -1, gi).to(torch.int32)
+                pool_idx[:, k_sel:] = -1
             else:
                 # Tiled: each tile's local top-k becomes candidate slot 1 next to the running set
                 # in slot 0, and the native merge reduces the pair under the single-pass kernel's
