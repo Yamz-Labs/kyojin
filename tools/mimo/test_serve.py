@@ -51,7 +51,7 @@ class ServeTests(unittest.TestCase):
         from aiohttp.test_utils import TestClient, TestServer
 
         class Spy(FakeEngine):
-            ctx = 20
+            ctx = 256 + 20   # the page table holds 256 tokens here: the 20 extra do not count
             num_draft = 1
 
             async def generate(self, prompt: str, **kwargs):
@@ -71,14 +71,14 @@ class ServeTests(unittest.TestCase):
             await client.close()
             return status
 
-        # room = ctx - prompt - 1 slot - 1 draft token
+        # room = whole pages of ctx - prompt - 1 slot - 1 draft token
         self.assertEqual(run(post("a b c d", max_completion_tokens=32768)), 200)
         used = engine.count_tokens(engine.prompts[-1])
-        self.assertEqual(engine.kwargs["max_tokens"], 20 - used - 1 - 1)
+        self.assertEqual(engine.kwargs["max_tokens"], 256 - used - 1 - 1)
         self.assertEqual(run(post("a b c d", max_tokens=3)), 200)
         self.assertEqual(engine.kwargs["max_tokens"], 3)
         engine.kwargs = None
-        self.assertEqual(run(post(" ".join("w" * 30))), 400)
+        self.assertEqual(run(post(" ".join("w" * 300))), 400)
         self.assertIsNone(engine.kwargs)
 
     def test_template_rendering(self):
