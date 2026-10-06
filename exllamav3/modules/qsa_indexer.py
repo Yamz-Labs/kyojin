@@ -244,6 +244,9 @@ class QSAIndexer(Module):
     # narrower slabs cost more than the extra top-k passes save
     SEL_SLAB = 1024
     SEL_TILE = int(os.environ.get("EXL3_QSA_SCORE_TILE", 8192))
+    # Scorer launch shape "block_m,block_n,num_warps,num_stages" (unset = the scorer's own default). Every output
+    # element is computed by the same MMA sequence whatever the tile, so the scores are bit-identical
+    SCORE_CFG = os.environ.get("EXL3_QSA_SCORE_CFG", "")
     # Row count up to which the plane-update workspaces come from g_tensor_cache (decode-class
     # calls: MTP verify, bsz > 1 fallbacks, where allocation latency matters); prefill chunks
     # allocate per call, the static cache being meant for small buffers only
@@ -299,6 +302,11 @@ class QSAIndexer(Module):
         s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile")
         tiled_topk = hasattr(ext, "dsa_topk_tile") and hasattr(ext, "dsa_topk_merge_tiles")
 
+        cfg = {}
+        if self.SCORE_CFG:
+            bm, bn, nw, ns = (int(x) for x in self.SCORE_CFG.split(","))
+            cfg = dict(block_m = bm, block_n = bn, num_warps = nw, num_stages = ns)
+
         def tile_scores(q_slab, rows, t0, t1):
             # Tile [t0, t1) of the pooled plane scored as if it started at pool 0: the row-0
             # position shifts by t0 * cr so the causal bounds shift by t0. Contiguous pools:
@@ -316,12 +324,12 @@ class QSAIndexer(Module):
             if block_table is None:
                 return dsa_indexer_scores(
                     q_slab, self._sel_weights(rows, dev), pool_flat[t0 : t1], pos0 + r0 - t0 * cr,
-                    cr, t1 - t0, scores = sc, scale = self.scale,
+                    cr, t1 - t0, scores = sc, scale = self.scale, **cfg,
                 )
             bt = block_table[t0 // epp : -(-t1 // epp)] if t0 else block_table
             return dsa_indexer_scores(
                 q_slab, self._sel_weights(rows, dev), pool_flat, pos0 + r0 - t0 * cr, cr, t1 - t0,
-                scores = sc, block_table = bt, epp = epp, scale = self.scale,
+                scores = sc, block_table = bt, epp = epp, scale = self.scale, **cfg,
             )
 
         for r0 in range(0, R, self.SEL_SLAB):
