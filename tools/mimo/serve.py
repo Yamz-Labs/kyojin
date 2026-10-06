@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -27,6 +28,9 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 
 DEFAULT_MODEL = os.path.expanduser("~/models/mimo26-exl3")
 DEFAULT_MODEL_ID = "MiMo-2.6-EXL3"
@@ -258,8 +262,12 @@ class ResidentEngine:
         model_init.add_args(parser, cache=True, add_draft_model_args=True)
         args = parser.parse_args(argv)
 
+        # model_init.init loads the drafter first, then the target, through one call: a drop of the module counter
+        # moves /health to the next stage.
+        weight_stages = (["drafter weights"] if drafter_path else []) + ["target weights"]
         (self.model, self.config, self.cache, self.tokenizer, self.draft_model,
-         self.draft_config, self.draft_cache) = model_init.init(args)
+         self.draft_config, self.draft_cache) = model_init.init(args, callback=startup_health.load_callback(weight_stages))
+        startup_health.stage("engine setup")
         self.ndt = ndt if drafter_path else 1
         self.drafter_path = drafter_path
         self.generator = Generator(
@@ -367,7 +375,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             gate = engine.gate_stats()
         except Exception:                                        # noqa: BLE001
             gate = None
-        return web.json_response({"status": "ok", "model": model_id,
+        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id,
                                   "generator": getattr(engine, "generator", None) is not None,
                                   "spec_gate": gate})
 
@@ -748,20 +756,31 @@ def main() -> None:
             print(f"msrv: no drafter found ({explicit or 'looked in <model>/drafter and <model>-drafter'}); "
                   "decoding without speculation", flush=True)
 
+    stages = (["drafter weights"] if drafter else []) + ["target weights", "engine setup"]
+    startup_health.start("mimo", stages, args.host, args.port)
     # --ctx 0 = the model's own max context, with the nested text_config handled like the GLM fix.
-    probe = Config.from_directory(args.model)
-    ctx = args.ctx or min(config_max_position(probe), 131072)
-    engine = ResidentEngine(args.model, drafter, ndt=args.ndt, spec_gate=args.spec_gate, ctx=ctx,
-                            reset_gate_per_request=args.spec_gate_reset_per_request,
-                            dynamic_draft=args.dynamic_draft, draft_confidence=args.draft_confidence)
-    from exllamav3.generator.slot_store import SlotStore
-    engine.slot_store = SlotStore(engine.generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
-                                  args.slot_save_path, args.model_id)
-    template = (Path(args.model) / "chat_template.jinja").read_text(encoding="utf-8")
+    try:
+        probe = Config.from_directory(args.model)
+        ctx = args.ctx or min(config_max_position(probe), 131072)
+        engine = ResidentEngine(args.model, drafter, ndt=args.ndt, spec_gate=args.spec_gate, ctx=ctx,
+                                reset_gate_per_request=args.spec_gate_reset_per_request,
+                                dynamic_draft=args.dynamic_draft, draft_confidence=args.draft_confidence)
+        from exllamav3.generator.slot_store import SlotStore
+        engine.slot_store = SlotStore(engine.generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
+                                      args.slot_save_path, args.model_id)
+        template = (Path(args.model) / "chat_template.jinja").read_text(encoding="utf-8")
+    except BaseException as exc:                                  # noqa: BLE001
+        startup_health.abort(f"{type(exc).__name__}: {exc}")
+        raise
     print(f"msrv: model={args.model} drafter={drafter} ndt={args.ndt} "
           f"spec_gate={engine.spec_gate_on} ctx={ctx} "
           f"max_position={config_max_position(engine.config)}", flush=True)
-    web.run_app(create_app(engine, args.model_id, template), host=args.host, port=args.port)
+    app = create_app(engine, args.model_id, template)
+    sock = startup_health.finish()                                # the early listener's open socket: no refused connection
+    if sock is not None:
+        web.run_app(app, sock=sock)
+    else:
+        web.run_app(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

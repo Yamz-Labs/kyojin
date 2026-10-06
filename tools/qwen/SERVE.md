@@ -84,6 +84,39 @@ environment wins. The engine modules read several of these when they are importe
   forgets the prompt cache first (cold run), `"return_token_ids": true` adds the generated ids. Switching
   speculative mode or `cache_prompt: false` rebuilds the Generator and so drops the prompt cache (400 with `--sessions` > 1).
 
+## Start-up progress on `/health`
+
+The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok","source":"kyojin"}`
+(plus the fields listed above) when the server is ready, and while it loads:
+
+```json
+503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 5,
+     "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
+```
+
+Every `/health` reply carries `"source": "kyojin"` (a hint for parsers). While `status` is `loading`, `message` is one plain line for a UI, built from the other fields: stage, percent, "stage x of y", and "about N s left" when an ETA exists.
+
+Stages here: target weights, drafter weights, vision tower, engine setup, warm-up (the vision stage is absent with `--no-vision`, the drafter with `--draft-policy off`). `stage_progress` is the share of modules loaded (or kernel keys tuned) and is `null` when a
+stage cannot count its work. `progress` counts finished stages plus that share, with equal weights
+(`progress_basis: "stages"`); once one start has completed, its stage durations are kept in
+`~/.cache/kyojin/startup-qwen.json` (`KYOJIN_HEALTH_DIR` changes the folder) and later starts weigh the stages by
+them (`"history"`) and report `eta_s`. Without a history `eta_s` is `null`: no estimate is made up. A failed load
+answers `500 {"status":"error","message":...}` for a few seconds before the process exits. Every other path answers
+`503 {"error":{"message":"Loading model",...}}` during the load, like llama.cpp. Nothing changes after READY, and
+the `READY` line is the same. The helper is `tools/startup_health.py`, shared by the three servers.
+
+llama-swap polls `checkEndpoint` (default `/health`, HTTP 200 = ready) until `healthCheckTimeout` runs out, so give it
+room for a first start:
+
+```yaml
+healthCheckTimeout: 300      # seconds; a first start tunes kernels
+models:
+  "qwen":
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    cmd: python tools/qwen/serve.py --port ${PORT}
+```
+
 ## Prompt cache between turns
 
 The Generator keeps KV pages (256 tokens) and GDN recurrent checkpoints in RAM (4 GiB, about 111 MiB each). A follow-up
@@ -115,7 +148,7 @@ The server prints this warning at start-up whenever N > 1, and a second one past
 
 ## Tests
 
-    python -m pytest tools/qwen/test_serve.py tools/qwen/test_guard.py   # CPU, fake engine, no GPU (template test needs the pack)
+    python -m pytest tools/test_startup_health.py tools/qwen/test_serve.py tools/qwen/test_guard.py   # CPU, fake engine, no GPU (template test needs the pack)
     python tools/qwen/serve_check.py http://127.0.0.1:8000 out_dir      # live server: chat, thinking, tools, stream, image,
                                                                          # 3-turn cache, plain vs speculative, warm vs cold
 

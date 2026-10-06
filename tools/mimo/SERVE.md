@@ -44,6 +44,39 @@ top-level config does not carry `max_position_embeddings` — the GLM fix.
   carries the live counters `n_spec n_plain n_off n_shadow n_probe_fail t_plain t_spec
   tok_round`. Useful while tuning.
 
+## Start-up progress on `/health`
+
+The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok","source":"kyojin"}`
+(plus the fields listed above) when the server is ready, and while it loads:
+
+```json
+503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 3,
+     "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
+```
+
+Every `/health` reply carries `"source": "kyojin"` (a hint for parsers). While `status` is `loading`, `message` is one plain line for a UI, built from the other fields: stage, percent, "stage x of y", and "about N s left" when an ETA exists.
+
+Stages here: drafter weights, target weights, engine setup (no drafter stage with `--no-dflash`). `stage_progress` is the share of modules loaded (or kernel keys tuned) and is `null` when a
+stage cannot count its work. `progress` counts finished stages plus that share, with equal weights
+(`progress_basis: "stages"`); once one start has completed, its stage durations are kept in
+`~/.cache/kyojin/startup-mimo.json` (`KYOJIN_HEALTH_DIR` changes the folder) and later starts weigh the stages by
+them (`"history"`) and report `eta_s`. Without a history `eta_s` is `null`: no estimate is made up. A failed load
+answers `500 {"status":"error","message":...}` for a few seconds before the process exits. Every other path answers
+`503 {"error":{"message":"Loading model",...}}` during the load, like llama.cpp. Nothing changes after READY, and
+the `READY` line is the same. The helper is `tools/startup_health.py`, shared by the three servers.
+
+llama-swap polls `checkEndpoint` (default `/health`, HTTP 200 = ready) until `healthCheckTimeout` runs out, so give it
+room for a first start:
+
+```yaml
+healthCheckTimeout: 600      # seconds; a first start tunes kernels
+models:
+  "mimo":
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    cmd: python tools/mimo/serve.py --port ${PORT}
+```
+
 ## SpecGate across mixed requests — decision
 
 **Kept, not reset per request** (the default). The gate holds no prompt content: only smoothed
@@ -60,6 +93,7 @@ it is a debugging switch, not the default.
 ## Tests
 
     python tools/mimo/test_serve.py     # no GPU
+    python tools/test_startup_health.py # /health load progress, no GPU
     python tools/mimo/test_toolcalls.py # tool-call parser, no GPU
 
 No `exllamav3` import and no model: the tests drive the HTTP layer against a fake engine and cover

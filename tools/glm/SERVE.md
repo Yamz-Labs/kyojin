@@ -59,6 +59,9 @@ python tools/glm/mtp_eh_sidecar.py <official GLM-5.3 checkpoint dir> <model fold
 
 ## Endpoints
 
+### `GET /health`
+`200 {"status":"ok","source":"kyojin"}` when ready; load progress before that (see Start-up progress below).
+
 ### `GET /v1/models`
 One entry: `{"id": "<model-id>", "object": "model", "created": 0, "owned_by": "local"}`.
 
@@ -111,6 +114,39 @@ simply absent. GLM tool calls are emitted by the model as `<\u200btool_call>name
 deliberate so plain prose never triggers the parser; arg values are JSON-parsed when they
 parse, otherwise kept as strings.
 
+## Start-up progress on `/health`
+
+The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok","source":"kyojin"}`
+(plus the fields listed above) when the server is ready, and while it loads:
+
+```json
+503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 4,
+     "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
+```
+
+Every `/health` reply carries `"source": "kyojin"` (a hint for parsers). While `status` is `loading`, `message` is one plain line for a UI, built from the other fields: stage, percent, "stage x of y", and "about N s left" when an ETA exists.
+
+Stages here: target weights, drafter weights, warm-up, dense GEMM tuning (the last two can be switched off by `EXL3_SERVE_WARMUP=0` and `EXL3_SERVE_DTUNE_PRIME_S=0`). `stage_progress` is the share of modules loaded (or kernel keys tuned) and is `null` when a
+stage cannot count its work. `progress` counts finished stages plus that share, with equal weights
+(`progress_basis: "stages"`); once one start has completed, its stage durations are kept in
+`~/.cache/kyojin/startup-glm.json` (`KYOJIN_HEALTH_DIR` changes the folder) and later starts weigh the stages by
+them (`"history"`) and report `eta_s`. Without a history `eta_s` is `null`: no estimate is made up. A failed load
+answers `500 {"status":"error","message":...}` for a few seconds before the process exits. Every other path answers
+`503 {"error":{"message":"Loading model",...}}` during the load, like llama.cpp. Nothing changes after READY, and
+the `READY` line is the same. The helper is `tools/startup_health.py`, shared by the three servers.
+
+llama-swap polls `checkEndpoint` (default `/health`, HTTP 200 = ready) until `healthCheckTimeout` runs out, so give it
+room for a first start:
+
+```yaml
+healthCheckTimeout: 1800      # seconds; a first start tunes kernels
+models:
+  "glm":
+    proxy: http://127.0.0.1:${PORT}
+    checkEndpoint: /health
+    cmd: python tools/glm/serve.py --port ${PORT}
+```
+
 ## Known limits
 
 - **One model, one flight.** The `asyncio.Queue` worker serializes every request; a
@@ -142,7 +178,7 @@ parse, otherwise kept as strings.
 ## Tests
 
 ```bash
-python -m pytest -q tools/glm/test_serve.py
+python -m pytest -q tools/glm/test_serve.py tools/test_startup_health.py
 ```
 
 Model-free: a `FakeEngine` emits deterministic GLM XML in 3-character chunks so tags are

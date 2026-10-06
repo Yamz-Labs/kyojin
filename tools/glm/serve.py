@@ -19,6 +19,9 @@ import aiohttp
 from aiohttp import web
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
+
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
 EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
 # Name inside the model folder. Not *.safetensors, so the weight loader never indexes it as model weights
@@ -258,11 +261,13 @@ class ResidentEngine:
         self.ctx = ctx
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
                            max_history=max_history)
-        self.model.load(device="cuda:0", progressbar=False)
+        startup_health.stage("target weights")
+        self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         self.draft_model = Model.from_config(self.config, component="mtp")
         self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
                                  max_history=max_history)
-        self.draft_model.load(device="cuda:0", progressbar=False)
+        startup_health.stage("drafter weights")
+        self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         self.greedy_generator = Generator(
             model=self.model, cache=self.cache, tokenizer=self.tokenizer,
             draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft,
@@ -396,6 +401,7 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
     class (15 shapes). Warm-up has just logged every shape it met, so cross those shapes with all
     classes 256..4096 and pay the tuning here. A cached key costs one GEMM. Tuned winners are
     bit-exact with the default path, so outputs do not change. Returns (keys, seconds)."""
+    startup_health.stage("dense GEMM tuning")   # entered even when nothing is left to tune: a clean stage list
     path = dense_tune_path()
     if os.environ.get("EXL3_DENSE_GEMM_TUNE", "1") == "0" or not path.exists():
         return 0, 0.0
@@ -445,6 +451,7 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
         c = c_buf[:mc * w * dt.itemsize].view(dt).view(mc, w)
         ext.hgemm_recon(a, b, c if ldn else c[:, :n])
         done += 1
+        startup_health.progress(done, len(todo))
     torch.cuda.synchronize()
     del a_buf, b_buf, c_buf
     torch.cuda.empty_cache()
@@ -457,6 +464,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     lock = asyncio.Lock()  # serializes generation with slot save/restore
     app = web.Application(client_max_size=16 * 1024**2)
     app.update(engine=engine, model_id=model_id, template=template, queue=queue)
+
+    async def health(_: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id})
 
     async def models(_: web.Request) -> web.Response:
         return web.json_response({"object": "list", "data": [
@@ -757,6 +767,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     if getattr(engine, "slot_store", None) is not None:
         app.router.add_get("/slots", slots)
         app.router.add_post("/slots/{id}", slot_action)
+    app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models)
     app.router.add_post("/v1/chat/completions", completions)
     app.router.add_post("/apply-template", apply_template)
@@ -791,35 +802,49 @@ def main() -> None:
         os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
     apply_eh_sidecar_default(args.model)
-    engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft)
-    template = Path(args.chat_template or Path(args.model) / "chat_template.jinja").expanduser().read_text(encoding="utf-8")
-    print(mem_line("loaded"), flush=True)
-    # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
-    # EXL3_SERVE_WARMUP=0 skips it.
-    if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":
-        print(f"serve: warm-up {warmup(engine, template):.1f} s", flush=True)
-        print(mem_line("warm"), flush=True)
-        if os.environ.get("EXL3_SERVE_EMPTY_CACHE", "1") == "1":   # lever (a): drop the allocator's inactive slack
-            import torch
-            torch.cuda.empty_cache()
-            print(mem_line("emptied"), flush=True)
-        if os.environ.get("EXL3_SERVE_MEMDIAG") == "1":
-            mem_diag("warm")
-        # EXL3_SERVE_DTUNE_PRIME_S: time budget for pre-tuning dense GEMM classes (0 = skip)
-        budget = float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600"))
-        if budget > 0:
-            keys, secs = prime_dense_tune(budget)
-            print(f"serve: dense GEMM prime {keys} keys {secs:.1f} s", flush=True)
-            print(mem_line("primed"), flush=True)
-    from exllamav3.generator.slot_store import SlotStore
-    engine.slot_store = SlotStore(engine.greedy_generator, [engine.cache, engine.draft_cache],
-                                  args.slot_save_path, args.model_id)
-    if os.environ.get("EXL3_SERVE_RSS_LOG"):  # rssleak1: per-request host-RSS accounting, off by default
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from rss_probe import install
-        install(engine)
-        print(f"serve: rss probe -> {os.environ['EXL3_SERVE_RSS_LOG']}", flush=True)
-    web.run_app(create_app(engine, args.model_id, template), host=args.host, port=args.port)
+    warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
+    tune = warm and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
+    stages = ["target weights", "drafter weights"] + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
+    startup_health.start("glm", stages, args.host, args.port)
+    try:
+        engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft)
+        template = Path(args.chat_template or Path(args.model) / "chat_template.jinja").expanduser().read_text(encoding="utf-8")
+        print(mem_line("loaded"), flush=True)
+        # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
+        # EXL3_SERVE_WARMUP=0 skips it.
+        if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":
+            startup_health.stage("warm-up")
+            print(f"serve: warm-up {warmup(engine, template):.1f} s", flush=True)
+            print(mem_line("warm"), flush=True)
+            if os.environ.get("EXL3_SERVE_EMPTY_CACHE", "1") == "1":   # lever (a): drop the allocator's inactive slack
+                import torch
+                torch.cuda.empty_cache()
+                print(mem_line("emptied"), flush=True)
+            if os.environ.get("EXL3_SERVE_MEMDIAG") == "1":
+                mem_diag("warm")
+            # EXL3_SERVE_DTUNE_PRIME_S: time budget for pre-tuning dense GEMM classes (0 = skip)
+            budget = float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600"))
+            if budget > 0:
+                keys, secs = prime_dense_tune(budget)
+                print(f"serve: dense GEMM prime {keys} keys {secs:.1f} s", flush=True)
+                print(mem_line("primed"), flush=True)
+        from exllamav3.generator.slot_store import SlotStore
+        engine.slot_store = SlotStore(engine.greedy_generator, [engine.cache, engine.draft_cache],
+                                      args.slot_save_path, args.model_id)
+        if os.environ.get("EXL3_SERVE_RSS_LOG"):  # rssleak1: per-request host-RSS accounting, off by default
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from rss_probe import install
+            install(engine)
+            print(f"serve: rss probe -> {os.environ['EXL3_SERVE_RSS_LOG']}", flush=True)
+    except BaseException as exc:                                  # noqa: BLE001
+        startup_health.abort(f"{type(exc).__name__}: {exc}")
+        raise
+    app = create_app(engine, args.model_id, template)
+    sock = startup_health.finish()                                # the early listener's open socket: no refused connection
+    if sock is not None:
+        web.run_app(app, sock=sock)
+    else:
+        web.run_app(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

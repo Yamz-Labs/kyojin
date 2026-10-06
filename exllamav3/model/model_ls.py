@@ -33,11 +33,13 @@ class Model_LSMixin(ABC):
         device: torch.device,
         config: Config,
         modules: list,
-        verbose: bool
+        verbose: bool,
+        callback = None
     ):
         pin = config.infer_params.vision_pinned and getattr(self, "component", "text") == "vision"
         with ProgressBar(f"Loading" if progressbar else None, len(modules)) as progress:
             for idx, module in enumerate(modules):
+                if callback: callback(idx, len(modules))
                 defer = module.can_defer_load()
                 if defer:
                     # Pinned modules leave the arena alone: their slab slices would keep whole
