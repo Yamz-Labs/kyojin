@@ -1298,10 +1298,11 @@ class Attention(Module):
                 # Row-invariant verify: the R-row paged decode tiles the KV span from the batch's single
                 # cache_seqlens/q_len, a different float order than R batch-1 calls. Run the exact
                 # batch-1 call per row (each appends its own K/V at cache_seqlens + i and attends i + 1 keys).
+                # a one-row slice is only contiguous at batch 1; the paged kernels need contiguous rows
                 o = torch.cat([attn_dispatch(
-                    q = q[:, i:i + 1],
-                    k = k[:, i:i + 1],
-                    v = v[:, i:i + 1],
+                    q = q[:, i:i + 1].contiguous(),
+                    k = k[:, i:i + 1].contiguous(),
+                    v = v[:, i:i + 1].contiguous(),
                     cache = cache,
                     cache_idx = self.layer_idx,
                     cache_instance = params.get("layer_instance"),
