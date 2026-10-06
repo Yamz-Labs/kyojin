@@ -72,17 +72,17 @@ pip install -r requirements.txt
 
 Check with `python -c "import torch; print(torch.version.hip)"`: it must print a version, not `None`.
 
-## A build, a test or the first import hangs with no output
+## A test or the first import hangs with no output
 
-Cause: a stale lock file from an interrupted extension build. When the extension is built through torch, torch waits on `~/.cache/torch_extensions/<version>/exllamav3_ext/lock` before it starts, and it waits silently as long as the file is there.
+Cause: a stale lock file from an interrupted JIT load. When `exllamav3` is imported and no built extension is found, torch compiles it on the fly, and it first waits on `~/.cache/torch_extensions/<version>/exllamav3_ext/lock`, silently, as long as the file is there. `./build.sh` installs through pip and does not use this lock.
 
-Fix: make sure no other build is running, then remove the lock:
+Fix: make sure no other process is loading the extension, then remove the lock:
 
 ```bash
 ls ~/.cache/torch_extensions/*/exllamav3_ext/lock
 rm ~/.cache/torch_extensions/*/exllamav3_ext/lock
 ```
 
-Then run the command that hung again (`./build.sh` if it was the build). If `ls` prints `No such file or directory`, there is no stale lock, and the hang has another cause.
+Then run the command that hung again. If `ls` prints `No such file or directory`, there is no stale lock, and the hang has another cause.
 
 If `TORCH_EXTENSIONS_DIR` is set, the lock is under that directory instead.
