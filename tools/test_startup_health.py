@@ -11,6 +11,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -92,7 +93,7 @@ class SnapshotTest(unittest.TestCase):
     def test_ready_error(self):
         t = tracker(["a"])
         t.ready()
-        self.assertEqual(t.snapshot(), (200, {"status": "ok"}))
+        self.assertEqual(t.snapshot(), (200, {"status": "ok", "source": "kyojin"}))
         t = tracker(["a"])
         t.fail("boom")
         code, body = t.snapshot()
@@ -201,6 +202,36 @@ class LoadCallbackTest(unittest.TestCase):
         sh.abort("x")
 
 
+class SourceMessageTest(unittest.TestCase):
+    def test_source_in_every_state_and_loading_message(self):
+        c = Clock()
+        t = tracker(["target weights", "warm-up"], clock=c)
+        t.begin("target weights")
+        t.progress(2, 5)
+        code, body = t.snapshot()
+        self.assertEqual((code, body["source"]), (503, "kyojin"))
+        self.assertEqual(body["message"], "Target weights, 40 % (stage 1 of 2)")
+        t.begin("warm-up")                                                   # no fraction: overall percent, no ETA
+        self.assertEqual(t.snapshot()[1]["message"], "Warm-up (stage 2 of 2), 50 % overall")
+        t.fail("boom")
+        self.assertEqual(t.snapshot()[1]["source"], "kyojin")
+        t2 = tracker(["a"])
+        t2.ready()
+        self.assertEqual(t2.snapshot(), (200, {"status": "ok", "source": "kyojin"}))
+
+    def test_message_has_eta_when_known(self):
+        self.assertEqual(sh._loading_message("target weights", 3, 5, 0.42, 0.5, 35.4),
+                         "Target weights, 42 % (stage 3 of 5), about 35 s left")
+
+    def test_servers_own_health_carries_source(self):
+        for name in ("qwen", "glm", "mimo"):
+            src = (TOOLS / name / "serve.py").read_text()
+            i = src.index("async def health")
+            self.assertIn('"source": "kyojin"', src[i:i + 500], name)
+            if name == "glm":
+                self.assertIn('add_get("/health", health)', src)
+
+
 class ListenerTest(unittest.TestCase):
     def test_health_and_other_paths_while_loading_then_handoff(self):
         c = Clock()
@@ -256,6 +287,86 @@ class ListenerTest(unittest.TestCase):
         asyncio.run(run())
         self.assertEqual(result["r"][0], 200)
         self.assertEqual(result["r"][1]["model"], "m")
+
+    def _hammer(self, port, stop, refused, ok):
+        while not stop.is_set():
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=2).close()
+                ok.append(1)
+            except OSError as exc:
+                refused.append(exc)
+
+    def _handoff_under_load(self, handoff):
+        """Hammer the port with connections while `handoff(t, port, runner)` swaps the listener for aiohttp."""
+        from aiohttp import web
+        t = tracker(["weights"])
+        t.serve("127.0.0.1", 0)
+        port = t.server.port
+        stop, refused, ok = threading.Event(), [], []
+        threads = [threading.Thread(target=self._hammer, args=(port, stop, refused, ok), daemon=True) for _ in range(4)]
+        for th in threads:
+            th.start()
+        time.sleep(0.2)
+        result = {}
+
+        async def run():
+            app = web.Application()
+
+            async def health(_):
+                return web.json_response({"status": "ok"})
+            app.router.add_get("/health", health)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            await handoff(t, port, runner)
+            await asyncio.sleep(0.3)
+            result["r"] = await asyncio.get_running_loop().run_in_executor(None, get, f"http://127.0.0.1:{port}/health")
+            stop.set()                                                       # stop hammering before the server closes
+            await asyncio.get_running_loop().run_in_executor(None, lambda: [th.join() for th in threads])
+            await runner.cleanup()
+        try:
+            asyncio.run(run())
+        finally:
+            stop.set()
+            for th in threads:
+                th.join()
+        return refused, ok, result["r"]
+
+    def test_handoff_refuses_no_connection(self):
+        from aiohttp import web
+
+        async def handoff(t, port, runner):
+            sock = t.handoff_socket()                                        # what startup_health.finish() does
+            t.ready()
+            await web.SockSite(runner, sock).start()
+        refused, ok, r = self._handoff_under_load(handoff)
+        self.assertEqual(refused, [])
+        self.assertGreater(len(ok), 50)
+        self.assertEqual(r[0], 200)
+
+    def test_close_then_bind_does_refuse_connections(self):
+        """Control: the old hand-off (close the listener, then bind) is caught by the hammer."""
+        from aiohttp import web
+
+        async def handoff(t, port, runner):
+            t.release_port()
+            t.ready()
+            await asyncio.sleep(1.5)                                         # longer than a client's SYN retry
+            await web.TCPSite(runner, "127.0.0.1", port).start()
+        refused, ok, r = self._handoff_under_load(handoff)
+        self.assertGreater(len(refused), 0)
+
+    def test_finish_returns_the_live_socket_and_none_without_listener(self):
+        sh.ACTIVE = None
+        self.assertIsNone(sh.finish())
+        sh.start("x", ["a"], "127.0.0.1", 0)
+        port = sh.ACTIVE.server.port
+        sock = sh.finish()
+        try:
+            self.assertEqual(sock.getsockname()[1], port)
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()   # still listening
+        finally:
+            sock.close()
+            sh.ACTIVE = None
 
     def test_start_fails_fast_when_the_port_is_taken(self):
         s = socket.socket()

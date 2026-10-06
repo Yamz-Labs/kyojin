@@ -465,6 +465,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     app = web.Application(client_max_size=16 * 1024**2)
     app.update(engine=engine, model_id=model_id, template=template, queue=queue)
 
+    async def health(_: web.Request) -> web.Response:
+        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id})
+
     async def models(_: web.Request) -> web.Response:
         return web.json_response({"object": "list", "data": [
             {"id": model_id, "object": "model", "created": 0, "owned_by": "local"}]})
@@ -764,6 +767,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     if getattr(engine, "slot_store", None) is not None:
         app.router.add_get("/slots", slots)
         app.router.add_post("/slots/{id}", slot_action)
+    app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models)
     app.router.add_post("/v1/chat/completions", completions)
     app.router.add_post("/apply-template", apply_template)
@@ -836,8 +840,11 @@ def main() -> None:
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
     app = create_app(engine, args.model_id, template)
-    startup_health.finish()                                       # free the early listener's port, then bind
-    web.run_app(app, host=args.host, port=args.port)
+    sock = startup_health.finish()                                # the early listener's open socket: no refused connection
+    if sock is not None:
+        web.run_app(app, sock=sock)
+    else:
+        web.run_app(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

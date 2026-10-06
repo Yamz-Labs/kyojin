@@ -4,11 +4,13 @@ The servers open their HTTP port only after the model is loaded, which can take 
 8-20 minutes on a first start). This module opens a small stdlib listener on the same host and port before the load,
 answers every request with 503, and answers GET /health with the real load progress:
 
-    200 {"status": "ok"}                                         ready (the server's own /health takes over)
-    503 {"status": "loading", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 4,
+    200 {"status": "ok", "source": "kyojin"}                      ready (the server's own /health takes over)
+    503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 4,
          "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
-    500 {"status": "error", "message": "..."}
+    500 {"status": "error", "source": "kyojin", "message": "..."}
 
+Every reply carries `"source": "kyojin"` (a hint for parsers); while loading, `message` is one plain line for a UI
+built from the other fields (stage name, percent, stage x of y, about N s left when an ETA exists).
 Honest values only: `stage_progress` is null when the stage cannot count its work; `progress` counts finished stages
 plus the reported fraction of the current one (equal weights, or the durations of the previous start when it is
 recorded: progress_basis "history"); `eta_s` is null unless a previous start recorded the stage durations
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +35,16 @@ ACTIVE: "StartupTracker | None" = None
 
 def history_dir() -> Path:
     return Path(os.environ.get("KYOJIN_HEALTH_DIR") or "~/.cache/kyojin").expanduser()
+
+
+def _loading_message(stage: str, index: int, count: int, frac, progress: float, eta) -> str:
+    """One plain line for a UI, built only from the fields of the same reply."""
+    what = stage[0].upper() + stage[1:]
+    pct = f"{round((frac if frac is not None else progress) * 100)} %"
+    text = f"{what}, {pct} (stage {index} of {count})" if frac is not None else f"{what} (stage {index} of {count}), {pct} overall"
+    if eta is not None:
+        text += f", about {round(eta)} s left"
+    return text
 
 
 class StartupTracker:
@@ -105,9 +118,9 @@ class StartupTracker:
             now = self.clock()
             elapsed = round(now - self.t0, 1)
             if self.state == "ready":
-                return 200, {"status": "ok"}
+                return 200, {"status": "ok", "source": "kyojin"}
             if self.state == "error":
-                return 500, {"status": "error", "message": self.message, "elapsed_s": elapsed}
+                return 500, {"status": "error", "source": "kyojin", "message": self.message, "elapsed_s": elapsed}
             n, cur, frac = len(self.stages), self.current, self.fraction
             stage_elapsed = now - self.stage_t0
             exp = self.expected
@@ -124,7 +137,10 @@ class StartupTracker:
                 eta = sum(exp[s] for s in self.stages[cur + 1:]) + left if left >= 0 else None
             else:
                 progress, basis, eta = (cur + (frac or 0.0)) / n, "stages", None
-            return 503, {"status": "loading", "progress": round(min(progress, 0.999), 3),
+            progress = round(min(progress, 0.999), 3)
+            return 503, {"status": "loading", "source": "kyojin",
+                         "message": _loading_message(self.stages[cur], cur + 1, n, frac, progress, eta),
+                         "progress": progress,
                          "stage": self.stages[cur], "stage_index": cur + 1, "stage_count": n,
                          "stage_progress": None if frac is None else round(frac, 3),
                          "elapsed_s": elapsed, "eta_s": None if eta is None else round(eta, 1),
@@ -136,10 +152,20 @@ class StartupTracker:
         self.server = _EarlyServer(self, host, port)
 
     def release_port(self) -> None:
-        """Close the early listener; call right before the real server binds the same port."""
+        """Close the early listener (tests and the failure path). The servers use `handoff_socket` instead."""
         if self.server is not None:
             self.server.close()
             self.server = None
+
+    def handoff_socket(self) -> socket.socket | None:
+        """Stop the early accept loop and give the still-listening socket to the real server.
+        The port never closes, so no connection is refused: clients that connect during the hand-off wait in the
+        listen backlog until the real server accepts them."""
+        if self.server is None:
+            return None
+        sock = self.server.detach()
+        self.server = None
+        return sock
 
 
 class _EarlyServer:
@@ -168,14 +194,23 @@ class _EarlyServer:
         class Server(ThreadingHTTPServer):
             daemon_threads = True
             allow_reuse_address = True
+            request_queue_size = 128   # clients arriving during the hand-off wait in this backlog
 
         self.httpd = Server((host, port), Handler)
         self.port = self.httpd.server_address[1]
         # A fork-without-exec child would keep the listening socket open after close() and block the real bind.
         sock = self.httpd.socket
-        os.register_at_fork(after_in_child=lambda: sock.close())
+        self._owned = True
+        os.register_at_fork(after_in_child=lambda: sock.close() if self._owned else None)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True, name="startup-health")
         self.thread.start()
+
+    def detach(self) -> socket.socket:
+        """Stop answering but keep the listening socket open and return it (the caller now owns it)."""
+        self._owned = False
+        self.httpd.shutdown()
+        self.thread.join(timeout=5)
+        return self.httpd.socket
 
     def close(self) -> None:
         self.httpd.shutdown()
@@ -221,11 +256,14 @@ def load_callback(stages: list[str] | None = None):
     return cb
 
 
-def finish() -> None:
-    """Models loaded and the real server about to bind: free the port, then mark ready."""
-    if ACTIVE is not None:
-        ACTIVE.release_port()
-        ACTIVE.ready()
+def finish() -> socket.socket | None:
+    """Models loaded: stop the early answers, mark ready, and return the listening socket for the real server
+    (aiohttp `SockSite` / `run_app(sock=...)`). None without an early listener: the server then binds host/port."""
+    if ACTIVE is None:
+        return None
+    sock = ACTIVE.handoff_socket()
+    ACTIVE.ready()
+    return sock
 
 
 def abort(message: str, grace_s: float = 3.0) -> None:

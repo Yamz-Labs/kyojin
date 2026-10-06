@@ -375,7 +375,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             gate = engine.gate_stats()
         except Exception:                                        # noqa: BLE001
             gate = None
-        return web.json_response({"status": "ok", "model": model_id,
+        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id,
                                   "generator": getattr(engine, "generator", None) is not None,
                                   "spec_gate": gate})
 
@@ -776,8 +776,11 @@ def main() -> None:
           f"spec_gate={engine.spec_gate_on} ctx={ctx} "
           f"max_position={config_max_position(engine.config)}", flush=True)
     app = create_app(engine, args.model_id, template)
-    startup_health.finish()                                       # free the early listener's port, then bind
-    web.run_app(app, host=args.host, port=args.port)
+    sock = startup_health.finish()                                # the early listener's open socket: no refused connection
+    if sock is not None:
+        web.run_app(app, sock=sock)
+    else:
+        web.run_app(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

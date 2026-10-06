@@ -1035,7 +1035,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
              "max_context": getattr(engine, "ctx", None)}]})
 
     async def health(_: web.Request) -> web.Response:
-        return web.json_response({"status": "ok", "model": model_id, "vision": bool(engine.supports_vision),
+        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id, "vision": bool(engine.supports_vision),
                                   **(engine.spec_stats() if hasattr(engine, "spec_stats") else {})})
 
     async def worker() -> None:
@@ -1573,8 +1573,9 @@ def main() -> None:
     async def serve() -> None:
         runner = web.AppRunner(app)
         await runner.setup()
-        startup_health.finish()                                   # free the early listener's port, then bind
-        await web.TCPSite(runner, args.host, args.port).start()
+        sock = startup_health.finish()                            # the early listener's open socket: no refused connection
+        site = web.SockSite(runner, sock) if sock is not None else web.TCPSite(runner, args.host, args.port)
+        await site.start()
         print(f"qserve: READY on http://{args.host}:{args.port}  model={args.model_id} ctx={args.ctx} "
               f"speculative={engine.spec_on} vision={engine.supports_vision} (start-up {time.time() - t0:.0f} s)",
               flush=True)

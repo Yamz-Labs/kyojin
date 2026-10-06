@@ -60,7 +60,7 @@ python tools/glm/mtp_eh_sidecar.py <official GLM-5.3 checkpoint dir> <model fold
 ## Endpoints
 
 ### `GET /health`
-`200 {"status":"ok"}` when ready; load progress before that (see Start-up progress below).
+`200 {"status":"ok","source":"kyojin"}` when ready; load progress before that (see Start-up progress below).
 
 ### `GET /v1/models`
 One entry: `{"id": "<model-id>", "object": "model", "created": 0, "owned_by": "local"}`.
@@ -116,13 +116,15 @@ parse, otherwise kept as strings.
 
 ## Start-up progress on `/health`
 
-The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok"}`
+The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok","source":"kyojin"}`
 (plus the fields listed above) when the server is ready, and while it loads:
 
 ```json
-503 {"status": "loading", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 4,
+503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 4,
      "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
 ```
+
+Every `/health` reply carries `"source": "kyojin"` (a hint for parsers). While `status` is `loading`, `message` is one plain line for a UI, built from the other fields: stage, percent, "stage x of y", and "about N s left" when an ETA exists.
 
 Stages here: target weights, drafter weights, warm-up, dense GEMM tuning (the last two can be switched off by `EXL3_SERVE_WARMUP=0` and `EXL3_SERVE_DTUNE_PRIME_S=0`). `stage_progress` is the share of modules loaded (or kernel keys tuned) and is `null` when a
 stage cannot count its work. `progress` counts finished stages plus that share, with equal weights

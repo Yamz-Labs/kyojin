@@ -84,13 +84,15 @@ environment wins. The engine modules read several of these when they are importe
 
 ## Start-up progress on `/health`
 
-The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok"}`
+The port answers from the first second, while the model is still loading. `GET /health` returns `200 {"status":"ok","source":"kyojin"}`
 (plus the fields listed above) when the server is ready, and while it loads:
 
 ```json
-503 {"status": "loading", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 5,
+503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 5,
      "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
 ```
+
+Every `/health` reply carries `"source": "kyojin"` (a hint for parsers). While `status` is `loading`, `message` is one plain line for a UI, built from the other fields: stage, percent, "stage x of y", and "about N s left" when an ETA exists.
 
 Stages here: target weights, drafter weights, vision tower, engine setup, warm-up (the vision stage is absent with `--no-vision`, the drafter with `--draft-policy off`). `stage_progress` is the share of modules loaded (or kernel keys tuned) and is `null` when a
 stage cannot count its work. `progress` counts finished stages plus that share, with equal weights
