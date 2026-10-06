@@ -759,7 +759,11 @@ class QwenEngine:
             self._driver = loop.create_task(self._drive())
         elif self._driver.done():
             exc = None if self._driver.cancelled() else self._driver.exception()
-            raise RuntimeError("the engine driver has stopped") from exc
+            if exc is None:        # cancelled (shutdown): stays stopped
+                raise RuntimeError("the engine driver has stopped")
+            # crashed: _drive already failed everything that was waiting, so a fresh driver can take the next request
+            print(f"qserve: WARNING the engine driver crashed ({exc!r}); starting a new one", file=sys.stderr, flush=True)
+            self._driver = loop.create_task(self._drive())
 
     async def _drive(self) -> None:
         try:
@@ -804,11 +808,30 @@ class QwenEngine:
                 continue
             by_serial: dict[int, list] = {}
             for ev in events:
-                by_serial.setdefault(ev["serial"], []).append(ev)
+                try:
+                    by_serial.setdefault(ev["serial"], []).append(ev)
+                except Exception as exc:                              # noqa: BLE001
+                    self._fail_unroutable(ev, exc)
             for serial, evs in by_serial.items():
                 route = self._routes.get(serial)
                 if route is not None:      # None: cancelled after the step started
                     route[1].put_nowait(evs)
+
+    def _fail_unroutable(self, ev, exc: Exception) -> None:
+        """An event the driver cannot route must not stop the driver. Fail the request it belongs to (found through its job),
+        or every request when that is unknown, and keep serving."""
+        print(f"qserve: WARNING unroutable generator event ({exc!r}): {ev!r:.200}", file=sys.stderr, flush=True)
+        job = ev.get("job") if isinstance(ev, dict) else None
+        serial = getattr(job, "serial_number", None)
+        route = self._routes.pop(serial, None) if serial is not None else None
+        if route is not None:
+            route[1].put_nowait(exc)
+            self._cancel_serial(serial)
+            return
+        for _, q in self._routes.values():
+            q.put_nowait(exc)
+        self._routes.clear()
+        self.generator.clear_queue()
 
     def _cancel_serial(self, serial: int) -> None:
         for job in self.generator.active_jobs + self.generator.pending_jobs:

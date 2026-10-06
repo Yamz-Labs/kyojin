@@ -394,6 +394,101 @@ class SessionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "driver has stopped"):
             asyncio.run(asyncio.wait_for(go(), 10))
 
+    def poisoned_engine(self, poison, once):
+        """Engine whose generator hands back one event the driver cannot route (`poison(ev)` damages it), or raises."""
+        class Poison(MultiStubGenerator):
+            hit = False
+            cleared = 0
+
+            def iterate(self):
+                evs = super().iterate()
+                if evs and not Poison.hit and evs[0]["job"].seed == 1 and len(self.jobs.get(evs[0]["job"], ())) >= 4:
+                    Poison.hit = True
+                    poison(evs[0])
+                return evs
+
+            def clear_queue(self):
+                Poison.cleared += 1
+                self.jobs.clear()
+
+        e = make_engine(self.seeded, per_iter=2)
+        e.generator = Poison(self.seeded, per_iter=2)
+        return e
+
+    @staticmethod
+    async def one(e, seed):
+        st = {}
+        try:
+            async for _ in e.generate("p", stats=st, sampling={"temperature": 0}, stop=[], max_tokens=600, seed=seed,
+                                      loop_guard=False):
+                pass
+        except Exception as exc:                                      # noqa: BLE001
+            return exc
+        return st.get("token_ids")
+
+    def test_event_without_serial_fails_only_its_request_and_the_server_keeps_serving(self):
+        e = self.poisoned_engine(lambda ev: ev.pop("serial"), True)
+
+        async def go():
+            a, b = await asyncio.wait_for(asyncio.gather(self.one(e, 1), self.one(e, 2)), 10)
+            later = await asyncio.wait_for(self.one(e, 3), 10)
+            return a, b, later
+        a, b, later = asyncio.run(go())
+        self.assertIsInstance(a, KeyError)
+        self.assertEqual(b, [20_200 + i for i in range(30)])        # the other session is not touched
+        self.assertEqual(later, [30_200 + i for i in range(30)])    # a later request on the same driver succeeds
+        self.assertEqual(e.generator.jobs, {})
+
+    def test_event_with_no_job_either_fails_every_request_but_not_the_driver(self):
+        e = self.poisoned_engine(lambda ev: (ev.pop("serial"), ev.pop("job")), True)
+
+        async def go():
+            a, b = await asyncio.wait_for(asyncio.gather(self.one(e, 1), self.one(e, 2)), 10)
+            later = await asyncio.wait_for(self.one(e, 3), 10)
+            return a, b, later
+        a, b, later = asyncio.run(go())
+        self.assertIsInstance(a, KeyError)
+        self.assertIsInstance(b, KeyError)
+        self.assertEqual(later, [30_200 + i for i in range(30)])
+
+    def test_crashed_driver_is_replaced_by_the_next_request(self):
+        e = self.poisoned_engine(lambda ev: None, True)
+        real = e.generator.num_remaining_jobs
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 6:            # outside the executor calls: nothing in the loop catches it
+                raise ValueError("boom")
+            return real()
+        e.generator.num_remaining_jobs = flaky
+
+        async def go():
+            a = await asyncio.wait_for(self.one(e, 1), 10)
+            later = await asyncio.wait_for(self.one(e, 3), 10)
+            return a, later
+        a, later = asyncio.run(go())
+        self.assertIsInstance(a, RuntimeError)
+        self.assertIn("driver has stopped", str(a))
+        self.assertEqual(later, [30_200 + i for i in range(30)])
+
+    def test_shutdown_still_fails_waiting_requests_and_returns(self):
+        e = make_engine(self.seeded, per_iter=1)
+        e.generator = MultiStubGenerator(self.seeded, per_iter=1)
+
+        async def go():
+            first = asyncio.ensure_future(self.one(e, 1))
+            while not any(e.generator.jobs.values()):  # a request is decoding
+                await asyncio.sleep(0)
+            e._driver.cancel()
+            r = await asyncio.wait_for(first, 10)
+            late = await asyncio.wait_for(self.one(e, 2), 10)
+            return r, late
+        r, late = asyncio.run(go())
+        for res in (r, late):
+            self.assertIsInstance(res, RuntimeError)
+            self.assertIn("driver has stopped", str(res))        # cancelled: not restarted
+
     def test_cancel_leaves_the_other_session_running(self):
         (a, b), gen = self.run_two(cancel_first_after=3)
         self.assertIsNone(a)
