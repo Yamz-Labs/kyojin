@@ -531,8 +531,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 await flush(True)
                 message = parse_completion(text, body.get("tools"))
                 if "tool_calls" in message:
-                    await response.write(sse(event({"tool_calls": [
-                        dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
+                    for n, call in enumerate(message["tool_calls"]):   # one stream message per call (clients that read one call per message)
+                        await response.write(sse(event({"tool_calls": [dict(call, index=n)]})))
                 await response.write(sse(event({}, finish_for(message, text)) |
                                          {"usage": usage(text), "timings": timings()}))
                 await response.write(b"data: [DONE]\n\n")

@@ -1077,7 +1077,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                     await response.write(sse(event({key: piece})))
                 calls = parse_tool_calls(sp.tool_text, job["tools"])
                 if calls:
-                    await response.write(sse(event({"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]})))
+                    for i, c in enumerate(calls):   # one stream message per call: some clients read only the first call of a message
+                        await response.write(sse(event({"tool_calls": [dict(c, index=i)]})))
                 reason, usage, timings = finish_and_stats(stats, full, bool(calls))
                 final = event({}, reason) | {"usage": usage, "timings": timings}
                 if job["return_token_ids"]:

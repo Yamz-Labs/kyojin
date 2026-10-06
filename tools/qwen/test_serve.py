@@ -269,6 +269,15 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(ev[-1]["usage"]["completion_tokens"], 7)
         self.assertIn("timings", ev[-1])
 
+    def test_parallel_tool_calls_one_stream_message_each(self):
+        eng = FakeEngine("</think>\n\n" + CALL + "\n" + CALL + "\n" + CALL)
+        st, raw = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}], "tools": TOOLS}, stream=True)
+        msgs = [e["choices"][0]["delta"]["tool_calls"] for e in sse_events(raw) if e["choices"][0]["delta"].get("tool_calls")]
+        self.assertEqual([len(m) for m in msgs], [1, 1, 1])
+        self.assertEqual([m[0]["index"] for m in msgs], [0, 1, 2])
+        for m in msgs:
+            json.loads(m[0]["function"]["arguments"])
+
     def test_stream_length(self):
         eng = FakeEngine("abc", {"new_tokens": 2, "eos_reason": "max_new_tokens"})
         _, raw = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}]}, stream=True)
