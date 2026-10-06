@@ -236,8 +236,8 @@ class Glm5NextMTPModel(Model):
         unquantized weight from a sidecar file (key "<prefix>.layers.<n>.eh_proj.weight",
         [out, in] = [H, 2H], bf16/fp16, e.g. from the HF checkpoint via
         tools/glm/mtp_eh_sidecar.py). td205 stores eh_proj at mtp_bits = 2; on real MTP inputs
-        its output has cos ~0.78 vs the bf16 weight, which costs ~0.1 of draft acceptance
-        (acceptaudit2). The fp16 weight is 64 MiB, read once per draft forward.
+        its output has cos ~0.78 vs the bf16 weight, which costs ~0.1 of draft acceptance.
+       The fp16 weight is 64 MiB, read once per draft forward.
         """
         path = path if path is not None else os.getenv("EXL3_MTP_EH_FP16", "")
         if not path or path == "0":

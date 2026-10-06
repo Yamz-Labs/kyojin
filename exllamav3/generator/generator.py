@@ -230,7 +230,7 @@ class Generator:
         self.ngram_match_min = ngram_match_min
         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
-        # REPORT-28 cost-model gate: skip the drafter forward (and the R-row verify) whenever the
+        # cost-model gate: skip the drafter forward (and the R-row verify) whenever the
         # measured speculative rate would not beat plain decode. Opt-in: EXL3_SPEC_GATE=1
         self.spec_gate = SpecGate() if (draft_model is not None and
                                         os.environ.get("EXL3_SPEC_GATE", "0") != "0") else None
@@ -1287,7 +1287,7 @@ class Generator:
             "positions": positions,
             "recurrent_history": draft_tokens is not None,
             "pinned_staging": True,
-            # REPORT-17: marks a real DFlash verify forward (R rows, target model), as opposed to
+            #  marks a real DFlash verify forward (R rows, target model), as opposed to
             # any other multi-row call with rows in the same 2..MAX_BSZN range -- prefill routes
             # 2-8 tokens to plenty of individual MoE experts, and the draft model's own forward
             # has draft_tokens is None too. The four R-row fast paths (block_sparse_mlp.py's MoE
@@ -1977,7 +1977,7 @@ def _pt():
 
 class SpecGate:
     """
-    Cost-model gate for speculative decoding (REPORT-28). Keeps EMAs of the plain step time, the
+    Cost-model gate for speculative decoding. Keeps EMAs of the plain step time, the
     speculative round time and the tokens a round yields, and speculates only while
     tokens_per_round / t_round >= 1 / t_plain. In plain mode it probes one speculative round after
     `probe` plain steps; a failed probe doubles the interval (up to probe_max), a successful one

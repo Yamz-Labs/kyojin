@@ -1,4 +1,4 @@
-# verifyrow1: marginal verify-row cost by op. One load, several MTP arms (ndt -> verify R=ndt+1),
+# marginal verify-row cost by op. One load, several MTP arms (ndt -> verify R=ndt+1),
 # interleaved (RS_NDTS, default 1,2,3,3,2,1), each arm wrapped in an arm_<i>_R<r> marker span so
 # row_split_floor.py --arm slices the one rocprofv3 trace per arm. Derived from round_decomp.py:
 # glm-mtp D1-1 rounddecomp: decompose ONE served MTP round (ndt 1, verify R=2) into
@@ -30,7 +30,7 @@ torch.set_grad_enabled(False)
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
-if os.environ.get("RD_SPEED_ENV", "0") != "0":   # verifyfuse1: served SPEED_ENV (serve.py), as the lane runs
+if os.environ.get("RD_SPEED_ENV", "0") != "0":   # served SPEED_ENV (serve.py), as the lane runs
     import ast
     _src = open(os.path.join(ROOT, "tools/glm/serve.py")).read()
     for k, v in next(ast.literal_eval(n.value) for n in ast.parse(_src).body
@@ -252,7 +252,7 @@ for i, ndt in enumerate(NDTS):
     UNIQ = collections.defaultdict(list)
     for ph_, rows_, sel, _w in SELS:
         UNIQ[f"{ph_}|R{rows_}"].append(int(torch.unique(sel).numel()))
-    if os.environ.get("RS_SAVE_PICKS"):   # verifyrow1: union picks + routing weights, for the top-k trim study
+    if os.environ.get("RS_SAVE_PICKS"):   # union picks + routing weights, for the top-k trim study
         torch.save([(ph_, r_, s_.cpu(), w_.cpu()) for ph_, r_, s_, w_ in SELS if ph_.startswith("verify_fwd")],
                    f"{os.environ['RS_SAVE_PICKS']}_{label}.pt")
     A_ = dict(label=label, ndt=ndt, R=ndt + 1, rounds=nr, accept=acc,

@@ -1,4 +1,4 @@
-"""verifyfuse1: EXL3_VERIFY_FUSE A/B on the served GLM config (serve.py SPEED_ENV + MTP n1f2, UNION_V2).
+"""EXL3_VERIFY_FUSE A/B on the served GLM config (serve.py SPEED_ENV + MTP n1f2, UNION_V2).
 One load, arms switched at run time (VERIFY_FUSE["on"] + block_graph.purge()).
   R1: plain generator (no draft) greedy 32 ids x 3 prompts   -> must be bitwise (flag only acts on R > 1)
   R2: MTP generator greedy 64 ids x 3 prompts + accept        -> greedy-ids gate

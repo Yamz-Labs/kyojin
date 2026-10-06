@@ -437,7 +437,7 @@ class MLP(Module):
 
 
 def _vf_plain_exl3(l, dim: int) -> bool:
-    """verifyfuse1: a Linear whose forward is exactly inner.forward (no pad/trim/lora/scales/bias)
+    """a Linear whose forward is exactly inner.forward (no pad/trim/lora/scales/bias)
     and whose inner LinearEXL3 can run exl3_dec_gemv_r."""
     return (
         getattr(l, "quant_type", None) == "exl3" and getattr(l.inner, "dec_ok", False) and
@@ -749,7 +749,7 @@ class GatedMLP(Module):
 
             for s in r:
 
-                # verifyfuse1: R-row verify, gate+up in ONE exl3_dec_gemv_r_multi launch (Hadamards
+                # R-row verify, gate+up in ONE exl3_dec_gemv_r_multi launch (Hadamards
                 # inside) instead of 2 x (had_in + exl3_gemv + had_out); down goes to gemv_r via
                 # LinearEXL3.forward. Same activation call as the unfused branch below.
                 if (

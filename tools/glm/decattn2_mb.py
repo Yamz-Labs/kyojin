@@ -1,4 +1,4 @@
-"""decattn2 microbench: served dt DSA decode split vs variants, GLM decode shapes (bench_dsa_split.build).
+"""microbench: served dt DSA decode split vs variants, GLM decode shapes (bench_dsa_split.build).
 Each arm = env overrides applied before the call (dsa_triton reads them per call).
 Prints median / amortized ms and relL2 vs the torch reference per (ctx, R).
 usage: python tools/glm/decattn2_mb.py [--ctx 4096,32768] [--rows 1,2] [--reps 200]

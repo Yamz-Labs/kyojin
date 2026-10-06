@@ -1,4 +1,4 @@
-"""decattn2 probe: which DSA decode kernel does the served GLM config hit, at which R, and what
+"""probe: which DSA decode kernel does the served GLM config hit, at which R, and what
 do the real top-k indices look like at 4K (valid count, are the -1 tail-only)?
 Served env: serve.py SPEED_ENV + MTP (num_draft_tokens=1, MTP_FUSE_CATCHUP=2).
 Usage: python decattn2_probe.py <model> <corpus> <out.json>"""

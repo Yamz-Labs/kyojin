@@ -1,4 +1,4 @@
-# verifyrow1 model A/B: EXL3_GEMV_R_DEC1 off/on/on/off at MTP R=2/3/4, one load, served SPEED_ENV.
+# model A/B: EXL3_GEMV_R_DEC1 off/on/on/off at MTP R=2/3/4, one load, served SPEED_ENV.
 # Per (prompt, R): 4 runs of 128 greedy tokens; decode t/s + ms/round; ids must be identical across
 # arms (kernel is bit-exact). Unique prompt per rep. Usage: python tools/glm/dec1_ab.py <out.json>
 import os, sys, ast, json, time, statistics, torch

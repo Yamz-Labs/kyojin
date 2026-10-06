@@ -581,7 +581,7 @@ void hc_mix_norm_1pass_kernel
 
 /*
 
-hc_pf_apply_mix_norm_1pass (pffuse1, GLM prefill, EXL3_PF_HC_FUSE): residual apply of site A
+hc_pf_apply_mix_norm_1pass (GLM prefill, EXL3_PF_HC_FUSE): residual apply of site A
 fused with the hc_mix_norm_1pass of the NEXT site B. The (R, H, D) stream stack is written
 once (by the apply) and read once from HBM (by the finalize); the partials phase re-reads
 the just-written row L2-hot.
@@ -1838,7 +1838,7 @@ void hc_apply
     cuda_check(cudaPeekAtLastError());
 }
 
-// Prefill apply+mix_norm fusion (pffuse1, EXL3_PF_HC_FUSE): site-A hc_apply with comb
+// Prefill apply+mix_norm fusion (EXL3_PF_HC_FUSE): site-A hc_apply with comb
 // followed by the site-B hc_mix_norm_1pass, one launch. Single-chunk regime only
 // (grid (1, R)); the caller sizes partials (R, 1, M + 1).
 void hc_pf_apply_mix_norm

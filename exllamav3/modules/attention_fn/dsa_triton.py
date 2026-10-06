@@ -37,7 +37,7 @@ from ...util.tensor import g_tensor_cache
 # compile in debug mode, so force TRITON_DEBUG before any compilation
 dsa_debug_bounds = os.environ.get("EXL3_DSA_DEBUG_BOUNDS", "0") != "0"
 
-# dsaglue1: gates only. dsa_glue_expand additionally runs the eager chain and raises on any
+# gates only. dsa_glue_expand additionally runs the eager chain and raises on any
 # bitwise mismatch. Read once (it sits on the per-layer decode path).
 dsa_glue_check = os.environ.get("EXL3_DSA_GLUE_CHECK", "0") == "1"
 
@@ -851,7 +851,7 @@ def _dsa_attn_split_fast_kernel(
     PIPE: tl.constexpr = 0,      # issue the next tile's index -> page -> row chain early
     QK_DYN: tl.constexpr = 1,
 ):
-    """decattn2 (EXL3_DEC_DSA_FAST): _dsa_attn_split_dt_kernel with a shorter dependent-load
+    """EXL3_DEC_DSA_FAST: _dsa_attn_split_dt_kernel with a shorter dependent-load
     chain. REBAL: every program first reads the row's whole index vector (one K_pad-wide load)
     and splits [0, last valid + 1) instead of k_len: at 4K the selection holds 1024 valid
     entries of 2048, so each program walks half the tiles. Exact for any -1 pattern (a
@@ -1471,7 +1471,7 @@ def dsa_attn(
             est = (win_len if has_window else 0) + \
                   (k_len if indices is not dummy_i else min(pool_len, (q_pos0 + R) // max(compress_rate, 1)))
             n_splits = 16 if est > 256 else 8
-            # decattn2: EXL3_DEC_DSA_FAST split count (gathered latent decode only)
+            # EXL3_DEC_DSA_FAST split count (gathered latent decode only)
             if fast_cfg is not None and fast_cfg[2] > 0 and indices is not dummy_i and out_latent:
                 n_splits = fast_cfg[2]
         else:
@@ -1506,13 +1506,13 @@ def dsa_attn(
             and not has_window and not dense_pool and indices is not dummy_i and not dbg
             and not dbg_pages and block_h == 16) else None
         if dt_cfg is not None and fast_cfg is not None and len(fast_cfg) == 10:
-            dt_cfg = fast_cfg[3:]   # decattn2 preset carries its own BH,DT,BN,DK,NW,NS,QK
+            dt_cfg = fast_cfg[3:]   # the fast preset carries its own BH,DT,BN,DK,NW,NS,QK
         if dt_cfg is not None and (H % dt_cfg[0] or D_c % dt_cfg[1]
                                    or (H // dt_cfg[0]) * (D_c // dt_cfg[1]) != hb):
             dt_cfg = None
         with torch.cuda.device(q.device):
             if dt_cfg is not None and fast_cfg is not None:
-                # decattn2: dt kernel with the valid-prefix split / pipelined index chain
+                # dt kernel with the valid-prefix split / pipelined index chain
                 bh, bdt, bn, bdk, nw, ns, qd = dt_cfg
                 _dsa_attn_split_fast_kernel[(R * hb, n_splits)](
                     q, ring, kv_chunk, pc_arg, pool_r.reshape(-1),
@@ -1719,7 +1719,7 @@ def dsa_indexer_scores(
 
 
 def _dsa_dec_fast_cfg(R = 1):
-    """decattn2: EXL3_DEC_DSA_FAST (read per call, default 0 = off) = "REBAL,PIPE,SPLITS" for
+    """EXL3_DEC_DSA_FAST (read per call, default 0 = off) = "REBAL,PIPE,SPLITS" for
     _dsa_attn_split_fast_kernel on the dt decode path (SPLITS 0 = launcher default);
     "REBAL,PIPE,SPLITS,BH,DT,BN,DK,NW,NS,QK" also overrides the dt tile config (EXL3_DSA_DEC_CFG);
     "1" = the preset below. Needs the dt path (EXL3_DSA_DEC_DT=1, the default)."""
@@ -1727,7 +1727,7 @@ def _dsa_dec_fast_cfg(R = 1):
     if v == "0":
         return None
     if v == "1":
-        # test box microbench (scratch/decattn2/report.md): at R >= 2 (MTP verify, ~94 % of the
+        # test box microbench : at R >= 2 (MTP verify, ~94 % of the
         # served decode calls) BH 32 x DT 256 halves the redundant QK of the 64 x 128 dt tile,
         # 12 splits + pipelined index chain + num_stages 2: 0.091 -> 0.057 ms. R = 1: no
         # variant beats dt (all within +-5 %), so R = 1 keeps it
@@ -1754,7 +1754,7 @@ def _dsa_glue_expand_kernel(
     s_pool, s_out,
     P: tl.constexpr, DO_TAIL: tl.constexpr, BLOCK: tl.constexpr = 128,
 ):
-    """dsaglue1: one program per (row, 128-col block) of the DSA indexer pool expand.
+    """one program per (row, 128-col block) of the DSA indexer pool expand.
 
     Fuses the decode/verify torch glue after dsa_topk (mla_attn._indexer_topk_kpool):
     pool_idx * P + arange(P) expand, the >= 0 where-mask, the out copy, and the
@@ -1784,7 +1784,7 @@ def _dsa_glue_expand_kernel(
 
 
 def dsa_glue_expand(pool_idx, out_slab, P, q_pos0, do_tail):
-    """dsaglue1: fused pool-expand + tail-append for one _indexer_topk_kpool slab.
+    """fused pool-expand + tail-append for one _indexer_topk_kpool slab.
 
     pool_idx (rows, k_sel) int32 top-k pool ids; out_slab (rows, k_pad) int32 slice
     of the -1-filled selection; q_pos0 = host_seqlens[b] + r0. Returns the expand

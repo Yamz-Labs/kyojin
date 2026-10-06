@@ -69,16 +69,16 @@ def chunk_kda_fwd_h_fused_hip(q, k, v, gk, beta, Akk, Aqk, scale, initial_state=
         assert t.is_contiguous()
     pf = os.environ.get("EXL3_KDA_PF_SPLIT", "0") if not defs else ""
     if pf == "2":
-        # kdapf2: spill-free build (0 VGPR spills vs 462): sched barriers (SB), opaque lane
+        # spill-free build (0 VGPR spills vs 462): sched barriers (SB), opaque lane
         # indices (OPQ), pinned WMMA accumulators (OPV), uniform o-store base (ADR), no LSR,
         # plus PH1=4 PF=1 next-chunk register prefetch. Bitwise-identical to defs="".
         # Microbench T=4096 HV=64 (test box): 8.70 -> 5.40 ms (-38 %). Default off.
         defs = "BRL=1 UNI=1 OPQ=15 OPV=11 SB=15 ADR=1 PH1=4 PF=1 -mllvm -disable-lsr"
     elif pf == "1":
-        # kdapf1: BRL (branchless f2bf, single basic block) + UNI (wave-uniform rows).
+        # BRL (branchless f2bf, single basic block) + UNI (wave-uniform rows).
         # Bitwise-identical to defs="" (sweep T=4096: 10.979 -> 8.615 ms/layer, -21.5 %),
         # default off. Name kept per brief; the 2-WG split (lever a) was ruled NO-GO by
-        # construction (w/tril/vn couple all halves; see scratch/kdapf1/NOTES.md).
+        # construction (w/tril/vn couple all halves).
         defs = "BRL=1 UNI=1"
     fn = _load(defs)
     if o is None:

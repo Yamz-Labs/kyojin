@@ -286,7 +286,7 @@ __device__ __forceinline__ void tile_dot(const uint32_t* w, const f16x2* xp, flo
 #endif
 }
 
-// verifyrow1 (EXL3_GEMV_R_DEC1): R-row twin of pair_dot/tile_dot. Each weight pair is decoded ONCE
+// (EXL3_GEMV_R_DEC1): R-row twin of pair_dot/tile_dot. Each weight pair is decoded ONCE
 // and applied to every row (tile_dot per row re-decodes the whole tile per row, which made each
 // extra verify row cost ~7 % of the dense gemv time in pure ALU). Per row, the fdot2 operands, the
 // accumulator and the order of accumulation are exactly tile_dot's, so the output is bit-identical.
@@ -402,13 +402,13 @@ __device__ __forceinline__ void lane_gemv(const u32x4* tiles, size_t tstride, co
     }
 }
 
-// R-row variant (REPORT-16): each tile is loaded once (identical RING pipeline to lane_gemv), then
+// R-row variant: each tile is loaded once (identical RING pipeline to lane_gemv), then
 // applied to `nrows` independent input rows in the exact same per-row tile_dot/pair_dot arithmetic
 // lane_gemv would run for a batch-1 call on that row -- so row j of acc is bit-identical to what a
 // batch-1 lane_gemv(..., xs_rows[j], n, acc_row_j) call would produce. xp is scoped inside the row
 // loop (not hoisted per-row), so only one row's 8 xp registers are live at a time; acc[MOE_R_MAX][16]
 // (only the first `nrows` rows used) is the only cost that scales with rows.
-// RM (REPORT-28): compile-time row bound. The row loop used to run to the runtime nrows, which
+// RM: compile-time row bound. The row loop used to run to the runtime nrows, which
 // indexes acc[j] dynamically and pushes the whole accumulator array to scratch memory; unrolled to
 // RM with a uniform `j < nrows` guard, acc stays in VGPRs. Arithmetic per row is unchanged.
 // RING_ (default ring_of<KB2>) only sets how many tiles are in flight; the per-tile arithmetic and
@@ -445,7 +445,7 @@ __device__ __forceinline__ void lane_gemv_r(const u32x4* tiles, size_t tstride, 
     }
 }
 
-// verifyrow1: lane_gemv_r with the decode shared across rows (pair_dot_r). Same ring, same loads.
+// lane_gemv_r with the decode shared across rows (pair_dot_r). Same ring, same loads.
 template <int KB2, int CB, int RM, int RING_ = 0>
 __device__ __forceinline__ void lane_gemv_r1(const u32x4* tiles, size_t tstride, const half* const* xs_rows, int n, float acc[][16])
 {
@@ -1027,7 +1027,7 @@ void moe_down_kernel(MoeArgs a, int kbs)
 
 
 // ------------------------------------------------------------------------------------------------
-// R-row union MoE (REPORT-16): verify-window MoE, R<=8 rows sharing one launch. Each *unique*
+// R-row union MoE: verify-window MoE, R<=8 rows sharing one launch. Each *unique*
 // expert across the R rows' top-k selections is decoded exactly once (grid.y = unique-expert
 // index u, not row) and its lane_gemv accumulation is run once per row assigned to it, in the
 // exact per-lane arithmetic order (tile_dot/pair_dot, same acc[16] sequence) a batch-1
@@ -1314,7 +1314,7 @@ void moe_down_kernel_r(MoeArgsR a, int kbs, int ctr_b_off)
     }
 }
 
-// Device-side unique-expert / assignment table for the R-row union MoE (REPORT-28): no host sync.
+// Device-side unique-expert / assignment table for the R-row union MoE: no host sync.
 // Generic in E, topk (<= 64) and R (<= MOE_R_MAX). Slot i = row * topk + k. A slot "leads" when no
 // earlier slot selected the same expert; leader i gets u = number of leaders before it, and
 // assign[u * MOE_R_MAX + c] lists every slot with that expert in slot order (same as the host build).
@@ -2235,7 +2235,7 @@ void exl3_dec_gemv_strided
 }
 
 // ------------------------------------------------------------------------------------------------
-// R-row dense GEMV (REPORT-17): each weight tile is decoded once (identical RING pipeline to
+// R-row dense GEMV: each weight tile is decoded once (identical RING pipeline to
 // batch-1's gemv_kernel) and applied to up to `rpb` rows via lane_gemv_r, in the exact per-row
 // arithmetic order (tile_dot/pair_dot/block_reduce/arrive) a batch-1 exl3_dec_gemv call would
 // use for that row -- so row j's output is bit-identical to a fresh batch-1 call, PROVIDED ktw
@@ -2435,7 +2435,7 @@ static void dec_gemv_r_impl
     int rpb = std::max(1, std::min(R, GEMV_R_ROW_BUDGET / ktw));
     const int rpb_cap = env_int("EXL3_GEMV_R_RPB", 0);
     if (rpb_cap > 0) rpb = std::min(rpb, rpb_cap);
-    // mimoident2 (MiMo, R 5..8 verify, bitwise independent of rpb): the 8-row kernel variant wins at R 5-6
+    // (MiMo, R 5..8 verify, bitwise independent of rpb): the 8-row kernel variant wins at R 5-6
     // but loses at R 7-8 (131 vs 123 ms per verify forward, spills); from R 7 on run two 4-row chunks (grid.y = 2).
     else if (R >= 7 && rpb > 4 && env_int("EXL3_GEMV_R_RPB78", 4) > 0) rpb = env_int("EXL3_GEMV_R_RPB78", 4);
 
@@ -2478,7 +2478,7 @@ static void dec_gemv_r_impl
     const dim3 grid(blocks, (R + rpb - 1) / rpb);
     EXL3_DEC_DISPATCH_CB(mcg ? 1 : 2, EXL3_DEC_DISPATCH_RM(rpb, EXL3_DEC_DISPATCH_KB2(kb2,
         {
-            // verifyrow1: EXL3_GEMV_R_DEC1=1 decodes each tile once for all rows (bit-identical)
+            // EXL3_GEMV_R_DEC1=1 decodes each tile once for all rows (bit-identical)
             if (RM > 1 && env_int("EXL3_GEMV_R_DEC1", 0) == 1)
             { auto kfn = gemv_kernel_r<KB2, CB, RM, true>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
             else
@@ -2714,7 +2714,7 @@ void exl3_dec_moe_shared
     cuda_check(cudaPeekAtLastError());
 }
 
-// R-row union MoE, REPORT-16. See the comment above MoeArgsR. Builds the unique-expert /
+// R-row union MoE. See the comment above MoeArgsR. Builds the unique-expert /
 // assignment table on the host (R * topk <= 80 entries, negligible next to the GEMVs) and runs
 // gu + down + combine. x: [R, H] fp16, out: [R, H] fp32, selected/weights: [R, topk].
 void exl3_dec_moe_union
@@ -2794,7 +2794,7 @@ void exl3_dec_moe_union
     }
     else
     {
-        // REPORT-28: table built on device, grid.y = max possible U, padded slots exit at once
+        // Table built on device, grid.y = max possible U, padded slots exit at once
         const int64_t experts_d = experts;
         TORCH_CHECK(topk <= 64, "exl3_dec_moe_union: device table needs topk <= 64");
         U = (int) std::min<int64_t>((int64_t) R * topk, experts_d);

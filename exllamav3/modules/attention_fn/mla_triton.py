@@ -1312,7 +1312,7 @@ def _unfold_cfg(R: int, v_head_dim: int):
     if _pf_fast():
         bm, bk, bn, st, nw = _PF_UNFOLD[_row_bucket(R)]
         return min(bm, block_m), bk, min(bn, v_head_dim), st, nw
-    # Default = one V tile, 2 stages, k tile halved until it fits. REPORT-28: split-V restores the
+    # Default = one V tile, 2 stages, k tile halved until it fits. Split-V restores the
     # full 128 k tile at D_v 256 but measured 1.6-1.9x slower; the best decode tile ("64,256,1,8",
     # 99 vs 116 us/call, bit-exact) moved full-model decode by -0.2% (noise), so it is not default
     return block_m, 128, v_head_dim, 2, 4

@@ -1,4 +1,4 @@
-"""decattn2: EXL3_DEC_DSA_FAST A/B on the served GLM config (serve.py SPEED_ENV + MTP n1, MTP_FUSE_CATCHUP=2).
+"""EXL3_DEC_DSA_FAST A/B on the served GLM config (serve.py SPEED_ENV + MTP n1, MTP_FUSE_CATCHUP=2).
 One load. Arms: off (flag 0) / on (flag = $DECATTN2_ON, default "1"). Adapted from mla-fast tools/glm/mlafast_ab.py (a1debac4).
 Phase A (target only): greedy 32 ids x 3 prompts + teacher-forced decode-path NLL (3 x 4K prompt, 128 forced tokens).
 Phase B (MTP generator as served): greedy 32 ids x 3, then 4K decode interleaved off/on/on/off..., 128 tokens.

@@ -27,7 +27,7 @@ torch.set_grad_enabled(False)
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
-if os.environ.get("RD_SPEED_ENV", "0") != "0":   # verifyfuse1: served SPEED_ENV (serve.py), as the lane runs
+if os.environ.get("RD_SPEED_ENV", "0") != "0":   # served SPEED_ENV (serve.py), as the lane runs
     import ast
     _src = open(os.path.join(ROOT, "tools/glm/serve.py")).read()
     for k, v in next(ast.literal_eval(n.value) for n in ast.parse(_src).body

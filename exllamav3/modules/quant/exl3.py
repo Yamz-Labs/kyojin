@@ -10,7 +10,7 @@ from ...util import profile_opt
 MAX_BSZN_GEMV_R = 8  # must match MOE_R_MAX in exllamav3_ext/quant/exl3_dec.cu
 # K >= this runs R batch-1 launches instead of one gemv_r launch (A/B knob; 99 = never loop)
 DEC_GEMV_R_LOOP_MIN_K = int(os.environ.get("EXL3_DEC_GEMV_R_LOOP_MIN_K", "99"))
-# verifyfuse1: EXL3_VERIFY_FUSE=1 routes every R-row (1 < R <= 8) dense EXL3 linear of the MTP/DFlash
+# EXL3_VERIFY_FUSE=1 routes every R-row (1 < R <= 8) dense EXL3 linear of the MTP/DFlash
 # verify forward to exl3_dec_gemv_r (both Hadamards inside, 1 launch) instead of had_in + exl3_gemv +
 # had_out (3 launches), and fuses the shared-expert gate+up pair into one gemv_r_multi launch
 # (mlp.py). Rows stay bit-exact vs R batch-1 dec_gemv calls (the R=1 plain-decode math). R=1 untouched.
@@ -229,7 +229,7 @@ def dec_workspace(device: torch.device):
     return ws
 
 
-# specrow1: wide-N R-row GEMV (lm_head, N=248320: R*kbs*N partial sums > DEC_SCRATCH_FLOATS even at R=2) used to fall back to
+# wide-N R-row GEMV (lm_head, N=248320: R*kbs*N partial sums > DEC_SCRATCH_FLOATS even at R=2) used to fall back to
 # R batch-1 launches, each re-reading the whole weight (R x 1.36 ms). A dedicated scratch lets one gemv_r launch carry all rows
 # (same kernel, same per-row reduction order, so bit-exact). Counters are shared (R * ceil(N/512) <= 3880 <= 4096 for R <= 8).
 # Mutable at run time for one-load A/B: set WIDE_R["on"].
@@ -262,7 +262,7 @@ def dec_moe_supported(inner) -> bool:
     """True when a LinearEXL3 can feed the fused routed-MoE decode (exl3_dec_moe / _union).
 
     Same as dec_supported() except that both codebooks qualify: the MoE kernels decode the mcg
-    codebook as well as mul1 since REPORT-21 (GLM-5.3-Flash's published packs are all mcg), while
+    codebook as well as mul1 (GLM-5.3-Flash's published packs are all mcg), while
     the dense exl3_dec_gemv route stays mul1-only.
     """
     return (
@@ -414,7 +414,7 @@ class LinearEXL3:
             if rows <= AUTO_RECONSTRUCT_THRESHOLD or self.config.infer_params.no_reconstruct:
                 if rows == 1 and self.dec_ok and not params.get("moe_valu"):
                     return self.dec_gemv(x, out_dtype)
-                # R-row DFlash verify (REPORT-17): same kernel family as dec_gemv, one weight
+                # R-row DFlash verify: same kernel family as dec_gemv, one weight
                 # tile decode shared across rows -- see exl3_dec_gemv_r's docstring for why this
                 # is bit-exact vs R independent dec_gemv calls. Opt-in (EXL3_DEC_MOE_UNION, the
                 # same flag dec_norm_route_r/the union MoE branch use, so one flag controls the
@@ -465,7 +465,7 @@ class LinearEXL3:
 
 
     def dec_gemv_r(self, x: torch.Tensor, rows: int, out_dtype):
-        """R-row decode GEMV (exl3_dec_gemv_r, REPORT-17): one launch, each weight tile decoded
+        """R-row decode GEMV (exl3_dec_gemv_r): one launch, each weight tile decoded
         once and applied to every row -- bit-exact vs R independent dec_gemv calls, see the
         kernel's own docstring. Reuses the global dec_workspace() scratch/counters: this call
         never runs concurrently (same stream) with a bsz==1 dec_gemv call reading the same

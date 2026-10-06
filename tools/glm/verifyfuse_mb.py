@@ -1,4 +1,4 @@
-# verifyfuse1 microbench: R-row dense EXL3 GEMV at GLM verify shapes, no model load.
+# microbench: R-row dense EXL3 GEMV at GLM verify shapes, no model load.
 #   A = served R=2 path (bc.run_alloc / exl3_gemv: had_in + exl3_gemv + had_out, 3 launches)
 #   B = exl3_dec_gemv_r (input/output Hadamards inside, 1 launch; bit-exact vs R batch-1 dec_gemv)
 #   B2 = exl3_dec_gemv_r_multi for shared gate+up (1 launch for 2 matrices)

@@ -64,7 +64,7 @@ void hc_apply
     const c10::optional<at::Tensor>& comb
 );
 
-// Prefill apply+mix_norm fusion (pffuse1, EXL3_PF_HC_FUSE, default off)
+// Prefill apply+mix_norm fusion (EXL3_PF_HC_FUSE, default off)
 void hc_pf_apply_mix_norm
 (
     at::Tensor x,

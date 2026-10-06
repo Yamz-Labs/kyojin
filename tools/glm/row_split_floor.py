@@ -111,7 +111,7 @@ def main():
     kern.sort(); marks.sort()
     KS = [k[0] for k in kern]
     def in_round(rs, re_):
-        # verifyrow1: kernels overlapping [rs, re_) via bisect (the trace holds all arms)
+        # kernels overlapping [rs, re_) via bisect (the trace holds all arms)
         i = max(0, bisect.bisect_left(KS, rs) - 64)
         j = bisect.bisect_left(KS, re_)
         return [k for k in kern[i:j] if k[1] > rs]
@@ -120,7 +120,7 @@ def main():
     GRID = 256
     EV = J["events"]; want = [x[0] for x in EV]
     raw = [m[3] for m in marks]
-    # verifyrow1: greedy alignment -- the trace also holds unrelated complex64 fills (grid capped
+    # greedy alignment -- the trace also holds unrelated complex64 fills (grid capped
     # at 96*256 for big buffers, e.g. during the per-arm prefills), so skip any mark that is not
     # the next expected id.
     mk = []; j = 0

@@ -19,7 +19,7 @@ from spec_prompts import EXTRA
 import spec_policy
 from exllamav3.modules import moe_fused
 from exllamav3.modules.quant import exl3 as qexl3
-# specrow1: arm plain0 = plain greedy with the previous engine config (mf7 MoE kernel, lm_head loop, no GEMV_R_DEC1), every other arm = current config
+# arm plain0 = plain greedy with the previous engine config (mf7 MoE kernel, lm_head loop, no GEMV_R_DEC1), every other arm = current config
 CUR = (os.environ.get("EXL3_GEMV_R_DEC1", "0"), qexl3.WIDE_R["on"], moe_fused.MF9["variant"])
 def set_cfg(old):
     os.environ["EXL3_GEMV_R_DEC1"], qexl3.WIDE_R["on"], moe_fused.MF9["variant"] = ("0", False, 0) if old else CUR

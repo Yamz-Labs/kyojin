@@ -31,36 +31,36 @@ SPEED_ENV = {
     "EXL3_BLOCK_GRAPH_MLA": "2",
     "EXL3_HC_FN_HALF_PF": "1",
     "EXL3_HC_1PASS_PF": "1",
-    # 26/09 WINs: decattn2 decode +4.6 % 4K; chunk4096/chunk4096b prefill -7.3 % pf4k.
+    # 26/09 gains: DSA decode attention +4.6 % at 4K; prefill chunking -7.3 % at 4K.
     "EXL3_DEC_DSA_FAST": "1",
     "EXL3_MIDCHUNK_CKPT": "2",
     "EXL3_PREFILL_BIG_TAIL": "1",
     "EXL3_BIG_TAIL_DENSE": "1",
-    "EXL3_PREFILL_BIG_CHUNK_MAXPOS": "32768",  # mem512k1: plain chunks beyond 32K depth, lower peak memory at 512K ctx
-    # 27/09 acceptaudit2 WIN: unquantized MTP eh_proj (td205 stores it at 2 bpw, cos 0.79):
+    "EXL3_PREFILL_BIG_CHUNK_MAXPOS": "32768",  # plain chunks beyond 32K depth, lower peak memory at 512K ctx
+    # 27/09: unquantized MTP eh_proj (td205 stores it at 2 bpw, cos 0.79):
     # served accept +0.077 +- 0.008 (n=24), target ids 24/24 equal, serve_accept decode +4.8 %.
     # The pack ships the sidecar as mtp_eh_proj.st; loaded by default (see apply_eh_sidecar_default()).
-    # 27/09 verifyfuse1 WIN: R-row verify linears in one launch (Hadamards in-kernel):
+    # 27/09: R-row verify linears in one launch (Hadamards in-kernel):
     # served R=2 round -3.04 +- 0.20 ms, +6.7 % t/s; R=1 bitwise, R=2 greedy 64/64.
     "EXL3_VERIFY_FUSE": "1",
-    # 27/09 round2 WIN: one router launch per verify + wide MoE combine; with R=3 (--num-draft 2)
+    # 27/09: one router launch per verify + wide MoE combine; with R=3 (--num-draft 2)
     # served +6.42 +- 1.34 % vs R=2 base (12 prompts/arm, greedy ids 128/128 x 3 equal).
     "EXL3_DEC_ROUTER_ROWS": "2",
     "EXL3_MOE_COMBINE_WIDE": "1",
-    # 27/09 moedec1 WIN: R=3 union MoE with RM=3 instead of RM=4 (tighter registers/LDS
+    # 27/09: R=3 union MoE with RM=3 instead of RM=4 (tighter registers/LDS
     # when every expert serves at most 3 rows); served R=3 round -1.08 ms, +1.46 +- 0.06 % t/s
     # (one box, one load, n=12/arm paired), greedy ids 12x128/128 identical, kernel bitwise.
     "EXL3_MOEDEC1_RM3": "1",
-    # kbsgate 71655909: NLL n=64 mean +0.092 % (CI incl 0), median -0.003 %, dPPL -0.04 % -> within GOAL PPL <= +0.1 %; union MoE -3 %.
+    # NLL n=64 mean +0.092 % (CI incl 0), median -0.003 %, dPPL -0.04 % -> within GOAL PPL <= +0.1 %; union MoE -3 %.
     "EXL3_MOEDEC1_KBS_A": "3",
     "EXL3_GEMV_R_DEC1": "1",
-    # 27/09 dsaglue1 + stackbench3 WIN (one box, one load, n=27/arm paired): decode 29.53 -> 30.04 t/s,
+    # 27/09: DSA indexer glue fused (n=27/arm paired): decode 29.53 -> 30.04 t/s,
     # +1.74 +- 0.43 %; greedy ids 3x64 and MTP accept identical. (round2's stack saw -0.08 % at n=12.)
     "EXL3_DSA_GLUE_FUSE": "1",
-    # 27/09 pffuse1 + stackbench3 WIN: prefill mHC apply + next mix_norm fused; 16K 574.3 -> 579.8
-    # (+0.95 +- 0.07 %), pffuse1 4K +1.46 +- 0.48 % (n=10). Decode neutral. Needs the rebuilt ext.
+    # 27/09: prefill mHC apply + next mix_norm fused; 16K 574.3 -> 579.8
+    # (+0.95 +- 0.07 %), 4K +1.46 +- 0.48 % (n=10). Decode neutral. Needs the rebuilt ext.
     "EXL3_PF_HC_FUSE": "1",
-    # 27/09 moegemm WIN: mpw2x MoE grouped GEMM (no register spill, 224 VGPR): prefill 579.8 -> 598.2
+    # 27/09: mpw2x MoE grouped GEMM (no register spill, 224 VGPR): prefill 579.8 -> 598.2
     # t/s 4K (+3.24 +- 0.19 %, n=6), 16K +2.62 +- 0.24 % (n=4); ids identical, logits bitwise at 4K.
     "EXL3_MPW2X": "2",
     "EXL3_MLA_PF_FAST": "1",
@@ -798,7 +798,7 @@ def main() -> None:
     if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":
         print(f"serve: warm-up {warmup(engine, template):.1f} s", flush=True)
         print(mem_line("warm"), flush=True)
-        if os.environ.get("EXL3_SERVE_EMPTY_CACHE", "1") == "1":   # mem512k1 lever (a): drop the allocator's inactive slack
+        if os.environ.get("EXL3_SERVE_EMPTY_CACHE", "1") == "1":   # lever (a): drop the allocator's inactive slack
             import torch
             torch.cuda.empty_cache()
             print(mem_line("emptied"), flush=True)

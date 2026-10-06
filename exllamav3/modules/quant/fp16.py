@@ -6,7 +6,7 @@ import os as _os
 _f32_via_f16 = _os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
 _f32_via_f16_min_rows = int(_os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "32"))
 # gfx1151 decode: fp16-out torch.matmul at M <= 8 lands on a single-workgroup hipBLAS tile (GLM-5.3
-# indexer wk/weights_proj: 108-154 us for 1 MB, REPORT-31); ext.hgemm takes the multi-CU skinny
+# indexer wk/weights_proj: 108-154 us for 1 MB); ext.hgemm takes the multi-CU skinny
 # split-K GEMV first (M <= 8, N <= 128) and falls back to the same GEMM otherwise
 _hip = bool(torch.version.hip)
 _f16_small_m_hgemm = _os.environ.get("EXL3_HIP_F16_SMALL_M_HGEMM", "1") != "0" and bool(torch.version.hip)

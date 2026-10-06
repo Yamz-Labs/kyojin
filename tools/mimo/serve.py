@@ -222,7 +222,7 @@ class ResidentEngine:
                  spec_gate: bool = False, ctx: int | None = None,
                  reset_gate_per_request: bool = False,
                  dynamic_draft: bool = True, draft_confidence: float = 0.6):
-        # Lossless speculation (mimoident1): every verify row uses the exact R=1 arithmetic, so
+        # Lossless speculation: every verify row uses the exact R=1 arithmetic, so
         # speculative output equals plain greedy output (20/20 prompts). Costs about 5 % chat and
         # 12 % code tok/s. EXL3_MIMO_LOSSLESS=0 restores the fast, not bit-identical verify.
         # Set before the exllamav3 import. Catch-up fusion stays automatic (on with the union MoE).
@@ -230,7 +230,7 @@ class ResidentEngine:
             for k, v in (("EXL3_VERIFY_ATTN_LOOP", "1"), ("EXL3_VERIFY_GEMV_R", "1"),
                          ("EXL3_DEC_MOE_UNION", "1")):
                 os.environ.setdefault(k, v)
-        # v2mimochk1: the one-launch wide-N verify GEMV (specrow1, lm_head) is a Qwen win but costs MiMo
+        # the one-launch wide-N verify GEMV (lm_head) is a Qwen win but costs MiMo
         # about 7 % tok/s (35.6/31.0/42.3 -> 33.2/28.9/39.5). Off by default here; the caller's env wins.
         os.environ.setdefault("EXL3_VERIFY_WIDE_R", "0")
         import torch

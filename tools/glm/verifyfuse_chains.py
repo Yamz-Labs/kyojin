@@ -1,4 +1,4 @@
-# verifyfuse1: rank GPU-side gaps inside verify_fwd_R2 by kernel and by chain, from a D1-1 rounddecomp trace.
+# rank GPU-side gaps inside verify_fwd_R2 by kernel and by chain, from a D1-1 rounddecomp trace.
 #   usage: verifyfuse_chains.py <run.rocprof dir> <round_decomp.json> [phase]
 import csv, glob, json, re, sys, collections
 d, jf = sys.argv[1], sys.argv[2]; PH = sys.argv[3] if len(sys.argv) > 3 else "verify_fwd_R2"

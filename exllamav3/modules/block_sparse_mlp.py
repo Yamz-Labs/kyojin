@@ -812,7 +812,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
             # Codebook: exl3_dec_moe takes one flag for all three projections (the kernel is
             # templated on the codebook, not per projection), so the layer needs a uniform one.
-            # mul1 and mcg both decode (REPORT-21); anything else leaves the fused path off.
+            # mul1 and mcg both decode; anything else leaves the fused path off.
             if cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)):
                 self.dec_moe_mcg = bool(cbs[0][0])
             self.support_dec_moe = self.support_dec_moe and self.dec_moe_mcg is not None
@@ -821,7 +821,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.dec_moe_act = g_tensor_cache.get(
                     self.device, (self.num_experts_per_tok, self.intermediate_size_padded), torch.half, "dec_moe_act")
                 self.dec_shf_setup()
-                # R-row union MoE (REPORT-16/17, exl3_dec_moe_union): shared, per-device
+                # R-row union MoE (exl3_dec_moe_union): shared, per-device
                 # workspace (like dec_workspace) sized for the worst case (MAX_BSZN rows, this
                 # layer's topk/H/I) and reused across layers -- forward calls are stream-ordered
                 # so a later layer never races an earlier one's still-in-flight kernel.
@@ -847,7 +847,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 for multi in (self.multi_gate, self.multi_up, self.multi_down)
             ) and self.multi_gate.K == self.multi_up.K
             # Codebook: mpw_gemm is templated on it and takes one flag for all three projections
-            # (REPORT-22), so the layer needs a uniform codebook. Unknown (neither mul1 nor mcg,
+            #, so the layer needs a uniform codebook. Unknown (neither mul1 nor mcg,
             # or mixed) leaves the path off.
             wmma_cbs = {(m.mul1, m.mcg) for m in (self.multi_gate, self.multi_up, self.multi_down)}
             if len(wmma_cbs) == 1:
@@ -1353,7 +1353,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if os.environ.get("BSZ_DEBUG"):
             print(f"[bsz_debug] layer={self.key} bsz={bsz} union={os.environ.get('EXL3_DEC_MOE_UNION')}")
         bc_sh_exp = False
-        # REPORT-28: R-row union MoE with the unique-expert table built on device (no host sync),
+        #  R-row union MoE with the unique-expert table built on device (no host sync),
         # fed by the batched router -- independent of EXL3_DEC_MOE_UNION's bit-exact per-row loops
         union_dev = os.environ.get("EXL3_DEC_MOE_UNION_DEV", "0") != "0"
         # V2 selects the device-built unique-expert table without enabling the legacy
@@ -1506,11 +1506,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 return res
             final_hidden_states = self.dec_moe_out.view(eshape)
 
-        # R-row union decode (REPORT-16/17, exl3_dec_moe_union), DFlash verify: bit-exact vs
-        # bsz independent batch-1 exl3_dec_moe calls under shared routing (REPORT-16 Sec 1) --
+        # R-row union decode (exl3_dec_moe_union), DFlash verify: bit-exact vs
+        # bsz independent batch-1 exl3_dec_moe calls under shared routing --
         # each unique expert across the bsz rows' picks is decoded once and applied to every row
         # that picked it in the exact batch-1 per-row arithmetic order. Opt-in (default off):
-        # REPORT-16 measured no clear speed win yet at R=1 or R=6-8 (host-side unique/assign
+        # Measured: no clear speed win yet at R=1 or R=6-8 (host-side unique/assign
         # build dominates), only R=2..5; EXL3_DEC_MOE_UNION=1 to use it anyway (e.g. to get a
         # bit-exact verify path even before that's fixed).
         elif (
@@ -2089,7 +2089,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         literal batch-1 exl3_dec_router_norm launch (same kernel, same args, just row j's data),
         so row j of the returned y and of dec_routed's (selected, weights) is bit-identical to
         what plain batch-1 decode would produce stepping through row j alone -- this is what
-        REPORT-16 Sec 6 found missing: that report's row-invariance probe exercised
+        an earlier row-invariance probe missed: it exercised
         exl3_dec_router (unfused), not the exl3_dec_router_norm/dec_norm_route path real decode
         actually takes, which is why it saw a k-order mismatch and (for one cell) a 1.22e-4
         weight mismatch -- neither is possible here, since this never runs a second, independent
@@ -2104,7 +2104,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # dec_norm_route's raw-buffer return is consumed immediately by the caller either way.
             return self.dec_norm_route(norm, xa[0], r[0], params)
         # R>1 (DFlash verify): gated by the same flag as the union MoE kernel it feeds, so
-        # EXL3_DEC_MOE_UNION=0 reproduces the exact pre-REPORT-17 behavior (generic norm+router,
+        # EXL3_DEC_MOE_UNION=0 reproduces the exact earlier behavior (generic norm+router,
         # dedup MoE) for a clean A/B against it -- R sequential kernel launches here is a real
         # per-layer cost even though it's bit-exact, not a free win to force on unconditionally.
         # Also refuse above MAX_BSZN: prefill calls this with R = chunk size (hundreds+), where

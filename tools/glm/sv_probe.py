@@ -1,4 +1,4 @@
-"""servedverify1 probe: first-call cost root cause + served-path decode A/B, one load.
+"""probe: first-call cost root cause + served-path decode A/B, one load.
 
 Loads GLM exactly as tools/glm/serve.py (ResidentEngine, SPEED_ENV, MTP n1f2+v2) and drives
 engine.generate() with chat-templated prompts, as the HTTP layer does.

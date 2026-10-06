@@ -40,7 +40,7 @@ assert _score_tile % 256 == 0 and _score_tile > 0
 # call instead of running the per-tile top-k merge below.  Prefill remains tiled.
 EXL3_DSA_DEC_NOTILE = _os.environ.get("EXL3_DSA_DEC_NOTILE", "1") == "1"
 
-# dsaglue1: fuse the decode/verify DSA indexer torch glue (pool expand + tail
+# fuse the decode/verify DSA indexer torch glue (pool expand + tail
 # append, ~15 launches/layer, ~0.73 ms/round) into one Triton kernel. Default off.
 EXL3_DSA_GLUE_FUSE = _os.environ.get("EXL3_DSA_GLUE_FUSE", "0") == "1"
 
@@ -933,7 +933,7 @@ class MLAttention(Module):
                         pool_idx = torch.where(
                             run_scr > -float("inf"), run_idx, run_idx.new_full((), -1))
 
-                    # Expand pools to raw token indices (dsaglue1: one kernel when set;
+                    # Expand pools to raw token indices (one kernel when set;
                     # single-slab only so the tail offset is this slab's expand width)
                     if EXL3_DSA_GLUE_FUSE and seqlen <= 256:
                         from .attention_fn.dsa_triton import dsa_glue_expand

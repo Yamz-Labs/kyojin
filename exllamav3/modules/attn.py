@@ -749,7 +749,7 @@ class Attention(Module):
                 v = outs[2] if len(outs) > 2 else k
                 return self.finish_qkv(q, k, v, None, bsz, q_len, params)
 
-        # DFlash verify (R rows, REPORT-17): same fused launch as the bsz==1 case above,
+        # DFlash verify (R rows): same fused launch as the bsz==1 case above,
         # generalized to R rows via exl3_dec_gemv_r_multi -- see sliding_attn.py's identical
         # branch for why the fused multi-matrix call (not per-Linear dec_gemv_r) is required for
         # bit-exactness (shared strips_total -> shared ktw/kbs with the batch-1 launch). This is
