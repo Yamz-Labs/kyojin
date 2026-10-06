@@ -201,7 +201,7 @@ def reply_room(engine: Any, prompt_tokens: int) -> int | None:
     ctx = getattr(engine, "ctx", None)
     if not ctx:
         return None
-    room = ctx - prompt_tokens - 1 - getattr(engine, "num_draft", 0)
+    room = ctx // 256 * 256 - prompt_tokens - 1 - getattr(engine, "num_draft", 0)   # page table = ctx // 256 pages of 256 tokens
     if room < 1:
         raise web.HTTPBadRequest(reason=f"prompt is {prompt_tokens} tokens, the server context is {ctx}")
     return room

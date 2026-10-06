@@ -443,6 +443,70 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(ev[-1]["choices"][0]["finish_reason"], "error")
 
 
+class ReplyRoomTests(unittest.TestCase):
+    """The reply budget must never make Job.prepare ask for more pages than the page table holds."""
+
+    @staticmethod
+    def pages_needed(x, new_tokens, draft):
+        """Job.prepare for one sequence without an explicit requeue budget: max_rq = new + 1 + draft; pagetable.Sequence.prepare."""
+        max_len = x + new_tokens + 1 + draft
+        return (max_len + 255) // 256
+
+    def test_room_is_exactly_the_largest_that_fits(self):
+        for ctx in (4096, 4097, 4351, 131072, 272384, 98305):
+            pages = ctx // 256                       # PageTable.max_pages = cache.max_num_tokens // PAGE_SIZE
+            for draft in (0, 1, 3, 4):
+                for x in (1, 255, 256, 257, 1000, ctx - 300, ctx - 5, ctx - 4):
+                    room = serve.reply_room(ctx, x, draft)
+                    if room < 1:
+                        self.assertGreater(self.pages_needed(x, 1, draft), pages, (ctx, draft, x))
+                        continue
+                    self.assertLessEqual(self.pages_needed(x, room, draft), pages, (ctx, draft, x))      # fits
+                    self.assertGreater(self.pages_needed(x, room + 1, draft), pages, (ctx, draft, x))     # one more does not
+
+    def test_old_rule_overflowed_at_the_page_boundary(self):
+        ctx, x, draft = 131072, 1000, 3
+        old = ctx - x - 1
+        self.assertGreater(self.pages_needed(x, old, draft), ctx // 256)
+        self.assertEqual(serve.reply_room(ctx, x, draft), old - draft)
+        self.assertEqual(serve.reply_room(ctx, x, 0), old)           # no speculation: nothing lost
+
+    def test_draft_window_only_when_speculating(self):
+        class E:
+            ndt, draft_model = 3, object()
+        self.assertEqual(serve.draft_window(E()), 3)
+        self.assertEqual(serve.draft_window(E(), False), 0)
+        self.assertEqual(serve.draft_window(FakeEngine("x")), 0)
+
+    def test_http_clip_and_400(self):
+        class E(FakeEngine):
+            ctx, ndt, draft_model = 4096, 3, object()
+        eng = E("x")
+        words = lambda n: "w " * n
+
+        async def fn(client):
+            out = []
+            for n, mt in ((100, 100000), (4096 - 4 - 3, 10), (4096, 10)):
+                r = await client.post("/v1/completions", json={"model": "m", "prompt": words(n), "max_tokens": mt})
+                out.append((r.status, await r.json()))
+            return out
+        res = with_client(eng, fn)
+        self.assertEqual(res[0][0], 200)
+        self.assertEqual(eng.calls[0][1]["max_tokens"], 4096 - eng.count_tokens(words(100)) - 1 - 3)
+        self.assertEqual(res[2][0], 400)
+        self.assertEqual(res[2][1]["error"]["type"], "invalid_request_error")
+        self.assertIn("context length exceeded", res[2][1]["error"]["message"])
+
+    def test_completions_honours_speculative_false(self):
+        eng = FakeEngine("x")
+
+        async def fn(client):
+            await client.post("/v1/completions", json={"model": "m", "prompt": "hi", "speculative": False})
+            await client.post("/v1/completions", json={"model": "m", "prompt": "hi"})
+        with_client(eng, fn)
+        self.assertEqual([c[1]["speculative"] for c in eng.calls], [False, True])
+
+
 class MiscTests(unittest.TestCase):
     def test_sse_framing_and_stop_text(self):
         self.assertEqual(serve.sse({"a": 1}), b'data: {"a":1}\n\n')

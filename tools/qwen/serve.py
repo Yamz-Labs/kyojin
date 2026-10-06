@@ -65,6 +65,23 @@ class BadRequest(Exception):
     pass
 
 
+PAGE_TOKENS = 256   # the K/V cache is allocated in pages of this many tokens (exllamav3.generator.pagetable.PAGE_SIZE)
+
+
+def reply_room(ctx: int, prompt_tokens: int, draft: int = 0) -> int:
+    """Largest max_new_tokens the generator accepts for a prompt, or less than 1 when none fits.
+    Job.prepare reserves prompt + max_new_tokens + 1 + num_draft_tokens slots (the default requeue budget: the whole reply, one
+    token and one speculative window) and asks for ceil(that / 256) pages, while the page table holds ctx // 256 pages, so
+    the usable cache is ctx rounded DOWN to a page and the window is part of the reserve. Anything above this value ends in
+    "Job requires N pages (only N-1 available)"."""
+    return ctx // PAGE_TOKENS * PAGE_TOKENS - prompt_tokens - 1 - draft
+
+
+def draft_window(engine: Any, speculative: bool = True) -> int:
+    """Draft tokens the generator reserves per window for a request: the engine's ndt when it speculates, else 0."""
+    return int(getattr(engine, "ndt", 0)) if speculative and getattr(engine, "draft_model", None) is not None else 0
+
+
 # ---------------------------------------------------------------------------- parsing of the model output
 
 
@@ -740,9 +757,9 @@ class QwenEngine:
         ids, embs = await loop.run_in_executor(None, self._encode, prompt, images or [])
         ctx = getattr(self, "ctx", None)
         if ctx:   # the chat handler counted a picture as one token; its embeddings take many
-            room = ctx - int(ids.numel()) - 1
+            room = reply_room(ctx, int(ids.numel()), int(getattr(self.generator, "num_draft_tokens", 0)))
             if room < 1:
-                raise BadRequest(f"prompt is {int(ids.numel())} tokens, the server context is {ctx}")
+                raise BadRequest(f"context length exceeded: prompt is {int(ids.numel())} tokens, the server context is {ctx}")
             max_tokens = min(max_tokens, room)
         if self.slot_store is not None:
             self.slot_store.note_prompt(prompt, ids)
@@ -969,9 +986,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             max_tokens = body.get("max_tokens")
         if max_tokens is not None and (not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1):
             raise BadRequest("max_tokens must be a positive integer")
-        room = (ctx - prompt_tokens - 1) if ctx else default_max_tokens
+        room = reply_room(ctx, prompt_tokens, draft_window(engine, body.get("speculative", True) is not False)) if ctx else default_max_tokens
         if room < 1:
-            raise BadRequest(f"prompt is {prompt_tokens} tokens, the server context is {ctx}")
+            raise BadRequest(f"context length exceeded: prompt is {prompt_tokens} tokens, the server context is {ctx}")
         max_tokens = min(max_tokens or default_max_tokens, room)
         seed = body.get("seed")
         if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
@@ -1162,9 +1179,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 raise BadRequest("stop must be a string or a list of strings")
             ctx = getattr(engine, "ctx", None)
             if ctx:
-                room = ctx - engine.count_tokens(prompt) - 1
+                room = reply_room(ctx, engine.count_tokens(prompt), draft_window(engine))
                 if room < 1:
-                    raise BadRequest(f"prompt is longer than the server context ({ctx})")
+                    raise BadRequest(f"context length exceeded: prompt is longer than the server context ({ctx})")
                 n_predict = min(n_predict, room)
             job = {"prompt": prompt, "max_tokens": n_predict,
                    "sampling": sampling_from({k: body.get(k) for k in ("temperature", "top_p", "top_k", "min_p")}, defaults),
@@ -1231,11 +1248,11 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             prompt_tokens = engine.count_tokens(prompt)
             ctx = getattr(engine, "ctx", None)
             if ctx:
-                room = ctx - prompt_tokens - 1
+                room = reply_room(ctx, prompt_tokens, draft_window(engine, body.get("speculative", True) is not False))
                 if room < 1:
-                    raise BadRequest(f"prompt is {prompt_tokens} tokens, the server context is {ctx}")
+                    raise BadRequest(f"context length exceeded: prompt is {prompt_tokens} tokens, the server context is {ctx}")
                 max_tokens = min(max_tokens, room)
-            job = {"prompt": prompt, "max_tokens": max_tokens, "stop": stops, "images": [], "speculative": True, "seed": seed,
+            job = {"prompt": prompt, "max_tokens": max_tokens, "stop": stops, "images": [], "speculative": body.get("speculative", True) is not False, "seed": seed,
                    "sampling": sampling_from(body, defaults), "cache_prompt": body.get("cache_prompt", True) is not False,
                    "loop_guard": body.get("loop_guard"), "cancel": asyncio.Event()}
         except json.JSONDecodeError as exc:
