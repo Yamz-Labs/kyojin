@@ -455,7 +455,7 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
 
 def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
-    queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue]] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
     processing = 0  # admitted requests; closure, app config is immutable after startup
     app = web.Application(client_max_size=16 * 1024**2)
@@ -482,7 +482,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     async def worker() -> None:
         nonlocal processing
         while True:
-            body, out = await queue.get()
+            body, out, request_stats = await queue.get()
             cancel = body.get("_cancel")
             if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
                 out.put_nowait(None)
@@ -500,6 +500,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
                         cancel=body.get("_cancel")):
                         out.put_nowait(delta)
+                    request_stats.update(getattr(engine, "last_stats", None) or {})
+                    if request_stats:
+                        observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
                     out.put_nowait(None)
             except Exception as exc:
                 out.put_nowait(exc)
@@ -552,6 +555,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             body["_stop"] = [stops] if isinstance(stops, str) else list(stops)
             prompt = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
             prompt_tokens = engine.count_tokens(prompt)
+            body["_prompt_tokens"] = prompt_tokens
             body["_room"] = reply_room(engine, prompt_tokens)
             body["_prompt"] = prompt
             for key in ("temperature", "top_p"):
@@ -570,8 +574,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             return base | {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
         out: asyncio.Queue = asyncio.Queue()
+        request_stats: dict[str, Any] = {}
         cancel = body["_cancel"] = asyncio.Event()
-        await queue.put((body, out))
+        await queue.put((body, out, request_stats))
         prefix = "<think>" if opens_thinking(prompt) else ""
 
         def deltas() -> AsyncIterator[str]:
@@ -591,7 +596,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
         def timings(raw: str) -> dict[str, Any]:
             # llama.cpp names: the swap orchestrator reads cache_n as the verdict of a KV restore
-            st = getattr(engine, "last_stats", None) or {}
+            st = request_stats
             cache_n = int(st.get("cached_tokens", 0))
             pre, gen = st.get("time_prefill") or 0.0, st.get("time_generate") or 0.0
             n = int(st.get("new_tokens", 0))
@@ -638,7 +643,6 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         dict(call, index=n) for n, call in enumerate(message["tool_calls"])]})))
                 await response.write(sse(event({}, finish_for(message, text[len(prefix):])) |
                                          {"usage": usage(text[len(prefix):]), "timings": timings(text)}))
-                observe(getattr(engine, "last_stats", None) or {}, prompt_tokens)
                 await response.write(b"data: [DONE]\n\n")
                 await response.write_eof()
             except ConnectionResetError:
@@ -672,7 +676,6 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         text, _ = stop_text(prefix + raw, body["_stop"])
         message = parse_completion(text)
         finish = finish_for(message, text[len(prefix):])
-        observe(getattr(engine, "last_stats", None) or {}, prompt_tokens)
         return web.json_response({
             "id": request_id, "object": "chat.completion", "created": created, "model": model_id,
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],
@@ -726,8 +729,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             raise web.HTTPBadRequest(reason=str(exc)) from exc
 
         out: asyncio.Queue = asyncio.Queue()
+        request_stats: dict[str, Any] = {}
         cancel = job["_cancel"] = asyncio.Event()
-        await queue.put((job, out))
+        await queue.put((job, out, request_stats))
         text = ""
         try:
             async for item in drain(request, cancel, out):
@@ -741,8 +745,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             cancel.set()
             raise
         text, stopped = stop_text(text, job["_stop"])
-        st = getattr(engine, "last_stats", None) or {}
-        observe(st, int(st.get("prompt_tokens", 0)))
+        st = request_stats
         return web.json_response({
             "id": f"cmpl-{uuid.uuid4().hex}", "object": "completion", "created": int(time.time()),
             "model": model_id, "content": text,
