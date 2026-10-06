@@ -20,7 +20,7 @@ The server prints its effective `EXL3_*` / `MPW*` environment at start-up.
 The server prints a progress line every 15 s while it loads (target, drafter, vision, warm-up). The port opens only when
 everything is ready, and the last line says so:
 
-    qserve: READY on http://127.0.0.1:8000  model=Qwen3.8-Flash-Yamz ctx=65536 speculative=True vision=True (start-up N s)
+    qserve: READY on http://127.0.0.1:8000  model=Qwen3.8-Flash-Yamz ctx=65536 sessions=1 speculative=True vision=True (start-up N s)
 
 Quick test:
 
@@ -44,6 +44,7 @@ Quick test:
 | `--no-thinking` | off | thinking off unless a request turns it on |
 | `--default-max-tokens` | 32768 | when a request omits `max_tokens` (always clipped to the free context) |
 | `--slot-save-path` | `~/cache/llama-slots` | directory for slot files |
+| `--sessions` | 1 | requests decoded together; see below |
 
 Environment: the server sets the measured Qwen configuration with `setdefault` before the engine loads (the list is
 `SERVE_ENV` in `serve.py`; the start-up log prints the effective `EXL3_*` / `MPW*` environment). It covers decode and
@@ -80,7 +81,7 @@ environment wins. The engine modules read several of these when they are importe
   template, one prompt, one choice (`n`, `best_of`, `echo` answer 400). The slot routes are CPU-tested only.
 - Debug extensions (all optional): `"speculative": false` decodes plain for that request, `"cache_prompt": false`
   forgets the prompt cache first (cold run), `"return_token_ids": true` adds the generated ids. Switching
-  speculative mode or `cache_prompt: false` rebuilds the Generator and so drops the prompt cache.
+  speculative mode or `cache_prompt: false` rebuilds the Generator and so drops the prompt cache (400 with `--sessions` > 1).
 
 ## Start-up progress on `/health`
 
@@ -119,7 +120,30 @@ models:
 
 The Generator keeps KV pages (256 tokens) and GDN recurrent checkpoints in RAM (4 GiB, about 111 MiB each). A follow-up
 turn re-prefills only the part after the last checkpoint: the tail of the previous prompt (under 256 tokens) plus the
-new text. `timings.prompt_n` shows how many tokens were prefilled. Requests are served one at a time, in order.
+new text. `timings.prompt_n` shows how many tokens were prefilled. By default requests are served one at a time, in order (see `--sessions` below).
+
+## Concurrent sessions
+
+`--sessions N` decodes up to N requests together (one recurrent slot each); more requests wait in order. A request
+reserves the pages for its prompt plus `max_tokens` when it starts, so one that does not fit next to the running ones
+waits. With N > 1, a request with `speculative: false` or `cache_prompt: false` answers 400 (both rebuild the Generator), and slot
+save/restore/erase wait until the running requests finish.
+
+Measured with `--ndt 3`, `-c 262144`, temperature 0, two short prompts sent together (four for `--sessions 4`):
+
+| `--sessions` | `--cache-bits` | greedy output equal to a solo run | second stream's first token | total tok/s |
+|---|---|---|---|---|
+| 1 | 8 | yes | 6.55 s (waits for the first) | 44.4 |
+| 2 | 8 | no (1 of 2 differs) | 1.16 s | 47.3 |
+| 2 | 0 | yes | 1.17 s | 49.6 |
+| 4 | 8 | no (2 of 4 differ) | 2.19 s | 51.4 |
+
+With N > 1, greedy output is not guaranteed equal to a solo run, for either cache width: the decode attention kernel
+chooses how it splits the cache from the batch it runs with, so the last bits of the sums, and now and then a near-tie
+token, can change. What was measured: the 16-bit cache (`--cache-bits 0`) stayed equal on two short prompts at 2 sessions;
+the 8-bit cache did not (rows above). Two short prompts show nothing more than that.
+
+The server prints this warning at start-up whenever N > 1, and a second one past 8 verify rows (`N x (ndt + 1)`).
 
 ## Tests
 
