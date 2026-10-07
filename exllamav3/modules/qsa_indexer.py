@@ -287,8 +287,8 @@ class QSAIndexer(Module):
     # beyond ~32K pools the row no longer stays cache resident (about 10x the cost per column at 64K pools). N > 0 never
     # lets that kernel see a row wider than N pools: a longer selection is cut into equal tiles of at most N pools (a
     # multiple of 128), each run through the same kernel, and the candidates are merged in torch under the kernel's own
-    # total order. Rows up to N pools stay one pass. 0 = always one full-width pass
-    TOPK_TILE = int(os.environ.get("EXL3_QSA_TOPK_TILE", 0))
+    # total order. Rows up to N pools stay one pass. Default 32768; 0 = always one full-width pass
+    TOPK_TILE = int(os.environ.get("EXL3_QSA_TOPK_TILE", 32768))
     # The tiled selection serves prefill chunks only: calls of at most TOPK_MIN_ROWS rows (decode, MTP verify rounds,
     # bsz > 1 fallbacks) keep the single pass, whose result is identical. "topk" merges the tile candidates with one more
     # pass of the same kernel over the (R, tiles * kp) candidate buffer; "torch" is the elementwise merge kept for A/B runs
