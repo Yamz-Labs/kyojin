@@ -19,7 +19,7 @@ Tokens per second; prefill by context, speculative decode by kind of text.
 
 | Model | Pack | Prefill 8K | Prefill 32K | Prefill 64K | Prefill 128K | Prefill 256K | Spec prose | Spec chat | Spec code |
 |---|---|---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 95 GB | 1494 | 1478 | 1457 | 1395 | 1277 | 44.5 | 49.8 | 59.1 |
+| Qwen3.8-Flash-Next | 95 GB | 1471 | 1463 | 1439 | 1390 | 1292 | 45.7 | 48.6 | 61.0 |
 | MiMo-V2.6-Flash | 105.8 GB | 812 | 698 | - | - | - | 29.1 | 32.4 | 38.9 |
 
 
@@ -71,7 +71,7 @@ Same machine, one method for every engine we ran: non-thinking chat, an essay re
 
 | tok/s | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Kyojin | 1494 | 1478 | 1457 | 1395 | 1277 |
+| Kyojin | 1471 | 1463 | 1439 | 1390 | 1292 |
 | Gufo v0.8.0, measured by us | 1250 | 1308 | 1289 | 1230 | - |
 
 Strata prefill, independent measurement by Ciru Inference Lab ([report](https://llm.ciru.ai/strataflash/), 6 October 2026; cold prompts of 32K, 64K and 120K tokens; a different machine and different prompts; the lab states that it did not reproduce the publisher's exact workload and that the cause of the gap is not established): 795 / 762 / 709 tok/s at 32K / 64K / 120K.
@@ -82,11 +82,11 @@ Strata prefill, independent measurement by Ciru Inference Lab ([report](https://
 
 | tok/s | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Kyojin | 43.4 | 40.2 | 36.7 | 31.9 | 20.4 |
+| Kyojin | 47.1 | 49.6 | 48.8 | 46.9 | 41.8 |
 | Gufo, measured by us | 35.3 | 31.9 | 35.8 | 31.4 | - |
 | Strata, measured by us | 39.0 | 38.7 | 36.4 | 35.0 | 37.5 |
 
-Card prompts (chat / prose / code): Kyojin 49.8 / 44.5 / 59.1; Gufo 37.3 / 32.5 / 52.3; Strata 46.7 / 41.5 / 61.6 (measured by us, client-timed). Gufo could not take the 256K prompt: the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window.
+Card prompts (chat / prose / code): Kyojin 48.6 / 45.7 / 61.0; Gufo 37.3 / 32.5 / 52.3; Strata 46.7 / 41.5 / 61.6 (measured by us, client-timed). Gufo could not take the 256K prompt: the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window.
 
 ### Fidelity to the original model
 
@@ -98,7 +98,7 @@ Top-1 agreement and KL divergence against the official FP8 release: 200 public n
 | Strata | 93.7 GB | 93.64 % | 0.0316 | 0.0074 |
 | Gufo | 111.3 GB | 95.36 % | 0.0156 | 0.0000 |
 
-Sources: [Strata](https://github.com/Niko1221/Strata/releases/tag/v0.1.40) (v0.1.40, seen 2026-10-06), [Gufo](https://github.com/gufo-org/gufo/blob/main/docs/models/qwen3.8-flash-next/BENCHMARKS.md) (v0.8.0, seen 2026-10-06). Scripts, prompts and raw outputs are in the repository.
+Sources: [Strata](https://github.com/Niko1221/Strata/releases/tag/v0.1.40) (v0.1.40, seen 2026-10-07), [Gufo](https://github.com/gufo-org/gufo/blob/main/docs/models/qwen3.8-flash-next/BENCHMARKS.md) (v0.8.0, seen 2026-10-07). Scripts, prompts and raw outputs are in the repository.
 
 ## Other engines
 

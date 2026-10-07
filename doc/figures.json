@@ -2,31 +2,31 @@
  "_comment": "Single source for the README table and the charts. null = not published/measured (left out of the chart). Qwen and MiMo: new-user recipe at commit a3ac00d. GLM: figures already published (see source). Rebuild: python3 tools/make_charts.py && python3 tools/make_readme_table.py before = previous release (same method). rivals: readme = figures published by the rival, measured = ours with the same ladder, independent = third party. quality: top-1 / KL against the FP8 original.",
  "machine": "Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB",
  "method": "new-user install, published packs, default environment, card prompts, greedy, engine-reported prefill",
- "date": "2026-10-06",
- "commit": "a3ac00d",
+ "date": "2026-10-07",
+ "commit": "19265ed",
  "models": [
   {
    "id": "qwen",
    "name": "Qwen3.8-Flash-Next",
    "pack_gb": 95.0,
    "prefill": {
-    "8192": 1494,
-    "32768": 1478,
-    "65536": 1457,
-    "131072": 1395,
-    "262144": 1277
+    "8192": 1471,
+    "32768": 1463,
+    "65536": 1439,
+    "131072": 1390,
+    "262144": 1292
    },
    "spec": {
-    "prose": 44.5,
-    "chat": 49.8,
-    "code": 59.1
+    "prose": 45.7,
+    "chat": 48.6,
+    "code": 61.0
    },
    "decode": {
-    "8192": 43.4,
-    "32768": 40.2,
-    "65536": 36.7,
-    "131072": 31.9,
-    "262144": 20.4
+    "8192": 47.1,
+    "32768": 49.6,
+    "65536": 48.8,
+    "131072": 46.9,
+    "262144": 41.8
    },
    "table": {
     "prefill": "1494 at 8K",
@@ -129,7 +129,7 @@
    "pack_gb": 93.7,
    "repo": "https://github.com/Niko1221/Strata",
    "source_url": "https://github.com/Niko1221/Strata/releases/tag/v0.1.40",
-   "seen": "2026-10-06",
+   "seen": "2026-10-07",
    "prefill_independent": {
     "32768": 795.1,
     "65536": 762.5,
@@ -153,7 +153,8 @@
     "chat": 46.7,
     "prose": 41.5,
     "code": 61.6
-   }
+   },
+   "latest_release_note": "v0.1.40.1 (2026-10-06) is a server hotfix, same engine as v0.1.40: figures unchanged"
   },
   "gufo": {
    "name": "Gufo",
@@ -162,7 +163,7 @@
    "pack_gb": 111.3,
    "repo": "https://github.com/gufo-org/gufo",
    "source_url": "https://github.com/gufo-org/gufo/blob/main/docs/models/qwen3.8-flash-next/BENCHMARKS.md",
-   "seen": "2026-10-06",
+   "seen": "2026-10-07",
    "prefill_measured": {
     "8192": 1250.5,
     "32768": 1308.1,
@@ -180,7 +181,22 @@
     "prose": 32.5,
     "code": 52.3
    },
-   "note_256K": "the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window"
+   "note_256K": "the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window",
+   "prev_seen_2026_10_06": {
+    "prefill_readme": {
+     "8K": 1492.95,
+     "32K": 1449.56,
+     "64K": 1316.7,
+     "128K": 1335.91
+    },
+    "decode_readme": {
+     "8K": 36.08,
+     "32K": 31.03,
+     "64K": 32.63,
+     "128K": 34.2
+    }
+   },
+   "source_commit_note": "benchmarks page updated 2026-10-06 21:57 UTC (perf: reduce prefill work at long context, #463), single-user figures dated October 6, 2026 (4c5a00d2); latest release v0.8.1"
   }
  },
  "quality": {

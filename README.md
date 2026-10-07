@@ -14,7 +14,7 @@ An inference engine built on <a href="https://github.com/turboderp-org/exllamav3
 
 <table align="center">
 <tr><th align="left">Model</th><th>Pack</th><th>Prefill</th><th>Speculative decode</th></tr>
-<tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">95 GB</td><td align="right">1494 at 8K</td><td align="right"><b>44.5 to 59.1</b></td></tr>
+<tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">95 GB</td><td align="right">1471 at 8K</td><td align="right"><b>45.7 to 61.0</b></td></tr>
 <tr><td><b>GLM-5.3-Flash</b></td><td align="right">99.73 GB</td><td align="right">584 at 14K</td><td align="right"><b>27.6 to 30.3</b></td></tr>
 <tr><td><b>MiMo-V2.6-Flash</b></td><td align="right">105.8 GB</td><td align="right">812 at 8K</td><td align="right"><b>29.1 to 38.9</b></td></tr>
 </table>
