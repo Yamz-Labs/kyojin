@@ -86,9 +86,14 @@ def test_hipconfig_next_to_the_interpreter_when_path_has_none(bare, tmp_path, mo
     monkeypatch.setattr(bench, "sys", SimpleNamespace(executable=str(bin_dir / "python")))
     monkeypatch.setattr(bench, "sdk_trees", lambda: [str(_tree(tmp_path / "sdk", "7.13.0"))])
     asked = []
-    monkeypatch.setattr(bench, "sh", lambda cmd: asked.append(cmd) or ("7.13.60980-c76140fa27" if cmd.endswith("--version") else ""))
+
+    def sh(cmd):
+        asked.append(cmd)
+        return "7.13.60980-c76140fa27" if cmd.endswith("--version") else ""
+
+    monkeypatch.setattr(bench, "sh", sh)
     assert bench.rocm_version() == "7.13.60980-c76140fa27"
-    assert asked == [f"{shlex.quote(str(bin_dir / 'hipconfig'))} --version"]    # the path it found, quoted for the shell
+    assert asked == [f"{shlex.quote(str(bin_dir / 'hipconfig'))} --version"]   # the path it found, quoted for the shell
 
 
 def test_devel_tree_wins_over_torch(bare, tmp_path, monkeypatch):
