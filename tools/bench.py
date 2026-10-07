@@ -135,6 +135,16 @@ def ram_gib():
     return "unknown"
 
 
+def server_compiler(base):
+    """(compiler line, warning or None) the server reports on /health (the server root, one level above /v1)."""
+    root = re.sub(r"/v1$", "", base)
+    try:
+        h = json.load(urllib.request.urlopen(root + "/health", timeout=10))
+    except Exception:
+        return "unknown", None
+    return h.get("hip_compiler") or "unknown (server does not report it)", h.get("hip_compiler_warning")
+
+
 def rocm_version():
     for f in ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev"):
         if Path(f).is_file():
@@ -232,8 +242,11 @@ def main():
         return f"{x:.1f}" if x is not None else "n/a"
 
     ptok = int(statistics.median(n for n, _ in pf))
+    comp = server_compiler(base)
+    if comp[1]:
+        print(comp[1], file=sys.stderr)
     info = {"model": model, "cpu": cpu_name(), "ram": ram_gib(), "gpu_target": gpu_name(), "kernel": platform.release(),
-            "rocm": rocm_version(), "server": base, "date": time.strftime('%Y-%m-%d')}
+            "rocm": rocm_version(), "kernel_compiler": comp[0], "server": base, "date": time.strftime('%Y-%m-%d')}
     prefill_med = med([t for _, t in pf])
     lines = [
         "### Kyojin benchmark",
@@ -244,6 +257,7 @@ def main():
         f"- GPU target: {info['gpu_target']}",
         f"- Kernel: {info['kernel']}",
         f"- ROCm: {info['rocm']}",
+        f"- Kernel compiler: {info['kernel_compiler']}",
         f"- Server: {info['server']}",
         f"- Date: {info['date']}",
         "",

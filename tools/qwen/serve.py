@@ -1186,7 +1186,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
              "max_context": getattr(engine, "ctx", None)}]})
 
     async def health(_: web.Request) -> web.Response:
-        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id, "vision": bool(engine.supports_vision),
+        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id, "vision": bool(engine.supports_vision), **startup_health.compiler_health(),
                                   **(engine.spec_stats() if hasattr(engine, "spec_stats") else {})})
 
     async def worker() -> None:
@@ -1757,6 +1757,7 @@ def main() -> None:
         + (["vision tower"] if not args.no_vision else []) + ["engine setup", "warm-up"]
     startup_health.check_model_dir("qserve", args.model)
     startup_health.start("qwen", stages, args.host, args.port, routes=ROUTES)
+    startup_health.report_compiler()
     try:
         engine, template, defaults, model_dir, t0 = load_all(args)
     except BaseException as exc:                                  # noqa: BLE001

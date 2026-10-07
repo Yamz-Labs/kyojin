@@ -111,5 +111,7 @@ except ImportError as e:
     print("exllamav3_ext: NOT BUILT --", e)
 import exllamav3
 print("exllamav3:", exllamav3.__version__ if hasattr(exllamav3, "__version__") else "imported")
+from exllamav3.util import hip_compiler
+hip_compiler.report(print)
 PY
 fi

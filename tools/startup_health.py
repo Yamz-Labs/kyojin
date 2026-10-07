@@ -310,6 +310,28 @@ def start(name: str, stages: list[str], host: str, port: int, variant: str | Non
     return ACTIVE
 
 
+def compiler_health() -> dict:
+    """Fields for /health: the HIP kernel compiler line, plus the warning line when it is not the rocm-sdk compiler.
+    Lazy import: nothing here needs torch at import time."""
+    try:
+        from exllamav3.util import hip_compiler
+        out = {"hip_compiler": hip_compiler.describe().removeprefix("HIP kernel compiler: ")}
+        if hip_compiler.warning():
+            out["hip_compiler_warning"] = hip_compiler.warning()
+        return out
+    except Exception as e:  # noqa: BLE001
+        return {"hip_compiler": f"unknown ({type(e).__name__})"}
+
+
+def report_compiler() -> None:
+    """Start-up log: which compiler builds the JIT kernels, plus one warning line when it is not the rocm-sdk one."""
+    try:
+        from exllamav3.util import hip_compiler
+        hip_compiler.report(lambda line: print(line, flush=True))
+    except Exception as e:  # noqa: BLE001
+        print(f"[kyojin] HIP kernel compiler: unknown ({type(e).__name__}: {e})", flush=True)
+
+
 def stage(name: str) -> None:
     if ACTIVE is not None and name in ACTIVE.stages:
         ACTIVE.begin(name)

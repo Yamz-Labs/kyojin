@@ -2,6 +2,7 @@
 # launched through torch's libamdhip64 on the current stream (same method as gdn_fused_h_hip.py).
 import ctypes, hashlib, os, shutil, subprocess
 import torch
+from exllamav3.util import hip_compiler
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gr_mix.hip")
@@ -9,10 +10,7 @@ _state = {}
 H, DD, RANK, NTOT, K1 = 4, 2560, 320, 324, 10240
 
 def _hipcc():
-    for p in (os.environ.get("EXL3_HIPCC"), os.path.join(os.environ.get("EXL3_ROCM_SDK", ""), "bin", "hipcc"),
-              shutil.which("hipcc"), "/opt/rocm/bin/hipcc"):
-        if p and os.path.isfile(p): return p
-    raise RuntimeError("gr_mix_hip: hipcc not found (set EXL3_HIPCC)")
+    return hip_compiler.hipcc()
 
 def compile_hsaco(defs="", arch="gfx1151", src_path=None):
     src_path = src_path or _SRC
@@ -20,7 +18,7 @@ def compile_hsaco(defs="", arch="gfx1151", src_path=None):
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off"] + [x if x.startswith("-") else f"-D{x}" for x in defs.split()]
     gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
     if os.path.isdir(gcc): flags.append(f"--gcc-install-dir={gcc}")
-    tag = hashlib.sha1(src + " ".join(flags).encode()).hexdigest()[:16]
+    tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"gr_mix_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
         os.makedirs(os.path.dirname(cache), exist_ok=True)

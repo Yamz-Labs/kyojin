@@ -400,6 +400,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             gate = None
         return web.json_response({"status": "ok", "source": "kyojin", "model": model_id,
                                   "generator": getattr(engine, "generator", None) is not None,
+                                  **startup_health.compiler_health(),
                                   "spec_gate": gate})
 
     async def worker() -> None:
@@ -806,6 +807,7 @@ def main() -> None:
     stages = (["drafter weights"] if drafter else []) + ["target weights", "engine setup"]
     startup_health.check_model_dir("msrv", args.model)
     startup_health.start("mimo", stages, args.host, args.port, routes=ROUTES)
+    startup_health.report_compiler()
     # --ctx 0 = the model's own max context, with the nested text_config handled like the GLM fix.
     try:
         probe = Config.from_directory(args.model)

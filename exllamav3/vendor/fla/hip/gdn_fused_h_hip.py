@@ -4,6 +4,7 @@
 
 import ctypes, hashlib, os, shutil, subprocess
 import torch
+from exllamav3.util import hip_compiler
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gdn_fused_h.hip")
@@ -11,13 +12,7 @@ _state = {}
 
 
 def _hipcc():
-    for p in (os.environ.get("EXL3_HIPCC"),
-              os.path.join(os.environ.get("EXL3_ROCM_SDK", ""), "bin", "hipcc"),
-              "$EXL3_ROOT",
-              shutil.which("hipcc"), "/opt/rocm/bin/hipcc"):
-        if p and os.path.isfile(p):
-            return p
-    raise RuntimeError("gdn_fused_h_hip: hipcc not found (set EXL3_HIPCC)")
+    return hip_compiler.hipcc()
 
 
 def _compile(defs, arch):
@@ -27,7 +22,7 @@ def _compile(defs, arch):
     gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
     if os.path.isdir(gcc):
         flags.append(f"--gcc-install-dir={gcc}")
-    tag = hashlib.sha1(src + " ".join(flags).encode()).hexdigest()[:16]
+    tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"gdn_fused_h_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
         os.makedirs(os.path.dirname(cache), exist_ok=True)
