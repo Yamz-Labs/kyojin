@@ -312,9 +312,9 @@ def env_defaults(ndt):
     return _envf("QWSPEC_THF", 0.6), _envf("QWSPEC_THV", 0.3), _envf("QWSPEC_MAXD", int(ndt))
 
 def rule_from_env(thf, thv, maxd):
-    """QWSPEC_RULE = product (default) | tier (default thresholds below depth 4, stricter 5+ row tier: QWSPEC_THFD/THVD/DSPLIT) | cost | online | table (depth from the request's acceptance history, no probabilities); QWSPEC_GAMMA / QWSPEC_SCALE tune the calibrated reach.
+    """QWSPEC_RULE = tier (default) | product (the former 0.6/0.3/3 rule when maxd=3) | tier (default thresholds below depth 4, stricter 5+ row tier: QWSPEC_THFD/THVD/DSPLIT) | cost | online | table (depth from the request's acceptance history, no probabilities); QWSPEC_GAMMA / QWSPEC_SCALE tune the calibrated reach.
     QWSPEC_FIXD = N: draft N depths with no host read and truncate once per round (rule applied on the stacked probabilities)."""
-    kind = os.environ.get("QWSPEC_RULE", "product")
+    kind = os.environ.get("QWSPEC_RULE", "tier")
     if kind == "product": r = ProductRule(thf, thv, maxd)
     elif kind == "cost": r = CostRule(thf, thv, maxd, _envf("QWSPEC_GAMMA", 1.0), _envf("QWSPEC_SCALE", 1.0))
     elif kind == "tier": r = TierRule(thf, thv, maxd, _envf("QWSPEC_THFD", 0.9), _envf("QWSPEC_THVD", 0.5), _envf("QWSPEC_DSPLIT", 3))
