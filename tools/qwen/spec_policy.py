@@ -231,9 +231,11 @@ class TierRule(ProductRule):
     Why (adapt, 07/10): one pair (thf, thv) serves two jobs. Raising thf to 0.8 to avoid unprofitable 5+ row rounds also cut the
     2..4 row rounds short, which cost 1-4 % where depth 2-4 acceptance is good (128K, chat). Verify rows cost the same at every
     context (~10.5 ms per row incl. its draft step); a row beyond the 4th pays only when its chance of being accepted is above
-    ~0.5, and the drafter's reach overstates it, so the deep tier asks for reach >= 0.9 to start and >= 0.5 to keep."""
+    ~0.5, and the drafter's reach overstates it, so the deep tier asks for reach >= 0.95 to start and >= 0.85 to keep.
+    Measured on the served model: 0.9 / 0.7 lost about 1 % at 32K to deep rounds that did not pay; 0.95 / 0.85 matches the
+    former 4-row rule there and keeps the gain on chat, prose, code and at 128K."""
     name = "tier"
-    def __init__(self, thf=0.6, thv=0.3, maxd=7, thfd=0.9, thvd=0.7, dsplit=3):
+    def __init__(self, thf=0.6, thv=0.3, maxd=7, thfd=0.95, thvd=0.85, dsplit=3):
         super().__init__(thf, thv, maxd); self.thfd, self.thvd, self.dsplit = thfd, thvd, dsplit
     def step(self, i, p):
         q = self.q(i, p); k = i + 1
@@ -317,7 +319,7 @@ def rule_from_env(thf, thv, maxd):
     kind = os.environ.get("QWSPEC_RULE", "tier")
     if kind == "product": r = ProductRule(thf, thv, maxd)
     elif kind == "cost": r = CostRule(thf, thv, maxd, _envf("QWSPEC_GAMMA", 1.0), _envf("QWSPEC_SCALE", 1.0))
-    elif kind == "tier": r = TierRule(thf, thv, maxd, _envf("QWSPEC_THFD", 0.9), _envf("QWSPEC_THVD", 0.7), _envf("QWSPEC_DSPLIT", 3))
+    elif kind == "tier": r = TierRule(thf, thv, maxd, _envf("QWSPEC_THFD", 0.95), _envf("QWSPEC_THVD", 0.85), _envf("QWSPEC_DSPLIT", 3))
     elif kind == "table":
         cyc = os.environ.get("QWSPEC_CYCLE"); r = TableRule(maxd, [float(x) for x in cyc.split(",")] if cyc else None, _envf("QWSPEC_DECAY", 0.75), _envf("QWSPEC_PRIOR", 0.75))
     elif kind == "online": r = OnlineRule(thf, thv, maxd, _envf("QWSPEC_GAMMA", 1.0), _envf("QWSPEC_ALPHA", 0.15))
