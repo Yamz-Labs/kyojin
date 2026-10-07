@@ -9,7 +9,7 @@ The Qwen and MiMo figures on the front page come from a run set up like yours (G
 - the public code at the commit named in `doc/figures.json`, built from the README install;
 - an empty home directory, the published packs downloaded from the hub, the default environment (no private flags);
 - greedy decoding, thinking off, the four card prompts for each of chat, prose and code, 256 tokens, median of 3 repetitions (`tools/bench.sh` runs the same prompts);
-- prefill and decode by context: cold prompts of 8K and 32K tokens (Qwen also 64K, 128K, 256K), a long essay request; prefill is the engine-reported prompt speed, decode the speculative decode speed over the reply. GLM and MiMo: median of 3 requests after a warm-up request, speed from the server timing; Qwen: one request per depth, essay of 256 tokens, as `ladder.py --chat`;
+- prefill and decode by context: cold prompts of 8K and 32K tokens (Qwen also 64K, 128K, 256K), a long essay request; prefill is the engine-reported prompt speed, decode the speculative decode speed over the reply. GLM and MiMo: median of 3 requests after a warm-up request, speed from the server timing; Qwen: {{LADDER}}, essay of 256 tokens;
 - speculative decode is the default server mode and returns the same tokens as plain decode.
 - the server log of each run has no `fallback`, `disabled`, `unavailable`, `not tuned` or `No module` line.
 
@@ -19,23 +19,13 @@ Tokens per second; prefill by context, speculative decode by kind of text.
 
 {{TABLE}}
 
-## GLM-5.3-Flash
-
-The GLM figures were published before this page and are quoted as published (99.7 GB pack, MTP with 2 drafts, `-c 98304`, hook on with the agent-lane server flags, prefill mean of 3, decode mean of 6, temperature 0):
-
-| Context | Prefill tok/s | Decode tok/s |
-|---|---|---|
-| 3.5K | 580 | 29.0 |
-| 14K | 584 | 30.3 |
-| 64K | 546 | 27.6 |
-
-At temperature 1.0 and top-p 0.95 decode is 26.0 / 28.5 / 26.4 tok/s. The GLM figures were not re-run with the new-user recipe above, so they are left out of the by-text-kind decode chart (the chart needs chat, prose and code figures for the same pack).
-
+{{GLM}}
 ## Where each figure comes from
 
-- Qwen3.8-Flash-Next (V1.2) prefill (1494 / 1478 / 1457 / 1395 / 1277 tok/s at 8K / 32K / 64K / 128K / 256K) and speculative decode on the card prompts (49.8 chat, 44.5 prose, 59.1 code): runs with the recipe above, at the commit named in `doc/figures.json`. The model card on the hub still carries the earlier V1.1 figures.
+- Qwen3.8-Flash-Next prefill and speculative decode (by context and on the card prompts): runs with the recipe above, at the commit named in `doc/figures.json`.
 - MiMo-V2.6-Flash: the same recipe and commit.
-- GLM-5.3-Flash: the "Measured numbers" table of the previous README (kept below) and the Speed section of the hub card, `yamz-labs/GLM-5.3-Flash-EXL3-Yamz`.
+- GLM-5.3-Flash: the recipe above where a value is in the main table; otherwise the "Measured numbers" table of the previous README (kept below) and the Speed section of the hub card, `yamz-labs/GLM-5.3-Flash-EXL3-Yamz`.
+- Strata and Gufo: the section "Strata and Gufo" below names the source of each figure.
 - Charts and the front-page table are built from `doc/figures.json` with `tools/make_charts.py` and `tools/make_readme_table.py`.
 
 Caveats, once: one machine, one OS image; prefill is the engine-reported prompt speed; contexts differ between models because each figure keeps the context at which it was published or measured. These are first versions and improvements are coming.
@@ -54,14 +44,14 @@ One machine: Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB LPDDR5X, ROCm. Ot
 | GLM-5.3-Flash, 99 GB pack, MTP 2, `-c 131072` | 24K | 609.0 | 28.1 (28.12, 28.09) | run, same harness as the next row |
 | GLM-5.3-Flash, 82 GB pack, hook off, today's engine, `-c 131072`, client temperature 0, mean of 3 | 3.5K / 14K | 661 / 645 | 32.0 prose, 33.6 chat, 35.7 code | run, second machine (same CPU) |
 | GLM-5.3-Flash (99.7 GB), hook on + agent-lane flags, `-c 98304`, prefill mean of 3, decode mean of 6 | 3.5K / 14K / 64K | 580 / 584 / 546 | 29.0 / 30.3 / 27.6 at temperature 0; 26.0 / 28.5 / 26.4 at temperature 1.0, top-p 0.95 | run |
-| MiMo-V2.6-Flash-MOPD, 105 GB pack, speculative decoding on (default), 4 bpw drafter (702 MB), `-c 32768`, client temperature 0, decode medians of 6 runs over two loads, 128 tokens | - | 32.1 prose, 34.8 chat, 44.3 code (plain: 28.9 on all three, 1.11x / 1.21x / 1.53x) | run, public tree |
-| MiMo-V2.6-Flash-MOPD, 105 GB pack, plain decode (no draft), 32K window, client temperature 0 | 4.1K / 23.7K | 594 / 613 | 25.2 to 27.8 | run, single runs |
+| MiMo-V2.6-Flash-MOPD, 105 GB pack, speculative decoding on (default), 4 bpw drafter (702 MB), `-c 32768`, client temperature 0, decode medians of 6 runs over two loads, 128 tokens | - | 32.1 prose, 34.8 chat, 44.3 code | run, public tree |
 
+## Strata and Gufo
+
+{{RIVALS}}
 ## Other engines
 
 llama.cpp (ROCm, UD-IQ1_S 1.56 bpw, `-fa 1 -ub 2048`, no MTP), same machine: pp4096 197.9, pp16384 158.3, tg128 16.74, tg at 64K 7.19 tok/s. Coarser quant: engine and format are compared together.
-
-Quality against the official FP8 weights (129 held-out rows): see the model cards.
 
 ## Share your numbers
 

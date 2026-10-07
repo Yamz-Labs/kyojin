@@ -1,5 +1,5 @@
 {
- "_comment": "Single source for the README table and the charts. null = not published/measured (left out of the chart). Qwen and MiMo: new-user recipe at commit a3ac00d. GLM: figures already published (see source). Rebuild: python3 tools/make_charts.py && python3 tools/make_readme_table.py",
+ "_comment": "Single source for the README table and the charts. null = not published/measured (left out of the chart). Qwen and MiMo: new-user recipe at commit a3ac00d. GLM: figures already published (see source). Rebuild: python3 tools/make_charts.py && python3 tools/make_readme_table.py before = previous release (same method). rivals: readme = figures published by the rival, measured = ours with the same ladder, independent = third party. quality: top-1 / KL against the FP8 original.",
  "machine": "Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB",
  "method": "new-user install, published packs, default environment, card prompts, greedy, engine-reported prefill",
  "date": "2026-10-06",
@@ -31,6 +31,22 @@
    "table": {
     "prefill": "1494 at 8K",
     "decode": "44.5 to 59.1"
+   },
+   "before": {
+    "prefill": {
+     "8192": 1494,
+     "32768": 1478,
+     "65536": 1457,
+     "131072": 1395,
+     "262144": 1277
+    },
+    "decode": {
+     "8192": 43.4,
+     "32768": 40.2,
+     "65536": 36.7,
+     "131072": 31.9,
+     "262144": 20.4
+    }
    }
   },
   {
@@ -56,7 +72,19 @@
     "prefill": "584 at 14K",
     "decode": "27.6 to 30.3"
    },
-   "source": "public README (Measured numbers, 99.7 GB row) and hub card yamz-labs/GLM-5.3-Flash-EXL3-Yamz, Speed section: -c 98304, hook on, agent-lane flags, MTP 2, prefill mean of 3, decode mean of 6 at temperature 0"
+   "source": "public README (Measured numbers, 99.7 GB row) and hub card yamz-labs/GLM-5.3-Flash-EXL3-Yamz, Speed section: -c 98304, hook on, agent-lane flags, MTP 2, prefill mean of 3, decode mean of 6 at temperature 0",
+   "before": {
+    "prefill": {
+     "3500": 580,
+     "14000": 584,
+     "65536": 546
+    },
+    "decode": {
+     "3500": 29.0,
+     "14000": 30.3,
+     "65536": 27.6
+    }
+   }
   },
   {
    "id": "mimo",
@@ -78,9 +106,106 @@
    "table": {
     "prefill": "812 at 8K",
     "decode": "29.1 to 38.9"
+   },
+   "before": {
+    "prefill": {
+     "8192": 812,
+     "32768": 698
+    },
+    "decode": {
+     "8192": 35.1,
+     "32768": 27.2
+    }
    }
   }
  ],
  "headline_prompt": "chat",
- "headline_prefill_ctx": "8192"
+ "headline_prefill_ctx": "8192",
+ "rivals": {
+  "strata": {
+   "name": "Strata",
+   "version": "v0.1.40",
+   "pack": "UD-IQ4_XS",
+   "pack_gb": 93.7,
+   "repo": "https://github.com/Niko1221/Strata",
+   "source_url": "https://github.com/Niko1221/Strata/releases/tag/v0.1.40",
+   "seen": "2026-10-06",
+   "prefill_independent": {
+    "32768": 795.1,
+    "65536": 762.5,
+    "120000": 709.1
+   },
+   "independent": {
+    "lab": "Ciru Inference Lab",
+    "date": "6 October 2026",
+    "url": "https://llm.ciru.ai/strataflash/",
+    "audit_url": "https://github.com/ciru-ai/strataflash/blob/main/benchmark/advertised-prefill-audit.json",
+    "sizes": "32K, 64K and 120K tokens"
+   },
+   "decode_measured": {
+    "8192": 39.0,
+    "32768": 38.7,
+    "65536": 36.4,
+    "131072": 35.0,
+    "262144": 37.5
+   },
+   "card_measured": {
+    "chat": 46.7,
+    "prose": 41.5,
+    "code": 61.6
+   }
+  },
+  "gufo": {
+   "name": "Gufo",
+   "version": "v0.8.0",
+   "pack": "UD-Q4_K_XL",
+   "pack_gb": 111.3,
+   "repo": "https://github.com/gufo-org/gufo",
+   "source_url": "https://github.com/gufo-org/gufo/blob/main/docs/models/qwen3.8-flash-next/BENCHMARKS.md",
+   "seen": "2026-10-06",
+   "prefill_measured": {
+    "8192": 1250.5,
+    "32768": 1308.1,
+    "65536": 1289.0,
+    "131072": 1230.2
+   },
+   "decode_measured": {
+    "8192": 35.3,
+    "32768": 31.9,
+    "65536": 35.8,
+    "131072": 31.4
+   },
+   "card_measured": {
+    "chat": 37.3,
+    "prose": 32.5,
+    "code": 52.3
+   },
+   "note_256K": "the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window"
+  }
+ },
+ "quality": {
+  "reference": "official FP8 release of the model",
+  "set": "200 public neutral texts, 3,084 scored positions, one scorer for all three engines, row-cluster bootstrap",
+  "positions": 3084,
+  "texts": 200,
+  "kyojin": {
+   "top1": 93.81,
+   "kl": 0.0216,
+   "kl_variation": 0.0008,
+   "pack_gb": 95.0
+  },
+  "strata": {
+   "top1": 93.64,
+   "kl": 0.0316,
+   "kl_variation": 0.0074,
+   "pack_gb": 93.7
+  },
+  "gufo": {
+   "top1": 95.36,
+   "kl": 0.0156,
+   "kl_variation": 0.0,
+   "pack_gb": 111.3
+  }
+ },
+ "method_ladder_reps": 1
 }
