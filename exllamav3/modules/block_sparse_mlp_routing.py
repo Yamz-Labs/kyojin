@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from ..util.device_copy import to_device
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
+from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS
 
 
 def _pad_rows(y):
@@ -238,9 +239,12 @@ def _routing_nogroup_torch(cfg, y, params, scores):
         selection_scores = scores
         if cfg.e_score_correction_bias is not None:
             selection_scores = selection_scores + cfg.e_score_correction_bias.float().unsqueeze(0)
-        selected_experts = torch.topk(
-            selection_scores, cfg.num_experts_per_tok, dim = -1, sorted = False
-        ).indices
+        # torch.topk breaks ties between equal scores in an arbitrary, run-dependent way (both the order and,
+        # at the k-th place, which expert is chosen). Router scores tie often, so identical inputs gave
+        # different expert sets from run to run. A stable descending sort keeps the lowest expert index first
+        # among equals: same values, reproducible routing.
+        selected_experts = torch.sort(selection_scores, dim = -1, descending = True, stable = True).indices[
+            :, :cfg.num_experts_per_tok].contiguous()
     routing_weights = scores.gather(1, selected_experts)
     routing_weights = routing_weights / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
     routing_weights = routing_weights * cfg.routed_scaling_factor
@@ -377,6 +381,24 @@ def routing_ds3(bsz, cfg, y, params):
 
 
 DEC_ROUTER_ROWS_MAX = 4  # loop ~23 us/row vs torch fallback ~120 us flat: loses past R~5
+ROUTER_ROWS_KERNEL_MAX = 4  # exl3_dec_router_rows takes NR in 2..4 (exl3_dec.cu)
+
+
+def _router_row_chunks(bsz: int) -> list:
+    """Balanced chunk sizes, each 2..ROUTER_ROWS_KERNEL_MAX, summing to bsz (bsz >= 2)."""
+    nch = -(-bsz // ROUTER_ROWS_KERNEL_MAX)
+    out, left = [], bsz
+    for c in range(nch):
+        k = -(-left // (nch - c))
+        out.append(k)
+        left -= k
+    return out
+
+
+def _router_rows_max() -> int:
+    # Row invariance: the torch fallback picks from another score arithmetic than the batch-1 kernel,
+    # so every verify row count up to the engine maximum stays on the batch-1 arithmetic
+    return ROW_INV_MAX_ROWS if ROW_INV["on"] else DEC_ROUTER_ROWS_MAX
 
 
 def _dec_router_ok(bsz, cfg, y, params) -> bool:
@@ -425,8 +447,13 @@ def _dec_router_rows(cfg, y, bsz):
     # bitwise to the per-row loop below
     if (os.environ.get("EXL3_DEC_ROUTER_ROWS", "1") == "2" and hasattr(ext, "exl3_dec_router_rows") and
             cfg.num_experts <= 320):
-        ext.exl3_dec_router_rows(y2, cfg.gate_tensor, bias, selected_experts, routing_weights,
-                                 scratch, counters, float(scale))
+        # The kernel takes 2..4 rows: more rows go as balanced chunks of 2..4 (5 -> 3+2, 8 -> 4+4),
+        # every row is still the batch-1 arithmetic
+        r0 = 0
+        for k in _router_row_chunks(bsz):
+            ext.exl3_dec_router_rows(y2[r0:r0 + k], cfg.gate_tensor, bias, selected_experts[r0:r0 + k],
+                                     routing_weights[r0:r0 + k], scratch, counters, float(scale))
+            r0 += k
         return selected_experts, routing_weights
     for r in range(bsz):
         ext.exl3_dec_router(y2[r:r + 1], cfg.gate_tensor, bias, selected_experts[r],
@@ -436,7 +463,7 @@ def _dec_router_rows(cfg, y, bsz):
 
 def _dec_router_rows_ok(bsz, cfg, y, params) -> bool:
     return (
-        1 < bsz <= DEC_ROUTER_ROWS_MAX and params.get("dflash_verify") and
+        1 < bsz <= _router_rows_max() and params.get("dflash_verify") and
         os.environ.get("EXL3_DEC_ROUTER_ROWS", "1") != "0" and
         y.is_contiguous() and y.numel() == bsz * y.shape[-1] and
         _dec_router_ok(1, cfg, y[:1] if y.dim() == 2 else y.view(bsz, -1)[:1], params)
