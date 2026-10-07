@@ -2271,6 +2271,7 @@ struct JobsR
     int kbs;
     int R;
     int rpb;             // rows per block (chunk size); grid.y = ceil(R / rpb)
+    int swap;            // 1: grid = (row chunks, blocks), so the chunks of one weight block run side by side and share its reads
     int x_row_pitch;      // half-elements between consecutive rows of x (K for contiguous x)
 };
 
@@ -2283,7 +2284,7 @@ constexpr int GEMV_R_ROW_BUDGET = MOE_R_MAX * MOE_R_KTW_MAX;   // 128: max rpb *
 #endif
 template <int KB2, int RM> constexpr int gemv_r_ring() { return EXL3_GEMV_R_RING > 0 ? EXL3_GEMV_R_RING : RM == 1 ? ring_of<KB2>() : 1; }
 
-template <int KB2, int CB, int RM, bool D1 = false>
+template <int KB2, int CB, int RM, int MODE = 0>
 __global__ __launch_bounds__(THREADS)
 void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* counters)
 {
@@ -2298,16 +2299,18 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
     const int wave = tid >> 5;
     const int lane = tid & 31;
 
+    const int bid = jobs.swap ? (int) blockIdx.y : (int) blockIdx.x;
+    const int chunk = jobs.swap ? (int) blockIdx.x : (int) blockIdx.y;
     int ji = 0;
     #pragma unroll
-    for (int i = 1; i < 4; ++i) if (i < jobs.count && (int) blockIdx.x >= jobs.j[i].block_base) ji = i;
+    for (int i = 1; i < 4; ++i) if (i < jobs.count && bid >= jobs.j[i].block_base) ji = i;
     const JobR& job = jobs.j[ji];
-    const int local = blockIdx.x - job.block_base;
+    const int local = bid - job.block_base;
     const int strip = local / jobs.kbs;
     const int kb = local % jobs.kbs;
     const int NT = job.N / 16;
 
-    const int row0 = blockIdx.y * jobs.rpb;
+    const int row0 = chunk * jobs.rpb;
     const int nrows = min(jobs.rpb, jobs.R - row0);
 
     int k0, ktw;
@@ -2334,8 +2337,8 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
         const u32x4* tiles = job.trellis + ((size_t) kt0 * NT + nt) * VEC;
         const half* xs_rows[RM];
         #pragma unroll
-        for (int j = 0; j < RM; ++j) xs_rows[j] = xs + (D1 ? min(j, nrows - 1) : j) * (ktw * 128) + wave * ktw * 16;
-        if constexpr (D1 && RM > 1)
+        for (int j = 0; j < RM; ++j) xs_rows[j] = xs + (MODE ? min(j, nrows - 1) : j) * (ktw * 128) + wave * ktw * 16;
+        if constexpr (MODE == 1 && RM > 1)
             lane_gemv_r1<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles, (size_t) NT * VEC, xs_rows, ktw, acc);
         else
             lane_gemv_r<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles, (size_t) NT * VEC, xs_rows, nrows, ktw, acc);
@@ -2445,6 +2448,7 @@ static void dec_gemv_r_impl
     jobs.kbs = kbs;
     jobs.R = R;
     jobs.rpb = rpb;
+    jobs.swap = env_int("EXL3_GEMV_R_CHUNK_FAST", 0) != 0 && R > 4 && R > rpb;   // 5..8 rows only: the <= 4 row launches keep their grid
     jobs.x_row_pitch = Kdim;
     int blocks = 0, part = 0, ctr = 0;
     for (int i = 0; i < n; ++i)
@@ -2475,12 +2479,14 @@ static void dec_gemv_r_impl
     const half* xp = reinterpret_cast<const half*>(x.data_ptr());
     float* sp = scratch.data_ptr<float>();
     int* cp = counters.data_ptr<int>();
-    const dim3 grid(blocks, (R + rpb - 1) / rpb);
+    const int nch = (R + rpb - 1) / rpb;
+    TORCH_CHECK(!jobs.swap || blocks <= 65535, "exl3_dec_gemv_r: too many blocks for the swapped grid");
+    const dim3 grid = jobs.swap ? dim3(nch, blocks) : dim3(blocks, nch);
     EXL3_DEC_DISPATCH_CB(mcg ? 1 : 2, EXL3_DEC_DISPATCH_RM(rpb, EXL3_DEC_DISPATCH_KB2(kb2,
         {
             // EXL3_GEMV_R_DEC1=1 decodes each tile once for all rows (bit-identical)
             if (RM > 1 && env_int("EXL3_GEMV_R_DEC1", 0) == 1)
-            { auto kfn = gemv_kernel_r<KB2, CB, RM, true>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+            { auto kfn = gemv_kernel_r<KB2, CB, RM, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
             else
             { auto kfn = gemv_kernel_r<KB2, CB, RM>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
         })));
