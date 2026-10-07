@@ -104,10 +104,34 @@ class T(unittest.TestCase):
             self.assertEqual(log[0]["keep"], ref); self.assertEqual(len(log[0]["ids"]), 7)
             self.assertEqual(len(log[0]["ps"]), 7)
 
+    def test_tier_equals_product_up_to_four_rows(self):
+        rng = random.Random(7)
+        for _ in range(2000):
+            ps = [rng.choice([rng.random(), 1.0 - 1e-3 * rng.random()]) for _ in range(7)]
+            self.assertEqual(early(sp.TierRule(0.6, 0.3, 3, 0.9, 0.5), ps), early(sp.ProductRule(0.6, 0.3, 3), ps))
+            k, fw = early(sp.TierRule(0.6, 0.3, 7, 0.9, 0.5), ps)
+            kp, fwp = early(sp.ProductRule(0.6, 0.3, 3), ps)
+            if k <= 3: self.assertEqual(k, kp)                  # same rows as the shipped rule when the deep tier adds none
+            else: self.assertEqual(kp, 3)                       # a deep round is always the shipped rule's 4-row round plus extra rows
+            self.assertEqual(early(sp.TierRule(0.6, 0.3, 7, 0.6, 0.3), ps), early(sp.ProductRule(0.6, 0.3, 7), ps))
+
+    def test_tier_deep_gate(self):
+        r = sp.TierRule(0.6, 0.3, 7, 0.9, 0.5)
+        self.assertEqual(early(r, [0.99] * 7), (7, 7))            # confident chain goes to the cap
+        self.assertEqual(early(r, [0.95, 0.95, 0.95, 0.9]), (3, 3)) # reach 0.857 < thfd: stops at depth 3, like the default rule
+        self.assertEqual(early(r, [0.99, 0.99, 0.99, 0.5, 0.9]), (3, 4))  # depth 4 drafted, reach 0.48 < thvd: dropped
+        self.assertEqual(early(r, [0.99, 0.99, 0.99, 0.6, 0.9]), (4, 4))  # kept (0.58 >= 0.5), reach < thfd: stop
+        os.environ["QWSPEC_RULE"] = "tier"
+        try: self.assertEqual((sp.rule_from_env(0.6, 0.3, 7).name, sp.rule_from_env(0.6, 0.3, 7).thfd), ("tier", 0.9))
+        finally: del os.environ["QWSPEC_RULE"]
+
     def test_env_defaults(self):
         for k in ("QWSPEC_THF", "QWSPEC_THV", "QWSPEC_MAXD", "QWSPEC_RULE"): os.environ.pop(k, None)
-        self.assertEqual(sp.env_defaults(3), (0.6, 0.3, 3))
-        r = sp.rule_from_env(0.6, 0.3, 3); self.assertEqual((r.name, r.thf, r.thv, r.maxd), ("product", 0.6, 0.3, 3))
+        self.assertEqual(sp.env_defaults(7), (0.6, 0.3, 7))
+        r = sp.rule_from_env(0.6, 0.3, 7); self.assertEqual((r.name, r.thf, r.thv, r.maxd, r.thfd, r.thvd), ("tier", 0.6, 0.3, 7, 0.9, 0.7))
+        os.environ["QWSPEC_RULE"] = "product"
+        try: r = sp.rule_from_env(0.6, 0.3, 3); self.assertEqual((r.name, r.thf, r.thv, r.maxd), ("product", 0.6, 0.3, 3))
+        finally: del os.environ["QWSPEC_RULE"]
         os.environ["QWSPEC_THF"] = "0.5"; os.environ["QWSPEC_MAXD"] = "5"
         try: self.assertEqual(sp.env_defaults(3), (0.5, 0.3, 5))
         finally: del os.environ["QWSPEC_THF"]; del os.environ["QWSPEC_MAXD"]
