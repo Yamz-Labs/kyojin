@@ -90,6 +90,24 @@ def merge_candidates(cand, k):
     return torch.where(gi == 0x7FFFFFFF, -1, gi).to(torch.int32)
 
 
+def gather_tile(scores, tile_idx, t0, cand_s, cand_i):
+    """Write one tile's top-k into its slot of the candidate buffers: the tile's own fp16 scores (bits untouched, -inf at the
+    -1 pads) into cand_s (R, kp) and global pool indices (-1 pads) into cand_i (R, kp). Valid entries are ascending."""
+    li = tile_idx.long()
+    ok = li >= 0
+    cand_s.copy_(torch.where(ok, torch.gather(scores, 1, li.clamp(min = 0)), float("-inf")))
+    cand_i.copy_(torch.where(ok, li + t0, -1))
+
+
+def merge_tiles_topk(topk_fn, cand_s, cand_i, pos_out, pool_idx, k):
+    """Exact merge: one top-k pass of the single-pass kernel over the concatenated candidates (R, W), W a multiple of 128.
+    Tiles are disjoint and ascending and each tile's valid entries ascend, so buffer position order is global index order:
+    the kernel's rule (score descending, lowest position first among ties, ascending output) is the single pass's rule.
+    pos_out (R, kp) int32 scratch, pool_idx (R, kp) int32 result (-1 padded)."""
+    topk_fn(cand_s, pos_out, k, None, 0)
+    pool_idx.copy_(torch.where(pos_out >= 0, torch.gather(cand_i, 1, pos_out.long().clamp(min = 0)), -1))
+
+
 class QSAIndexer(Module):
 
     def __init__(
@@ -271,6 +289,11 @@ class QSAIndexer(Module):
     # multiple of 128), each run through the same kernel, and the candidates are merged in torch under the kernel's own
     # total order. Rows up to N pools stay one pass. 0 = always one full-width pass
     TOPK_TILE = int(os.environ.get("EXL3_QSA_TOPK_TILE", 0))
+    # The tiled selection serves prefill chunks only: calls of at most TOPK_MIN_ROWS rows (decode, MTP verify rounds,
+    # bsz > 1 fallbacks) keep the single pass, whose result is identical. "topk" merges the tile candidates with one more
+    # pass of the same kernel over the (R, tiles * kp) candidate buffer; "torch" is the elementwise merge kept for A/B runs
+    TOPK_MIN_ROWS = int(os.environ.get("EXL3_QSA_TOPK_MIN_ROWS", 32))
+    TOPK_MERGE = os.environ.get("EXL3_QSA_TOPK_MERGE", "topk")
     # Row count up to which the plane-update workspaces come from g_tensor_cache (decode-class
     # calls: MTP verify, bsz > 1 fallbacks, where allocation latency matters); prefill chunks
     # allocate per call, the static cache being meant for small buffers only
@@ -318,7 +341,7 @@ class QSAIndexer(Module):
         k_sel = self.block_topk
         kp = -(-k_sel // 32) * 32
         tiled_topk = hasattr(ext, "dsa_topk_tile") and hasattr(ext, "dsa_topk_merge_tiles")
-        torch_merge = not tiled_topk and self.TOPK_TILE > 0
+        torch_merge = not tiled_topk and self.TOPK_TILE > 0 and R > self.TOPK_MIN_ROWS
         t_tile = self.TOPK_TILE // 128 * 128 if torch_merge else self.SEL_TILE
         if block_table is not None:
             t_tile = max(epp, t_tile // epp * epp)   # tiles must start on a pool page
@@ -369,7 +392,7 @@ class QSAIndexer(Module):
             elif T_slab <= t_tile or (not tiled_topk and not torch_merge):
                 sc = tile_scores(q_slab, rows, 0, T_slab)
                 ext.dsa_topk(sc, pool_idx, min(k_sel, T_slab), None, 0)
-            elif torch_merge:
+            elif torch_merge and self.TOPK_MERGE == "torch":
                 cand = []
                 tile_idx = torch.empty((rows, kp), dtype = torch.int32, device = dev)
                 n_tiles = -(-T_slab // t_tile)
@@ -381,6 +404,19 @@ class QSAIndexer(Module):
                     cand.append(tile_candidates(sc, tile_idx, t0))
                 pool_idx[:, :k_sel] = merge_candidates(cand, k_sel)
                 pool_idx[:, k_sel:] = -1
+            elif torch_merge:
+                tile_idx = torch.empty((rows, kp), dtype = torch.int32, device = dev)
+                n_tiles = -(-T_slab // t_tile)
+                w = -(-(-(-T_slab // n_tiles)) // 128) * 128   # equal tiles, 128 aligned
+                W = -(-(n_tiles * kp) // 128) * 128
+                cand_s = torch.full((rows, W), float("-inf"), dtype = torch.half, device = dev)
+                cand_i = torch.full((rows, W), -1, dtype = torch.int32, device = dev)
+                for n, t0 in enumerate(range(0, T_slab, w)):
+                    t1 = min(t0 + w, T_slab)
+                    sc = tile_scores(q_slab, rows, t0, t1)
+                    ext.dsa_topk(sc, tile_idx, min(k_sel, t1 - t0), None, 0)
+                    gather_tile(sc, tile_idx, t0, cand_s[:, n * kp : (n + 1) * kp], cand_i[:, n * kp : (n + 1) * kp])
+                merge_tiles_topk(ext.dsa_topk, cand_s, cand_i, tile_idx, pool_idx, k_sel)
             else:
                 # Tiled: each tile's local top-k becomes candidate slot 1 next to the running set
                 # in slot 0, and the native merge reduces the pair under the single-pass kernel's
