@@ -13,6 +13,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import serve
 
+
+class SharedModuleTests(unittest.TestCase):
+    def test_serve_metrics_resolves_next_to_the_server(self):
+        # serve.py loads tools/mimo/serve.py, which imports serve_metrics from the sys.path of this folder
+        import serve_metrics
+        self.assertTrue(hasattr(serve_metrics, "Metrics"))
+
 PACK = Path(os.environ.get("QWEN_PACK", os.path.expanduser("~/models/qwen38-yamz-v1")))
 THINK_TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
                   "{% if tools %}TOOLS={{ tools|length }}{% endif %}"

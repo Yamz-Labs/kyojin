@@ -32,12 +32,21 @@ class FakeEngine:
         self.prompts.append(prompt)
         if kwargs.get("reset_gate"):
             self.reset_gate()
+        self.last_stats = {"cached_tokens": 8, "new_tokens": 4, "prompt_tokens": 20,
+                           "time_prefill": 0.5, "time_generate": 1.0,
+                           "accepted_draft_tokens": 6, "rejected_draft_tokens": 6}
+        self.last_rounds = 5
         for i in range(0, len(self.output), 3):  # small chunks cut tags in half
             yield self.output[i:i + 3]
 
 
 def run(coro):
     return asyncio.run(coro)
+
+
+def metrics_samples(text: str) -> dict:
+    return {line.split()[0]: float(line.split()[1]) for line in text.splitlines()
+            if line and not line.startswith("#")}
 
 
 TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>"
@@ -421,6 +430,88 @@ class ServeTests(unittest.TestCase):
             await client.close()
 
         run(check())
+
+    def test_metrics_endpoint(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        import serve_metrics
+        engine = FakeEngine('hello there')
+        app = serve.create_app(engine, "m", TEMPLATE)
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            await client.post("/v1/chat/completions", json={
+                "model": "m", "messages": [{"role": "user", "content": "one two three four"}]})
+            resp = await client.get("/metrics")
+            text = await resp.text()
+            await client.close()
+            return resp, text
+
+        resp, text = run(check())
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(resp.headers["Content-Type"].startswith("text/plain"))
+        for name, mtype, _ in serve_metrics.METRICS:
+            self.assertIn(f"# HELP {name} ", text)
+            self.assertIn(f"# TYPE {name} {mtype}", text)
+        v = metrics_samples(text)
+        st = engine.last_stats
+        prompt_tokens = engine.count_tokens(engine.prompts[-1])
+        serve_metrics.assert_reported(
+            v, self, prompt_tokens=prompt_tokens, cached=st["cached_tokens"],
+            predicted=st["new_tokens"], prefill_s=st["time_prefill"], generate_s=st["time_generate"],
+            drafts=engine.last_rounds,
+            draft_tokens=st["accepted_draft_tokens"] + st["rejected_draft_tokens"],
+            accepted=st["accepted_draft_tokens"])
+        self.assertEqual(v["llamacpp:requests_processing"], 0)
+        self.assertEqual(v["llamacpp:requests_deferred"], 0)
+        self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0)  # fake engine: no get_cache_stats
+
+    def test_two_queued_requests_are_both_counted(self):
+        """Back-to-back requests each get their own timings handed over by the worker, so both are
+        counted in full even though engine.last_stats is a single shared attr reset per job."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class QueuedEngine(FakeEngine):
+            def __init__(self):
+                super().__init__("")
+                self.calls = 0
+
+            async def generate(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                self.calls += 1
+                n = 3 * self.calls  # distinct per request: 3 then 6
+                self.last_stats = {"cached_tokens": self.calls, "new_tokens": n,
+                                   "prompt_tokens": 20, "time_prefill": 0.5, "time_generate": 1.0,
+                                   "accepted_draft_tokens": 2, "rejected_draft_tokens": 2}
+                self.last_rounds = self.calls
+                await asyncio.sleep(0)  # let the second request sit queued behind this one
+                yield f"reply {self.calls}"
+
+        async def check():
+            engine = QueuedEngine()
+            client = TestClient(TestServer(serve.create_app(engine, "m", TEMPLATE)))
+            await client.start_server()
+            bodies = [
+                {"model": "m", "messages": [{"role": "user", "content": "one two three four"}]},
+                {"model": "m", "messages": [{"role": "user", "content": "five six seven eight nine"}]},
+            ]
+            responses = await asyncio.gather(*(client.post("/v1/chat/completions", json=b) for b in bodies))
+            for r in responses:
+                self.assertEqual(r.status, 200)
+            # each reply reports its own generation, not the shared attr's last value (which would be 6 for both)
+            payloads = await asyncio.gather(*(r.json() for r in responses))
+            predicted = sorted(p["timings"]["predicted_n"] for p in payloads)
+            self.assertEqual(predicted, [3, 6])
+            resp = await client.get("/metrics")
+            text = await resp.text()
+            await client.close()
+            return engine, text
+
+        engine, text = run(check())
+        v = metrics_samples(text)
+        # both generations counted in full: predicted = 3 + 6, not a prompt-only first request
+        self.assertEqual(v["llamacpp:tokens_predicted_total"], 9.0)
+        self.assertEqual(v["llamacpp:prompt_tokens_total"], float(sum(engine.count_tokens(p) for p in engine.prompts)))
 
 
 if __name__ == "__main__":
