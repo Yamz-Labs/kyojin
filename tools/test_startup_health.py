@@ -644,6 +644,17 @@ class WiringTest(unittest.TestCase):
     def test_glm_keeps_tuned_and_untuned_history_apart(self):
         self.assertIn('variant="tuned" if tune and dense_tune_path().exists() else "untuned"', (TOOLS / "glm" / "serve.py").read_text())
 
+    def test_compiler_report_does_not_import_the_engine_package(self):
+        # The Qwen server sets its serving environment after startup_health.report_compiler(): importing exllamav3 there
+        # latches the engine defaults and check_latched_env() refuses to start (found on the first GPU start of the merge).
+        import subprocess
+        code = ("import sys; sys.path.insert(0, %r); import startup_health as s; s.report_compiler(); h = s.compiler_health(); "
+                "assert 'hip_compiler' in h, h; assert 'exllamav3' not in sys.modules and 'torch' not in sys.modules, sorted(m for m in sys.modules if m.startswith(('exllamav3', 'torch'))); "
+                "assert s._hip_compiler() is sys.modules['exllamav3.util.hip_compiler']") % str(TOOLS)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-800:])
+        self.assertIn("HIP kernel compiler", r.stdout)
+
     def test_default_ready_line_unchanged(self):
         self.assertIn("qserve: READY on http://", (TOOLS / "qwen" / "serve.py").read_text())
 

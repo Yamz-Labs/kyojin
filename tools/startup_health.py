@@ -21,9 +21,11 @@ tracker is active (tests, library use).
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -310,11 +312,26 @@ def start(name: str, stages: list[str], host: str, port: int, variant: str | Non
     return ACTIVE
 
 
+def _hip_compiler():
+    """exllamav3/util/hip_compiler.py loaded by path, under its package name, WITHOUT importing the exllamav3 package: the Qwen
+    server applies its serving environment after this runs, and importing exllamav3 first would latch the engine defaults
+    (check_latched_env refuses to start). Later `from exllamav3.util import hip_compiler` finds the same module object."""
+    name = "exllamav3.util.hip_compiler"
+    mod = sys.modules.get(name)
+    if mod is None:
+        path = Path(__file__).resolve().parent.parent / "exllamav3" / "util" / "hip_compiler.py"
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
 def compiler_health() -> dict:
     """Fields for /health: the HIP kernel compiler line, plus the warning line when it is not the rocm-sdk compiler.
-    Lazy import: nothing here needs torch at import time."""
+    Loaded by path: no torch and no exllamav3 package import."""
     try:
-        from exllamav3.util import hip_compiler
+        hip_compiler = _hip_compiler()
         out = {"hip_compiler": hip_compiler.describe().removeprefix("HIP kernel compiler: ")}
         if hip_compiler.warning():
             out["hip_compiler_warning"] = hip_compiler.warning()
@@ -326,7 +343,7 @@ def compiler_health() -> dict:
 def report_compiler() -> None:
     """Start-up log: which compiler builds the JIT kernels, plus one warning line when it is not the rocm-sdk one."""
     try:
-        from exllamav3.util import hip_compiler
+        hip_compiler = _hip_compiler()
         hip_compiler.report(lambda line: print(line, flush=True))
     except Exception as e:  # noqa: BLE001
         print(f"[kyojin] HIP kernel compiler: unknown ({type(e).__name__}: {e})", flush=True)
