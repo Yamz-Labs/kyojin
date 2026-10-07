@@ -128,7 +128,7 @@ The port answers from the first second, while the model is still loading. `GET /
 
 ```json
 503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 4,
-     "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
+     "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "stage_eta_s": 78.0, "progress_basis": "stages"}
 ```
 
 Every `/health` reply carries `"source": "kyojin"` (a hint for parsers). While `status` is `loading`, `message` is one plain line for a UI, built from the other fields: stage, percent, "stage x of y", and "about N s left" when an ETA exists.
@@ -137,9 +137,9 @@ Stages here: target weights, drafter weights, warm-up, dense GEMM tuning (the la
 stage cannot count its work. `progress` counts finished stages plus that share, with equal weights
 (`progress_basis: "stages"`); once one start has completed, its stage durations are kept in
 `~/.cache/kyojin/startup-glm.json` (`KYOJIN_HEALTH_DIR` changes the folder) and later starts weigh the stages by
-them (`"history"`) and report `eta_s`. Without a history `eta_s` is `null`: no estimate is made up. A failed load
-answers `500 {"status":"error","message":...}` for a few seconds before the process exits. Every other path answers
-`503 {"error":{"message":"Loading model",...}}` during the load, like llama.cpp. Nothing changes after READY, and
+them (`"history"`) and report `eta_s`. Without a history `eta_s` is `null`: no estimate is made up. `stage_eta_s` is this run's own estimate for the current stage alone (from the share loaded so far); it is `null` until 2 % of the stage is done, and is there with or without a history. GLM keeps two histories (`startup-glm-tuned.json`, `startup-glm-untuned.json`) so a start with the dense GEMM tuning already cached is never timed with the slow first start. A failed load
+answers `500 {"status":"error","message":...}` for a few seconds before the process exits. The real API endpoints answer
+`503 {"error":{"message":"Loading model",...}}` during the load, like llama.cpp; an unknown path answers `404` and a wrong method `405`, in the same JSON error shape (also after READY). Nothing changes after READY, and
 the `READY` line is the same. The helper is `tools/startup_health.py`, shared by the three servers.
 
 llama-swap polls `checkEndpoint` (default `/health`, HTTP 200 = ready) until `healthCheckTimeout` runs out, so give it

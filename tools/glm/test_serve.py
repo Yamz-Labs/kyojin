@@ -46,6 +46,50 @@ def metrics_samples(text: str) -> dict:
 class ServeTests(unittest.TestCase):
     template = "{% for m in messages %}<|im_start|>{{ m.role }}: {{ m.content }}<|im_end|>{% endfor %}{% if tools %}TOOLS={{ tools|length }}{% endif %}"
 
+
+
+    def test_prompt_longer_than_the_context_is_a_clear_400(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Small(FakeEngine):
+            ctx = 256
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Small("x"), "m", self.template)))
+            await client.start_server()
+            out = []
+            for stream in (False, True):
+                r = await client.post("/v1/chat/completions", json={
+                    "model": "m", "stream": stream, "messages": [{"role": "user", "content": "word " * 400}]})
+                out.append((r.status, await r.json()))
+            await client.close()
+            return out
+
+        for status, body in run(check()):
+            self.assertEqual(status, 400)
+            self.assertEqual(body["error"]["type"], "invalid_request_error")
+            self.assertIn("context length exceeded: prompt is", body["error"]["message"])
+            self.assertIn("the server context is 256", body["error"]["message"])
+
+    def test_unknown_path_and_wrong_method_answer_404_405_in_json(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(FakeEngine("x"), "m", self.template)))
+            await client.start_server()
+            out = []
+            for method, path in (("GET", "/nope"), ("POST", "/nope"), ("POST", "/health"), ("GET", "/v1/chat/completions")):
+                r = await client.request(method, path)
+                out.append((r.status, r.headers["Content-Type"], await r.json()))
+            await client.close()
+            return out
+
+        for (status, ctype, body), want in zip(run(check()), (404, 404, 405, 405)):
+            self.assertEqual(status, want)
+            self.assertTrue(ctype.startswith("application/json"))
+            self.assertEqual((body["error"]["code"], body["error"]["type"]), (want, "invalid_request_error"))
+            self.assertTrue(body["error"]["message"])
+
     def test_eh_sidecar_source_order(self):
         import os, tempfile
         from unittest import mock

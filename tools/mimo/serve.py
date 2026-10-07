@@ -209,7 +209,7 @@ def reply_room(engine: Any, prompt_tokens: int) -> int | None:
         return None
     room = ctx // 256 * 256 - prompt_tokens - 1 - getattr(engine, "num_draft", 0)   # page table = ctx // 256 pages of 256 tokens
     if room < 1:
-        raise web.HTTPBadRequest(reason=f"prompt is {prompt_tokens} tokens, the server context is {ctx}")
+        raise web.HTTPBadRequest(reason=f"context length exceeded: prompt is {prompt_tokens} tokens, the server context is {ctx}")
     return room
 
 
@@ -362,12 +362,16 @@ class ResidentEngine:
 # ---------------------------------------------------------------------------- HTTP
 
 
+# Every route of create_app(), for the early /health listener (404 / 405 while loading); a test keeps it in step.
+ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/completion": ("POST",), "/slots/{id}": ("POST",)}
+
+
 def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
     processing = 0  # admitted requests; closure, app config is immutable after startup
-    app = web.Application(client_max_size=16 * 1024**2)
+    app = web.Application(client_max_size=16 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
@@ -800,7 +804,8 @@ def main() -> None:
                   "decoding without speculation", flush=True)
 
     stages = (["drafter weights"] if drafter else []) + ["target weights", "engine setup"]
-    startup_health.start("mimo", stages, args.host, args.port)
+    startup_health.check_model_dir("msrv", args.model)
+    startup_health.start("mimo", stages, args.host, args.port, routes=ROUTES)
     # --ctx 0 = the model's own max context, with the nested text_config handled like the GLM fix.
     try:
         probe = Config.from_directory(args.model)

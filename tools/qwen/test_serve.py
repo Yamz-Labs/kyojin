@@ -695,6 +695,26 @@ class ReplyRoomTests(unittest.TestCase):
 
 
 class MiscTests(unittest.TestCase):
+
+    def test_unknown_path_and_wrong_method_answer_404_405_in_json(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(FakeEngine("x"), "m", THINK_TEMPLATE, serve.load_defaults("/x"))))
+            await client.start_server()
+            out = []
+            for method, path in (("GET", "/nope"), ("POST", "/nope"), ("POST", "/health"), ("GET", "/v1/chat/completions")):
+                r = await client.request(method, path)
+                out.append((r.status, r.headers["Content-Type"], await r.json()))
+            await client.close()
+            return out
+
+        for (status, ctype, body), want in zip(run(check()), (404, 404, 405, 405)):
+            self.assertEqual(status, want)
+            self.assertTrue(ctype.startswith("application/json"))
+            self.assertEqual((body["error"]["code"], body["error"]["type"]), (want, "invalid_request_error"))
+            self.assertTrue(body["error"]["message"])
+
     def test_sse_framing_and_stop_text(self):
         self.assertEqual(serve.sse({"a": 1}), b'data: {"a":1}\n\n')
         self.assertEqual(serve.stop_text("hello STOP x", ["STOP"]), ("hello ", "STOP"))

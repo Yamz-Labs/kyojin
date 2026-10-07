@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import re
 import socket
 import sys
 import tempfile
@@ -164,6 +165,49 @@ class HistoryTest(unittest.TestCase):
     def test_corrupt_history_is_ignored(self):
         self.path.write_text("{nope")
         self.assertEqual(tracker(["a"], history=self.path).snapshot()[1]["progress_basis"], "stages")
+
+    def test_variants_keep_their_histories_apart(self):
+        # a cold start (slow stage) must not time a later warm start, and the other way round
+        base = Path(self.dir.name)
+        old = sh.history_dir
+        sh.history_dir = lambda: base
+        try:
+            for variant, dur in (("untuned", {"a": 5, "b": 600}), ("tuned", {"a": 5, "b": 20})):
+                c = Clock()
+                t = sh.StartupTracker("g", ["a", "b"], clock=c, variant=variant)
+                for stage in ("a", "b"):
+                    t.begin(stage)
+                    c.t += dur[stage]
+                t.ready()
+            self.assertEqual(json.loads((base / "startup-g-untuned.json").read_text())["b"], 600.0)
+            self.assertEqual(json.loads((base / "startup-g-tuned.json").read_text())["b"], 20.0)
+            t = sh.StartupTracker("g", ["a", "b"], clock=Clock(), variant="tuned")
+            self.assertEqual(t.snapshot()[1]["eta_s"], 25.0)              # 5 + 20, not 605
+            t = sh.StartupTracker("g", ["a", "b"], clock=Clock(), variant="other")
+            self.assertEqual(t.snapshot()[1]["progress_basis"], "stages")  # no history for it: no made-up eta
+        finally:
+            sh.history_dir = old
+
+    def test_stage_eta_from_own_pace_without_history(self):
+        c = Clock()
+        t = tracker(["a", "b"], clock=c)
+        body = t.snapshot()[1]
+        self.assertIn("stage_eta_s", body)
+        self.assertIsNone(body["stage_eta_s"])
+        c.t += 30
+        t.progress(1, 4)                                                # 30 s for a quarter: 90 s left in this stage
+        body = t.snapshot()[1]
+        self.assertEqual((body["eta_s"], body["stage_eta_s"], body["progress_basis"]), (None, 90.0, "stages"))
+        self.assertIn("about 90 s left in this stage", body["message"])
+
+    def test_stage_eta_is_there_with_history_too(self):
+        self.run_start(["a", "b"], {"a": 600, "b": 10})
+        c = Clock()
+        t = tracker(["a", "b"], history=self.path, clock=c)
+        c.t += 10
+        t.progress(50, 100)
+        body = t.snapshot()[1]
+        self.assertEqual((body["eta_s"], body["stage_eta_s"]), (20.0, 10.0))
 
 
 class LoadCallbackTest(unittest.TestCase):
@@ -373,8 +417,12 @@ class ListenerTest(unittest.TestCase):
         s.bind(("127.0.0.1", 0))
         s.listen(1)
         try:
-            with self.assertRaises(OSError):
+            with self.assertRaises(SystemExit) as cm:                       # one plain line, no traceback
                 sh.start("t", ["a"], "127.0.0.1", s.getsockname()[1])
+            msg = str(cm.exception)
+            self.assertIn("cannot listen on 127.0.0.1:", msg)
+            self.assertIn("choose another --port", msg)
+            self.assertIsNone(sh.ACTIVE)
         finally:
             s.close()
             sh.ACTIVE = None
@@ -389,6 +437,94 @@ class ListenerTest(unittest.TestCase):
         [x.join() for x in threads]
         t.release_port()
         self.assertEqual(codes, [503] * 8)
+
+
+class RouteErrorTest(unittest.TestCase):
+    ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/v1/chat/completions": ("POST",), "/slots/{id}": ("POST",)}
+
+    def test_early_listener_answers_404_and_405_in_json_and_keeps_503_for_real_endpoints(self):
+        t = tracker(["weights"])
+        t.routes = self.ROUTES
+        t.serve("127.0.0.1", 0)
+        base = f"http://127.0.0.1:{t.server.port}"
+        try:
+            code, body, headers = get(base + "/nope")
+            self.assertEqual((code, body["error"]["code"], body["error"]["type"]), (404, 404, "invalid_request_error"))
+            self.assertIn("/nope", body["error"]["message"])
+            self.assertEqual(headers["Content-Type"], "application/json")
+            code, body, _ = get(base + "/v1/chat/completions")             # GET on a POST route
+            self.assertEqual((code, body["error"]["code"]), (405, 405))
+            self.assertEqual(_["Allow"], "POST")
+            req = urllib.request.Request(base + "/health", data=b"{}", method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(req, timeout=5)
+            self.assertEqual(cm.exception.code, 405)
+            self.assertEqual(get(base + "/v1/models")[0], 503)             # a real endpoint: still "loading"
+            self.assertEqual(get(base + "/health")[0], 503)
+            self.assertEqual(get(base + "/slots/3")[0], 405)               # wildcard segment matched, wrong method
+            self.assertEqual(get(base + "/slots")[0], 404)
+        finally:
+            t.release_port()
+
+    def test_route_methods_matching(self):
+        self.assertEqual(sh.route_methods(self.ROUTES, "/slots/7"), ("POST",))
+        self.assertEqual(sh.route_methods(self.ROUTES, "/v1/models/"), ("GET",))
+        self.assertIsNone(sh.route_methods(self.ROUTES, "/slots/"))
+        self.assertIsNone(sh.route_methods(self.ROUTES, "/x/y/z"))
+
+    def test_middleware_gives_json_404_405_and_leaves_handler_answers_alone(self):
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def ok(_):
+            return web.json_response({"ok": 1})
+
+        async def teapot(_):
+            return web.json_response({"error": {"message": "mine"}}, status=418)
+
+        async def go():
+            app = web.Application(middlewares=[sh.json_errors_middleware()])
+            app.router.add_get("/ok", ok)
+            app.router.add_post("/tea", teapot)
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            out = {}
+            for key, method, path in (("404", "GET", "/nope"), ("405", "POST", "/ok"), ("ok", "GET", "/ok"), ("418", "POST", "/tea")):
+                r = await client.request(method, path)
+                out[key] = (r.status, r.headers["Content-Type"], await r.json(), r.headers.get("Allow"))
+            await client.close()
+            return out
+        out = asyncio.run(go())
+        self.assertEqual(out["404"][0], 404)
+        self.assertTrue(out["404"][1].startswith("application/json"))
+        self.assertEqual(out["404"][2]["error"], {"message": "not found: GET /nope", "type": "invalid_request_error", "code": 404})
+        self.assertEqual(out["405"][0], 405)
+        self.assertEqual(out["405"][3], "GET,HEAD")
+        self.assertIn("(allowed: GET, HEAD)", out["405"][2]["error"]["message"])
+        self.assertIn("method POST not allowed on /ok", out["405"][2]["error"]["message"])
+        self.assertEqual(out["ok"][2], {"ok": 1})
+        self.assertEqual((out["418"][0], out["418"][2]["error"]["message"]), (418, "mine"))
+
+
+class ModelDirTest(unittest.TestCase):
+    def test_missing_folder_and_missing_files_give_one_plain_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(SystemExit) as cm:
+                sh.check_model_dir("qserve", Path(d) / "nope")
+            self.assertIn("model folder not found", str(cm.exception))
+            self.assertIn("--model", str(cm.exception))
+            (Path(d) / "config.json").write_text("{}")
+            with self.assertRaises(SystemExit) as cm:
+                sh.check_model_dir("qserve", d)
+            self.assertIn("missing: chat_template.jinja", str(cm.exception))
+            sh.check_model_dir("qserve", d, ("config.json",))                # needed list is the caller's
+            (Path(d) / "chat_template.jinja").write_text("x")
+            sh.check_model_dir("qserve", d)
+
+    def test_servers_check_the_pack_before_the_port_opens(self):
+        for name in ("qwen", "glm", "mimo"):
+            src = (TOOLS / name / "serve.py").read_text()
+            self.assertLess(src.index("startup_health.check_model_dir("), src.index("startup_health.start("), name)
 
 
 class QuietDisconnectTest(unittest.TestCase):
@@ -494,6 +630,19 @@ class WiringTest(unittest.TestCase):
         src = (TOOLS.parent / "exllamav3" / "model_init.py").read_text()
         self.assertLess(src.index("draft_model.load("), src.index("    model.load("))
         self.assertIn('["drafter weights"] if drafter_path else []) + ["target weights"]', (TOOLS / "mimo" / "serve.py").read_text())
+
+    def test_servers_pass_routes_and_json_middleware_and_routes_match_the_app(self):
+        for name in self.EXPECT:
+            src = (TOOLS / name / "serve.py").read_text()
+            self.assertIn("routes=ROUTES", src, name)
+            self.assertIn("middlewares=[startup_health.json_errors_middleware()]", src, name)
+            registered = set(re.findall(r'router\.add_(?:get|post)\("([^"]+)"', src))
+            declared = set(re.search(r"^ROUTES = (\{.*\})$", src, re.M).group(1).replace("(", "[").replace(")", "]") and
+                           json.loads(re.search(r"^ROUTES = (\{.*\})$", src, re.M).group(1).replace("(", "[").replace(")", "]").replace(",]", "]")))
+            self.assertEqual(registered, declared, name)
+
+    def test_glm_keeps_tuned_and_untuned_history_apart(self):
+        self.assertIn('variant="tuned" if tune and dense_tune_path().exists() else "untuned"', (TOOLS / "glm" / "serve.py").read_text())
 
     def test_default_ready_line_unchanged(self):
         self.assertIn("qserve: READY on http://", (TOOLS / "qwen" / "serve.py").read_text())

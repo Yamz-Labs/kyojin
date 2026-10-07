@@ -1160,6 +1160,10 @@ def format_logprobs(entries: list, token_ids: list[int], token_str, chat: bool) 
             "top_logprobs_ids": [None if e is None else [[int(a), b] for a, b in e[1]] for e in entries]}
 
 
+# Every route of create_app(), for the early /health listener (404 / 405 while loading); a test keeps it in step.
+ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",)}
+
+
 def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, Any] | None = None,
                default_max_tokens: int = 32768) -> web.Application:
     """HTTP layer around a resident engine (also accepts a fake engine in tests)."""
@@ -1169,7 +1173,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
     gate = asyncio.Semaphore(sessions)   # one permit per running request; slot actions take them all (drain)
     lock = asyncio.Lock()                # serializes the slot actions
     running = 0
-    app = web.Application(client_max_size=64 * 1024**2)
+    app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, defaults=defaults)
 
     def err(status: int, message: str) -> web.Response:
@@ -1751,7 +1755,8 @@ def main() -> None:
     # /health answers 503 with the load progress from here until READY (stdlib listener on the same port).
     stages = ["target weights"] + (["drafter weights"] if args.draft_policy != "off" else []) \
         + (["vision tower"] if not args.no_vision else []) + ["engine setup", "warm-up"]
-    startup_health.start("qwen", stages, args.host, args.port)
+    startup_health.check_model_dir("qserve", args.model)
+    startup_health.start("qwen", stages, args.host, args.port, routes=ROUTES)
     try:
         engine, template, defaults, model_dir, t0 = load_all(args)
     except BaseException as exc:                                  # noqa: BLE001

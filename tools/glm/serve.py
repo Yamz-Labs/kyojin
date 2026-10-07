@@ -229,7 +229,7 @@ def reply_room(engine: Any, prompt_tokens: int) -> int | None:
         return None
     room = ctx - prompt_tokens - 1 - getattr(engine, "num_draft", 0)
     if room < 1:
-        raise web.HTTPBadRequest(reason=f"prompt is {prompt_tokens} tokens, the server context is {ctx}")
+        raise web.HTTPBadRequest(reason=f"context length exceeded: prompt is {prompt_tokens} tokens, the server context is {ctx}")
     return room
 
 
@@ -460,12 +460,16 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
     return done, time.perf_counter() - t0
 
 
+# Every route of create_app(), for the early /health listener (404 / 405 while loading); a test keeps it in step.
+ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/completion": ("POST",), "/slots/{id}": ("POST",)}
+
+
 def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
     processing = 0  # admitted requests; closure, app config is immutable after startup
-    app = web.Application(client_max_size=16 * 1024**2)
+    app = web.Application(client_max_size=16 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
@@ -847,7 +851,10 @@ def main() -> None:
     warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
     tune = warm and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
     stages = ["target weights", "drafter weights"] + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
-    startup_health.start("glm", stages, args.host, args.port)
+    startup_health.check_model_dir("serve", args.model, ("config.json",) if args.chat_template else ("config.json", "chat_template.jinja"))
+    # A start with the dense GEMM tuning already cached is much shorter than the first one: keep their timings apart.
+    startup_health.start("glm", stages, args.host, args.port, routes=ROUTES,
+                         variant="tuned" if tune and dense_tune_path().exists() else "untuned")
     try:
         engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft)
         template = Path(args.chat_template or Path(args.model) / "chat_template.jinja").expanduser().read_text(encoding="utf-8")

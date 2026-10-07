@@ -6,7 +6,7 @@ answers every request with 503, and answers GET /health with the real load progr
 
     200 {"status": "ok", "source": "kyojin"}                      ready (the server's own /health takes over)
     503 {"status": "loading", "source": "kyojin", "message": "Target weights, 40 % (stage 1 of 4)", "progress": 0.31, "stage": "target weights", "stage_index": 1, "stage_count": 4,
-         "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "progress_basis": "stages"}
+         "stage_progress": 0.4, "elapsed_s": 52.1, "eta_s": null, "stage_eta_s": 78.0, "progress_basis": "stages"}
     500 {"status": "error", "source": "kyojin", "message": "..."}
 
 Every reply carries `"source": "kyojin"` (a hint for parsers); while loading, `message` is one plain line for a UI
@@ -33,28 +33,73 @@ LOADING_BODY = {"error": {"message": "Loading model", "type": "unavailable_error
 ACTIVE: "StartupTracker | None" = None
 
 
+def error_body(code: int, message: str) -> dict:
+    """The JSON error shape of the servers (OpenAI style)."""
+    return {"error": {"message": message, "type": "invalid_request_error", "code": code}}
+
+
+def route_methods(routes: dict[str, tuple[str, ...]], path: str) -> tuple[str, ...] | None:
+    """Allowed methods for `path` in a route table (`{x}` matches one segment), or None when the path is unknown."""
+    parts = path.rstrip("/").split("/")
+    for pattern, methods in routes.items():
+        pp = pattern.rstrip("/").split("/")
+        if len(pp) == len(parts) and all(a == b or (a.startswith("{") and a.endswith("}") and b) for a, b in zip(pp, parts)):
+            return methods
+    return None
+
+
+def json_errors_middleware():
+    """aiohttp middleware: 404, 405 and the other HTTP errors raised by the router answer in the JSON error shape
+    (aiohttp's own reply is plain text). Imported lazily: the rest of this module needs no aiohttp."""
+    from aiohttp import web
+
+    @web.middleware
+    async def middleware(request, handler):
+        try:
+            return await handler(request)
+        except web.HTTPException as exc:
+            if exc.status < 400:
+                raise
+            if exc.status == 404:
+                message = f"not found: {request.method} {request.path}"
+            elif exc.status == 405:
+                message = f"method {request.method} not allowed on {request.path} (allowed: {', '.join(a.strip() for a in exc.headers.get('Allow', '').split(','))})"
+            else:
+                # aiohttp's default body is "<status>: <reason>"; the JSON message is the reason alone
+                message = exc.reason if exc.text in (None, "", f"{exc.status}: {exc.reason}") else exc.text
+            headers = {"Allow": exc.headers["Allow"]} if "Allow" in exc.headers else None
+            return web.json_response(error_body(exc.status, message), status=exc.status, headers=headers)
+    return middleware
+
+
 def history_dir() -> Path:
     return Path(os.environ.get("KYOJIN_HEALTH_DIR") or "~/.cache/kyojin").expanduser()
 
 
-def _loading_message(stage: str, index: int, count: int, frac, progress: float, eta) -> str:
+def _loading_message(stage: str, index: int, count: int, frac, progress: float, eta, stage_eta=None) -> str:
     """One plain line for a UI, built only from the fields of the same reply."""
     what = stage[0].upper() + stage[1:]
     pct = f"{round((frac if frac is not None else progress) * 100)} %"
     text = f"{what}, {pct} (stage {index} of {count})" if frac is not None else f"{what} (stage {index} of {count}), {pct} overall"
     if eta is not None:
         text += f", about {round(eta)} s left"
+    elif stage_eta is not None:
+        text += f", about {round(stage_eta)} s left in this stage"
     return text
 
 
 class StartupTracker:
     """Thread-safe record of the start-up stages. Stage indices are 1-based."""
 
-    def __init__(self, name: str, stages: list[str], clock=time.monotonic, history: Path | None = None):
+    def __init__(self, name: str, stages: list[str], clock=time.monotonic, history: Path | None = None,
+                 variant: str | None = None):
         if not stages:
             raise ValueError("at least one stage")
         self.name, self.stages, self.clock = name, list(stages), clock
-        self.history_path = (history if history is not None else history_dir() / f"startup-{name}.json")
+        # `variant` keeps the durations of different kinds of start apart (e.g. cached kernel tuning or not), so a
+        # fast start is never timed with the history of a slow one.
+        suffix = f"-{variant}" if variant else ""
+        self.history_path = (history if history is not None else history_dir() / f"startup-{name}{suffix}.json")
         self.lock = threading.Lock()
         self.t0 = clock()
         self.state = "loading"
@@ -65,6 +110,7 @@ class StartupTracker:
         self.durations: dict[str, float] = {}
         self.expected = self._load_history()
         self.server: _EarlyServer | None = None
+        self.routes: dict[str, tuple[str, ...]] | None = None
 
     def _load_history(self) -> dict[str, float] | None:
         try:
@@ -137,13 +183,16 @@ class StartupTracker:
                 eta = sum(exp[s] for s in self.stages[cur + 1:]) + left if left >= 0 else None
             else:
                 progress, basis, eta = (cur + (frac or 0.0)) / n, "stages", None
+            # Pace of this run in the current stage: an estimate for that stage alone, whatever the history says.
+            stage_eta = stage_elapsed * (1 - frac) / frac if frac is not None and frac >= 0.02 and stage_elapsed > 0 else None
             progress = round(min(progress, 0.999), 3)
             return 503, {"status": "loading", "source": "kyojin",
-                         "message": _loading_message(self.stages[cur], cur + 1, n, frac, progress, eta),
+                         "message": _loading_message(self.stages[cur], cur + 1, n, frac, progress, eta, stage_eta),
                          "progress": progress,
                          "stage": self.stages[cur], "stage_index": cur + 1, "stage_count": n,
                          "stage_progress": None if frac is None else round(frac, 3),
                          "elapsed_s": elapsed, "eta_s": None if eta is None else round(eta, 1),
+                         "stage_eta_s": None if stage_eta is None else round(stage_eta, 1),
                          "progress_basis": basis}
 
     # ---- early listener
@@ -172,13 +221,24 @@ class _EarlyServer:
     def __init__(self, tracker: StartupTracker, host: str, port: int):
         class Handler(BaseHTTPRequestHandler):
             def _reply(self):
-                if self.path.split("?", 1)[0].rstrip("/") == "/health":
+                path = self.path.split("?", 1)[0]
+                routes = getattr(tracker, "routes", None)
+                allowed = route_methods(routes, path) if routes is not None else None
+                extra = None
+                if path.rstrip("/") == "/health" and self.command in ("GET", "HEAD"):
                     code, body = tracker.snapshot()
+                elif allowed is None and routes is not None:
+                    code, body = 404, error_body(404, f"not found: {self.command} {path}")
+                elif allowed is not None and self.command not in allowed and not (self.command == "HEAD" and "GET" in allowed):
+                    code, body = 405, error_body(405, f"method {self.command} not allowed on {path} (allowed: {', '.join(allowed)})")
+                    extra = ("Allow", ", ".join(allowed))
                 else:
                     code, body = 503, LOADING_BODY
                 data = json.dumps(body).encode()
                 try:
                     self.send_response(code)
+                    if extra:
+                        self.send_header(*extra)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(data)))
                     self.send_header("Retry-After", "5")
@@ -223,11 +283,30 @@ class _EarlyServer:
 
 # ---- module-level helpers used by the servers (no-ops without an active tracker)
 
-def start(name: str, stages: list[str], host: str, port: int) -> StartupTracker:
-    """Create the tracker and open the early listener. Fails at once when the port is taken."""
+def check_model_dir(name: str, model_dir, needed: tuple[str, ...] = ("config.json", "chat_template.jinja")) -> None:
+    """Exit with one plain line (no traceback) when the pack folder is missing or lacks a file every start needs."""
+    d = Path(model_dir).expanduser()
+    if not d.is_dir():
+        raise SystemExit(f"{name}: model folder not found: {d} (point --model at the downloaded pack folder)")
+    missing = [f for f in needed if not (d / f).is_file()]
+    if missing:
+        raise SystemExit(f"{name}: {d} is not a complete pack, missing: {', '.join(missing)} (download it again)")
+
+
+def start(name: str, stages: list[str], host: str, port: int, variant: str | None = None,
+          routes: dict[str, tuple[str, ...]] | None = None) -> StartupTracker:
+    """Create the tracker and open the early listener. Fails at once when the port is taken.
+    `routes` maps each path of the server (`{x}` is a wildcard segment) to its allowed methods: while loading, a path
+    outside it answers 404 and a wrong method 405 (JSON), the real endpoints answer 503."""
     global ACTIVE
-    ACTIVE = StartupTracker(name, stages)
-    ACTIVE.serve(host, port)
+    ACTIVE = StartupTracker(name, stages, variant=variant)
+    ACTIVE.routes = routes
+    try:
+        ACTIVE.serve(host, port)
+    except OSError as exc:
+        ACTIVE = None
+        raise SystemExit(f"{name}: cannot listen on {host}:{port}: {exc.strerror or exc} "
+                         "(another server on this port? choose another --port)") from None
     return ACTIVE
 
 
