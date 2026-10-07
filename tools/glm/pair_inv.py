@@ -26,6 +26,10 @@ ap.add_argument("--ops-pairs", default="0:1,2:7,4:5")
 ap.add_argument("--mlp-layer", type=int, default=26)
 ap.add_argument("--prompt", type=int, default=4)
 ap.add_argument("--solo-passes", type=int, default=2)
+ap.add_argument("--corpus", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus.txt"))
+ap.add_argument("--long-lens", default="2600,4000,7000")
+ap.add_argument("--long-tokens", type=int, default=64)
+ap.add_argument("--long-reps", type=int, default=2)
 args = ap.parse_args()
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -803,6 +807,41 @@ def stage_speed():
             res["solo"][a].append(ntok / tt)
             log("speed rep", rep, a, "paired agg tok/s", round(res["paired"][a][-1], 2), "solo tok/s", round(res["solo"][a][-1], 2))
             save("speed", res)
+
+
+def stage_long():
+    """Prompts above index_topk (2048): the DSA sparse path. Solo ids (two passes) against paired ids, mixed lengths."""
+    corpus = open(args.corpus).read()
+    want = [int(x) for x in args.long_lens.split(",")]
+    P = []; off = 0
+    for w in want:
+        c = int(w * 3.5); txt = None
+        for _ in range(4):
+            txt = "Summarise the following text in three sentences.\n\n" + corpus[off:off + c]
+            n = int(enc(txt).shape[-1])
+            c = int(c * w / max(n, 1))
+        P.append(enc(txt)); off += c + 1000
+    lens = [int(p.shape[-1]) for p in P]
+    log("long prompt tokens", lens)
+    short = enc(ALL_PROMPTS[0])
+    N = args.long_tokens
+    set_arm("on")
+    solo = [[decode([(p, N, True)])[0][0] for p in P + [short]] for _ in range(2)]
+    stable = [solo[0][i] == solo[1][i] for i in range(len(P) + 1)]
+    log("long solo stable", stable)
+    ref = solo[0]
+    items = P + [short]
+    res = {"lens": lens + [int(short.shape[-1])], "solo_stable": stable, "pairs": []}
+    pairs = [(i, j) for i in range(len(items)) for j in range(i + 1, len(items))]
+    for rep in range(args.long_reps):
+        for i, j in pairs:
+            tk, _ = decode([(items[i], N, True), (items[j], N, True)])
+            for k, a in enumerate((i, j)):
+                first = next((x for x in range(min(len(tk[k]), len(ref[a]))) if tk[k][x] != ref[a][x]), None)
+                res["pairs"].append({"rep": rep, "pair": [i, j], "prompt": a, "equal": tk[k] == ref[a], "first_diff": first})
+        eq = [p["equal"] for p in res["pairs"]]
+        log("long rep", rep, f"{sum(eq)}/{len(eq)} equal")
+        save("long", res)
 
 
 stages = args.stages.split(",")
