@@ -1709,6 +1709,9 @@ def load_all(args: argparse.Namespace):
     startup_health.stage("warm-up")
     with Heartbeat("warm-up (first decode steps)"):
         engine.warmup()
+    if os.environ.get("EXL3_SWAP_IN", "1") != "0":
+        from exllamav3.util.memory import swap_in_process
+        print(f"qserve: process pages swapped out during the load, read back before READY: {swap_in_process()}", flush=True)
     return engine, template, defaults, model_dir, t0
 
 

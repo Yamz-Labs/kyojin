@@ -656,3 +656,42 @@ def check_host_memory(nbytes: int, what: str):
             f"in host memory (fewer offloaded experts, no --ngram_ram, ...) or set "
             f"EXL3_HOST_MEM_RESERVE_MB=0 to skip this check."
         )
+
+
+def swap_in_process(min_swap_kib: int = 1024) -> dict:
+    """Bring the process's own swapped-out pages back into RAM (Linux). The 95 GB weight load leaves little free RAM, so the kernel
+    swaps out cold pages of the process itself (Python heap, library code, small anonymous maps). The first requests then take a
+    major page fault (about 1 ms each) every time a decode path not yet used touches such a page: 40-130 per request, on text the
+    server has not seen, until all those pages are back. This reads them back once, before READY. Only the maps that report
+    Swap > min_swap_kib are advised (MADV_POPULATE_WRITE for private writable maps, MADV_POPULATE_READ for the rest), so the cost
+    is the swapped size (a few hundred MB, well under a second). Contents are unchanged. Returns stats; never raises."""
+    import ctypes, os, re, time
+    info = {"swap_before_kib": 0, "swap_after_kib": 0, "maps": 0, "seconds": 0.0}
+    try:
+        libc = ctypes.CDLL(None, use_errno = True)
+        t0 = time.perf_counter()
+        todo = []
+        cur = None
+        with open("/proc/self/smaps") as f:
+            for line in f:
+                m = re.match(r"^([0-9a-f]+)-([0-9a-f]+) (\S+) ", line)
+                if m:
+                    cur = [int(m.group(1), 16), int(m.group(2), 16), m.group(3), 0]
+                    todo.append(cur)
+                elif line.startswith("Swap:") and cur is not None:
+                    cur[3] = int(line.split()[1])
+        for lo, hi, perms, swap in todo:
+            if swap < min_swap_kib or perms[0] != "r":
+                continue
+            info["swap_before_kib"] += swap
+            advice = 23 if perms[1] == "w" and perms[3] == "p" else 22      # MADV_POPULATE_WRITE / MADV_POPULATE_READ
+            if libc.madvise(ctypes.c_void_p(lo), ctypes.c_size_t(hi - lo), advice) == 0:
+                info["maps"] += 1
+        info["seconds"] = round(time.perf_counter() - t0, 3)
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSwap:"):
+                    info["swap_after_kib"] = int(line.split()[1])
+    except Exception as e:
+        info["error"] = repr(e)
+    return info
