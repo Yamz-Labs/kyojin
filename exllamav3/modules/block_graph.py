@@ -72,6 +72,7 @@ BLOCK_GRAPH_DRAFT = _env_int("EXL3_BLOCK_GRAPH_DRAFT", 0)
 # input already in place: no copy-in, no output clone (2 copyBuffer launches per block).
 # Runtime-mutable; call purge() after toggling (captured graphs bake in the buffer address).
 from .quant.exl3 import VERIFY_FUSE as _VF   # fused and unfused verify never share a graph
+from .moe_fused import R8 as _R8   # one-launch and split 5..8-row MoE never share a graph
 BG_KNOBS = {"shared_x": os.environ.get("EXL3_BG_SHARED_X", "1") != "0"}
 _shared_x: dict = {}
 
@@ -206,7 +207,7 @@ class BlockGraphRunner:
         history = bool(params.get("recurrent_history", False))
         return (x.device.index, bsz, seqlen, history, id(rsg[0].cache),
                 params.get("layer_instance", 0),
-                tuple(x.shape), str(x.dtype), bool(params.get("dflash_verify")), _VF["on"])
+                tuple(x.shape), str(x.dtype), bool(params.get("dflash_verify")), _VF["on"], _R8["on"])
 
     def _mlp_io_ok(self, x: torch.Tensor, params: dict, draft: bool = False) -> bool:
         """Checks shared by every captured block type: MLP route, TP, device, io, rows. `draft`:

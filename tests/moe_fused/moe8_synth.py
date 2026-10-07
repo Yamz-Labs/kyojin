@@ -44,7 +44,7 @@ def launch(x, variant=VAR):
     R = x.shape[0]
     buf = torch.full((R * H * D + 2 * PAD,), 12345.0, dtype=torch.float, device=dev)
     xv = buf[PAD: PAD + R * H * D].view(1, R, H, D); xv.copy_(x.view(1, R, H, D))
-    torch.ops.mf9.half(xv, fn, fn_scale, upt, up_scale, w_h, router, sgate, wt, svt, ws, 1e-6, 1, 0, variant | 0x1000, *SHAPE)
+    torch.ops.mf9.half(xv, fn, fn_scale, upt, up_scale, w_h, router, sgate, wt, svt, ws, 1e-6, 1, 0, variant, *SHAPE)
     torch.cuda.synchronize()
     assert bool((buf[:PAD] == 12345.0).all()) and bool((buf[PAD + R * H * D:] == 12345.0).all()), 'x canary overwritten'
     assert bool((ws[off[-1]:] == 0xAB).all()), 'workspace tail canary overwritten'
@@ -101,7 +101,7 @@ if os.environ.get('BENCH', '0') != '0':
         return best
     def raw(x):
         R = x.shape[0]; xv = x.clone().view(1, R, H, D)
-        return lambda: torch.ops.mf9.half(xv, fn, fn_scale, upt, up_scale, w_h, router, sgate, wt, svt, ws, 1e-6, 1, 0, VAR | 0x1000, *SHAPE)
+        return lambda: torch.ops.mf9.half(xv, fn, fn_scale, upt, up_scale, w_h, router, sgate, wt, svt, ws, 1e-6, 1, 0, VAR, *SHAPE)
     # real distinct rows (random inputs pick mostly different experts; a decode batch is similar)
     for R in range(1, 9):
         x = base[:R]
