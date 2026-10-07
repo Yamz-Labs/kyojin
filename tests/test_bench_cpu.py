@@ -211,3 +211,31 @@ def test_json_block_matches_the_table(server, monkeypatch, tmp_path):
     for cat in ("prose", "chat"):
         assert f"| Decode, {cat}, 128 tokens, temperature 0 (median of 3) | 20.0 tok/s |" in plain
     assert "| Decode, code, 128 tokens, temperature 0 (median of 0) | n/a tok/s |" in plain
+
+
+def test_compiler_line_behind_a_proxy(monkeypatch):
+    """A proxy answers /health itself (plain text); the engine's reply is under /upstream/<model>/health."""
+    seen = []
+
+    def fake_urlopen(url, timeout=None):
+        seen.append(url)
+        if url.endswith("/upstream/my/model/health"):
+            return io.StringIO(json.dumps({"status": "ok", "hip_compiler": "clang 20", "hip_compiler_warning": None}))
+        return io.StringIO("OK")
+
+    monkeypatch.setattr(bench.urllib.request, "urlopen", fake_urlopen)
+    assert bench.server_compiler("http://h:8080/v1", "my/model") == ("clang 20", None)
+    assert seen == ["http://h:8080/health", "http://h:8080/upstream/my/model/health"]
+    assert bench.server_compiler("http://h:8080/v1") == ("unknown", None)
+
+
+def test_compiler_line_direct(monkeypatch):
+    monkeypatch.setattr(bench.urllib.request, "urlopen",
+                        lambda url, timeout=None: io.StringIO(json.dumps({"hip_compiler": "clang 19"})))
+    assert bench.server_compiler("http://h:8000/v1", "m") == ("clang 19", None)
+
+
+def test_compiler_line_not_reported(monkeypatch):
+    monkeypatch.setattr(bench.urllib.request, "urlopen",
+                        lambda url, timeout=None: io.StringIO(json.dumps({"status": "ok"})))
+    assert bench.server_compiler("http://h:8000/v1", "m") == ("unknown (server does not report it)", None)

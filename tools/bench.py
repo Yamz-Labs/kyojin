@@ -32,6 +32,7 @@ import subprocess
 import sys
 import sysconfig
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -138,14 +139,23 @@ def ram_gib():
     return "unknown"
 
 
-def server_compiler(base):
-    """(compiler line, warning or None) the server reports on /health (the server root, one level above /v1)."""
+def server_compiler(base, model=None):
+    """(compiler line, warning or None) the server reports on /health (the server root, one level above /v1).
+    Behind a proxy such as llama-swap the root /health is the proxy's own, so /upstream/<model>/health is tried next."""
     root = re.sub(r"/v1$", "", base)
-    try:
-        h = json.load(urllib.request.urlopen(root + "/health", timeout=10))
-    except Exception:
-        return "unknown", None
-    return h.get("hip_compiler") or "unknown (server does not report it)", h.get("hip_compiler_warning")
+    paths = ["/health"] + (["/upstream/" + urllib.parse.quote(model) + "/health"] if model else [])
+    answered = False
+    for path in paths:
+        try:
+            h = json.load(urllib.request.urlopen(root + path, timeout=10))
+        except Exception:
+            continue
+        if not isinstance(h, dict):
+            continue
+        answered = True
+        if h.get("hip_compiler"):
+            return h["hip_compiler"], h.get("hip_compiler_warning")
+    return "unknown (server does not report it)" if answered else "unknown", None
 
 
 ROCM_INFO_FILES = ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev")
@@ -295,7 +305,7 @@ def main():
         return f"{x:.1f}" if x is not None else "n/a"
 
     ptok = int(statistics.median(n for n, _ in pf))
-    comp = server_compiler(base)
+    comp = server_compiler(base, model)
     if comp[1]:
         print(comp[1], file=sys.stderr)
     info = {"model": model, "cpu": cpu_name(), "ram": ram_gib(), "gpu_target": gpu_name(), "kernel": platform.release(),
