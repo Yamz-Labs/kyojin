@@ -27,9 +27,10 @@ ARMS = {
  "D1": {"EXL3_GEMV_R_DEC1": "1"},
  "D1c4": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RPB": "4"},
  "D1c4f": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RPB": "4", "EXL3_GEMV_R_CHUNK_FAST": "1"},
+ "D1rm6": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RPB": "4", "EXL3_GEMV_R_CHUNK_FAST": "1", "EXL3_GEMV_R_RM6": "1"},
  "D0": {},
 }
-KEYS = ["EXL3_GEMV_R_DEC1", "EXL3_GEMV_R_RPB", "EXL3_GEMV_R_CHUNK_FAST", "EXL3_GEMV_R_RPB78"]
+KEYS = ["EXL3_GEMV_R_DEC1", "EXL3_GEMV_R_RPB", "EXL3_GEMV_R_CHUNK_FAST", "EXL3_GEMV_R_RPB78", "EXL3_GEMV_R_RM6"]
 def setarm(name):
     for k in KEYS: os.environ.pop(k, None)
     os.environ.update(ARMS[name])
