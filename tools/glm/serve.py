@@ -483,7 +483,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             draft_tokens=proposed, accepted=accepted)
 
     async def health(_: web.Request) -> web.Response:
-        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id})
+        return web.json_response({"status": "ok", "source": "kyojin", "model": model_id,
+                                  **startup_health.compiler_health()})
 
     async def models(_: web.Request) -> web.Response:
         return web.json_response({"object": "list", "data": [
@@ -848,6 +849,7 @@ def main() -> None:
     tune = warm and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
     stages = ["target weights", "drafter weights"] + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
     startup_health.start("glm", stages, args.host, args.port)
+    startup_health.report_compiler()
     try:
         engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft)
         template = Path(args.chat_template or Path(args.model) / "chat_template.jinja").expanduser().read_text(encoding="utf-8")

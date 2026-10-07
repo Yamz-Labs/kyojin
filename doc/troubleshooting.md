@@ -26,6 +26,10 @@ To use another copy of the runtime, set `EXL3_HSA_LIB` to its path before sourci
 
 If `env.sh` prints `[env.sh] WARNING: no libhsa-runtime64.so.1 found`, none of its candidates exist: set `EXL3_ROCM_SDK` or `EXL3_HSA_LIB` as above.
 
+## Prefill is about 20 % slower than the published figures
+
+The server prints one line at start, `[kyojin] HIP kernel compiler: ...`, and `/health` shows the same text (field `hip_compiler`). If it points to `/opt/rocm` or another system compiler and a `WARNING` line follows, the engine built its kernels with the system ROCm instead of the SDK compiler. Run `export EXL3_ROCM_SDK=$(rocm-sdk path --root)` and restart. The kernel cache is keyed by compiler version, so the new start rebuilds the kernels once; the old files stay in `~/.cache/exllamav3` and can be deleted by hand. Please include that line in a performance report.
+
 ## `HIP error: invalid device function` on every kernel
 
 Cause: ROCm 6.4 or older. It has no code object for gfx1151.

@@ -17,7 +17,7 @@ hf download yamz-labs/GLM-5.3-Flash-EXL3-Yamz --local-dir ./glm-pack
 python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
 curl http://localhost:8000/v1/models
 ```
-In every new shell, before serving: activate the venv, run `export EXL3_ROCM_SDK=$(rocm-sdk path --root)` again, then `source tools/strix_halo/env.sh`. Without the export, `env.sh` falls back to a system ROCm that may not match the wheel (`undefined symbol: hsa_ext_image_create_v2`).
+In every new shell, before serving: activate the venv, run `export EXL3_ROCM_SDK=$(rocm-sdk path --root)` again, then `source tools/strix_halo/env.sh`. The engine builds some of its GPU kernels on first use, and the server prints at start which compiler it used. The SDK compiler from the export is the fast one; the server also finds it by itself when `rocm-sdk` is installed in the same venv, but the export is the safe way. If the log shows a warning that the system compiler is in use, prefill can be about 20 % slower, so export the line above and restart. Without the export, `env.sh` falls back to a system ROCm that may not match the wheel (`undefined symbol: hsa_ext_image_create_v2`).
 If a step fails, see [troubleshooting.md](troubleshooting.md).
 Status: build and MiMo serving were verified from a fresh clone on a second Strix Halo machine (build in 8 to 10 minutes). Both published packs were checked there against `SHA256SUMS` and served (one chat request each); `env.sh --check` has not been run there yet. The first request after a build is slow while the kernels warm up.
 
