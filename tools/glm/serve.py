@@ -21,6 +21,8 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
+# serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
+from serve_metrics import Metrics
 
 DEFAULT_MODEL = "~/models/glm53-exl3-td205"
 EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
@@ -460,10 +462,25 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
 
 def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
-    queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue]] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
+    processing = 0  # admitted requests; closure, app config is immutable after startup
     app = web.Application(client_max_size=16 * 1024**2)
-    app.update(engine=engine, model_id=model_id, template=template, queue=queue)
+    app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
+
+    def observe(st: dict[str, Any], prompt_tokens: int) -> None:
+        # The MTP window is a fixed num_draft_tokens per round, so rounds = proposed / window
+        # (exact except for a final window truncated by max_new_tokens). No generator -> no rounds.
+        num_draft = int(getattr(getattr(engine, "greedy_generator", None), "num_draft_tokens", 0) or 0)
+        accepted = int(st.get("accepted_draft_tokens", 0))
+        rejected = int(st.get("rejected_draft_tokens", 0))
+        proposed = accepted + rejected
+        app["metrics"].observe(
+            prompt_tokens=prompt_tokens, cached=int(st.get("cached_tokens", 0)),
+            predicted=int(st.get("new_tokens", 0)),
+            prefill_s=float(st.get("time_prefill") or 0.0), generate_s=float(st.get("time_generate") or 0.0),
+            drafts=proposed // num_draft if proposed and num_draft else 0,
+            draft_tokens=proposed, accepted=accepted)
 
     async def health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "source": "kyojin", "model": model_id})
@@ -473,28 +490,35 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             {"id": model_id, "object": "model", "created": 0, "owned_by": "local"}]})
 
     async def worker() -> None:
+        nonlocal processing
         while True:
-            body, out = await queue.get()
+            body, out, request_stats = await queue.get()
             cancel = body.get("_cancel")
             if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
                 out.put_nowait(None)
                 queue.task_done()
                 continue
             store = getattr(engine, "slot_store", None)
+            processing += 1  # admitted: counted from the dequeue, incl. lock and slot restore
             try:
                 async with lock:
                     if store is not None:
                         store.busy = True
+                    engine.last_stats = {}  # a cancelled or failed job must not re-count the previous one
                     async for delta in engine.generate(
                         body["_prompt"],
                         max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
                         top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
                         cancel=body.get("_cancel")):
                         out.put_nowait(delta)
+                    request_stats.update(getattr(engine, "last_stats", None) or {})
+                    if request_stats:
+                        observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
                     out.put_nowait(None)
             except Exception as exc:
                 out.put_nowait(exc)
             finally:
+                processing -= 1
                 if store is not None:
                     store.busy = False
                 queue.task_done()
@@ -542,6 +566,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             body["_stop"] = [stops] if isinstance(stops, str) else list(stops)
             prompt = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
             prompt_tokens = engine.count_tokens(prompt)
+            body["_prompt_tokens"] = prompt_tokens
             body["_room"] = reply_room(engine, prompt_tokens)
             body["_prompt"] = prompt
             for key in ("temperature", "top_p"):
@@ -560,8 +585,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             return base | {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
         out: asyncio.Queue = asyncio.Queue()
+        request_stats: dict[str, Any] = {}
         cancel = body["_cancel"] = asyncio.Event()
-        await queue.put((body, out))
+        await queue.put((body, out, request_stats))
         prefix = "<think>" if opens_thinking(prompt) else ""
 
         def deltas() -> AsyncIterator[str]:
@@ -581,7 +607,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
         def timings(raw: str) -> dict[str, Any]:
             # llama.cpp names: the swap orchestrator reads cache_n as the verdict of a KV restore
-            st = getattr(engine, "last_stats", None) or {}
+            st = request_stats
             cache_n = int(st.get("cached_tokens", 0))
             pre, gen = st.get("time_prefill") or 0.0, st.get("time_generate") or 0.0
             n = int(st.get("new_tokens", 0))
@@ -715,8 +741,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             raise web.HTTPBadRequest(reason=str(exc)) from exc
 
         out: asyncio.Queue = asyncio.Queue()
+        request_stats: dict[str, Any] = {}
         cancel = job["_cancel"] = asyncio.Event()
-        await queue.put((job, out))
+        await queue.put((job, out, request_stats))
         text = ""
         try:
             async for item in drain(request, cancel, out):
@@ -730,7 +757,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             cancel.set()
             raise
         text, stopped = stop_text(text, job["_stop"])
-        st = getattr(engine, "last_stats", None) or {}
+        st = request_stats
         return web.json_response({
             "id": f"cmpl-{uuid.uuid4().hex}", "object": "completion", "created": int(time.time()),
             "model": model_id, "content": text,
@@ -764,11 +791,26 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             return web.json_response({"error": {"code": 400, "message": f"{type(exc).__name__}: {exc}", "type": "invalid_request_error"}},
                                      status=400)
 
+    async def metrics_view(_: web.Request) -> web.Response:
+        # used_tokens = pages referenced by active jobs: in-flight tokens, retained cache excluded.
+        # get_cache_stats is memoized on the page tables; the except covers fake engines and a
+        # page-table mutation in the worker thread mid-walk.
+        gen = getattr(engine, "generator", None) or getattr(engine, "greedy_generator", None)
+        try:
+            cs = gen.get_cache_stats()
+            kv = cs["used_tokens"] / cs["max_tokens"] if cs.get("max_tokens") else 0.0
+        except Exception:                                        # noqa: BLE001
+            kv = 0.0
+        return web.Response(body=app["metrics"].render(
+            processing=processing, deferred=queue.qsize(), kv_ratio=kv),
+            headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})
+
     if getattr(engine, "slot_store", None) is not None:
         app.router.add_get("/slots", slots)
         app.router.add_post("/slots/{id}", slot_action)
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models)
+    app.router.add_get("/metrics", metrics_view)
     app.router.add_post("/v1/chat/completions", completions)
     app.router.add_post("/apply-template", apply_template)
     app.router.add_post("/completion", completion)

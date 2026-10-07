@@ -16,7 +16,8 @@ file). Each request starts with a unique tag so no prompt cache can answer it. T
 after a build or a first launch is slow while the kernels tune: a short warm-up runs first, and
 you should run the script twice on a fresh install.
 
-Prints one Markdown block to paste into a benchmark report issue.
+Prints one Markdown block to paste into a benchmark report issue. With --json, a fenced JSON block with the
+same measurements (and every run) follows it, so results can be collected into a table.
 """
 import argparse
 import json
@@ -184,6 +185,7 @@ def main():
     ap.add_argument("--reps", type=int, default=3, help="runs per measurement (default 3)")
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--corpus", help="text file for the prefill prompt (default: Markdown files of this repository)")
+    ap.add_argument("--json", action="store_true", help="also print the measurements as a fenced JSON block")
     a = ap.parse_args()
     base = a.base.rstrip("/")
     reps = max(1, min(a.reps, 3))
@@ -224,30 +226,44 @@ def main():
                 dec.setdefault(cat, []).append(v)
 
     def med(xs):
-        return f"{statistics.median(xs):.1f}" if xs else "n/a"
+        return round(statistics.median(xs), 1) if xs else None
+
+    def fmt(x):
+        return f"{x:.1f}" if x is not None else "n/a"
 
     ptok = int(statistics.median(n for n, _ in pf))
+    info = {"model": model, "cpu": cpu_name(), "ram": ram_gib(), "gpu_target": gpu_name(), "kernel": platform.release(),
+            "rocm": rocm_version(), "server": base, "date": time.strftime('%Y-%m-%d')}
+    prefill_med = med([t for _, t in pf])
     lines = [
         "### Kyojin benchmark",
         "",
-        f"- Model: `{model}`",
-        f"- CPU: {cpu_name()}",
-        f"- RAM: {ram_gib()}",
-        f"- GPU target: {gpu_name()}",
-        f"- Kernel: {platform.release()}",
-        f"- ROCm: {rocm_version()}",
-        f"- Server: {base}",
-        f"- Date: {time.strftime('%Y-%m-%d')}",
+        f"- Model: `{info['model']}`",
+        f"- CPU: {info['cpu']}",
+        f"- RAM: {info['ram']}",
+        f"- GPU target: {info['gpu_target']}",
+        f"- Kernel: {info['kernel']}",
+        f"- ROCm: {info['rocm']}",
+        f"- Server: {info['server']}",
+        f"- Date: {info['date']}",
         "",
         "| Measurement | Result |",
         "|---|---|",
-        f"| Prefill, ~{ptok} tokens (median of {len(pf)}) | {med([t for _, t in pf])} tok/s |",
+        f"| Prefill, ~{ptok} tokens (median of {len(pf)}) | {fmt(prefill_med)} tok/s |",
     ]
     for cat in DECODE_PROMPTS:
         xs = dec.get(cat, [])
-        lines.append(f"| Decode, {cat}, {a.max_tokens} tokens, temperature 0 (median of {len(xs)}) | {med(xs)} tok/s |")
+        lines.append(f"| Decode, {cat}, {a.max_tokens} tokens, temperature 0 (median of {len(xs)}) | {fmt(med(xs))} tok/s |")
     lines += ["", "Method: prefill = prompt tokens / wall time (1 output token); decode = (tokens - 1) / streaming time. "
                   "Same prompts as the numbers in the README."]
+    if a.json:
+        result = info | {
+            "prefill": {"prompt_tokens": ptok, "max_tokens": 1, "temperature": 0, "tok_s": prefill_med,
+                        "runs": [round(t, 1) for _, t in pf]},
+            "decode": {cat: {"max_tokens": a.max_tokens, "temperature": 0, "tok_s": med(dec.get(cat, [])),
+                             "runs": [round(v, 1) for v in dec.get(cat, [])]} for cat in DECODE_PROMPTS},
+        }
+        lines += ["", "```json", json.dumps(result, indent=2), "```"]
     print("\n".join(lines))
 
 

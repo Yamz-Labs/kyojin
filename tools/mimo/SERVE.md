@@ -43,6 +43,12 @@ top-level config does not carry `max_position_embeddings` — the GLM fix.
 - `GET /health` — `{"status","model","generator","spec_gate"}` once ready (load progress while starting: see below); with the gate on, `spec_gate`
   carries the live counters `n_spec n_plain n_off n_shadow n_probe_fail t_plain t_spec
   tok_round`. Useful while tuning.
+- `GET /metrics` — Prometheus text (llama.cpp `llamacpp:*` names) for scraping. Counters
+  accumulate when a request completes; `requests_processing`, `requests_deferred` and
+  `kv_cache_usage_ratio` are read live. `spec_decode_num_drafts_total` counts the engine's
+  decode steps (one verification round each while speculating), an upper bound when
+  `--spec-gate` falls back to plain. A request cancelled mid-stream is not counted in this
+  first version.
 
 ## Start-up progress on `/health`
 
