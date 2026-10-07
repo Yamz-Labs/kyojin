@@ -1171,6 +1171,7 @@ class MLAttention(Module):
             return self._attend_sparse(
                 q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache, block_table, indices, qc,
                 pool_len = max(host_seqlens) + seqlen,
+                pool_lens = [int(h) + seqlen for h in host_seqlens],
             )
 
         if use_mha:
@@ -1319,7 +1320,7 @@ class MLAttention(Module):
 
 
     def _attend_sparse(self, q_lat, q_pe, bsz, seqlen, params, ckv_cache, kpe_cache,
-                       block_table, indices, qc, pool_len = 0):
+                       block_table, indices, qc, pool_len = 0, pool_lens = None):
         """Gathered attention over the top-k selected latent rows (V3.2-on-MLA form of
         dsa_attn: no window, no sinks, V is the latent). The chunk's own rows are already in
         the paged pool (fp16 or packed-quantized; the packed form is dequantized online by the
@@ -1334,19 +1335,36 @@ class MLAttention(Module):
         R = bsz * seqlen
         D_r = self.qk_rope_head_dim
 
-        # A single-row block table is shared by every query row inside dsa_attn (stride-0
-        # lookup), so bsz 1 never materializes the (R, pages) expansion which would other-
-        # wise be the one sparse-path transient that grows with context (pages)
-        bt = block_table if bsz == 1 or seqlen == 1 \
-            else block_table.repeat_interleave(seqlen, dim = 0)
-        o_lat = dsa_attn(
-            q_lat, ckv_cache, kpe_cache, bt,
-            indices = indices, k_len = indices.shape[1],
-            scale = self.sm_scale, page_size = ckv_cache.shape[1],
-            q_pe = q_pe.reshape(R, H, D_r), out_latent = True,
-            qc = qc,   # packed latent pages read online (scales, bits), or staged for prefill
-            pool_len = pool_len,   # entries the selection can reference (context, not pool)
-        )
+        if bsz > 1 and seqlen <= MAX_DECODE_QLEN and ROW_INV["on"] and os.environ.get("EXL3_DSA_ATTN_ROWLOOP", "1") != "0":
+            # Row invariance (issue 28; EXL3_DSA_ATTN_ROWLOOP=0 = the batched call): the gathered-attention launcher picks its kernel and split layout from the row
+            # count (R <= 4 the dt kernel, R <= 8 the split kernel with another tile, more rows one pass), so the same
+            # job rounds differently next to another job than alone. One call per job, exactly the solo call.
+            outs = []
+            for b in range(bsz):
+                r0, r1 = b * seqlen, (b + 1) * seqlen
+                outs.append(dsa_attn(
+                    q_lat[:, r0:r1].contiguous(), ckv_cache, kpe_cache, block_table[b : b + 1],
+                    indices = indices[r0:r1], k_len = indices.shape[1],
+                    scale = self.sm_scale, page_size = ckv_cache.shape[1],
+                    q_pe = q_pe.reshape(R, H, D_r)[r0:r1], out_latent = True,
+                    qc = qc,
+                    pool_len = pool_lens[b] if pool_lens is not None else pool_len,
+                ))
+            o_lat = torch.cat(outs, dim = 1)
+        else:
+            # A single-row block table is shared by every query row inside dsa_attn (stride-0
+            # lookup), so bsz 1 never materializes the (R, pages) expansion which would other-
+            # wise be the one sparse-path transient that grows with context (pages)
+            bt = block_table if bsz == 1 or seqlen == 1 \
+                else block_table.repeat_interleave(seqlen, dim = 0)
+            o_lat = dsa_attn(
+                q_lat, ckv_cache, kpe_cache, bt,
+                indices = indices, k_len = indices.shape[1],
+                scale = self.sm_scale, page_size = ckv_cache.shape[1],
+                q_pe = q_pe.reshape(R, H, D_r), out_latent = True,
+                qc = qc,   # packed latent pages read online (scales, bits), or staged for prefill
+                pool_len = pool_len,   # entries the selection can reference (context, not pool)
+            )
         if params.get("_mla_defer_post"):
             return o_lat
         return self.attend_post(o_lat, bsz, seqlen, params)

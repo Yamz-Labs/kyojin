@@ -7,6 +7,9 @@ One model load, serve defaults (SPEED_ENV of tools/glm/serve.py, num_draft 2). S
            op (execution order) whose output differs; graphs off so every op is hooked
   e2e    : greedy tokens of N prompts alone and in pairs (pairs also against a partner with a wider block table)
   repeat : the paired run again K times, ids must repeat
+  long   : prompts above index_topk (--long-lens), solo against paired, every run on a new Generator (fresh prefill);
+           arms: off, on, old (ROW_INV on, EXL3_DSA_ATTN_ROWLOOP=0). A stage name may carry its own lengths: long@2600/4000/7000
+  cachex : fresh against prompt-cache-hit prefill, alone and in pairs; state3: the same down to the first differing op
   speed  : 2 jobs together, wall time per token, ROW_INV off against on, interleaved, same load
 Arms: ROW_INV is flipped in process (ROW_INV["on"]), graphs purged at every flip.
 Run it alone on the GPU. Writes one json per stage into --out.
@@ -26,10 +29,13 @@ ap.add_argument("--ops-pairs", default="0:1,2:7,4:5")
 ap.add_argument("--mlp-layer", type=int, default=26)
 ap.add_argument("--prompt", type=int, default=4)
 ap.add_argument("--solo-passes", type=int, default=2)
-ap.add_argument("--corpus", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus.txt"))
+ap.add_argument("--corpus", default="", help="text file for the long stage; default: built by make_corpus.py (deterministic, no files)")
 ap.add_argument("--long-lens", default="2600,4000,7000")
+ap.add_argument("--ops-warm", type=int, default=0, help="ops stage: decode each captured set once first, so the captured run is a prompt-cache hit (0: fresh solo, then cached pairs)")
+ap.add_argument("--ops-long", default="", help="ops stage: comma list of long prompt lengths appended to the prompt list as ids N, N+1, ... (N = len(ALL_PROMPTS))")
 ap.add_argument("--long-tokens", type=int, default=64)
 ap.add_argument("--long-reps", type=int, default=2)
+ap.add_argument("--long-cache", type=int, default=0, help="1: one Generator for the whole long stage (prompt-cache hits between runs)")
 args = ap.parse_args()
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -101,7 +107,9 @@ log("loaded", round(time.perf_counter() - t0, 1), "s; env", {k: v for k, v in os
 
 
 def set_arm(arm):
-    ROW_INV["on"] = arm == "on"
+    """off: ROW_INV off; on: ROW_INV on (default); old: ROW_INV on without the per-job sparse attention call (EXL3_DSA_ATTN_ROWLOOP=0)."""
+    ROW_INV["on"] = arm in ("on", "old")
+    os.environ["EXL3_DSA_ATTN_ROWLOOP"] = "0" if arm == "old" else "1"
     BG.purge()
 
 
@@ -248,6 +256,14 @@ def install_hooks():
     def attn_w(*a, **k):
         o = f0(*a, **k); cap("mla_decode", o); return o
     MA.mla_attn_triton_decode = attn_w
+    from exllamav3.modules.attention_fn import dsa_triton as DT
+    da0 = DT.dsa_attn
+    def da_w(q, *a, **k):
+        o = da0(q, *a, **k)
+        if CAP["on"]:
+            cap("dsa_attn_q", q); cap("dsa_attn_idx", k["indices"]); cap("dsa_attn_out", o)
+        return o
+    DT.dsa_attn = da_w
     fwd0 = model.forward
     def fwd(*a, **k):
         x = a[0] if a else k.get("input_ids")
@@ -309,6 +325,14 @@ def compare(solo, paired, idx):
     return out, missing
 
 
+_OPS_LONG = []
+def ops_prompt(i):
+    """Prompt i of the ops stage: ALL_PROMPTS, then the --ops-long prompts."""
+    if i < len(ALL_PROMPTS): return enc(ALL_PROMPTS[i])
+    if not _OPS_LONG: _OPS_LONG.extend(long_prompts([int(x) for x in args.ops_long.split(",")]))
+    return _OPS_LONG[i - len(ALL_PROMPTS)]
+
+
 def stage_ops():
     install_hooks()
     BG.BLOCK_GRAPH_ENABLED = False
@@ -319,13 +343,15 @@ def stage_ops():
     solo = {}
     for i in sorted({i for p in pairs for i in p}):
         BG.purge()
-        solo[i] = capture_run([enc(ALL_PROMPTS[i])], 1)
+        if args.ops_warm: new_gen(); decode([(ops_prompt(i), 6, True)])
+        solo[i] = capture_run([ops_prompt(i)], 1)
         log("ops solo", i, "ids", solo[i][2].tolist(), "seqlens", solo[i][3], "n_ops", len(solo[i][0]))
     for arm in ARMS:
         set_arm(arm); BG.BLOCK_GRAPH_ENABLED = False
         rows = []
         for (i, j) in pairs:
-            rec, lg, ids, sl = capture_run([enc(ALL_PROMPTS[i]), enc(ALL_PROMPTS[j])], 2)
+            if args.ops_warm: new_gen(); decode([(ops_prompt(i), 6, True)]); decode([(ops_prompt(i), 6, True), (ops_prompt(j), 6, True)])
+            rec, lg, ids, sl = capture_run([ops_prompt(i), ops_prompt(j)], 2)
             for idx, k in enumerate((i, j)):
                 srec, slg, sids, ssl = solo[k]
                 same_in = bool(torch.equal(ids[idx], sids[0])) and sl[idx] == ssl[0]
@@ -809,10 +835,13 @@ def stage_speed():
             save("speed", res)
 
 
-def stage_long():
-    """Prompts above index_topk (2048): the DSA sparse path. Solo ids (two passes) against paired ids, mixed lengths."""
-    corpus = open(args.corpus).read()
-    want = [int(x) for x in args.long_lens.split(",")]
+def long_prompts(want):
+    """One prompt per wanted token count, cut from the corpus (a file, or the deterministic generator)."""
+    if args.corpus:
+        corpus = open(args.corpus).read()
+    else:
+        from make_corpus import build
+        corpus = build(max(180000, int(sum(want) * 3.6) + 4000 * len(want)))
     P = []; off = 0
     for w in want:
         c = int(w * 3.5); txt = None
@@ -821,27 +850,152 @@ def stage_long():
             n = int(enc(txt).shape[-1])
             c = int(c * w / max(n, 1))
         P.append(enc(txt)); off += c + 1000
+    return P
+
+
+_PLAN = []
+def plan_on():
+    """Record (batch, rows, cache_seqlens) of every target forward with more than NDT + 1 rows (the prefill chunk plan)."""
+    if getattr(model, "_plan_wrapped", False): return
+    model._plan_wrapped = True
+    f0 = model.forward
+    def fwd(*a, **k):
+        x = a[0] if a else k.get("input_ids")
+        p = k.get("params") or {}
+        if x.shape[-1] > NDT + 1 and not torch.cuda.is_current_stream_capturing():
+            cs = p.get("cache_seqlens")
+            _PLAN.append([int(x.shape[0]), int(x.shape[-1]), cs.tolist() if cs is not None else None])
+        return f0(*a, **k)
+    model.forward = fwd
+
+
+def first_diff(a, b):
+    return next((x for x in range(min(len(a), len(b))) if a[x] != b[x]), None)
+
+
+def stage_long():
+    """Prompts above index_topk (2048): the DSA sparse path. Solo ids (--solo-passes passes, at least 4) against paired ids.
+    Every run starts on a new Generator (empty page table): a prompt-cache hit restores a recurrent-state checkpoint and
+    prefills only the tail, which is not bit-equal to a fresh prefill (a solo pass 0 differs from passes 1.. for that
+    reason, see stage_cachex), so cached and fresh runs must not be compared with each other. --long-cache 1 keeps one
+    Generator for the whole stage (the old behaviour; pass 0 is then reported on its own)."""
+    plan_on()
+    want = [int(x) for x in args.long_lens.split(",")]
+    P = long_prompts(want)
     lens = [int(p.shape[-1]) for p in P]
     log("long prompt tokens", lens)
+    for arm in ARMS:
+        long_arm(arm, P)
+
+
+def long_arm(arm, P):
+    lens = [int(p.shape[-1]) for p in P]
     short = enc(ALL_PROMPTS[0])
     N = args.long_tokens
-    set_arm("on")
-    solo = [[decode([(p, N, True)])[0][0] for p in P + [short]] for _ in range(2)]
-    stable = [solo[0][i] == solo[1][i] for i in range(len(P) + 1)]
-    log("long solo stable", stable)
-    ref = solo[0]
+    set_arm(arm)
+    def run(items):
+        if not args.long_cache: new_gen()
+        _PLAN.clear()
+        tk, _ = decode(items)
+        return tk, list(_PLAN)
     items = P + [short]
-    res = {"lens": lens + [int(short.shape[-1])], "solo_stable": stable, "pairs": []}
+    solo = []; plans = []
+    for _ in range(max(args.solo_passes, 4)):
+        row = []; prow = []
+        for p in items:
+            tk, pl = run([(p, N, True)]); row.append(tk[0]); prow.append(pl)
+        solo.append(row); plans.append(prow)
+    ref = solo[-1]
+    first = 0 if not args.long_cache else 1   # with a shared Generator pass 0 is the only fresh one
+    stable = [all(solo[k][i] == ref[i] for k in range(first, len(solo))) for i in range(len(items))]
+    cold = [first_diff(solo[0][i], ref[i]) for i in range(len(items))]
+    log("long", arm, "solo stable", stable, "pass 0 first diff vs last", cold)
+    res = {"arm": arm, "lens": lens + [int(short.shape[-1])], "fresh_runs": not args.long_cache, "solo_stable": stable,
+           "solo_pass0_first_diff": cold, "solo_plans": {"pass0": plans[0], "pass1": plans[1]}, "pairs": []}
     pairs = [(i, j) for i in range(len(items)) for j in range(i + 1, len(items))]
     for rep in range(args.long_reps):
         for i, j in pairs:
-            tk, _ = decode([(items[i], N, True), (items[j], N, True)])
+            tk, pl = run([(items[i], N, True), (items[j], N, True)])
             for k, a in enumerate((i, j)):
-                first = next((x for x in range(min(len(tk[k]), len(ref[a]))) if tk[k][x] != ref[a][x]), None)
-                res["pairs"].append({"rep": rep, "pair": [i, j], "prompt": a, "equal": tk[k] == ref[a], "first_diff": first})
+                fd = first_diff(tk[k], ref[a])
+                res["pairs"].append({"rep": rep, "pair": [i, j], "prompt": a, "equal": tk[k] == ref[a], "first_diff": fd,
+                                     "plan": pl if rep == 0 and fd is not None else None})
+                if fd is not None: log("long DIFF", arm, "rep", rep, "pair", (i, j), "prompt", a, "len", res["lens"][a], "first_diff", fd)
         eq = [p["equal"] for p in res["pairs"]]
-        log("long rep", rep, f"{sum(eq)}/{len(eq)} equal")
-        save("long", res)
+        log("long", arm, "rep", rep, f"{sum(eq)}/{len(eq)} equal")
+        save("long_" + arm, res)
+
+
+def stage_speedlong():
+    """Decode speed on the sparse path: two jobs of --long-lens together and the first alone, arms interleaved, --reps reps,
+    prompts cached after the first pass (prefill excluded from the timing: decode wall time per generated token)."""
+    P = long_prompts([int(x) for x in args.long_lens.split(",")][:2]); N = args.tokens
+    res = {"paired": {a: [] for a in ARMS}, "solo": {a: [] for a in ARMS}}
+    for a in ARMS:
+        set_arm(a); decode([(P[0], 16, True), (P[1], 16, True)]); decode([(P[0], 16, True)])
+    for rep in range(args.reps):
+        for a in ARMS:
+            set_arm(a)
+            tk, dt = decode([(P[0], N, True), (P[1], N, True)]); res["paired"][a].append(sum(len(x) for x in tk) / dt)
+            tk, dt = decode([(P[0], N, True)]); res["solo"][a].append(len(tk[0]) / dt)
+            log("speedlong rep", rep, a, "paired agg tok/s", round(res["paired"][a][-1], 2), "solo tok/s", round(res["solo"][a][-1], 2))
+            save("speedlong", res)
+
+
+def stage_state3():
+    """Which of fresh / cached / paired moves the recurrent state and the ops (issue 28). Captures the first verify
+    forward of job i in: A fresh solo, B cached solo, B2 cached solo again, D cached next to a fresh short job,
+    E fresh pair, G cached pair (both warmed). Pairwise: number of differing ops, first differing op, max |d| of the state."""
+    install_hooks()
+    BG.BLOCK_GRAPH_ENABLED = False
+    MA.MLAttention.bc_mla_step = lambda self, *a, **k: None
+    set_arm("on"); BG.BLOCK_GRAPH_ENABLED = False
+    out = []
+    for i in [int(x) for x in args.ops_pairs.split(",")]:
+        p = ops_prompt(i); sh = ops_prompt(0)
+        new_gen(); A = capture_run([p], 1); B = capture_run([p], 1); B2 = capture_run([p], 1)
+        new_gen(); decode([(p, 6, True)]); D = capture_run([p, sh], 2)
+        new_gen(); E = capture_run([p, sh], 2)
+        new_gen(); decode([(p, 6, True), (sh, 6, True)]); G = capture_run([p, sh], 2)
+        runs = {"A": (A, 0), "B": (B, 0), "B2": (B2, 0), "D": (D, 0), "E": (E, 0), "G": (G, 0)}
+        row = {"prompt": i}
+        for x, y in (("A", "B"), ("B", "B2"), ("B", "D"), ("A", "E"), ("B", "G"), ("D", "G"), ("A", "G")):
+            diffs, _ = compare(runs[x][0][0], runs[y][0][0], 0)
+            st = [d for d in diffs if d[0] == "kda:in_state#0"]
+            row[x + "~" + y] = {"n_diff": len(diffs), "first": diffs[0][:3] if diffs else None, "state": st[0][2] if st else 0}
+        out.append(row); log("state3", row); save("state3", out)
+
+
+def new_gen():
+    """A Generator with an empty page table: no prompt-cache hit, no restored recurrent state (same model, same caches)."""
+    global gen
+    gen = Generator(model=model, cache=cache, tokenizer=tok, draft_model=draft_model, draft_cache=draft_cache,
+                    num_draft_tokens=NDT)
+    return gen
+
+
+def stage_cachex():
+    """Fresh prefill against prompt-cache hit, alone and in pairs: which of the two moves the ids (issue 28).
+    Per prompt: F fresh solo, C1 C2 cached solo, PF fresh pair with the short partner, PC the same pair cached,
+    PM pair where only the long prompt is cached. First differing token against F and against C2."""
+    plan_on()
+    want = [int(x) for x in args.long_lens.split(",")]
+    P = long_prompts(want)
+    short = enc(ALL_PROMPTS[0]); N = args.long_tokens
+    set_arm("on")
+    res = []
+    for p in P:
+        L = int(p.shape[-1]); o = {"len": L}
+        new_gen(); F = decode([(p, N, True)])[0][0]
+        C1 = decode([(p, N, True)])[0][0]; C2 = decode([(p, N, True)])[0][0]
+        new_gen(); PF = decode([(p, N, True), (short, N, True)])[0][0]
+        PC = decode([(p, N, True), (short, N, True)])[0][0]
+        new_gen(); decode([(p, N, True)]); PM = decode([(p, N, True), (short, N, True)])[0][0]
+        new_gen(); PF2 = decode([(p, N, True), (short, N, True)])[0][0]
+        for nm, t in (("C1", C1), ("C2", C2), ("PF", PF), ("PC", PC), ("PM", PM), ("PF2", PF2)):
+            o[nm + "_vs_F"] = first_diff(t, F); o[nm + "_vs_C2"] = first_diff(t, C2)
+        o["F_head"] = F[:16]; o["C2_head"] = C2[:16]; o["PC_head"] = PC[:16]
+        res.append(o); log("cachex", o); save("cachex", res)
 
 
 stages = args.stages.split(",")
@@ -849,7 +1003,10 @@ stages = args.stages.split(",")
 assert not ({"ops", "det", "pre", "pre2", "seq", "seq2", "seq3"} & set(stages)) or stages[-1] in ("ops", "det", "pre", "pre2", "seq", "seq2", "seq3"), "run the ops stage last"
 for st in stages:
     try:
-        log("stage", st); globals()["stage_" + st]()
+        log("stage", st)
+        if "@" in st:   # long@2600/4000/7000 : the long stage on its own prompt lengths (own corpus offsets)
+            st, args.long_lens = st.split("@", 1); args.long_lens = args.long_lens.replace("/", ",")
+        globals()["stage_" + st]()
     except Exception:
         log("ERROR", st, traceback.format_exc()[-1800:])
 log("DONE")
