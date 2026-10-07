@@ -36,6 +36,7 @@ template <class S7, bool TM, int OCC, int INL, int ABL = 0> void launch7(const a
                                 at::Tensor& ws, double rms_eps, int native, int R, int vmask, hipStream_t stream)
 {
     using DM = mf::Dm<S7>;
+    TORCH_CHECK(R >= 1 && R <= mf::TRows<S7>::v, "mf9: rows exceed this instantiation");
     const auto off = exl3_moe_fused_ws_offsets(S7::D, S7::H, S7::LR, S7::NEXP, S7::TOPK, S7::INTER, S7::RB, S7::SB);
     TORCH_CHECK(ws.numel() >= off.back(), "mf9: workspace too small");
     const bool gs = fn_scale.numel() != DM::MR;
@@ -87,12 +88,24 @@ void mf9_half(at::Tensor& x, const at::Tensor& fn, const at::Tensor& fn_scale, c
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(x.dtype() == at::kFloat && x.is_contiguous() && x.dim() == 4 && x.size(2) == H && x.size(3) == D, "mf9: x");
     const int R = (int) (x.size(0) * x.size(1));
-    TORCH_CHECK(R >= 1 && R <= mf::MAXR, "mf9: rows 1..4");
+    TORCH_CHECK(R >= 1 && R <= mf::MAXRT, "mf9: rows 1..8");
     TORCH_CHECK(fn.dtype() == at::kChar && upt.dtype() == at::kChar && fn_scale.dtype() == at::kFloat && up_scale.dtype() == at::kFloat, "mf9: dtypes");
     TORCH_CHECK(w_h.dtype() == at::kHalf && router.dtype() == at::kHalf && sgate.dtype() == at::kHalf && ws.dtype() == at::kByte, "mf9: dtypes 2");
     TORCH_CHECK(native == 0 || native == 1, "mf9: native flag");
 #define L7A(SH, TMV, OCCV, INLV, ABLV) launch7<SH, TMV, OCCV, INLV, ABLV>(x, fn, fn_scale, upt, up_scale, w_h, router, sgate, wt, svt, ws, rms_eps, (int) native, R, (int) (variant & 0xffff), stream)
 #define L7(SH, TMV, OCCV, INLV) launch7<SH, TMV, OCCV, INLV>(x, fn, fn_scale, upt, up_scale, w_h, router, sgate, wt, svt, ws, rms_eps, (int) native, R, (int) (variant & 0xffff), stream)
+    // moe8: 5..8 rows in one launch (wide instantiation: row windows in the front end, units of <= 4 rows in the back end). Served variant only (six stage launches; the one-kernel variants spill at 8 rows).
+    if (R > mf::MAXR)
+    {
+        TORCH_CHECK(!timing, "mf9: wide launches (rows 5..8) have no timing build");
+        const int64_t vv = variant & 0x1f0000;
+        TORCH_CHECK(vv == 0x160000, "mf9: wide launches (rows 5..8) exist for the default variant 0x160000 (six stage launches) only");
+#define XW(SH) if (Match7<mf::Wide<SH>>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) { L7(mf::Wide<SH>, false, 4, 1); return; }
+        XW(mf::QwenShape) XW(mf::SmallTestShape) XW(mf::QwenK3S4) XW(mf::QwenK3S5) XW(mf::QwenK4S4) XW(mf::QwenK4S5)
+        XW(mf::SmallK3S4) XW(mf::SmallK3S5) XW(mf::SmallK4S4) XW(mf::SmallK4S5)
+#undef XW
+        TORCH_CHECK(false, "mf9: shape not instantiated for wide launches");
+    }
 #define X7(SH) if (Match7<SH>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) { \
         if (variant & 0x100000) { TORCH_CHECK((variant & 0x1f0000) == 0x160000 && !timing, "mf9: split launches (0x100000) need variant 0x160000 and no timing"); L7(SH, false, 4, 1); return; }   /* six stage launches, no grid barrier */ \
         if ((variant & 0x80000) && (variant & 0x70000) == 0x60000) { if (timing) L7(SH, true, 3, 1); else L7(SH, false, 3, 1); return; }   /* one block per WGP */ \

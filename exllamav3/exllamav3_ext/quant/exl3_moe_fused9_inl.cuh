@@ -345,11 +345,14 @@ __device__ __forceinline__ void ph_topk_tail9(const Params& p, Smem<S>& s)
     __syncthreads();
     if (threadIdx.x == 0)
     {
+        if constexpr (TRows<S>::v > MAXR) { s.ngroups = build_units_wide(s.head, NA, R, s.gstart, s.urows); }   // moe8: units of <= MAXR rows, shared expert = ceil(R / MAXR) units
+        else {
         int g = 0;
         for (int q = 0; q < NA; ++q) if (s.head[q]) s.gstart[g++] = q;
         s.gstart[g] = NA; s.ngroups = g;
         for (int u = 0; u < g; ++u) s.urows[u] = min(s.gstart[u + 1] - s.gstart[u], MAXR);
         s.urows[g] = R;                       // the shared expert: R rows
+        }
     }
     __syncthreads();
 }
@@ -462,7 +465,7 @@ __device__ __forceinline__ void topk_restore9(const Params& p, Smem<S>& s)
     if (threadIdx.x < p.R * S::TOPK)
     {
         s.sel[threadIdx.x] = p.seldbg[threadIdx.x];
-        s.wt[threadIdx.x] = __ushort_as_half((unsigned short) p.seldbg[64 + threadIdx.x]);
+        s.wt[threadIdx.x] = __ushort_as_half((unsigned short) p.seldbg[sel_wt_base(TRows<S>::v) + threadIdx.x]);
     }
     __syncthreads();
     ph_topk_tail9<S>(p, s);
@@ -474,7 +477,7 @@ __device__ __forceinline__ void ph_gateup9(const Params& p, Smem<S>& s)
     MF_DIMS
     const int R = p.R, NA = R * TOPK, NAR = NA + R;
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int NU = s.ngroups + 1;
+    const int NU = s.ngroups + (TRows<S>::v > MAXR ? units_shared(R) : 1);
     constexpr int TPP = DM::TPP;
     const bool nat = p.native != 0;
     const long long W = split_total(s.urows, NU, 2, TPP);
@@ -497,7 +500,7 @@ __device__ __forceinline__ void ph_gateup9(const Params& p, Smem<S>& s)
             for (int task = wave; task < g.rows * DM::CMB_BLOCKS; task += 16)
             {
                 const int row = task / DM::CMB_BLOCKS, blk = task % DM::CMB_BLOCKS;
-                const int token = g.shared ? row : s.tok[g.p0 + row];
+                const int token = g.shared ? (TRows<S>::v > MAXR ? g.p0 - NA + row : row) : s.tok[g.p0 + row];
                 half4 v = ((const half4*) (p.mixed + mixed_row<S>(token) + blk * 128))[lane];
                 v = had_regs_h<true, false>(v, suh + blk * 128, lane);
                 ((half4*) (Abuf + a_row_gu<S>(row, blk)))[lane] = v;
@@ -528,7 +531,7 @@ __device__ __forceinline__ void ph_down9(const Params& p, Smem<S>& s)
     MF_DIMS
     const int R = p.R, NA = R * TOPK, NAR = NA + R;
     const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int NU = s.ngroups + 1;
+    const int NU = s.ngroups + (TRows<S>::v > MAXR ? units_shared(R) : 1);
     constexpr int TPU = DM::TPU;
     const bool nat = p.native != 0;
     const long long W = split_total(s.urows, NU, 1, TPU);

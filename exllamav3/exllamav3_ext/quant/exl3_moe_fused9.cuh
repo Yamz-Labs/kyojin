@@ -216,6 +216,70 @@ __device__ __forceinline__ void ph_dots9(const Params& p, Smem<S>& s, int vm, ui
     }
 }
 
+// moe8: the front-end phases (dots, finalize, router) are written for MAXR rows. A wide launch runs them once per 4-row window on a copy of Params whose per-row base
+// pointers are shifted (idx.h win_*): the phase code is the same inlined code, every row sees the arithmetic of the 4-row launch.
+template <class S>
+__device__ __forceinline__ Params row_window9(const Params& p, int r0)
+{
+    Params q = p;
+    q.R = win_rows(p.R, r0);
+    q.xin = p.xin + win_xin<S>(r0); q.xout = p.xout + win_xin<S>(r0);
+    q.dots = p.dots + win_dots<S>(r0); q.post = p.post + win_post<S>(r0); q.mixed = p.mixed + win_mixed<S>(r0);
+    q.scores = p.scores + win_scores<S>(r0); q.sgl = p.sgl + win_sgl(r0);
+    return q;
+}
+constexpr int V_TOUCH_ALL = V_T0 | V_TMID;
+template <class S>
+__device__ __forceinline__ void front_dots9(const Params& p, Smem<S>& s, int vm, uint32_t& sink)
+{
+    if constexpr (TRows<S>::v > MAXR)
+    {
+        #pragma unroll 1
+        for (int r0 = 0; r0 < p.R; r0 += MAXR)
+        {
+            if (r0) __syncthreads();
+            const Params q = row_window9<S>(p, r0);
+            ph_dots9<S>(q, s, r0 ? (vm & ~V_TOUCH_ALL) : vm, sink);
+        }
+    }
+    else ph_dots9<S>(p, s, vm, sink);
+}
+template <class S, bool TM>
+__device__ __forceinline__ void front_finalize9(const Params& p, Smem<S>& s)
+{
+    if constexpr (TRows<S>::v > MAXR)
+    {
+        #pragma unroll 1
+        for (int r0 = 0; r0 < p.R; r0 += MAXR)
+        {
+            if (r0) __syncthreads();
+            const Params q = row_window9<S>(p, r0);
+            ph_finalize9<S, TM>(q, s);
+        }
+    }
+    else ph_finalize9<S, TM>(p, s);
+}
+template <class S>
+__device__ __forceinline__ void front_router9(const Params& p, Smem<S>& s)
+{
+    if constexpr (TRows<S>::v > MAXR)
+    {
+        #pragma unroll 1
+        for (int r0 = 0; r0 < p.R; r0 += MAXR)
+        {
+            if (r0) __syncthreads();
+            const Params q = row_window9<S>(p, r0);
+            ph_router9<S>(q, s);
+        }
+    }
+    else ph_router9<S>(p, s);
+}
+
+// call-site selection: the <= 4-row instantiations call the phase functions directly (same text as before moe8), wide ones go through the window loops
+#define FRONT_DOTS(p, s, vm, sink) do { if constexpr (TRows<S>::v > MAXR) front_dots9<S>(p, s, vm, sink); else ph_dots9<S>(p, s, vm, sink); } while (0)
+#define FRONT_FIN(TMV, p, s) do { if constexpr (TRows<S>::v > MAXR) front_finalize9<S, TMV>(p, s); else ph_finalize9<S, TMV>(p, s); } while (0)
+#define FRONT_ROUTER(p, s) do { if constexpr (TRows<S>::v > MAXR) front_router9<S>(p, s); else ph_router9<S>(p, s); } while (0)
+
 template <class S, bool TM, bool INL, int ABL = 0>
 __device__ __forceinline__ void body9(const Params& p, int vm)
 {
@@ -224,16 +288,16 @@ __device__ __forceinline__ void body9(const Params& p, int vm)
     uint32_t sink = 0;
     mf7::st7<TM>(p, 0);
     if (vm & V_T0) touch_static<S>(p, vm, sink);
-    ph_dots9<S>(p, s, vm, sink);
+    FRONT_DOTS(p, s, vm, sink);
     mf7::gbar7<TM>(p, phase);
-    if constexpr (INL) ph_finalize9<S, TM>(p, s); else mf7::ph_finalize7<S, TM>(p, s);
+    if constexpr (INL) FRONT_FIN(TM, p, s); else mf7::ph_finalize7<S, TM>(p, s);
     mf7::gbar7<TM>(p, phase);
-    if constexpr (INL) ph_router9<S>(p, s); else mf7::ph_router7<S>(p, s);
+    if constexpr (INL) FRONT_ROUTER(p, s); else mf7::ph_router7<S>(p, s);
     mf7::gbar7<TM>(p, phase);
     if constexpr (INL) ph_topk9<S>(p, s, vm); else ph_topk<S>(p, s);
     mf7::st7<TM>(p, 15);
     if (blockIdx.x == 0 && threadIdx.x < p.R * S::TOPK) p.seldbg[threadIdx.x] = s.sel[threadIdx.x];
-    if (blockIdx.x == 0 && threadIdx.x < p.R * S::TOPK) p.seldbg[64 + threadIdx.x] = (int) __half_as_ushort(s.wt[threadIdx.x]);
+    if (blockIdx.x == 0 && threadIdx.x < p.R * S::TOPK) p.seldbg[sel_wt_base(TRows<S>::v) + threadIdx.x] = (int) __half_as_ushort(s.wt[threadIdx.x]);
     if (vm & V_TDOWN) touch_down<S>(p, s, sink);
     if constexpr (INL) ph_gateup9<S, ABL>(p, s); else mf7::ph_gateup7<S, 0>(p, s);
     mf7::gbar7<TM>(p, phase);
@@ -260,14 +324,14 @@ __device__ __forceinline__ void body9s(const Params& p, int vm)
     static_assert(INL, "split launches exist for the forced-inline phases only");
     __shared__ Smem<S> s;
     uint32_t sink = 0;
-    if constexpr (STAGE == 0) { if (vm & V_T0) touch_static<S>(p, vm, sink); ph_dots9<S>(p, s, vm, sink); }
-    if constexpr (STAGE == 1) ph_finalize9<S, false>(p, s);
-    if constexpr (STAGE == 2) ph_router9<S>(p, s);
+    if constexpr (STAGE == 0) { if (vm & V_T0) touch_static<S>(p, vm, sink); FRONT_DOTS(p, s, vm, sink); }
+    if constexpr (STAGE == 1) FRONT_FIN(false, p, s);
+    if constexpr (STAGE == 2) FRONT_ROUTER(p, s);
     if constexpr (STAGE == 3)
     {
         ph_topk9<S>(p, s, vm);
         if (blockIdx.x == 0 && threadIdx.x < p.R * S::TOPK) p.seldbg[threadIdx.x] = s.sel[threadIdx.x];
-        if (blockIdx.x == 0 && threadIdx.x < p.R * S::TOPK) p.seldbg[64 + threadIdx.x] = (int) __half_as_ushort(s.wt[threadIdx.x]);
+        if (blockIdx.x == 0 && threadIdx.x < p.R * S::TOPK) p.seldbg[sel_wt_base(TRows<S>::v) + threadIdx.x] = (int) __half_as_ushort(s.wt[threadIdx.x]);
         if (vm & V_TDOWN) touch_down<S>(p, s, sink);
         ph_gateup9<S, ABL>(p, s);
     }
