@@ -9,7 +9,7 @@ One model load, serve defaults (SPEED_ENV of tools/glm/serve.py, num_draft 2). S
   repeat : the paired run again K times, ids must repeat
   speed  : 2 jobs together, wall time per token, ROW_INV off against on, interleaved, same load
 Arms: ROW_INV is flipped in process (ROW_INV["on"]), graphs purged at every flip.
-Run through ~/hermes-work/bin/gpu-guard. Writes one json per stage into --out.
+Run it alone on the GPU. Writes one json per stage into --out.
 """
 import argparse, ast, json, os, sys, time, traceback, hashlib
 ap = argparse.ArgumentParser()
