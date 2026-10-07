@@ -228,7 +228,7 @@ class ProductRule:
 class TierRule(ProductRule):
     """ProductRule for rows <= dsplit + 1 (identical to the shipped rule there), stricter beyond: a draft deeper than dsplit
     is kept only if its reach >= thvd, and drafting goes past depth dsplit only if the reach so far >= thfd.
-    Why (adapt, 07/10): one pair (thf, thv) serves two jobs. Raising thf to 0.8 to avoid unprofitable 5+ row rounds also cut the
+    Why: one pair (thf, thv) serves two jobs. Raising thf to 0.8 to avoid unprofitable 5+ row rounds also cut the
     2..4 row rounds short, which cost 1-4 % where depth 2-4 acceptance is good (128K, chat). Verify rows cost the same at every
     context (~10.5 ms per row incl. its draft step); a row beyond the 4th pays only when its chance of being accepted is above
     ~0.5, and the drafter's reach overstates it, so the deep tier asks for reach >= 0.95 to start and >= 0.85 to keep.
