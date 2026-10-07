@@ -18,6 +18,7 @@ from .attention_fn.mla_triton import (
     mla_unfold,
 )
 from .attention_fn.bc_attn import MAX_BSZ as _bc_max_bsz
+from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS
 import os
 
 # Prefill strategy: "mha" (default) up-projects past tiles from the compressed cache and attends
@@ -66,7 +67,15 @@ EXL3_MLA_DEC = os.environ.get("EXL3_MLA_DEC", "1") != "0"
 # forward, run the MLA projections as one exl3_dec GEMV launch PER ROW (the exact batch-1 kernel)
 # instead of LinearEXL3.forward's M-row route (bc / hip GEMV, a different reduction), so row i of
 # an R-row verify equals the plain R = 1 decode bitwise. 0 restores the M-row route
-EXL3_MLA_DEC_ROWLOOP_MAX = int(os.environ.get("EXL3_MLA_DEC_ROWLOOP_MAX", "4"))
+# Default: 4 rows with EXL3_ROW_INV=0, ROW_INV_MAX_ROWS (8) otherwise, so two jobs of three rows
+# (MTP 2) stay on the exact path; an explicit value wins.
+_ROWLOOP_ENV = os.environ.get("EXL3_MLA_DEC_ROWLOOP_MAX")
+
+
+def _rowloop_max() -> int:
+    if _ROWLOOP_ENV is not None:
+        return int(_ROWLOOP_ENV)
+    return ROW_INV_MAX_ROWS if ROW_INV["on"] else 4
 
 # Same idea for the dense MLA decode kernel: a short verify pass runs as R one-row decodes
 EXL3_MLA_ATTN_ROWLOOP = os.environ.get("EXL3_MLA_ATTN_ROWLOOP", "1") != "0"
@@ -591,7 +600,7 @@ class MLAttention(Module):
                 "capture" not in params and "ovr" not in params):
             return 0
         rows = x.numel() // in_features
-        if 1 < rows <= EXL3_MLA_DEC_ROWLOOP_MAX and rows * in_features == x.numel():
+        if 1 < rows <= _rowloop_max() and rows * in_features == x.numel():
             return rows
         return 0
 
@@ -1184,31 +1193,40 @@ class MLAttention(Module):
 
         kernel = mla_attn_triton_decode if seqlen <= MAX_DECODE_QLEN else mla_attn_triton_prefill
         extra = {}
-        if (bsz == 1 and 1 < seqlen <= EXL3_MLA_DEC_ROWLOOP_MAX and EXL3_MLA_ATTN_ROWLOOP and
-                causal and params.get("dflash_verify")):
-            # Verify rows as R one-row decodes (row r sees cache + r + 1 keys): the q_len = 2 tile
-            # layout (block_h 8 x block_m 2, other split count) rounds row 0 differently from the
-            # plain q_len = 1 decode; this keeps every row bitwise equal to plain decode
+        if (1 < bsz * seqlen <= _rowloop_max() and EXL3_MLA_ATTN_ROWLOOP and
+                (bsz == 1 or ROW_INV["on"]) and causal and params.get("dflash_verify")):
+            # Verify rows as one-row decodes (row r of job b sees its cache + r + 1 keys): the q_len = 2+
+            # tile layout (block_h 8 x block_m 2, other split count) rounds row 0 differently from the
+            # plain q_len = 1 decode; this keeps every row bitwise equal to plain decode. With several
+            # jobs each row also gets its own job's cache length and its own block table width: the
+            # split layout follows the table width (max over the batch otherwise), see _row_table
             o_lat = torch.empty_like(q_lat)
-            for r in range(seqlen):
-                kw = {}
-                if host_cuts():
-                    # The kernel allocates its own out per row otherwise (one at::empty per
-                    # row per layer per round). Same shape, same dtype, fully overwritten by
-                    # the split/combine kernel pair, so a persistent per-layer buffer is
-                    # indistinguishable from the fresh one.
-                    from ..util.tensor import g_tensor_cache
-                    shape = (q_lat.shape[0], bsz, q_lat.shape[-1])
-                    kw["out"] = g_tensor_cache.get(
-                        q_lat.device, shape, q_lat.dtype, f"mla_row_out_{self.layer_idx}")
-                o_r = kernel(
-                    q_lat[:, r : r + 1].contiguous(), q_pe_hm[:, r : r + 1].contiguous(),
-                    ckv_cache, kpe_cache, block_table, cache_seqlens,
-                    bsz = 1, q_len = 1, causal = causal, softmax_scale = self.sm_scale,
-                    pre_appended_len = r + 1, qc = qc,
-                    **kw,
-                )
-                o_lat[:, r : r + 1].copy_(o_r)
+            for b in range(bsz):
+                if bsz == 1:
+                    bt_b, cs_b = block_table, cache_seqlens
+                else:
+                    bt_b = self._row_table(params, block_table, b, _host_seqlens(params, cache_seqlens), seqlen)
+                    cs_b = cache_seqlens[b : b + 1]
+                for r in range(seqlen):
+                    kw = {}
+                    if host_cuts():
+                        # The kernel allocates its own out per row otherwise (one at::empty per
+                        # row per layer per round). Same shape, same dtype, fully overwritten by
+                        # the split/combine kernel pair, so a persistent per-layer buffer is
+                        # indistinguishable from the fresh one.
+                        from ..util.tensor import g_tensor_cache
+                        shape = (q_lat.shape[0], 1, q_lat.shape[-1])
+                        kw["out"] = g_tensor_cache.get(
+                            q_lat.device, shape, q_lat.dtype, f"mla_row_out_{self.layer_idx}")
+                    i = b * seqlen + r
+                    o_r = kernel(
+                        q_lat[:, i : i + 1].contiguous(), q_pe_hm[:, i : i + 1].contiguous(),
+                        ckv_cache, kpe_cache, bt_b, cs_b,
+                        bsz = 1, q_len = 1, causal = causal, softmax_scale = self.sm_scale,
+                        pre_appended_len = r + 1, qc = qc,
+                        **kw,
+                    )
+                    o_lat[:, i : i + 1].copy_(o_r)
             if params.get("_mla_defer_post"):
                 return o_lat
             return self.attend_post(o_lat, bsz, seqlen, params)
@@ -1234,6 +1252,25 @@ class MLAttention(Module):
         if params.get("_mla_defer_post"):
             return o_lat
         return self.attend_post(o_lat, bsz, seqlen, params)
+
+
+    @staticmethod
+    def _row_table(params, block_table, b, host_seqlens, seqlen):
+        """Block table of job b alone, as a contiguous (1, w) tensor, once per forward and shared by
+        the layers. w is the width the job's own solo forward would have (the generator puts it in
+        params["dflash_table_pages"]): the MLA decode kernel derives its KV split from the table width,
+        so a row next to a longer neighbour would sum in different groups than alone."""
+        tabs = params.setdefault("_mla_row_tabs", {})
+        key = (b, block_table.data_ptr())
+        t = tabs.get(key)
+        if t is None:
+            pages = params.get("dflash_table_pages")
+            w = block_table.shape[1] if pages is None else min(int(pages[b]), block_table.shape[1])
+            t = block_table[b : b + 1, :w].contiguous()
+            # the narrower table must still cover the job's context: the kernel indexes it by page
+            _check_block_table(t, [host_seqlens[b]], seqlen)
+            tabs[key] = t
+        return t
 
 
     def attend_post(self, o_lat, bsz, seqlen, params):

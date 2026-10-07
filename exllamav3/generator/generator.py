@@ -64,6 +64,12 @@ def _mtp_fuse_catchup():
     on = lambda k: os.environ.get(k, "0") != "0"
     return 2 if on("EXL3_DEC_MOE_UNION") or on("EXL3_DEC_MOE_UNION_DEV") else 0
 
+def block_table_pages(max_seq_len: int) -> int:
+    """Block table width for a batch whose longest sequence reaches max_seq_len tokens: whole pages,
+    padded to a multiple of 16 so the pinned staging buffers cover a few distinct widths only."""
+    return ((max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE + 15) // 16 * 16
+
+
 class Generator:
 
     @staticmethod
@@ -1214,11 +1220,19 @@ class Generator:
         # Block-table width is padded to a multiple of 16 pages so the pinned staging buffers
         # cover a few distinct widths only; the extra (zeroed) columns are never dereferenced
         # since the kernels bound their reads by the cache lengths
-        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
-        max_pages_batch = (max_pages_batch + 15) // 16 * 16
+        max_pages_batch = block_table_pages(max_seq_len)
         block_index = self._staging("block_index", batch_size, max_pages_batch)
         block_index.zero_()
         cache_seqlens = self._staging("cache_seqlens", batch_size)
+        # Verify forwards: the block table width each sequence would have if its job ran alone (the MLA
+        # decode kernel's KV split follows the table width, so a row must not see its neighbour's)
+        own_pages = None
+        if draft_tokens is not None:
+            own_pages = []
+            for job in self.active_jobs:
+                if not job.is_prefill_done(): continue
+                own = block_table_pages(job.get_max_seq_len() + self.num_draft_tokens + draft_tokens.shape[-1])
+                own_pages += [own] * len(job.sequences)
         batch = 0
         use_offsets = "mrope" in self.model.caps
         positions = self._staging("positions", batch_size) if use_offsets else None
@@ -1297,6 +1311,8 @@ class Generator:
             # bit-exact against.
             "dflash_verify": draft_tokens is not None,
         }
+        if own_pages is not None:
+            params["dflash_table_pages"] = own_pages
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         _tv0 = _pt()
