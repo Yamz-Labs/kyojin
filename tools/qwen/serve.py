@@ -502,7 +502,8 @@ class Retract(int):
 # deinterleave_qg, the gated-residual GEMMs and the GDN chunk path (bitwise equal to the torch/triton paths, +21 % to +24 %
 # prefill at 4K/16K), and EXL3_PF_SKIP (the MTP draft prefill fills K/V only and skips the 1-row lm_head, +0.5 % to +2 %).
 # Set any of them to 0 to go back.
-SERVE_ENV = (("EXL3_MOE_FUSED", "1"), ("EXL3_MOE_VALU", "1"), ("EXL3_VERIFY_ATTN_LOOP", "1"),
+SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verify readback + fewer host dispatches: +0.8 % speculative, ids identical
+             ("EXL3_MOE_FUSED", "1"), ("EXL3_MOE_VALU", "1"), ("EXL3_VERIFY_ATTN_LOOP", "1"),
              ("EXL3_VERIFY_GEMV_R", "1"), ("EXL3_GEMV_R_DEC1", "1"), ("EXL3_MTP_FUSE_CATCHUP", "0"),
              ("EXL3_PLE_HIP", "1"), ("EXL3_DQ_HIP", "1"), ("EXL3_GR_HIP", "1"), ("EXL3_GDN_FUSE", "1"), ("EXL3_PF_SKIP", "1"),
              # 4096-row prefill chunks (one MoE pass per 4096 rows, no 2048 + 2048 + tail split below 4097 tokens) and the
