@@ -225,6 +225,21 @@ class ProductRule:
         return True, not (q < self.thf or i + 1 >= self.maxd)
     def end_round(self, drafted, accepted): pass
 
+class TierRule(ProductRule):
+    """ProductRule for rows <= dsplit + 1 (identical to the shipped rule there), stricter beyond: a draft deeper than dsplit
+    is kept only if its reach >= thvd, and drafting goes past depth dsplit only if the reach so far >= thfd.
+    Why (adapt, 07/10): one pair (thf, thv) serves two jobs. Raising thf to 0.8 to avoid unprofitable 5+ row rounds also cut the
+    2..4 row rounds short, which cost 1-4 % where depth 2-4 acceptance is good (128K, chat). Verify rows cost the same at every
+    context (~10.5 ms per row incl. its draft step); a row beyond the 4th pays only when its chance of being accepted is above
+    ~0.5, and the drafter's reach overstates it, so the deep tier asks for reach >= 0.9 to start and >= 0.5 to keep."""
+    name = "tier"
+    def __init__(self, thf=0.6, thv=0.3, maxd=7, thfd=0.9, thvd=0.7, dsplit=3):
+        super().__init__(thf, thv, maxd); self.thfd, self.thvd, self.dsplit = thfd, thvd, dsplit
+    def step(self, i, p):
+        q = self.q(i, p); k = i + 1
+        if i > 0 and q < (self.thv if k <= self.dsplit else self.thvd): return False, False
+        return True, not (q < (self.thf if k < self.dsplit else self.thfd) or k >= self.maxd)
+
 class CostRule(ProductRule):
     """Same shape, calibrated reach: q = min(1, scale * reach ** gamma). thv = cost of one verify row / ms per token
     (keep a row when its chance to add a token pays its ~row_ms), thf = the same test one depth ahead (drafting also costs)."""
@@ -297,11 +312,12 @@ def env_defaults(ndt):
     return _envf("QWSPEC_THF", 0.6), _envf("QWSPEC_THV", 0.3), _envf("QWSPEC_MAXD", int(ndt))
 
 def rule_from_env(thf, thv, maxd):
-    """QWSPEC_RULE = product (default) | cost | online | table (depth from the request's acceptance history, no probabilities); QWSPEC_GAMMA / QWSPEC_SCALE tune the calibrated reach.
+    """QWSPEC_RULE = tier (default) | product (the former 0.6/0.3/3 rule when maxd=3) | tier (default thresholds below depth 4, stricter 5+ row tier: QWSPEC_THFD/THVD/DSPLIT) | cost | online | table (depth from the request's acceptance history, no probabilities); QWSPEC_GAMMA / QWSPEC_SCALE tune the calibrated reach.
     QWSPEC_FIXD = N: draft N depths with no host read and truncate once per round (rule applied on the stacked probabilities)."""
-    kind = os.environ.get("QWSPEC_RULE", "product")
+    kind = os.environ.get("QWSPEC_RULE", "tier")
     if kind == "product": r = ProductRule(thf, thv, maxd)
     elif kind == "cost": r = CostRule(thf, thv, maxd, _envf("QWSPEC_GAMMA", 1.0), _envf("QWSPEC_SCALE", 1.0))
+    elif kind == "tier": r = TierRule(thf, thv, maxd, _envf("QWSPEC_THFD", 0.9), _envf("QWSPEC_THVD", 0.7), _envf("QWSPEC_DSPLIT", 3))
     elif kind == "table":
         cyc = os.environ.get("QWSPEC_CYCLE"); r = TableRule(maxd, [float(x) for x in cyc.split(",")] if cyc else None, _envf("QWSPEC_DECAY", 0.75), _envf("QWSPEC_PRIOR", 0.75))
     elif kind == "online": r = OnlineRule(thf, thv, maxd, _envf("QWSPEC_GAMMA", 1.0), _envf("QWSPEC_ALPHA", 0.15))

@@ -525,6 +525,9 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # bit-identical prefill levers (hyper-connection apply folded into the next norm, MoE glue v2), served
              # +2.4 % / +1.6 % / +1.8 % (fuse) and +0.9 / -0.1 / +0.3 % (glue) at 4K / 16K / 32K on bal. 0 = off.
              ("EXL3_PF_GR_FUSE", "1"), ("EXL3_MPW_GLUE", "1"),
+             # verify of 5..8 rows (deep draft tier of spec_policy.TierRule): row split, one-launch fused MoE, one-launch 6-row dense GEMV;
+             # bit-identical per row, rows <= 4 untouched. 0 = off.
+             ("EXL3_VERIFY_ROW_SPLIT", "2"), ("EXL3_MOE_R8", "1"), ("EXL3_GEMV_R_RM6", "1"),
              # Fidelity first: int8 mixer weights with group scales (fn 128 along H*D, up 64
              # along rank) and, when <model_dir>/hc_gs_sidecar.safetensors exists, its GPTQ-rounded codes (decoded-token KLD 0.0504 ->
              # 0.0455, plain decode +0.5-0.8 ms). A missing file means group scales with plain rounding. EXL3_GR_GS=0 = per-row scales.
@@ -606,7 +609,7 @@ def check_latched_env() -> None:
 class QwenEngine:
     """Target model + MTP drafter + (optional) vision tower + one Generator."""
 
-    def __init__(self, model_path: str, ctx: int, ndt: int = 3, draft_policy: str = "mix",
+    def __init__(self, model_path: str, ctx: int, ndt: int = 7, draft_policy: str = "mix",
                  vision: bool = True, max_chunk_size: int = 2048, cache_bits: int = 0, sessions: int = 1):
         # The measured Qwen serving configuration. Read at import time by the engine:
         # set before importing exllamav3. The caller's environment wins.
@@ -1719,7 +1722,7 @@ def main() -> None:
     parser.add_argument("--ctx", "-c", type=int, default=65536, help="KV cache size in tokens (default 65536)")
     parser.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
                         help="bits per K/V element of the attention cache pages (0 = fp16, the default; 8 = packed int8, about 40 %% smaller pages, saves 2.6 GiB at 256K, output not row-invariant for several rows)")
-    parser.add_argument("--ndt", type=int, default=3, help="max draft tokens per round (default 3)")
+    parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
     parser.add_argument("--draft-policy", choices=("mix", "mtp", "off"), default="mix",
                         help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, off = plain decode")
     parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower (saves memory)")
