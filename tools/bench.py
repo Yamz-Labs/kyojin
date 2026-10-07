@@ -21,13 +21,16 @@ same measurements (and every run) follows it, so results can be collected into a
 """
 import argparse
 import json
+import os
 import platform
 import random
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
 import sys
+import sysconfig
 import time
 import urllib.request
 from pathlib import Path
@@ -145,15 +148,65 @@ def server_compiler(base):
     return h.get("hip_compiler") or "unknown (server does not report it)", h.get("hip_compiler_warning")
 
 
-def rocm_version():
-    for f in ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev"):
-        if Path(f).is_file():
-            return Path(f).read_text().strip()
-    for cmd in ("rocm-sdk version", "hipconfig --version"):
-        if shutil.which(cmd.split()[0]):
-            out = sh(cmd)
+ROCM_INFO_FILES = ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev")
+SDK_TREE = "_rocm_sdk_devel"                           # what the rocm-sdk-devel wheel unpacks into site-packages
+
+
+def read_version(f):
+    """Contents of a version file, stripped, or an empty string when it is missing, empty or unreadable."""
+    try:
+        return Path(f).read_text().strip()
+    except OSError:
+        return ""
+
+
+def tool_version(cmd):
+    """First line printed by `cmd` (`rocm-sdk version`, `hipconfig --version`), run from PATH or, when PATH
+    does not have it, from the bin directory of the running interpreter: a venv installs both there, and a
+    shell that did not activate it leaves them out of PATH. Empty string when no copy of the tool runs."""
+    tool, _, args = cmd.partition(" ")
+    for path in (shutil.which(tool), str(Path(sys.executable).parent / tool)):
+        if path and Path(path).is_file():
+            out = sh(f"{shlex.quote(path)} {args}")
             if out:
                 return out.splitlines()[0]
+    return ""
+
+
+def site_packages():
+    """Site-packages directories of the running interpreter, from sysconfig and from sys.path."""
+    roots = {sysconfig.get_paths().get(k) for k in ("purelib", "platlib")}
+    roots |= {p for p in sys.path if p.endswith("site-packages")}
+    return sorted(r for r in roots if r)
+
+
+def sdk_trees():
+    """Candidate roots of a rocm-sdk devel tree: $EXL3_ROCM_SDK, then the wheel of the running
+    interpreter, then $EXL3_VENV. Cheap, never raises, empty when none of them is set."""
+    trees = [os.environ.get("EXL3_ROCM_SDK")]
+    trees += [str(Path(d) / SDK_TREE) for d in site_packages()]
+    venv = os.environ.get("EXL3_VENV")
+    if venv:
+        trees += [str(p) for p in Path(venv).glob(f"lib/python*/site-packages/{SDK_TREE}")]
+    return [t for t in trees if t]
+
+
+def rocm_version():
+    """ROCm version, from the first source that answers: /opt/rocm, then rocm-sdk and hipconfig, then the
+    .info/version of a rocm-sdk devel tree (the pip wheel, which a container has instead of /opt/rocm),
+    then the HIP version torch was built against."""
+    for f in ROCM_INFO_FILES:
+        v = read_version(f)
+        if v:
+            return v
+    for cmd in ("rocm-sdk version", "hipconfig --version"):
+        v = tool_version(cmd)
+        if v:
+            return v
+    for tree in sdk_trees():
+        v = read_version(Path(tree) / ".info" / "version")
+        if v:
+            return f"{v} (rocm-sdk)"
     out = sh(f"{sys.executable} -c 'import torch; print(torch.version.hip or \"\")'")
     return f"HIP {out} (PyTorch)" if out else "unknown"
 
