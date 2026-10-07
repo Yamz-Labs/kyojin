@@ -391,6 +391,28 @@ class ListenerTest(unittest.TestCase):
         self.assertEqual(codes, [503] * 8)
 
 
+class QuietDisconnectTest(unittest.TestCase):
+    def test_client_that_hangs_up_leaves_no_traceback(self):
+        import contextlib
+        import io
+        t = tracker(["weights"], clock=Clock())
+        t.serve("127.0.0.1", 0)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buf):
+                for _ in range(20):
+                    s = socket.create_connection(("127.0.0.1", t.server.port))
+                    s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+                    s.close()                                                # reset before the reply is read
+                time.sleep(0.3)
+                code, _, _ = get(f"http://127.0.0.1:{t.server.port}/health")
+            self.assertEqual(code, 503)
+        finally:
+            t.release_port()
+        self.assertNotIn("Traceback", buf.getvalue())
+
+
 class ForkTest(unittest.TestCase):
     def test_forked_child_does_not_keep_the_port(self):
         import os

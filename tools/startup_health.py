@@ -177,14 +177,17 @@ class _EarlyServer:
                 else:
                     code, body = 503, LOADING_BODY
                 data = json.dumps(body).encode()
-                self.send_response(code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Retry-After", "5")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                if self.command != "HEAD":
-                    self.wfile.write(data)
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Retry-After", "5")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass                                # the client gave up (poll timeout): nothing to report
 
             do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = _reply
 
