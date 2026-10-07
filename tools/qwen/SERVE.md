@@ -37,7 +37,7 @@ Quick test:
 | `--host`, `--port` | `127.0.0.1`, 8000 | listen address |
 | `-c`, `--ctx` | 65536 | KV cache size in tokens (prompt + answer must fit) |
 | `--cache-bits` | 0 | `0` = fp16 K/V cache pages (default); `8` = packed int8 pages: 2.6 GiB less at 256K (peak 83.6 vs 86.2 GiB), but output is not row-invariant when several rows decode together |
-| `--ndt` | 3 | max draft tokens per speculative round |
+| `--ndt` | 7 | max draft tokens per speculative round (the rule drafts up to 3 on most rounds, deeper only on confident chains) |
 | `--draft-policy` | `mix` | `mix` shipped rule, `mtp` fixed MTP chain, `off` plain decode (no drafter loaded) |
 | `--no-vision` | off | do not load the vision tower (less memory, image input answers 400) |
 | `--default-temperature/-top-p/-top-k/-min-p` | from `generation_config.json` (1.0 / 0.95 / 20) | used when a request omits them |
