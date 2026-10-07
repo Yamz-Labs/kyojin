@@ -72,6 +72,24 @@ def _pf_hip_ready() -> bool:
     return _PF_HIP["ok"]
 
 
+def tile_candidates(scores, tile_idx, t0):
+    """One tile's top-k as composite int64 keys: the top-k kernel's 16-bit order key (topk_key) above, 0xFFFFFFFF - global
+    index below, -1 for padding and -inf scores (the kernel's own validity test). scores (R, W) fp16 view, tile_idx (R, kp)
+    int32 local indices (-1 padded) as the kernel wrote them, t0 the tile's first pool."""
+    li = tile_idx.long()
+    bits = torch.gather(scores, 1, li.clamp(min = 0)).view(torch.int16).to(torch.int32) & 0xFFFF
+    key = torch.where(bits >= 0x8000, ~bits & 0xFFFF, bits | 0x8000).long()
+    return torch.where((li >= 0) & (key > 0x03FF), (key << 32) | (0xFFFFFFFF - (li + t0)), -1)
+
+
+def merge_candidates(cand, k):
+    """Top-k of the concatenated tile candidates under (score descending, index ascending), the single-pass kernel's order,
+    returned as ascending global indices, -1 padded: (R, k) int32. Valid keys are unique, so the selection is exact."""
+    top = torch.topk(torch.cat(cand, dim = 1), k, dim = 1, largest = True, sorted = False).values
+    gi = torch.where(top >= 0, 0xFFFFFFFF - (top & 0xFFFFFFFF), 0x7FFFFFFF).sort(dim = 1).values
+    return torch.where(gi == 0x7FFFFFFF, -1, gi).to(torch.int32)
+
+
 class QSAIndexer(Module):
 
     def __init__(
@@ -244,6 +262,15 @@ class QSAIndexer(Module):
     # narrower slabs cost more than the extra top-k passes save
     SEL_SLAB = 1024
     SEL_TILE = int(os.environ.get("EXL3_QSA_SCORE_TILE", 8192))
+    # Scorer launch shape "block_m,block_n,num_warps,num_stages" (unset = the scorer's own default). Every output
+    # element is computed by the same MMA sequence whatever the tile, so the scores are bit-identical
+    SCORE_CFG = os.environ.get("EXL3_QSA_SCORE_CFG", "")
+    # ROCm has no dsa_topk_tile / dsa_topk_merge_tiles: its one-block-per-row top-k scans a row three times, and
+    # beyond ~32K pools the row no longer stays cache resident (about 10x the cost per column at 64K pools). N > 0 never
+    # lets that kernel see a row wider than N pools: a longer selection is cut into equal tiles of at most N pools (a
+    # multiple of 128), each run through the same kernel, and the candidates are merged in torch under the kernel's own
+    # total order. Rows up to N pools stay one pass. 0 = always one full-width pass
+    TOPK_TILE = int(os.environ.get("EXL3_QSA_TOPK_TILE", 0))
     # Row count up to which the plane-update workspaces come from g_tensor_cache (decode-class
     # calls: MTP verify, bsz > 1 fallbacks, where allocation latency matters); prefill chunks
     # allocate per call, the static cache being meant for small buffers only
@@ -290,14 +317,20 @@ class QSAIndexer(Module):
         k_pad = out_rows.shape[1]
         k_sel = self.block_topk
         kp = -(-k_sel // 32) * 32
-        t_tile = self.SEL_TILE
+        tiled_topk = hasattr(ext, "dsa_topk_tile") and hasattr(ext, "dsa_topk_merge_tiles")
+        torch_merge = not tiled_topk and self.TOPK_TILE > 0
+        t_tile = self.TOPK_TILE // 128 * 128 if torch_merge else self.SEL_TILE
         if block_table is not None:
             t_tile = max(epp, t_tile // epp * epp)   # tiles must start on a pool page
         # Fixed score-row stride for every tile: it is a constexpr of the scoring kernel, so a
         # stride that followed the visible length recompiled it at every new 128-pool boundary
         s_stride = -(-t_tile // 128) * 128
         s_backing = g_tensor_cache.get(dev, (self.SEL_SLAB * s_stride,), torch.half, "dsa_stile")
-        tiled_topk = hasattr(ext, "dsa_topk_tile") and hasattr(ext, "dsa_topk_merge_tiles")
+
+        cfg = {}
+        if self.SCORE_CFG:
+            bm, bn, nw, ns = (int(x) for x in self.SCORE_CFG.split(","))
+            cfg = dict(block_m = bm, block_n = bn, num_warps = nw, num_stages = ns)
 
         def tile_scores(q_slab, rows, t0, t1):
             # Tile [t0, t1) of the pooled plane scored as if it started at pool 0: the row-0
@@ -316,12 +349,12 @@ class QSAIndexer(Module):
             if block_table is None:
                 return dsa_indexer_scores(
                     q_slab, self._sel_weights(rows, dev), pool_flat[t0 : t1], pos0 + r0 - t0 * cr,
-                    cr, t1 - t0, scores = sc, scale = self.scale,
+                    cr, t1 - t0, scores = sc, scale = self.scale, **cfg,
                 )
             bt = block_table[t0 // epp : -(-t1 // epp)] if t0 else block_table
             return dsa_indexer_scores(
                 q_slab, self._sel_weights(rows, dev), pool_flat, pos0 + r0 - t0 * cr, cr, t1 - t0,
-                scores = sc, block_table = bt, epp = epp, scale = self.scale,
+                scores = sc, block_table = bt, epp = epp, scale = self.scale, **cfg,
             )
 
         for r0 in range(0, R, self.SEL_SLAB):
@@ -333,9 +366,21 @@ class QSAIndexer(Module):
             q_slab = q_rows[r0 : r1]
             if T_slab <= 0:
                 pool_idx.fill_(-1)
-            elif T_slab <= t_tile or not tiled_topk:
+            elif T_slab <= t_tile or (not tiled_topk and not torch_merge):
                 sc = tile_scores(q_slab, rows, 0, T_slab)
                 ext.dsa_topk(sc, pool_idx, min(k_sel, T_slab), None, 0)
+            elif torch_merge:
+                cand = []
+                tile_idx = torch.empty((rows, kp), dtype = torch.int32, device = dev)
+                n_tiles = -(-T_slab // t_tile)
+                w = -(-(-(-T_slab // n_tiles)) // 128) * 128   # equal tiles, 128 aligned
+                for t0 in range(0, T_slab, w):
+                    t1 = min(t0 + w, T_slab)
+                    sc = tile_scores(q_slab, rows, t0, t1)
+                    ext.dsa_topk(sc, tile_idx, min(k_sel, t1 - t0), None, 0)
+                    cand.append(tile_candidates(sc, tile_idx, t0))
+                pool_idx[:, :k_sel] = merge_candidates(cand, k_sel)
+                pool_idx[:, k_sel:] = -1
             else:
                 # Tiled: each tile's local top-k becomes candidate slot 1 next to the running set
                 # in slot 0, and the native merge reduces the pair under the single-pass kernel's
