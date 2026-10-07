@@ -113,6 +113,16 @@
 
 #endif
 
+#if defined(USE_ROCM)
+// The ROCm dense-GEMM tuner (hgemm.cu, dtune) only runs for >= 256 rows and can take seconds on a cold
+// tune cache: drop the GIL for those calls so the /health thread keeps answering. Smaller (decode)
+// calls keep the GIL, as before.
+static inline bool hgemm_gil_free(const at::Tensor& a)
+{
+    return a.dim() >= 1 && a.size(-1) > 0 && a.numel() / a.size(-1) >= 256;
+}
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("stloader_read", &stloader_read, "stloader_read");
@@ -235,8 +245,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
     m.def("hgemm", &hgemm, "hgemm");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
-    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon",
-          py::call_guard<py::gil_scoped_release>());
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("rope", &rope, "rope");
@@ -331,12 +340,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("had_paley", &had_paley, "had_paley");
     m.def("had_paley2", &had_paley2, "had_paley2");
 
-    m.def("hgemm", &hgemm, "hgemm");
+    m.def("hgemm", [](at::Tensor a, at::Tensor b, at::Tensor c)
+          {
+              if (hgemm_gil_free(a)) { py::gil_scoped_release nogil; hgemm(a, b, c); }
+              else hgemm(a, b, c);
+          }, "hgemm");
     m.def("skinny_cat", &skinny_cat, "skinny_cat");
     m.def("skinny_cat_w", &skinny_cat_w, "skinny_cat_w");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
-    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon",
-          py::call_guard<py::gil_scoped_release>());
+    m.def("hgemm_recon", [](at::Tensor a, at::Tensor b, at::Tensor c)
+          {
+              if (hgemm_gil_free(a)) { py::gil_scoped_release nogil; hgemm_recon(a, b, c); }
+              else hgemm_recon(a, b, c);
+          }, "hgemm_recon");
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("rope", &rope, "rope");
