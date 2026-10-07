@@ -138,10 +138,11 @@ Measured with `--ndt 3`, `-c 262144`, temperature 0, two short prompts sent toge
 | 2 | 8 | no (1 of 2 differs) | 1.16 s | 47.3 |
 | 2 | 0 | yes | 1.17 s | 49.6 |
 | 4 | 8 | no (2 of 4 differ) | 2.19 s | 51.4 |
+| 4 | 0 | no (2 of 4 differ) | not measured | 54.4 (reported, another machine) |
 
 With N > 1, greedy output is not guaranteed equal to a solo run, for either cache width: the decode attention kernel
 chooses how it splits the cache from the batch it runs with, so the last bits of the sums, and now and then a near-tie
-token, can change. What was measured: the 16-bit cache (`--cache-bits 0`) stayed equal on two short prompts at 2 sessions;
+token, can change. What was measured: the 16-bit cache (`--cache-bits 0`) stayed equal on two short prompts at 2 sessions and differed on 2 of 4 at 4 sessions (reported by @felladrin on 1.3);
 the 8-bit cache did not (rows above). Two short prompts show nothing more than that.
 
 The server prints this warning at start-up whenever N > 1, and a second one past 8 verify rows (`N x (ndt + 1)`).
