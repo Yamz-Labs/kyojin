@@ -23,7 +23,7 @@ Tokens per second; prefill by context, speculative decode by kind of text.
 ## Where each figure comes from
 
 - Qwen3.8-Flash-Next prefill and speculative decode (by context and on the card prompts): runs with the recipe above, at the commit named in `doc/figures.json`.
-- MiMo-V2.6-Flash: the same recipe and commit.
+- MiMo-V2.6-Flash: the same recipe, measured for release 1.2 and not run again for 1.3.
 - GLM-5.3-Flash: the recipe above where a value is in the main table; otherwise the "Measured numbers" table of the previous README (kept below) and the Speed section of the hub card, `yamz-labs/GLM-5.3-Flash-EXL3-Yamz`.
 - Strata and Gufo: the section "Strata and Gufo" below names the source of each figure.
 - Charts and the front-page table are built from `doc/figures.json` with `tools/make_charts.py` and `tools/make_readme_table.py`.
