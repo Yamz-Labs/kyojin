@@ -1,6 +1,6 @@
 # Install and first launch (Strix Halo, ROCm)
 
-Requirements: Linux (Ubuntu/Debian tested), a gfx1151 machine with 128 GB, Python 3.12, `gcc`, a ROCm 7 `libhsa-runtime64.so.1` (the PyTorch copy segfaults on gfx1151 and Ubuntu's own `libhsa-runtime64-1` is ROCm 5.7, too old; `tools/strix_halo/env.sh` finds the one inside the SDK wheel below first, then /opt/rocm, or take `EXL3_HSA_LIB=<path>`), ROCm 7.0 or newer (ROCm 6.4 has no gfx1151 code), a ROCm build of PyTorch for gfx1151, and a ROCm SDK devel tree with the `hipsparse/` and `thrust/` headers (the `rocm-sdk-devel` wheel).
+Requirements: Linux (Ubuntu/Debian tested), a gfx1151 machine with 128 GB, Python 3.12 with its headers, a C++ compiler (`g++`; on Ubuntu `sudo apt install g++ python3-dev python3-venv`, on Fedora `gcc-c++ python3.12-devel`, on Arch `gcc` and `python` have everything), a ROCm 7 `libhsa-runtime64.so.1` (the PyTorch copy segfaults on gfx1151 and Ubuntu's own `libhsa-runtime64-1` is ROCm 5.7, too old; `tools/strix_halo/env.sh` finds the one inside the SDK wheel below first, then /opt/rocm, or take `EXL3_HSA_LIB=<path>`), ROCm 7.0 or newer (ROCm 6.4 has no gfx1151 code), a ROCm build of PyTorch for gfx1151, and a ROCm SDK devel tree with the `hipsparse/` and `thrust/` headers (the `rocm-sdk-devel` wheel).
 
 ```bash
 git clone https://github.com/Yamz-Labs/kyojin && cd kyojin

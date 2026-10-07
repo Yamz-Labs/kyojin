@@ -59,6 +59,27 @@ export EXL3_ROCM_SDK=$(rocm-sdk path --root)
 
 With your own devel tree, set `EXL3_ROCM_DEV_INCLUDE` to an include directory that has `hipsparse/` and `thrust/` instead.
 
+## The build stops in a system header: `expected an identifier for the attribute name` (GCC 16)
+
+```text
+/usr/include/c++/16/format:4550:30: error: expected an identifier for the attribute name [-Wtemplate-body]
+ 4550 |       [[__gnu__::__noinline__]]
+```
+
+Seen on Fedora 44 and Arch Linux, at `bindings_hip.o`.
+
+Cause: GCC 16's libstdc++ uses `__noinline__` as an attribute name, and the `rocm-sdk-devel` wheel defines `__noinline__` to nothing for a non-clang host compiler (`include/hip/amd_detail/host_defines.h`). Older GCC (13 on Ubuntu 24.04) does not use that attribute, so the build passes there.
+
+Fix, until the ROCm header changes: undefine it right after that line in the venv's copy, then build again.
+
+```bash
+H=$(rocm-sdk path --root)/include/hip/amd_detail/host_defines.h
+sed -i 's/^#define __noinline__$/&\n#undef __noinline__/' "$H"
+./build.sh
+```
+
+Other distributions: Fedora 44's default `python3` is 3.14, so install `python3.12` and create the venv with `python3.12 -m venv .venv`. Arch only has Python 3.14; the build, the tests and the Qwen server were reported working with it.
+
 ## The build stops: PyTorch is not a ROCm build
 
 ```text
