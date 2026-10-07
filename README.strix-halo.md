@@ -1,6 +1,6 @@
 # exllamav3 on AMD Strix Halo (gfx1151)
 
-> **Just want to run Qwen3.8-Flash-Next on a Strix Halo box?** Use the recipe: [Qwen3.8-Flash-Next-EXL3-Framework-Strix-Halo-recipe](https://github.com/vcruz305/Qwen3.8-Flash-Next-EXL3-Framework-Strix-Halo-recipe) (setup / download / run scripts, measured results, troubleshooting). This file is the engineering log behind it.
+> **Just want to run a model?** Start with the [README](README.md) and [doc/install.md](doc/install.md). This page keeps the kernel notes of the gfx1151 port.
 
 > **This tree adds AMD GPU functionality to ExLlamaV3 that upstream does not have.** Upstream is
 > CUDA-only; the `sdougbrown/exllamav3` base adds a ROCm/HIP decode path for **gfx12 (RDNA 4)**
