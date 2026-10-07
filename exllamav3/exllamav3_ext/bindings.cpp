@@ -235,7 +235,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("n_stride_list") = py::none(), py::arg("had_src_list") = py::none(), py::arg("num_had_src") = 0);
     m.def("hgemm", &hgemm, "hgemm");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
-    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon",
+          py::call_guard<py::gil_scoped_release>());
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("rope", &rope, "rope");
@@ -334,7 +335,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("skinny_cat", &skinny_cat, "skinny_cat");
     m.def("skinny_cat_w", &skinny_cat_w, "skinny_cat_w");
     m.def("hgemm_batched", &hgemm_batched, "hgemm_batched");
-    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon");
+    m.def("hgemm_recon", &hgemm_recon, "hgemm_recon",
+          py::call_guard<py::gil_scoped_release>());
     m.def("hgemm_f16acc", &hgemm_f16acc, "hgemm_f16acc");
     m.def("hgemm_f16acc_status", &hgemm_f16acc_status, "hgemm_f16acc_status");
     m.def("rope", &rope, "rope");
