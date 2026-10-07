@@ -36,17 +36,17 @@ template <class S> struct MfShapeMatch
 template <class S> std::vector<int64_t> mf_ws_offsets()
 {
     using DM = mf::Dm<S>;
-    const int NARM = mf::MAXR * S::TOPK + mf::MAXR;
+    const int NARM = mf::MAXRT * S::TOPK + mf::MAXRT;   // moe8: sized for 8 rows (the <= 4-row kernels use the first part of every buffer)
     const int64_t sizes[] = {
         256,                                                   // ctl
-        (int64_t) mf::MAXR * (DM::MR + 1) * S::H * 4,         // dots f32
-        (int64_t) mf::MAXR * S::H * 4,                         // post f32
-        (int64_t) mf::MAXR * S::D * 2,                         // mixed half
-        (int64_t) mf::MAXR * S::NEXP * 2,                      // scores half
+        (int64_t) mf::MAXRT * (DM::MR + 1) * S::H * 4,         // dots f32
+        (int64_t) mf::MAXRT * S::H * 4,                         // post f32
+        (int64_t) mf::MAXRT * S::D * 2,                         // mixed half
+        (int64_t) mf::MAXRT * S::NEXP * 2,                      // scores half
         256,                                                   // sgl f32 (64)
         (int64_t) 2 * NARM * S::INTER * 2,                     // gu half
         (int64_t) NARM * S::D * 4,                             // dn f32
-        (int64_t) mf::MAXR * S::D * 4,                         // ydbg f32
+        (int64_t) mf::MAXRT * S::D * 4,                         // ydbg f32
         (int64_t) mf::SELDBG_INTS * 4,                         // seldbg i32
     };
     std::vector<int64_t> off; int64_t o = 0;

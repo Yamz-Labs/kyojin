@@ -2442,6 +2442,13 @@ static void dec_gemv_r_impl
     // but loses at R 7-8 (131 vs 123 ms per verify forward, spills); from R 7 on run two 4-row chunks (grid.y = 2).
     else if (R >= 7 && rpb > 4 && env_int("EXL3_GEMV_R_RPB78", 4) > 0) rpb = env_int("EXL3_GEMV_R_RPB78", 4);
 
+    // EXL3_GEMV_R_RM6=1 (needs EXL3_GEMV_R_DEC1=1): 5 or 6 rows run in ONE launch of the 6-row instantiation (one decode pass,
+    // no VGPR spill at K*2 = 8 / 10) instead of a 4-row chunk plus a 1..2 row chunk. Same per-row arithmetic (rows are independent
+    // in lane_gemv_r1 / pair_dot_r), rows 1..4 keep their own instantiations untouched.
+    const bool rm6 = R >= 5 && R <= 6 && (kb2 == 8 || kb2 == 10) && env_int("EXL3_GEMV_R_RM6", 0) != 0 &&
+                     env_int("EXL3_GEMV_R_DEC1", 0) == 1 && GEMV_R_ROW_BUDGET / ktw >= R;
+    if (rm6) rpb = R;
+
     JobsR jobs;
     jobs.count = n;
     jobs.K = Kdim;
@@ -2482,6 +2489,16 @@ static void dec_gemv_r_impl
     const int nch = (R + rpb - 1) / rpb;
     TORCH_CHECK(!jobs.swap || blocks <= 65535, "exl3_dec_gemv_r: too many blocks for the swapped grid");
     const dim3 grid = jobs.swap ? dim3(nch, blocks) : dim3(blocks, nch);
+    if (rm6)
+    {
+        EXL3_DEC_DISPATCH_CB(mcg ? 1 : 2,
+        {
+            if (kb2 == 8) { auto kfn = gemv_kernel_r<8, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+            else          { auto kfn = gemv_kernel_r<10, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+        });
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
     EXL3_DEC_DISPATCH_CB(mcg ? 1 : 2, EXL3_DEC_DISPATCH_RM(rpb, EXL3_DEC_DISPATCH_KB2(kb2,
         {
             // EXL3_GEMV_R_DEC1=1 decodes each tile once for all rows (bit-identical)

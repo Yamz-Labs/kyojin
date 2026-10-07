@@ -20,6 +20,14 @@ namespace mf {
 
 constexpr int MAXR = 4;       // rows per launch (R = 1..4)
 constexpr int THREADS = 512;  // 16 waves of 32
+// moe8: one launch of 5..8 rows. MAXR stays the row window of every LDS buffer and per-row register array (A / A2 hold MAXR rows, groups are cut to MAXR rows);
+// MAXRT is the capacity of the workspace and TR (a shape trait, default MAXR) the number of rows one launch of that shape instantiation takes.
+constexpr int MAXRT = 8;
+template <class...> struct mk_void { typedef void type; };
+template <class S, class = void> struct TRows { static constexpr int v = MAXR; };
+template <class S> struct TRows<S, typename mk_void<decltype(S::TR)>::type> { static constexpr int v = S::TR; };
+// the wide instantiation of a shape: same dimensions, up to 8 rows per launch
+template <class S> struct Wide : S { static constexpr int TR = MAXRT; };
 
 // A shape is a struct with static constexpr: D hidden, H hyper-connection streams, LR hc rank, NEXP experts, TOPK, INTER expert width,
 // RB routed expert bits, SB shared expert bits.
@@ -72,6 +80,7 @@ struct Dm
     static_assert(NEXP % 32 == 0 && NEXP <= 1024, "top-k lanes");
     static_assert(TOPK >= 1 && TOPK <= 15, "combine uses wave <= TOPK, 16 waves");
     static_assert(MAXR * TOPK <= THREADS && MAXR * TOPK <= 40, "sort/group arrays");
+    static_assert(TRows<S>::v >= MAXR && TRows<S>::v <= MAXRT && TRows<S>::v * TOPK <= THREADS, "wide instantiation: sort/group arrays (one thread per slot)");
     static_assert((RB >= 2 && RB <= 6) && (SB >= 2 && SB <= 6), "K2, K3, K4, K5, K6");
     static_assert(H >= 1 && H <= 4, "dred/rmr scratch");
     static_assert(LR % 1 == 0 && LR <= 1024, "t scratch");
@@ -164,6 +173,37 @@ template <class S> MF_FN long xout_idx(int r, int h, int col)       { return ((l
 constexpr int SELDBG_INTS = 1024;
 constexpr int STAMP_BASE = 256, STAMP_STRIDE = 16, STAMP_SLOTS = 12, STAMP_MAXB = 40;
 MF_FN int stamp_idx(int bx, int k)                                  { return STAMP_BASE + bx * STAMP_STRIDE + k; }
+
+// ---- moe8 wide launches (TR > MAXR). Every rule below is called by the kernel and by the CPU proof (tests/moe_fused/moe8_bounds.cpp).
+// row window: rows [r0, r0 + rows) of the launch run through the unchanged front-end phases with every per-row base pointer shifted by these element counts
+template <class S> MF_FN long win_xin(int r0)                       { return (long) r0 * Dm<S>::H * Dm<S>::D; }        // xin / xout (f32)
+template <class S> MF_FN long win_dots(int r0)                      { return (long) r0 * (Dm<S>::MR + 1) * Dm<S>::H; } // dots (f32)
+template <class S> MF_FN long win_post(int r0)                      { return (long) r0 * Dm<S>::H; }                   // post (f32)
+template <class S> MF_FN long win_mixed(int r0)                     { return (long) r0 * Dm<S>::D; }                   // mixed (half)
+template <class S> MF_FN long win_scores(int r0)                    { return (long) r0 * Dm<S>::NEXP; }                // scores (half)
+MF_FN long win_sgl(int r0)                                          { return r0; }                                     // sgl (f32)
+MF_FN int win_rows(int R, int r0)                                   { return R - r0 < MAXR ? R - r0 : MAXR; }
+// seldbg: selected experts at [0, NA), their weights at sel_wt_base(TR) + [0, NA): disjoint for NA <= 80, below STAMP_BASE
+MF_FN int sel_wt_base(int tr)                                       { return tr > MAXR ? 128 : 64; }
+// units: a routed group (rows that picked the same expert, consecutive in sorted order, head[q] = 1 at its first slot) is cut every MAXR rows; the shared expert follows
+// as ceil(R / MAXR) units of at most MAXR rows. gstart[u] = first sorted slot of routed unit u, gstart[ng] = NA. urows[u] = rows of unit u (routed 0..ng-1, shared ng..ng+nsh-1).
+// Returns ng (routed units). Arrays: gstart >= NA + 2 entries, urows >= NA + 2.
+MF_FN int units_shared(int R)                                       { return (R + MAXR - 1) / MAXR; }
+MF_FN int build_units_wide(const int* head, int NA, int R, int* gstart, int* urows)
+{
+    int g = 0, gsx = 0;
+    for (int q = 0; q < NA; ++q)
+    {
+        if (head[q]) gsx = q;
+        if (((q - gsx) % MAXR) == 0) gstart[g++] = q;
+    }
+    gstart[g] = NA;
+    for (int u = 0; u < g; ++u) urows[u] = gstart[u + 1] - gstart[u] < MAXR ? gstart[u + 1] - gstart[u] : MAXR;
+    for (int k = 0; k < units_shared(R); ++k) urows[g + k] = R - MAXR * k < MAXR ? R - MAXR * k : MAXR;
+    return g;
+}
+MF_FN int shared_p0(int NA, int k)                                  { return NA + MAXR * k; }   // first dn / gu row of shared unit k
+MF_FN int shared_rows(int R, int k)                                 { return R - MAXR * k < MAXR ? R - MAXR * k : MAXR; }
 
 // ---- top-k expert id sanitising: an id outside [0, NEXP) (all-NaN scores leave the sentinel) becomes 0, never a wild pointer
 MF_FN int clamp_expert(int e, int nexp)                             { return (e >= 0 && e < nexp) ? e : 0; }

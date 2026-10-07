@@ -37,11 +37,13 @@ struct Smem
         struct { float rows[(S::TOPK + 1) * 128]; } c;
         struct { float t[2][MAXR * S::LR]; float rmr[2][MAXR * 4]; float dred[4][MAXR][4][4]; } h;
     } u;
-    int sel[MAXR * S::TOPK];
-    half wt[MAXR * S::TOPK];
-    int sorted_e[MAXR * S::TOPK], sorted_a[MAXR * S::TOPK], tok[MAXR * S::TOPK], gstart[MAXR * S::TOPK + 2], head[MAXR * S::TOPK];
-    int urows[MAXR * S::TOPK + 1];
-    int ngroups;
+    static constexpr int TR = TRows<S>::v;                    // rows of one launch (4, or 8 in the moe8 wide instantiation)
+    static constexpr int TA = TR * S::TOPK;                   // top-k slots
+    int sel[TA];
+    half wt[TA];
+    int sorted_e[TA], sorted_a[TA], tok[TA], gstart[TA + 2], head[TA];
+    int urows[TA + (TR > MAXR ? 2 : 1)];                      // wide: up to TA routed units + 2 shared units
+    int ngroups;                                              // wide: routed units (groups cut to MAXR rows)
 };
 
 #define MF_DIMS using DM = Dm<S>; constexpr int D = DM::D, H = DM::H, LR = DM::LR, MR = DM::MR, NEXP = DM::NEXP, TOPK = DM::TOPK, INTER = DM::INTER; \
@@ -696,6 +698,13 @@ __device__ __forceinline__ Seg seginfo(const Params& p, const Smem<S>& s, int se
 {
     using DM = Dm<S>;
     Seg g; g.unit = two_proj ? seg >> 1 : seg; g.proj = two_proj ? (seg & 1) : 0; g.shared = g.unit == s.ngroups; g.e = 0;
+    if constexpr (TRows<S>::v > MAXR)
+    {
+        g.shared = g.unit >= s.ngroups;
+        if (g.shared) { const int k = g.unit - s.ngroups; g.rows = shared_rows(p.R, k); g.p0 = shared_p0(p.R * DM::TOPK, k); g.sv = p.svt + 6 * DM::NEXP; }
+        else { g.p0 = s.gstart[g.unit]; g.rows = min(s.gstart[g.unit + 1] - g.p0, MAXR); g.e = s.sorted_e[g.p0]; g.sv = p.svt + 6 * g.e; }
+        return g;
+    }
     if (g.shared) { g.rows = p.R; g.p0 = p.R * DM::TOPK; g.sv = p.svt + 6 * DM::NEXP; }
     else { g.p0 = s.gstart[g.unit]; g.rows = min(s.gstart[g.unit + 1] - g.p0, MAXR); g.e = s.sorted_e[g.p0]; g.sv = p.svt + 6 * g.e; }   // min: never active (distinct experts per row)
     return g;

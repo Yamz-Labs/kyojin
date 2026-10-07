@@ -19,6 +19,9 @@ from .hyperconnections import HyperConnection
 MAX_ROWS = 4
 # EXL3_VERIFY_ROW_SPLIT=1: 5..8 rows of one sequence run as fused sub-calls of at most 4 rows (per-row arithmetic unchanged)
 SPLIT_MAX_ROWS = 8 if os.environ.get("EXL3_VERIFY_ROW_SPLIT", "0") != "0" else MAX_ROWS
+# EXL3_MOE_R8=1 (read at call time through R8["on"], tests flip it in place): rows 5..8 of one sequence run as ONE fused launch (mf9 wide instantiation, same per-row arithmetic).
+# Needs the mf9 kernel at variant 0x160000 and a shape instantiated for wide launches; otherwise the split above (<= 4 rows per call) applies. "calls" counts wide launches.
+R8 = {"on": os.environ.get("EXL3_MOE_R8", "0") != "0", "calls": 0}
 
 
 # EXL3_MOE_FUSED9=<variant>: 0 off, 393216 (0x60000) = forced-inline phases + two blocks per WGP (core9), 917504 = same kernel, ONE block per WGP, 1441792 (0x160000, default) = same phases and block partition as 0x60000, but every grid barrier is a kernel boundary (six stage launches):
@@ -160,10 +163,22 @@ class FusedMoEHalf:
             return False
         if x.dtype != torch.float or not x.is_contiguous() or x.dim() != 4 or x.shape[2] != self.H or x.shape[3] != self.D:
             return False
-        return 1 <= x.shape[0] * x.shape[1] <= SPLIT_MAX_ROWS
+        return 1 <= x.shape[0] * x.shape[1] <= (8 if R8["on"] else SPLIT_MAX_ROWS)
+
+    def _wide_ok(self) -> bool:
+        """The one-launch 5..8 row path exists for this block: mf9 at the default variant 0x160000 (six stage launches), native layout, no timing. The wide instantiations cover K2..K5 only (the K6 drafter layer takes the split path)."""
+        v = MF9["variant"] & 0x1f0000
+        return bool(self.native and self.RB <= 5 and self.SB <= 5 and hasattr(torch.ops, "mf9") and hasattr(torch.ops.mf9, "half") and v == 0x160000 and not MF9["timing"])
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """x (b, s, H, D) fp32 residual stack, updated in place and returned."""
+        if x.shape[0] * x.shape[1] > MAX_ROWS and R8["on"] and self._wide_ok():
+            gr = self.gr
+            fq, fsc, uq, usc = gr.q8_set()
+            R8["calls"] += 1
+            torch.ops.mf9.half(x, fq, fsc, uq, usc, gr.w_h, self.router, self.sgate,
+                               self.wt, self.svt, self.ws, gr.rms_eps, 1, 0, MF9["variant"] | (0x1000 if MF9["tk2"] else 0), *self.shape)
+            return x
         if x.shape[0] * x.shape[1] > MAX_ROWS:
             assert x.shape[0] == 1
             for lo in range(0, x.shape[1], MAX_ROWS):
