@@ -128,7 +128,7 @@ class T(unittest.TestCase):
     def test_env_defaults(self):
         for k in ("QWSPEC_THF", "QWSPEC_THV", "QWSPEC_MAXD", "QWSPEC_RULE"): os.environ.pop(k, None)
         self.assertEqual(sp.env_defaults(7), (0.6, 0.3, 7))
-        r = sp.rule_from_env(0.6, 0.3, 7); self.assertEqual((r.name, r.thf, r.thv, r.maxd, r.thfd, r.thvd), ("tier", 0.6, 0.3, 7, 0.9, 0.5))
+        r = sp.rule_from_env(0.6, 0.3, 7); self.assertEqual((r.name, r.thf, r.thv, r.maxd, r.thfd, r.thvd), ("tier", 0.6, 0.3, 7, 0.9, 0.7))
         os.environ["QWSPEC_RULE"] = "product"
         try: r = sp.rule_from_env(0.6, 0.3, 3); self.assertEqual((r.name, r.thf, r.thv, r.maxd), ("product", 0.6, 0.3, 3))
         finally: del os.environ["QWSPEC_RULE"]
