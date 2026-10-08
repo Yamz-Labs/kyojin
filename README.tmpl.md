@@ -14,11 +14,11 @@ An inference engine built on <a href="https://github.com/turboderp-org/exllamav3
 
 {{TABLE}}
 
-<p align="center"><sub>Tokens per second on one Ryzen AI Max+ 395 with 128 GB. Prefill at the context shown in each cell, speculative decode across chat, prose and code prompts; the charts show both against context length. Method, sources and full tables: <a href="doc/benchmarks.md">doc/benchmarks.md</a>.</sub></p>
+<p align="center"><sub>Tokens per second on one Ryzen AI Max+ 395 with 128 GB. Prefill at the context shown in each cell, speculative decode across chat, prose and code prompts. Method, sources and full tables: <a href="doc/benchmarks.md">doc/benchmarks.md</a>.</sub></p>
 
 <p align="center">
 <img src="doc/img/prefill.svg" alt="Prefill speed against context length" width="49%">
-<img src="doc/img/decode_models.svg" alt="Speculative decode speed against context length" width="49%">
+<img src="doc/img/decode.svg" alt="Speculative decode speed by kind of text" width="49%">
 </p>
 
 These are first versions. Speed, context length and model support keep improving.
