@@ -1,51 +1,56 @@
 {
- "_comment": "Single source for the README table and the charts. null = not published/measured (left out of the chart). Qwen and MiMo: new-user recipe at commit a3ac00d. GLM: figures already published (see source). Rebuild: python3 tools/make_charts.py && python3 tools/make_readme_table.py before = previous release (same method). rivals: readme = figures published by the rival, measured = ours with the same ladder, independent = third party. quality: top-1 / KL against the FP8 original.",
+ "_comment": "Single source for the README table and the charts. null = not measured (left out of the chart). All three models: new-user recipe at the commit below. Rebuild: python3 tools/make_charts.py && python3 tools/make_readme_table.py. before = previous release, as published.",
  "machine": "Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB",
- "method": "new-user install, published packs, default environment, card prompts, greedy, engine-reported prefill",
- "date": "2026-10-07",
- "commit": "19265ed",
+ "method": "new-user install, published packs, default environment, card prompts, greedy, server-reported prefill",
+ "date": "2026-10-08",
+ "commit": "39dc956",
  "models": [
   {
    "id": "qwen",
    "name": "Qwen3.8-Flash-Next",
    "pack_gb": 95.0,
    "prefill": {
-    "8192": 1471,
-    "32768": 1463,
-    "65536": 1439,
-    "131072": 1390,
-    "262144": 1292
+    "8192": 1481,
+    "32768": 1477,
+    "65536": 1436,
+    "131072": 1396,
+    "262144": 1347
    },
    "spec": {
     "prose": 45.7,
-    "chat": 48.6,
-    "code": 61.0
+    "chat": 48.3,
+    "code": 66.8
    },
    "decode": {
-    "8192": 47.1,
-    "32768": 49.6,
-    "65536": 48.8,
-    "131072": 46.9,
-    "262144": 41.8
+    "8192": 46.5,
+    "32768": 46.4,
+    "65536": 46.4,
+    "131072": 45.1,
+    "262144": 44.3
    },
    "table": {
-    "prefill": "1494 at 8K",
-    "decode": "44.5 to 59.1"
+    "prefill": "1481 at 8K",
+    "decode": "45.7 to 66.8"
    },
    "before": {
     "prefill": {
-     "8192": 1494,
-     "32768": 1478,
-     "65536": 1457,
-     "131072": 1395,
-     "262144": 1277
+     "8192": 1471,
+     "32768": 1463,
+     "65536": 1439,
+     "131072": 1390,
+     "262144": 1292
     },
     "decode": {
-     "8192": 43.4,
-     "32768": 40.2,
-     "65536": 36.7,
-     "131072": 31.9,
-     "262144": 20.4
+     "8192": 47.1,
+     "32768": 49.6,
+     "65536": 48.8,
+     "131072": 46.9,
+     "262144": 41.8
+    },
+    "spec": {
+     "prose": 45.7,
+     "chat": 48.6,
+     "code": 61.0
     }
    }
   },
@@ -54,25 +59,28 @@
    "name": "GLM-5.3-Flash",
    "pack_gb": 99.73,
    "prefill": {
-    "3500": 580,
-    "14000": 584,
-    "65536": 546
+    "8192": 634,
+    "32768": 637,
+    "65536": 613,
+    "131072": 589,
+    "262144": 567
    },
    "spec": {
-    "prose": null,
-    "chat": null,
-    "code": null
+    "prose": 26.2,
+    "chat": 31.4,
+    "code": 33.4
    },
    "decode": {
-    "3500": 29.0,
-    "14000": 30.3,
-    "65536": 27.6
+    "8192": 31.1,
+    "32768": 30.7,
+    "65536": 30.0,
+    "131072": 32.1,
+    "262144": 32.3
    },
    "table": {
-    "prefill": "584 at 14K",
-    "decode": "27.6 to 30.3"
+    "prefill": "634 at 8K",
+    "decode": "26.2 to 33.4"
    },
-   "source": "public README (Measured numbers, 99.7 GB row) and hub card yamz-labs/GLM-5.3-Flash-EXL3-Yamz, Speed section: -c 98304, hook on, agent-lane flags, MTP 2, prefill mean of 3, decode mean of 6 at temperature 0",
    "before": {
     "prefill": {
      "3500": 580,
@@ -83,6 +91,11 @@
      "3500": 29.0,
      "14000": 30.3,
      "65536": 27.6
+    },
+    "spec": {
+     "prose": null,
+     "chat": null,
+     "code": null
     }
    }
   },
@@ -91,21 +104,25 @@
    "name": "MiMo-V2.6-Flash",
    "pack_gb": 105.8,
    "prefill": {
-    "8192": 812,
-    "32768": 698
+    "8192": 760,
+    "32768": 702,
+    "65536": 599,
+    "131072": 458
    },
    "spec": {
-    "prose": 29.1,
-    "chat": 32.4,
-    "code": 38.9
+    "prose": 28.9,
+    "chat": 31.2,
+    "code": 37.0
    },
    "decode": {
-    "8192": 35.1,
-    "32768": 27.2
+    "8192": 29.8,
+    "32768": 23.4,
+    "65536": 17.4,
+    "131072": 12.9
    },
    "table": {
-    "prefill": "812 at 8K",
-    "decode": "29.1 to 38.9"
+    "prefill": "760 at 8K",
+    "decode": "28.9 to 37.0"
    },
    "before": {
     "prefill": {
@@ -115,6 +132,11 @@
     "decode": {
      "8192": 35.1,
      "32768": 27.2
+    },
+    "spec": {
+     "prose": 29.1,
+     "chat": 32.4,
+     "code": 38.9
     }
    }
   }
