@@ -88,7 +88,15 @@ Honored:
 
 Ignored (accepted, no effect): `n`, `seed`, `logprobs`, `top_k`, `presence_penalty`,
 `frequency_penalty`, `response_format`, `stream_options`, `user`, `parallel_tool_calls`,
-`tool_choice`, multimodal content parts (images are never sent to the vision tower).
+`tool_choice`.
+
+### Images
+
+The server loads the vision tower of the pack at start (+0.35 GB GPU memory, about 2 s) and prints `vision=True`.
+An image goes in a user message as an OpenAI `image_url` part; the URL is a `data:` URI or a local file path (the
+server does not fetch remote URLs). One image takes 40 to about 1,500 tokens depending on its size. An image that is
+sent again in a later turn keeps the prompt cache. `--no-vision` skips the tower; an image request then gets HTTP 400,
+as do video and audio parts.
 
 ### Streaming format
 `Content-Type: text/event-stream`. Every frame is a bare `data: {...}` line (no `event:`

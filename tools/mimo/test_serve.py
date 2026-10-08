@@ -558,5 +558,39 @@ class ServeTests(unittest.TestCase):
         self.assertEqual(v["llamacpp:prompt_tokens_total"], float(sum(engine.count_tokens(p) for p in engine.prompts)))
 
 
+    def test_image_request_without_a_tower_is_a_clear_400_never_dropped(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        tpl = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{% for p in m.content %}"
+               "{% if p.type == 'image_url' %}<|vision_start|><|image_pad|><|vision_end|>{% else %}{{ p.text }}{% endif %}"
+               "{% endfor %}<|im_end|>{% endfor %}<|im_start|>assistant\n")
+        msgs = [{"role": "user", "content": [{"type": "text", "text": "what is this"},
+                                             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
+
+        async def check():
+            eng = FakeEngine("x")                       # no supports_vision attribute: a text-only server
+            client = TestClient(TestServer(serve.create_app(eng, "m", tpl)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={"model": "m", "messages": msgs})
+            out = (r.status, await r.json(), eng.prompts)
+            await client.close()
+            return out
+
+        status, body, prompts = run(check())
+        self.assertEqual(status, 400)
+        self.assertIn("without the vision tower", body["error"]["message"])
+        self.assertEqual(prompts, [])
+
+    def test_video_and_audio_parts_are_refused(self):
+        for kind in ("video_url", "input_audio"):
+            with self.assertRaises(Exception):
+                serve.extract_images([{"role": "user", "content": [{"type": kind, kind: {"url": "x"}}]}])
+
+    def test_extract_images_keeps_prompt_order(self):
+        msgs = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "a"}}, {"type": "text", "text": "t"}]},
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": [{"type": "image_url", "image_url": "b"}]}]
+        self.assertEqual(serve.extract_images(msgs), ["a", "b"])
+
+
 if __name__ == "__main__":
     unittest.main()

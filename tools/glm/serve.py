@@ -5,6 +5,10 @@ from __future__ import annotations
 import traceback
 import argparse
 import asyncio
+import base64
+import collections
+import hashlib
+import io
 import json
 import os
 import re
@@ -256,11 +260,73 @@ def sse(data: dict[str, Any], event: str | None = None) -> bytes:
 DEFAULT_SAMPLER_KW: dict = json.loads(os.environ.get("SERVE_SAMPLER_KW", "{}") or "{}")
 
 
+# ---- image input -----------------------------------------------------------------------------------
+# The chat template writes one IMAGE_TRIPLE per image part; the engine swaps each for the embedding's alias,
+# which the tokenizer expands to <|begin_of_image|> + one slot per vision token + <|end_of_image|>.
+IMAGE_TRIPLE = "<|begin_of_image|><|image|><|end_of_image|>"
+MAX_IMAGE_BYTES = 32 * 1024**2
+IMAGE_CACHE_SIZE = 8   # decoded embeddings kept by content hash, so a later turn re-sending the image reuses the KV cache
+
+
+def _bad(reason: str) -> web.HTTPBadRequest:
+    return web.HTTPBadRequest(reason=reason)
+
+
+def extract_images(messages: list[dict[str, Any]]) -> list[str]:
+    """Image URLs of the messages in prompt order (OpenAI image_url parts). Video and audio parts are refused:
+    this server has no such tower, and dropping them silently would let the model invent an answer."""
+    urls = []
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind in ("video", "video_url", "audio", "audio_url", "input_audio"):
+                raise _bad(f"{kind} input is not supported by this server (images only)")
+            if kind in ("image_url", "image"):
+                ref = part.get("image_url", part.get("image"))
+                url = ref.get("url") if isinstance(ref, dict) else ref
+                if not isinstance(url, str) or not url:
+                    raise _bad("image_url needs a url")
+                urls.append(url)
+    return urls
+
+
+def load_image(url: str) -> tuple[Any, str]:
+    """(PIL image, content hash) from a data: URI, a file:// URL or a local file path."""
+    from PIL import Image
+    if url.startswith("data:"):
+        try:
+            raw = base64.b64decode(url.split(",", 1)[1], validate=False)
+        except Exception as exc:                                      # noqa: BLE001
+            raise _bad(f"bad data URI: {exc}") from exc
+    elif url.startswith(("http://", "https://")):
+        raise _bad("image url must be a data: URI or a local file path (the server does not fetch remote images)")
+    else:
+        path = Path(url[7:] if url.startswith("file://") else url).expanduser()
+        try:
+            if path.stat().st_size > MAX_IMAGE_BYTES:
+                raise _bad("image too large")
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise _bad(f"cannot read image file: {exc}") from exc
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise _bad("image too large")
+    try:
+        return Image.open(io.BytesIO(raw)).convert("RGB"), hashlib.sha256(raw).hexdigest()
+    except Exception as exc:                                          # noqa: BLE001
+        raise _bad(f"cannot decode image: {exc}") from exc
+
+
 class ResidentEngine:
     """One loaded target model, optional MTP model, and resident paged caches."""
     supports_prefix_reuse = True
 
-    def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1):
+    def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
+                 vision: bool = True):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -284,6 +350,11 @@ class ResidentEngine:
                                  max_history=max_history)
         startup_health.stage("drafter weights")
         self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+        self.vision = None
+        self.emb_cache: collections.OrderedDict = collections.OrderedDict()
+        if vision:
+            self.vision = self._load_vision()
+        self.supports_vision = self.vision is not None
         self.greedy_generator = Generator(
             model=self.model, cache=self.cache, tokenizer=self.tokenizer,
             draft_model=self.draft_model, draft_cache=self.draft_cache, num_draft_tokens=num_draft,
@@ -294,12 +365,52 @@ class ResidentEngine:
         GM.MTP_FUSE_CATCHUP = 2
         os.environ.setdefault("EXL3_MOE_UNION_V2", "1")  # the "+v2" of n1f2+v2
 
+    def _load_vision(self):
+        """The vision tower (model.visual.*, fp16) next to the text model; None, with a log line, when the pack has none."""
+        from exllamav3 import Model
+        t0 = time.perf_counter()
+        try:
+            startup_health.stage("vision tower")
+            tower = Model.from_config(self.config, component="vision")
+            tower.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+        except Exception as exc:                                      # noqa: BLE001
+            print(f"serve: vision tower not loaded ({type(exc).__name__}: {exc}); image input disabled", flush=True)
+            return None
+        print(f"serve: vision tower loaded in {time.perf_counter() - t0:.1f} s", flush=True)
+        return tower
+
+    def image_tokens(self, image: Any) -> int:
+        """Vision tokens one image takes (the same canvas rule as the tower's preprocessing, no GPU)."""
+        from exllamav3.architecture.mm_processing.glm5_next import glm5_vision_canvas
+        v, pp = self.config.vision, self.config.vision_pp
+        w, h = image.size
+        th, tw = glm5_vision_canvas(pp.temporal_patch_size, h, w, pp.temporal_patch_size,
+                                    pp.patch_size * pp.merge_size, pp.min_image_tokens, pp.max_image_tokens)
+        return (th // pp.patch_size) * (tw // pp.patch_size) // (v.spatial_merge_size ** 2)
+
+    def _embed(self, images: list[tuple[Any, str]]) -> list:
+        """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
+        history turn that repeats an image still matches the paged KV cache; one prompt never holds an object twice."""
+        out, used = [], set()
+        for image, key in images:
+            emb = self.emb_cache.get(key) if key not in used else None
+            if emb is None:
+                emb = self.vision.get_image_embeddings(tokenizer=self.tokenizer, image=image)
+            self.emb_cache[key] = emb
+            self.emb_cache.move_to_end(key)
+            used.add(key)
+            out.append(emb)
+        while len(self.emb_cache) > IMAGE_CACHE_SIZE:
+            self.emb_cache.popitem(last=False)
+        return out
+
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
 
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float,
                        top_p: float, stop: list[str], sampler_kw: dict | None = None,
-                       cancel: asyncio.Event | None = None) -> AsyncIterator[str]:
+                       cancel: asyncio.Event | None = None,
+                       images: list | None = None) -> AsyncIterator[str]:
         """Yield incremental decoded text. Caller serializes access to this method.
 
         When `cancel` is set (client gone) the job is cancelled between two generator steps. A step is one
@@ -309,9 +420,20 @@ class ResidentEngine:
         from exllamav3.generator.sampler import ComboSampler, GreedySampler
         t0 = time.perf_counter()
         probe = getattr(self, "rss_probe", None)
-        ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
-        if getattr(self, "slot_store", None) is not None:
-            self.slot_store.note_prompt(prompt, ids)
+        embs = []
+        if images:
+            embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images)
+            for emb in embs:
+                prompt = prompt.replace(IMAGE_TRIPLE, emb.text_alias, 1)
+            ids = self.tokenizer.encode(prompt, encode_special_tokens=True, embeddings=embs)
+            if getattr(self, "slot_store", None) is not None:
+                self.slot_store.erase()   # embedding ids are per process: a saved image slot could never be matched again
+            room = reply_room(self, int(ids.numel()))
+            max_tokens = min(max_tokens, room) if room else max_tokens
+        else:
+            ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
+            if getattr(self, "slot_store", None) is not None:
+                self.slot_store.note_prompt(prompt, ids)
         self.last_stats = {}
         if cancel is not None and cancel.is_set():
             return                          # the client left while the request was queued: no prefill
@@ -323,7 +445,7 @@ class ResidentEngine:
         generator = self.greedy_generator
         conditions = list(self.config.eos_token_id_list) + stop
         job = self.Job(input_ids=ids, max_new_tokens=max_tokens, sampler=sampler,
-                       stop_conditions=conditions)
+                       stop_conditions=conditions, embeddings=embs or None)
         generator.enqueue(job)
         loop = asyncio.get_running_loop()
         try:
@@ -502,6 +624,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
     async def health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "source": "kyojin", "model": model_id,
+                                  "vision": bool(getattr(engine, "supports_vision", False)),
                                   **startup_health.compiler_health()})
 
     async def models(_: web.Request) -> web.Response:
@@ -528,7 +651,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         body["_prompt"],
                         max_tokens=token_limit(body), temperature=body.get("temperature", 0.0),
                         top_p=body.get("top_p", 1.0), stop=body.get("_stop", []),
-                        cancel=body.get("_cancel")):
+                        cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {})):
                         out.put_nowait(delta)
                     request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
@@ -583,8 +706,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise web.HTTPBadRequest(reason="stream must be boolean")
             stops = body.get("stop", [])
             body["_stop"] = [stops] if isinstance(stops, str) else list(stops)
+            urls = extract_images(body["messages"])
+            if urls and not getattr(engine, "supports_vision", False):
+                raise web.HTTPBadRequest(reason="this server runs without the vision tower (--no-vision or no vision weights in the model folder): it cannot read images")
             prompt = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
-            prompt_tokens = engine.count_tokens(prompt)
+            if len(urls) != prompt.count(IMAGE_TRIPLE):
+                raise web.HTTPBadRequest(reason="image parts and image placeholders do not match (the chat template must write one image placeholder per image part)")
+            images = [load_image(u) for u in urls]
+            body["_images"] = images or None
+            prompt_tokens = engine.count_tokens(prompt) + sum(engine.image_tokens(im) - 1 for im, _ in images)
             body["_prompt_tokens"] = prompt_tokens
             body["_room"] = reply_room(engine, prompt_tokens)
             body["_prompt"] = prompt
@@ -841,6 +971,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower (saves memory; image requests get HTTP 400)")
     parser.add_argument("--no-uncensor", action="store_true", help="ignore a bundled uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
     parser.add_argument("--model-id", default="glm-5.3-exl3")
     parser.add_argument("--host", default="127.0.0.1")
@@ -874,22 +1005,30 @@ def main() -> None:
     apply_eh_sidecar_default(args.model)
     warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
     tune = warm and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
-    stages = ["target weights", "drafter weights"] + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
+    stages = ["target weights", "drafter weights"] + ([] if args.no_vision else ["vision tower"]) + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
     startup_health.check_model_dir("serve", args.model, ("config.json",))
     # A start with the dense GEMM tuning already cached is much shorter than the first one: keep their timings apart.
     startup_health.start("glm", stages, args.host, args.port, routes=ROUTES,
                          variant="tuned" if tune and dense_tune_path().exists() else "untuned")
     startup_health.report_compiler()
     try:
-        engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft)
+        engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft,
+                              vision=not args.no_vision)
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
+        print(f"serve: vision={engine.supports_vision}", flush=True)
         # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
         # EXL3_SERVE_WARMUP=0 skips it.
         if os.environ.get("EXL3_SERVE_WARMUP", "1") != "0":
             startup_health.stage("warm-up")
             print(f"serve: warm-up {warmup(engine, template):.1f} s", flush=True)
             print(mem_line("warm"), flush=True)
+            if engine.supports_vision:   # first tower pass pays kernel setup and allocator growth: not on the first user image
+                from PIL import Image
+                t0 = time.perf_counter()
+                engine._embed([(Image.new("RGB", (448, 448), (127, 127, 127)), "warmup")])
+                engine.emb_cache.clear()
+                print(f"serve: vision warm-up {time.perf_counter() - t0:.1f} s", flush=True)
             if os.environ.get("EXL3_SERVE_EMPTY_CACHE", "1") == "1":   # lever (a): drop the allocator's inactive slack
                 import torch
                 torch.cuda.empty_cache()

@@ -32,6 +32,14 @@ Flags: `--host --port --model --model-id --drafter --ctx --ndt`
 Tool calls: a block body is JSON or `<parameter=k>v</parameter>` XML, typed by the request's tool schema; one block may hold several `<function=...>` elements; a malformed body is passed through raw; a cut-off trailing call is dropped.
 Model id in requests: `MiMo-2.6-EXL3`.
 
+### Images
+
+The server loads the vision tower from `<model>/vision/vision.safetensors` at start (1.4 GiB GPU memory, about 2 s).
+The file is in the hub pack; a pack downloaded before it was added needs `hf download` again. An image goes in a user
+message as an OpenAI `image_url` part; the URL is a `data:` URI or a local file path (the server does not fetch remote
+URLs). One image takes 24 to about 1,100 tokens depending on its size (capped at 2,097,152 pixels, `MIMO_IMAGE_MAX_PIXELS`). `--no-vision`
+skips the tower; an image request then gets HTTP 400, also when the file is missing. Audio and video are not supported.
+
 `--ctx 0` (default) takes the max context from the model config, following `text_config` when the
 top-level config does not carry `max_position_embeddings` — the GLM fix.
 
