@@ -63,6 +63,7 @@ FALLBACK_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "top_k":
 # Thinking effort when a request names none. The model's own template defines xhigh and low only;
 # chat_template.jinja next to this file is that template plus a medium level.
 DEFAULT_EFFORT = "medium"
+NO_CTX_REPLY = 32768  # reply budget when the engine reports no context length
 DEFAULT_TEMPLATE = Path(__file__).with_name("chat_template.jinja")
 # OpenAI effort names -> the Qwen template names (xhigh, medium, low).
 EFFORT_ALIASES = {"high": "xhigh", "minimal": "low"}
@@ -1172,7 +1173,7 @@ ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/slots": ("GET",), "/v1/
 
 
 def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, Any] | None = None,
-               default_max_tokens: int = 32768) -> web.Application:
+               default_max_tokens: int | None = None) -> web.Application:
     """HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     defaults = defaults or load_defaults("/nonexistent")
     queue: asyncio.Queue = asyncio.Queue()
@@ -1279,10 +1280,10 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             max_tokens = body.get("max_tokens")
         if max_tokens is not None and (not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1):
             raise BadRequest("max_tokens must be a positive integer")
-        room = reply_room(ctx, prompt_tokens, draft_window(engine, body.get("speculative", True) is not False)) if ctx else default_max_tokens
+        room = reply_room(ctx, prompt_tokens, draft_window(engine, body.get("speculative", True) is not False)) if ctx else (default_max_tokens or NO_CTX_REPLY)
         if room < 1:
             raise BadRequest(f"context length exceeded: prompt is {prompt_tokens} tokens, the server context is {ctx}")
-        max_tokens = min(max_tokens or default_max_tokens, room)
+        max_tokens = min(max_tokens or default_max_tokens or room, room)
         seed = body.get("seed")
         if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
             raise BadRequest("seed must be an integer")
@@ -1744,7 +1745,8 @@ def main() -> None:
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "xhigh"), default=None,
                         help=f"thinking effort when a request omits it (default: {DEFAULT_EFFORT})")
     parser.add_argument("--no-thinking", action="store_true", help="thinking off unless a request turns it on")
-    parser.add_argument("--default-max-tokens", type=int, default=32768, help="when a request omits max_tokens")
+    parser.add_argument("--default-max-tokens", type=int, default=None,
+                        help="reply budget when a request omits max_tokens (default: all the free context)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots")
     parser.add_argument("--sessions", type=int, default=1,
                         help="requests decoded together (default 1: one at a time, in order). Every session reserves the "

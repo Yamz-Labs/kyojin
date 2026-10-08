@@ -116,7 +116,7 @@ TOOL_CLOSE = "</tool_call>"
 # The engine's own default stays greedy; the lane passes the model card's sampling.
 # Used when a request omits the field. main() replaces the sampling values with the pack's
 # generation_config.json (the model card's recommendation); command-line flags win over both.
-SERVE_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "reasoning_effort": "medium", "max_tokens": 32768}
+SERVE_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "reasoning_effort": "medium", "max_tokens": None}
 # The model's template (levels low, high, max) with a medium level added: the model's "high" plus one instruction line.
 DEFAULT_TEMPLATE = Path(__file__).resolve().parent.parent / "lanes" / "assets" / "glm53-template-medium.jinja"
 
@@ -230,7 +230,7 @@ def token_limit(body: dict[str, Any], default: int | None = None) -> int:
         value = body.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
             return min(value, body.get("_room") or value)
-    default = default or SERVE_DEFAULTS["max_tokens"]
+    default = default or SERVE_DEFAULTS["max_tokens"] or body.get("_room") or 32768  # unset: all the free context
     return min(default, body.get("_room") or default)
 
 
@@ -858,7 +858,7 @@ def main() -> None:
     parser.add_argument("--default-top-p", type=float, default=None,
                         help="used when a request omits top_p (default: generation_config.json)")
     parser.add_argument("--default-max-tokens", type=int, default=None,
-                        help="reply budget when a request omits max_tokens, thinking included (default 32768)")
+                        help="reply budget when a request omits max_tokens, thinking included (default: all the free context)")
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
