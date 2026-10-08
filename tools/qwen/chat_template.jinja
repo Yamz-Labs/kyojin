@@ -51,7 +51,7 @@
     {%- if resolved_reasoning_effort == 'xhigh' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
     {%- elif resolved_reasoning_effort == 'medium' %}
-        {%- set reasoning_instructions = 'Reasoning effort is set to medium. Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer and verify what they rest on, not on alternatives the task does not call for. Gather what the answer needs, then give it.' %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to medium. Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on alternatives the task does not call for. Plan in your reasoning, but do not draft the answer there: write code and long text once, in the answer. When you have settled a point, keep it and move on.' %}
     {%- elif resolved_reasoning_effort == 'low' %}
         {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
     {%- endif %}
