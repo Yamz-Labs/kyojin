@@ -402,7 +402,9 @@ class ResidentEngine:
         for image, key in images:
             emb = self.emb_cache.get(key) if key not in used else None
             if emb is None:
+                t0 = time.perf_counter()
                 emb = self.vision.get_image_embeddings(image)
+                print(f"msrv: image {image.size[0]}x{image.size[1]} -> {emb.mm_length} tokens, tower {(time.perf_counter() - t0) * 1000:.0f} ms", flush=True)
             self.emb_cache[key] = emb
             self.emb_cache.move_to_end(key)
             used.add(key)
