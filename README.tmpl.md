@@ -21,6 +21,8 @@ An inference engine built on <a href="https://github.com/turboderp-org/exllamav3
 <img src="doc/img/decode_models.svg" alt="Speculative decode speed against context length" width="49%">
 </p>
 
+**Uncensored mode.** Each model has an optional mode that makes it refuse far less. The engine applies it at load and the weights stay untouched: ready-made packs for [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) and [MiMo-V2.6-Flash](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored), and a preset inside the [Qwen3.8-Flash-Next pack](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) that is off by default. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).
+
 These are first versions. Speed, context length and model support keep improving.
 
 ## Contributors
