@@ -44,7 +44,7 @@ Quick test:
 | `--default-reasoning-effort` | `medium` | `low`, `medium` or `xhigh` |
 | `--chat-template` | `tools/qwen/chat_template.jinja` | the model's template with a `medium` effort instruction added (the model's own leaves medium empty); `<model>/chat_template.jinja` is the unchanged one |
 | `--no-thinking` | off | thinking off unless a request turns it on |
-| `--default-max-tokens` | 32768 | when a request omits `max_tokens` (always clipped to the free context) |
+| `--default-max-tokens` | free context | reply budget when a request omits `max_tokens`; unset, a reply may use all the context left |
 | `--slot-save-path` | `~/cache/llama-slots` | directory for slot files |
 | `--sessions` | 1 | requests decoded together; see below |
 

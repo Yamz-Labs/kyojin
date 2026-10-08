@@ -81,7 +81,7 @@ Honored:
   because the GLM template iterates them as a dict.
 - `tools` — passed to the template verbatim (no server-side validation).
 - `stream` (bool) — SSE or a single JSON body.
-- `max_completion_tokens` or `max_tokens` (the first wins; default **32768**, thinking included; `--default-max-tokens`), `temperature` and
+- `max_completion_tokens` or `max_tokens` (the first wins; default: all the free context, thinking included; `--default-max-tokens` sets a limit), `temperature` and
   `top_p` (default: the pack's `generation_config.json`, 1.0 and 0.95), `stop` (string or array; also fed to EXL3 as stop conditions).
 - `model` — must equal `--model-id` if present, else 400.
 - `clear_thinking` — forwarded to the template as a Jinja variable.
