@@ -4,31 +4,33 @@
 
 One machine: Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB LPDDR5X, ROCm. Other GPUs are untested.
 
-The Qwen and MiMo figures on the front page come from a run set up like yours (GLM: see below):
+The figures of the three models come from a run set up like yours:
 
 - the public code at the commit named in `doc/figures.json`, built from the README install;
 - an empty home directory, the published packs downloaded from the hub, the default environment (no private flags);
 - greedy decoding, thinking off, the four card prompts for each of chat, prose and code, 256 tokens, median of 3 repetitions (`tools/bench.sh` runs the same prompts);
-- prefill and decode by context: cold prompts of 8K and 32K tokens (Qwen also 64K, 128K, 256K), a long essay request; prefill is the engine-reported prompt speed, decode the speculative decode speed over the reply. GLM and MiMo: median of 3 requests after a warm-up request, speed from the server timing; Qwen: {{LADDER}}, essay of 256 tokens;
+- prefill and decode by context: cold prompts of 8K to 256K tokens (MiMo: to 128K), an essay request of 256 tokens, after one discarded 8K request; prefill and decode are the speeds the server reports for the request. Qwen and GLM: {{LADDER}}; MiMo: two requests per depth, the second one reported. GLM and MiMo are started with a context large enough for the longest prompt (`-c 272384` and `-c 163840`);
 - speculative decode is the default server mode and returns the same tokens as plain decode.
 - the server log of each run has no `fallback`, `disabled`, `unavailable`, `not tuned` or `No module` line.
 
-## Qwen3.8-Flash-Next and MiMo-V2.6-Flash
+## Qwen3.8-Flash-Next, GLM-5.3-Flash and MiMo-V2.6-Flash
 
 Tokens per second; prefill by context, speculative decode by kind of text.
 
 {{TABLE}}
 
-{{GLM}}
+![Prefill against context, three models](img/prefill.svg)
+
+![Speculative decode by kind of text](img/decode.svg)
+
+{{DECODE}}
 ## Where each figure comes from
 
-- Qwen3.8-Flash-Next prefill and speculative decode (by context and on the card prompts): runs with the recipe above, at the commit named in `doc/figures.json`.
-- MiMo-V2.6-Flash: the same recipe, measured for release 1.2 and not run again for 1.3.
-- GLM-5.3-Flash: the recipe above where a value is in the main table; otherwise the "Measured numbers" table of the previous README (kept below) and the Speed section of the hub card, `yamz-labs/GLM-5.3-Flash-EXL3-Yamz`.
+- Qwen3.8-Flash-Next, GLM-5.3-Flash and MiMo-V2.6-Flash, prefill and speculative decode (by context and on the card prompts): runs with the recipe above, at the commit named in `doc/figures.json`.
 - Strata and Gufo: the section "Strata and Gufo" below names the source of each figure.
 - Charts and the front-page table are built from `doc/figures.json` with `tools/make_charts.py` and `tools/make_readme_table.py`.
 
-Caveats, once: one machine, one OS image; prefill is the engine-reported prompt speed; contexts differ between models because each figure keeps the context at which it was published or measured. These are first versions and improvements are coming.
+Caveats, once: one machine, one OS image; prefill is the engine-reported prompt speed; figures are steady-state: the first request at a new prompt length is slower than the next ones. These are first versions and improvements are coming.
 
 **First launch.** The engine tunes its dense GEMM kernels on the first requests and keeps the result in a cache. On a fresh install the first GLM prefills run at 200 to 240 tok/s; speed reaches the figures above within a few requests and stays there on later launches.
 

@@ -58,8 +58,11 @@ def draw_lines(headline, footer, xs, label, pos, series, note=None):
 
 def draw(key, headline, footer, xs, label, pos, getter, note=None):
     """One series per model; getter(model) -> {x key: value}."""
-    return draw_lines(headline, footer, xs, label, pos,
-                      [{"name": SHORT[m["id"]], "color": COL[m["id"]], "pts": getter(m)} for m in M], note)
+    series = [{"name": SHORT[m["id"]], "color": COL[m["id"]], "pts": getter(m)} for m in M]
+    first = lambda se: se["pts"][min(se["pts"], key=xs.index)] if se["pts"] else 0
+    low = min(series, key=first)  # the lowest line carries its labels under the points, so close lines do not overlap
+    if len(series) > 1: low["below"] = True
+    return draw_lines(headline, footer, xs, label, pos, series, note)
 
 def prefill_chart():
     ticks = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
@@ -102,8 +105,7 @@ def decode_context_chart():
     lo, hi = math.log2(ticks[0]), math.log2(ticks[-1])
     pos = lambda a, b: {c: a + (b - a) * (math.log2(c) - lo) / (hi - lo) for c in ticks}
     ints = lambda d: {int(c): v for c, v in d.items() if v}
-    series = [{"name": "Kyojin", "color": COL["qwen"], "pts": ints(q["decode"]), "below": True, "first_label": False}]
-    if q.get("before"): series.append({"name": "Kyojin, previous release", "color": COL["qwen"], "pts": ints(q["before"]["decode"]), "dash": True})
+    series = [{"name": "Kyojin", "color": COL["qwen"], "pts": ints(q["decode"]), "first_label": False}]
     if R.get("strata"): series.append({"name": "Strata (measured by us)", "color": "#E8745C", "pts": ints(R["strata"]["decode_measured"]), "first_label": False, "last_label": False})
     if R.get("gufo"): series.append({"name": "Gufo (measured by us)", "color": "#8FA3C4", "pts": ints(R["gufo"]["decode_measured"]), "first_label": False, "last_label": False})
     pts = ints(q["decode"]); cmax = max(pts) if pts else 0
@@ -111,6 +113,16 @@ def decode_context_chart():
     foot = "Speculative decode against context; same machine, 128 GB."
     return draw_lines(head, foot, ticks, lambda c: ck(c), pos, series)
 
+def decode_models_chart():
+    """Speculative decode against context length, one line per model."""
+    ticks = [8192, 16384, 32768, 65536, 131072, 262144]
+    lo, hi = math.log2(ticks[0]), math.log2(ticks[-1])
+    pos = lambda a, b: {c: a + (b - a) * (math.log2(c) - lo) / (hi - lo) for c in ticks}
+    qd = {int(c): v for c, v in M[0]["decode"].items() if v}; cmax = max(qd)
+    head = f"Qwen decode: {fmt(qd[cmax])} tok/s at {ck(cmax)}"
+    foot = "Speculative decode against context; same machine, 128 GB."
+    return draw("decode_models", head, foot, ticks, lambda c: ck(c), pos, lambda m: {int(c): v for c, v in m["decode"].items() if v})
+
 os.makedirs(out, exist_ok=True)
-for name, svg in (("prefill", prefill_chart()), ("decode", decode_chart()), ("decode_context", decode_context_chart()), ("prefill_context", prefill_context_chart())): open(os.path.join(out, name + ".svg"), "w").write(svg)
+for name, svg in (("prefill", prefill_chart()), ("decode", decode_chart()), ("decode_models", decode_models_chart()), ("decode_context", decode_context_chart()), ("prefill_context", prefill_context_chart())): open(os.path.join(out, name + ".svg"), "w").write(svg)
 print("wrote", out)

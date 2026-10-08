@@ -14,16 +14,16 @@ An inference engine built on <a href="https://github.com/turboderp-org/exllamav3
 
 <table align="center">
 <tr><th align="left">Model</th><th>Pack</th><th>Prefill</th><th>Speculative decode</th></tr>
-<tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">95 GB</td><td align="right">1471 at 8K</td><td align="right"><b>45.7 to 61.0</b></td></tr>
-<tr><td><b>GLM-5.3-Flash</b></td><td align="right">99.73 GB</td><td align="right">584 at 14K</td><td align="right"><b>27.6 to 30.3</b></td></tr>
-<tr><td><b>MiMo-V2.6-Flash</b></td><td align="right">105.8 GB</td><td align="right">812 at 8K</td><td align="right"><b>29.1 to 38.9</b></td></tr>
+<tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">95 GB</td><td align="right">1481 at 8K</td><td align="right"><b>45.7 to 66.8</b></td></tr>
+<tr><td><b>GLM-5.3-Flash</b></td><td align="right">99.73 GB</td><td align="right">634 at 8K</td><td align="right"><b>26.2 to 33.4</b></td></tr>
+<tr><td><b>MiMo-V2.6-Flash</b></td><td align="right">105.8 GB</td><td align="right">760 at 8K</td><td align="right"><b>28.9 to 37.0</b></td></tr>
 </table>
 
-<p align="center"><sub>Tokens per second on one Ryzen AI Max+ 395 with 128 GB. Prefill at the context shown in each cell, speculative decode across chat, prose and code prompts. Method, sources and full tables: <a href="doc/benchmarks.md">doc/benchmarks.md</a>.</sub></p>
+<p align="center"><sub>Tokens per second on one Ryzen AI Max+ 395 with 128 GB. Prefill at the context shown in each cell, speculative decode across chat, prose and code prompts; the charts show both against context length. Method, sources and full tables: <a href="doc/benchmarks.md">doc/benchmarks.md</a>.</sub></p>
 
 <p align="center">
 <img src="doc/img/prefill.svg" alt="Prefill speed against context length" width="49%">
-<img src="doc/img/decode.svg" alt="Speculative decode speed by kind of text" width="49%">
+<img src="doc/img/decode_models.svg" alt="Speculative decode speed against context length" width="49%">
 </p>
 
 These are first versions. Speed, context length and model support keep improving.

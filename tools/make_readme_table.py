@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fill the {{TABLE}}, {{GLM}}, {{RIVALS}} and {{LADDER}} fields of README.md and doc/benchmarks.md from doc/figures.json.
+"""Fill the {{TABLE}}, {{DECODE}}, {{RIVALS}} and {{LADDER}} fields of README.md and doc/benchmarks.md from doc/figures.json.
 Templates: README.tmpl.md, doc/benchmarks.tmpl.md. usage: python3 tools/make_readme_table.py"""
 import json, os
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -8,19 +8,13 @@ def f(v): return "n/a" if v is None else (f"{v:.1f}" if v < 100 else f"{v:.0f}")
 def ck(c): return f"{int(c) // 1024}K"
 rows = "".join(f'<tr><td><b>{m["name"]}</b></td><td align="right">{m["pack_gb"]:g} GB</td><td align="right">{m["table"]["prefill"]}</td><td align="right"><b>{m["table"]["decode"]}</b></td></tr>\n' for m in F["models"])
 table = ('<table align="center">\n<tr><th align="left">Model</th><th>Pack</th><th>Prefill</th><th>Speculative decode</th></tr>\n' + rows + '</table>')
-CT = sorted({int(c) for m in F["models"] if m["id"] != "glm" for c in m["prefill"]})
-in_main = [m for m in F["models"] if all(int(c) in CT for c in m["prefill"])]
+CT = sorted({int(c) for m in F["models"] for c in m["prefill"]})
+in_main = F["models"]
 def row(m): return f'| {m["name"]} | {m["pack_gb"]:g} GB | ' + " | ".join(f(m["prefill"].get(str(c))) if str(c) in m["prefill"] else "-" for c in CT) + f' | {f(m["spec"]["prose"])} | {f(m["spec"]["chat"])} | {f(m["spec"]["code"])} |\n'
 full = "| Model | Pack | " + " | ".join(f"Prefill {ck(c)}" for c in CT) + " | Spec prose | Spec chat | Spec code |\n|" + "---|" * (len(CT) + 5) + "\n" + "".join(row(m) for m in in_main)
 
-glm = next(m for m in F["models"] if m["id"] == "glm")
-if glm in in_main:
-    glm_block = ""
-else:
-    cs = sorted(int(c) for c in glm["prefill"])
-    glm_block = ("## GLM-5.3-Flash\n\nThe GLM figures were published before this page and are quoted as published (99.7 GB pack, MTP with 2 drafts, `-c 98304`, hook on with the agent-lane server flags, prefill mean of 3, decode mean of 6, temperature 0):\n\n"
-                 "| Context | Prefill tok/s | Decode tok/s |\n|---|---|---|\n" + "".join(f'| {f"{round(c / 1024)}K" if c >= 4096 else "3.5K"} | {f(glm["prefill"][str(c)])} | {f(glm["decode"][str(c)])} |\n' for c in cs)
-                 + "\nAt temperature 1.0 and top-p 0.95 decode is 26.0 / 28.5 / 26.4 tok/s. These GLM figures were not re-run with the new-user recipe above, so they are left out of the by-text-kind decode chart.\n")
+dec_block = ("### Speculative decode by context\n\n![Speculative decode against context, three models](img/decode_models.svg)\n\n| Model | " + " | ".join(ck(c) for c in CT) + " |\n|" + "---|" * (len(CT) + 1) + "\n"
+             + "".join(f'| {m["name"]} | ' + " | ".join(f(m["decode"][str(c)]) if m["decode"].get(str(c)) else "-" for c in CT) + " |\n" for m in F["models"]))
 
 def rivals():
     R = F.get("rivals")
@@ -48,6 +42,6 @@ def rivals():
 reps = F.get("method_ladder_reps", 1)
 ladder = "one request per depth" if reps == 1 else f"median of {reps} requests per depth"
 for tmpl, dst, tb in (("README.tmpl.md", "README.md", table), ("doc/benchmarks.tmpl.md", "doc/benchmarks.md", full)):
-    s = open(os.path.join(root, tmpl)).read().replace("{{TABLE}}", tb).replace("{{GLM}}", glm_block).replace("{{RIVALS}}", rivals()).replace("{{LADDER}}", ladder)
+    s = open(os.path.join(root, tmpl)).read().replace("{{TABLE}}", tb).replace("{{DECODE}}", dec_block).replace("{{RIVALS}}", rivals()).replace("{{LADDER}}", ladder)
     open(os.path.join(root, dst), "w").write(s)
 print("ok")
