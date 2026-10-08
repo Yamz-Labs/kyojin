@@ -520,6 +520,48 @@ class ServeTests(unittest.TestCase):
         self.assertEqual(v["llamacpp:tokens_predicted_total"], 9.0)
         self.assertEqual(v["llamacpp:prompt_tokens_total"], float(sum(engine.count_tokens(p) for p in engine.prompts)))
 
+    def test_image_request_without_vision_tower_is_refused_not_dropped(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        tpl = self.template.replace("{{ m.content }}", "{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{% if p.type == 'text' %}{{ p.text }}{% else %}" + serve.IMAGE_TRIPLE + "{% endif %}{% endfor %}{% endif %}")
+        body = {"model": "m", "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]}
+
+        async def check():
+            engine = FakeEngine("x")
+            client = TestClient(TestServer(serve.create_app(engine, "m", tpl)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json=body)
+            out = (r.status, (await r.json())["error"]["message"], engine.prompts)
+            h = await (await client.get("/health")).json()
+            await client.close()
+            return out, h
+
+        (status, message, prompts), health = run(check())
+        self.assertEqual(status, 400)
+        self.assertIn("vision tower", message)
+        self.assertEqual(prompts, [])          # nothing was generated
+        self.assertFalse(health["vision"])
+
+    def test_video_and_audio_parts_are_refused(self):
+        for kind in ("video_url", "input_audio"):
+            with self.assertRaises(serve.web.HTTPBadRequest):
+                serve.extract_images([{"role": "user", "content": [{"type": "text", "text": "x"}, {"type": kind, kind: {}}]}])
+
+    def test_load_image_sources(self):
+        import base64, io, tempfile
+        from PIL import Image
+        buf = io.BytesIO(); Image.new("RGB", (4, 3), (255, 0, 0)).save(buf, "PNG")
+        uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        im, key = serve.load_image(uri)
+        self.assertEqual(im.size, (4, 3))
+        with tempfile.NamedTemporaryFile(suffix=".png") as f:
+            f.write(buf.getvalue()); f.flush()
+            self.assertEqual(serve.load_image(f.name)[1], key)
+            self.assertEqual(serve.load_image("file://" + f.name)[1], key)
+        for bad in ("data:image/png;base64,AAAA", "/nonexistent.png", "https://example.com/a.png"):
+            with self.assertRaises(serve.web.HTTPBadRequest):
+                serve.load_image(bad)
+
 
 if __name__ == "__main__":
     unittest.main()
