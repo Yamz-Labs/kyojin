@@ -124,5 +124,5 @@ def decode_models_chart():
     return draw("decode_models", head, foot, ticks, lambda c: ck(c), pos, lambda m: {int(c): v for c, v in m["decode"].items() if v})
 
 os.makedirs(out, exist_ok=True)
-for name, svg in (("prefill", prefill_chart()), ("decode", decode_chart()), ("decode_models", decode_models_chart()), ("decode_context", decode_context_chart()), ("prefill_context", prefill_context_chart())): open(os.path.join(out, name + ".svg"), "w").write(svg)
+for name, svg in (("prefill", prefill_chart()), ("decode_models", decode_models_chart()), ("decode_context", decode_context_chart()), ("prefill_context", prefill_context_chart())): open(os.path.join(out, name + ".svg"), "w").write(svg)
 print("wrote", out)

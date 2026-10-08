@@ -23,7 +23,7 @@ An inference engine built on <a href="https://github.com/turboderp-org/exllamav3
 
 <p align="center">
 <img src="doc/img/prefill.svg" alt="Prefill speed against context length" width="49%">
-<img src="doc/img/decode.svg" alt="Speculative decode speed by kind of text" width="49%">
+<img src="doc/img/decode_models.svg" alt="Speculative decode speed against context length" width="49%">
 </p>
 
 These are first versions. Speed, context length and model support keep improving.

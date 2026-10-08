@@ -21,8 +21,6 @@ Tokens per second; prefill by context, speculative decode by kind of text.
 
 ![Prefill against context, three models](img/prefill.svg)
 
-![Speculative decode by kind of text](img/decode.svg)
-
 {{DECODE}}
 ## Where each figure comes from
 
