@@ -38,9 +38,29 @@ DEFAULT_MODEL = os.path.expanduser("~/models/mimo26-exl3")
 DEFAULT_MODEL_ID = "MiMo-2.6-EXL3"
 DEFAULT_CTX = 4096
 DEFAULT_NDT = 7
-# Sampling used when a request omits temperature/top_p. Agent clients often send neither, so
-# a plain-greedy default makes the lane loop; the lane launchers pass the model-card values (T1.0, top_p 0.95).
-SERVE_DEFAULTS: dict[str, float] = {"temperature": 0.0, "top_p": 1.0}
+# Used when a request omits the field. Agent clients often send no sampling at all, and plain greedy
+# makes the model loop: main() takes the values of the pack's generation_config.json (the model
+# card's recommendation); command-line flags win over both.
+SERVE_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "reasoning_effort": "medium"}
+# The model's own template plus a medium effort level (the model defines none).
+DEFAULT_TEMPLATE = Path(__file__).with_name("chat_template.jinja")
+
+
+def pack_sampling(model_dir: str) -> dict[str, float]:
+    """temperature / top_p of the pack's generation_config.json, when it has them."""
+    gc = Path(model_dir).expanduser() / "generation_config.json"
+    if not gc.is_file():
+        return {}
+    cfg = json.loads(gc.read_text())
+    return {k: float(cfg[k]) for k in ("temperature", "top_p") if cfg.get(k) is not None}
+
+
+def template_kwargs(body: dict[str, Any]) -> dict[str, Any]:
+    """reasoning_effort for the chat template: chat_template_kwargs > top level > server default."""
+    ctk = body.get("chat_template_kwargs")
+    ctk = ctk if isinstance(ctk, dict) else {}
+    effort = ctk.get("reasoning_effort") or body.get("reasoning_effort") or SERVE_DEFAULTS["reasoning_effort"]
+    return {"reasoning_effort": effort} if isinstance(effort, str) else {}
 # The template uses a zero-width space inside the tag so plain prose does not trigger tools.
 TOOL_OPEN = "<tool_call>"
 TOOL_CLOSE = "</tool_call>"
@@ -480,7 +500,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             stops = body.get("stop", [])
             body["_stop"] = [stops] if isinstance(stops, str) else list(stops)
             body["_reset_gate"] = bool(getattr(app["engine"], "reset_gate_per_request", False))
-            prompt = render_prompt(template, body["messages"], body.get("tools"))
+            prompt = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
             prompt_tokens = engine.count_tokens(prompt)
             body["_prompt_tokens"] = prompt_tokens
             body["_room"] = reply_room(engine, prompt_tokens)
@@ -624,7 +644,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             body = await request.json()
             if not isinstance(body.get("messages"), list) or not body["messages"]:
                 raise web.HTTPBadRequest(reason="messages must be a non-empty array")
-            prompt = render_prompt(template, body["messages"], body.get("tools"))
+            prompt = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
         except (json.JSONDecodeError, web.HTTPException, TypeError) as exc:
             if isinstance(exc, web.HTTPException):
                 raise
@@ -781,12 +801,21 @@ def main() -> None:
                         help="rebuild the SpecGate for every request (default: keep it)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
-    parser.add_argument("--default-temperature", type=float, default=0.0, help="used when a request omits temperature")
-    parser.add_argument("--default-top-p", type=float, default=1.0, help="used when a request omits top_p")
+    parser.add_argument("--chat-template", default=None,
+                        help="Jinja chat template file (default: chat_template.jinja next to this script; "
+                             "<model>/chat_template.jinja is the model's unchanged one)")
+    parser.add_argument("--default-temperature", type=float, default=None,
+                        help="used when a request omits temperature (default: generation_config.json)")
+    parser.add_argument("--default-top-p", type=float, default=None,
+                        help="used when a request omits top_p (default: generation_config.json)")
+    parser.add_argument("--default-reasoning-effort", choices=("medium", "none"), default=None,
+                        help="medium (default) adds one effort instruction to the prompt; none leaves the model's own prompt")
     args = parser.parse_args()
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
-    SERVE_DEFAULTS.update(temperature=args.default_temperature, top_p=args.default_top_p)
+    SERVE_DEFAULTS.update(pack_sampling(args.model))
+    SERVE_DEFAULTS.update({k: v for k, v in (("temperature", args.default_temperature), ("top_p", args.default_top_p),
+                                             ("reasoning_effort", args.default_reasoning_effort)) if v is not None})
 
     torch.set_grad_enabled(False)
     drafter = None
@@ -818,7 +847,7 @@ def main() -> None:
         from exllamav3.generator.slot_store import SlotStore
         engine.slot_store = SlotStore(engine.generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
                                       args.slot_save_path, args.model_id)
-        template = (Path(args.model) / "chat_template.jinja").read_text(encoding="utf-8")
+        template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
     except BaseException as exc:                                  # noqa: BLE001
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise

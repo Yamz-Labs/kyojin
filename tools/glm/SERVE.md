@@ -25,9 +25,9 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--model-id` | `glm-5.3-exl3` | id reported by `/v1/models` and echoed in every response |
 | `--host` | `127.0.0.1` | bind address |
 | `--port` | `8000` | port (smoke script uses 18080) |
-| `--chat-template` | the model's `chat_template.jinja` | Jinja template file; `tools/lanes/assets/glm53-template-medium.jinja` is the one the lane uses |
-| `--default-temperature` / `--default-top-p` | `0.0` / `1.0` | used when a request omits the field (explicit null too). The lane passes `1.0` / `0.95`: greedy defaults loop on agent clients |
-| `--default-reasoning-effort` | none | template `reasoning_effort` when a request omits it (the lane passes `medium`) |
+| `--chat-template` | `tools/lanes/assets/glm53-template-medium.jinja` | Jinja template file. The default is the model's template with a `medium` effort level added; `<model>/chat_template.jinja` is the unchanged one |
+| `--default-temperature` / `--default-top-p` | from `generation_config.json` (`1.0` / `0.95`) | used when a request omits the field (explicit null too). Greedy defaults loop on agent clients that send no sampling |
+| `--default-reasoning-effort` | `medium` | template `reasoning_effort` when a request omits it: `low`, `medium`, `high` or `max` |
 | `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
 
 Env vars the server sets for itself via `os.environ.setdefault` (so an external value

@@ -114,7 +114,20 @@ TOOL_CLOSE = "</tool_call>"
 
 # Server-side defaults for fields a client leaves out (set from the CLI in main()).
 # The engine's own default stays greedy; the lane passes the model card's sampling.
-SERVE_DEFAULTS: dict[str, Any] = {"temperature": 0.0, "top_p": 1.0, "reasoning_effort": None}
+# Used when a request omits the field. main() replaces the sampling values with the pack's
+# generation_config.json (the model card's recommendation); command-line flags win over both.
+SERVE_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "reasoning_effort": "medium"}
+# The model's template (levels low, high, max) with a medium level added: the model's "high" plus one instruction line.
+DEFAULT_TEMPLATE = Path(__file__).resolve().parent.parent / "lanes" / "assets" / "glm53-template-medium.jinja"
+
+
+def pack_sampling(model_dir: str) -> dict[str, float]:
+    """temperature / top_p of the pack's generation_config.json, when it has them."""
+    gc = Path(model_dir).expanduser() / "generation_config.json"
+    if not gc.is_file():
+        return {}
+    cfg = json.loads(gc.read_text())
+    return {k: float(cfg[k]) for k in ("temperature", "top_p") if cfg.get(k) is not None}
 
 
 def template_kwargs(body: dict[str, Any]) -> dict[str, Any]:
@@ -836,15 +849,21 @@ def main() -> None:
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots",
                         help="directory for /slots save/restore files (llama.cpp compatible)")
-    parser.add_argument("--chat-template", default=None, help="Jinja chat template file (default: the model's)")
-    parser.add_argument("--default-temperature", type=float, default=0.0, help="used when a request omits temperature")
-    parser.add_argument("--default-top-p", type=float, default=1.0, help="used when a request omits top_p")
-    parser.add_argument("--default-reasoning-effort", default=None, help="template reasoning_effort when a request omits it")
+    parser.add_argument("--chat-template", default=None,
+                        help="Jinja chat template file (default: tools/lanes/assets/glm53-template-medium.jinja; "
+                             "<model>/chat_template.jinja is the model's unchanged one)")
+    parser.add_argument("--default-temperature", type=float, default=None,
+                        help="used when a request omits temperature (default: generation_config.json)")
+    parser.add_argument("--default-top-p", type=float, default=None,
+                        help="used when a request omits top_p (default: generation_config.json)")
+    parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
+                        help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
     if args.no_uncensor:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
-    SERVE_DEFAULTS.update(temperature=args.default_temperature, top_p=args.default_top_p,
-                          reasoning_effort=args.default_reasoning_effort)
+    SERVE_DEFAULTS.update(pack_sampling(args.model))
+    SERVE_DEFAULTS.update({k: v for k, v in (("temperature", args.default_temperature), ("top_p", args.default_top_p),
+                                             ("reasoning_effort", args.default_reasoning_effort)) if v is not None})
     for key, value in SPEED_ENV.items():
         os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
@@ -852,14 +871,14 @@ def main() -> None:
     warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
     tune = warm and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
     stages = ["target weights", "drafter weights"] + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
-    startup_health.check_model_dir("serve", args.model, ("config.json",) if args.chat_template else ("config.json", "chat_template.jinja"))
+    startup_health.check_model_dir("serve", args.model, ("config.json",))
     # A start with the dense GEMM tuning already cached is much shorter than the first one: keep their timings apart.
     startup_health.start("glm", stages, args.host, args.port, routes=ROUTES,
                          variant="tuned" if tune and dense_tune_path().exists() else "untuned")
     startup_health.report_compiler()
     try:
         engine = ResidentEngine(args.model, max_history=args.max_history or args.num_draft, max_ctx=args.max_ctx, num_draft=args.num_draft)
-        template = Path(args.chat_template or Path(args.model) / "chat_template.jinja").expanduser().read_text(encoding="utf-8")
+        template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         # Warm-up before the slot store is attached, so the warm-up prompt never shows in /slots.
         # EXL3_SERVE_WARMUP=0 skips it.

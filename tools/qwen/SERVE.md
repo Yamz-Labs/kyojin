@@ -41,7 +41,8 @@ Quick test:
 | `--draft-policy` | `mix` | `mix` shipped rule, `mtp` fixed MTP chain, `off` plain decode (no drafter loaded) |
 | `--no-vision` | off | do not load the vision tower (less memory, image input answers 400) |
 | `--default-temperature/-top-p/-top-k/-min-p` | from `generation_config.json` (1.0 / 0.95 / 20) | used when a request omits them |
-| `--default-reasoning-effort` | template default (`xhigh`) | `low`, `medium` or `xhigh` |
+| `--default-reasoning-effort` | `medium` | `low`, `medium` or `xhigh` |
+| `--chat-template` | `tools/qwen/chat_template.jinja` | the model's template with a `medium` effort instruction added (the model's own leaves medium empty); `<model>/chat_template.jinja` is the unchanged one |
 | `--no-thinking` | off | thinking off unless a request turns it on |
 | `--default-max-tokens` | 32768 | when a request omits `max_tokens` (always clipped to the free context) |
 | `--slot-save-path` | `~/cache/llama-slots` | directory for slot files |
@@ -60,8 +61,8 @@ environment wins. The engine modules read several of these when they are importe
 
 - `POST /v1/chat/completions`: stream (SSE) and non-stream, `tools` and `tool_calls`, `tool` role messages, images as
   `image_url` parts (`data:` URI or http(s) URL), `stop`, `max_tokens` / `max_completion_tokens`, `temperature`,
-  `top_p`, `top_k`, `min_p`, `seed`. The model's own chat template renders the prompt (identical to the HF `apply_chat_template`).
-- Thinking: the template default is thinking ON at effort `xhigh`; the answer then starts inside a reasoning block.
+  `top_p`, `top_k`, `min_p`, `seed`. The chat template renders the prompt (with the model's own file, identical to the HF `apply_chat_template`).
+- Thinking: ON by default, at effort `medium`; the answer then starts inside a reasoning block.
   The server splits it into `reasoning_content` and `content`. Turn it off per request with `"enable_thinking": false`
   (or `"chat_template_kwargs": {"enable_thinking": false}` or `"reasoning_effort": "none"`). Effort: `low`, `medium`,
   `xhigh` (`high` maps to `xhigh`, `minimal` to `low`).
