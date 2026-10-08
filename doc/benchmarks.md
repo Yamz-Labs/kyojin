@@ -9,7 +9,7 @@ The figures of the three models come from a run set up like yours:
 - the public code at the commit named in `doc/figures.json`, built from the README install;
 - an empty home directory, the published packs downloaded from the hub, the default environment (no private flags);
 - greedy decoding, thinking off, the four card prompts for each of chat, prose and code, 256 tokens, median of 3 repetitions (`tools/bench.sh` runs the same prompts);
-- prefill and decode by context: cold prompts of 8K to 256K tokens (MiMo: to 128K), an essay request of 256 tokens, after one discarded 8K request; prefill and decode are the speeds the server reports for the request. Qwen and GLM: one request per depth; MiMo: two requests per depth, the second one reported. GLM and MiMo are started with a context large enough for the longest prompt (`-c 272384` and `-c 163840`);
+- prefill and decode by context: cold prompts of 8K to 256K tokens (MiMo: to 128K), an essay request of 256 tokens, after one discarded 8K request; prefill is the speed the server reports for the request. Decode: Qwen, like the other engines in the comparison below, is timed by the client from the first to the last streamed token; GLM and MiMo use the server's own decode counters (`/metrics`), because their streams arrive in bursts that a client clock misreads. Qwen and GLM: one request per depth; MiMo: two requests per depth, the second one reported. GLM and MiMo are started with a context large enough for the longest prompt (`-c 272384` and `-c 163840`);
 - speculative decode is the default server mode and returns the same tokens as plain decode.
 - the server log of each run has no `fallback`, `disabled`, `unavailable`, `not tuned` or `No module` line.
 
@@ -34,7 +34,7 @@ Tokens per second; prefill by context, speculative decode by kind of text.
 
 | Model | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 46.4 | 45.5 | 45.3 | 44.0 | 46.1 |
+| Qwen3.8-Flash-Next | 46.5 | 46.4 | 46.4 | 45.1 | 44.3 |
 | GLM-5.3-Flash | 31.1 | 30.7 | 30.0 | 32.1 | 32.3 |
 | MiMo-V2.6-Flash | 29.8 | 23.4 | 17.4 | 12.9 | - |
 
@@ -83,7 +83,7 @@ Strata prefill, independent measurement by Ciru Inference Lab ([report](https://
 
 | tok/s | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Kyojin | 46.4 | 45.5 | 45.3 | 44.0 | 46.1 |
+| Kyojin | 46.5 | 46.4 | 46.4 | 45.1 | 44.3 |
 | Gufo, measured by us | 35.3 | 31.9 | 35.8 | 31.4 | - |
 | Strata, measured by us | 39.0 | 38.7 | 36.4 | 35.0 | 37.5 |
 

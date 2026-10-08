@@ -1,7 +1,7 @@
 {
  "_comment": "Single source for the README table and the charts. null = not measured (left out of the chart). All three models: new-user recipe at the commit below. Rebuild: python3 tools/make_charts.py && python3 tools/make_readme_table.py. before = previous release, as published.",
  "machine": "Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB",
- "method": "new-user install, published packs, default environment, card prompts, greedy, server-reported prefill and decode",
+ "method": "new-user install, published packs, default environment, card prompts, greedy, server-reported prefill",
  "date": "2026-10-08",
  "commit": "39dc956",
  "models": [
@@ -22,11 +22,11 @@
     "code": 66.8
    },
    "decode": {
-    "8192": 46.4,
-    "32768": 45.5,
-    "65536": 45.3,
-    "131072": 44.0,
-    "262144": 46.1
+    "8192": 46.5,
+    "32768": 46.4,
+    "65536": 46.4,
+    "131072": 45.1,
+    "262144": 44.3
    },
    "table": {
     "prefill": "1481 at 8K",

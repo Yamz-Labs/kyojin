@@ -9,7 +9,7 @@ The figures of the three models come from a run set up like yours:
 - the public code at the commit named in `doc/figures.json`, built from the README install;
 - an empty home directory, the published packs downloaded from the hub, the default environment (no private flags);
 - greedy decoding, thinking off, the four card prompts for each of chat, prose and code, 256 tokens, median of 3 repetitions (`tools/bench.sh` runs the same prompts);
-- prefill and decode by context: cold prompts of 8K to 256K tokens (MiMo: to 128K), an essay request of 256 tokens, after one discarded 8K request; prefill and decode are the speeds the server reports for the request. Qwen and GLM: {{LADDER}}; MiMo: two requests per depth, the second one reported. GLM and MiMo are started with a context large enough for the longest prompt (`-c 272384` and `-c 163840`);
+- prefill and decode by context: cold prompts of 8K to 256K tokens (MiMo: to 128K), an essay request of 256 tokens, after one discarded 8K request; prefill is the speed the server reports for the request. Decode: Qwen, like the other engines in the comparison below, is timed by the client from the first to the last streamed token; GLM and MiMo use the server's own decode counters (`/metrics`), because their streams arrive in bursts that a client clock misreads. Qwen and GLM: {{LADDER}}; MiMo: two requests per depth, the second one reported. GLM and MiMo are started with a context large enough for the longest prompt (`-c 272384` and `-c 163840`);
 - speculative decode is the default server mode and returns the same tokens as plain decode.
 - the server log of each run has no `fallback`, `disabled`, `unavailable`, `not tuned` or `No module` line.
 
