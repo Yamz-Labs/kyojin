@@ -750,8 +750,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 n_predict = min(n_predict, room)
             stops = body.get("stop", [])
             job = {"_prompt": prompt, "max_tokens": n_predict,
-                   "temperature": float(body.get("temperature", 0.0)),
-                   "top_p": float(body.get("top_p", 1.0)),
+                   "temperature": float(body.get("temperature", SERVE_DEFAULTS["temperature"])),
+                   "top_p": float(body.get("top_p", SERVE_DEFAULTS["top_p"])),
                    "_stop": [stops] if isinstance(stops, str) else list(stops)}
         except (json.JSONDecodeError, web.HTTPException, TypeError, ValueError) as exc:
             if isinstance(exc, web.HTTPException):
