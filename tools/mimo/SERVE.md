@@ -39,7 +39,7 @@ top-level config does not carry `max_position_embeddings` — the GLM fix.
 
 - `POST /v1/chat/completions` — `stream: true` (SSE `chat.completion.chunk`) and `false`.
   `tools` / `tool_calls` / `tool` role messages, `reasoning_content` for `<think>` blocks,
-  `stop` (string or list), `temperature`, `top_p`, `max_completion_tokens` or `max_tokens` (the first wins; default 4096). A reply cut by the limit reports `finish_reason: "length"`. An engine failure mid-stream ends with an `error` frame, `finish_reason: "error"` and `[DONE]`. Tool calls are emitted only
+  `stop` (string or list), `temperature`, `top_p`, `max_completion_tokens` or `max_tokens` (the first wins; default 32768, thinking included; `--default-max-tokens`). A reply cut by the limit reports `finish_reason: "length"`. An engine failure mid-stream ends with an `error` frame, `finish_reason: "error"` and `[DONE]`. Tool calls are emitted only
   once the XML block closes, so a client never sees half a JSON payload.
 - `GET /v1/models` — one entry, `MiMo-2.6-EXL3`.
 - `GET /health` — `{"status","model","generator","spec_gate"}` once ready (load progress while starting: see below); with the gate on, `spec_gate`

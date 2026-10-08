@@ -116,7 +116,7 @@ TOOL_CLOSE = "</tool_call>"
 # The engine's own default stays greedy; the lane passes the model card's sampling.
 # Used when a request omits the field. main() replaces the sampling values with the pack's
 # generation_config.json (the model card's recommendation); command-line flags win over both.
-SERVE_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "reasoning_effort": "medium"}
+SERVE_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "reasoning_effort": "medium", "max_tokens": 32768}
 # The model's template (levels low, high, max) with a medium level added: the model's "high" plus one instruction line.
 DEFAULT_TEMPLATE = Path(__file__).resolve().parent.parent / "lanes" / "assets" / "glm53-template-medium.jinja"
 
@@ -224,12 +224,13 @@ def stop_text(text: str, stop: list[str]) -> tuple[str, str | None]:
     return text[:pos], match
 
 
-def token_limit(body: dict[str, Any], default: int = 4096) -> int:
+def token_limit(body: dict[str, Any], default: int | None = None) -> int:
     """Reply token budget: max_completion_tokens (newer OpenAI field) wins over max_tokens."""
     for key in ("max_completion_tokens", "max_tokens"):
         value = body.get(key)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
             return min(value, body.get("_room") or value)
+    default = default or SERVE_DEFAULTS["max_tokens"]
     return min(default, body.get("_room") or default)
 
 
@@ -856,6 +857,8 @@ def main() -> None:
                         help="used when a request omits temperature (default: generation_config.json)")
     parser.add_argument("--default-top-p", type=float, default=None,
                         help="used when a request omits top_p (default: generation_config.json)")
+    parser.add_argument("--default-max-tokens", type=int, default=None,
+                        help="reply budget when a request omits max_tokens, thinking included (default 32768)")
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
@@ -863,7 +866,8 @@ def main() -> None:
         os.environ["EXL3_ABLIT_RUNTIME"] = "off"
     SERVE_DEFAULTS.update(pack_sampling(args.model))
     SERVE_DEFAULTS.update({k: v for k, v in (("temperature", args.default_temperature), ("top_p", args.default_top_p),
-                                             ("reasoning_effort", args.default_reasoning_effort)) if v is not None})
+                                             ("reasoning_effort", args.default_reasoning_effort),
+                                             ("max_tokens", args.default_max_tokens)) if v is not None})
     for key, value in SPEED_ENV.items():
         os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")

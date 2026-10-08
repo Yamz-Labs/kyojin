@@ -146,7 +146,7 @@ class ServeTests(unittest.TestCase):
     def test_max_completion_tokens_is_honored(self):
         self.assertEqual(serve.token_limit({"max_completion_tokens": 7, "max_tokens": 9}), 7)
         self.assertEqual(serve.token_limit({"max_tokens": 9}), 9)
-        self.assertEqual(serve.token_limit({"max_tokens": None}), 4096)
+        self.assertEqual(serve.token_limit({"max_tokens": None}), 32768)
         from aiohttp.test_utils import TestClient, TestServer
 
         class Spy(FakeEngine):
