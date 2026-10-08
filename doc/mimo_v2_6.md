@@ -38,7 +38,7 @@ The upstream architecture-support issue is
 
 ### What is not supported
 
-* **Text only.** No vision, no audio (`vision: false`).
+* **No audio, no video.** Images work with `tools/mimo/serve.py` (see `tools/mimo/SERVE.md`); the TabbyAPI path below stays text only (`vision: false`).
 * **MTP drafting.** The checkpoint's `num_nextn_predict_layers: 3` head is not ported. Use
   DFlash instead — it is faster anyway.
 * **Tensor parallel.** `supports_tp = False` for this architecture.
