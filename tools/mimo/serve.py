@@ -15,6 +15,10 @@ from __future__ import annotations
 import traceback
 import argparse
 import asyncio
+import base64
+import collections
+import hashlib
+import io
 import json
 import os
 import re
@@ -44,6 +48,66 @@ DEFAULT_NDT = 7
 SERVE_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "reasoning_effort": "medium", "max_tokens": None}
 # The model's own template plus a medium effort level (the model defines none).
 DEFAULT_TEMPLATE = Path(__file__).with_name("chat_template.jinja")
+
+# ---- image input -----------------------------------------------------------------------------------
+# The chat template writes <|vision_start|><|image_pad|><|vision_end|> per image part; the engine swaps each
+# <|image_pad|> for the embedding's alias, which the tokenizer expands to one slot per vision token.
+IMAGE_PAD = "<|image_pad|>"
+MAX_IMAGE_BYTES = 32 * 1024**2
+IMAGE_CACHE_SIZE = 8   # embeddings kept by content hash: a later turn that re-sends the image reuses the KV cache
+
+
+def _bad(reason: str) -> web.HTTPBadRequest:
+    return web.HTTPBadRequest(reason=reason)
+
+
+def extract_images(messages: list[dict[str, Any]]) -> list[str]:
+    """Image URLs of the messages in prompt order (OpenAI image_url parts). Video and audio parts are refused:
+    this server has no such tower, and dropping them silently would let the model invent an answer."""
+    urls = []
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind in ("video", "video_url", "audio", "audio_url", "input_audio"):
+                raise _bad(f"{kind} input is not supported by this server (images only)")
+            if kind in ("image_url", "image"):
+                ref = part.get("image_url", part.get("image"))
+                url = ref.get("url") if isinstance(ref, dict) else ref
+                if not isinstance(url, str) or not url:
+                    raise _bad("image_url needs a url")
+                urls.append(url)
+    return urls
+
+
+def load_image(url: str) -> tuple[Any, str]:
+    """(PIL image, content hash) from a data: URI, a file:// URL or a local file path."""
+    from PIL import Image
+    if url.startswith("data:"):
+        try:
+            raw = base64.b64decode(url.split(",", 1)[1], validate=False)
+        except Exception as exc:                                      # noqa: BLE001
+            raise _bad(f"bad data URI: {exc}") from exc
+    elif url.startswith(("http://", "https://")):
+        raise _bad("image url must be a data: URI or a local file path (the server does not fetch remote images)")
+    else:
+        path = Path(url[7:] if url.startswith("file://") else url).expanduser()
+        try:
+            if path.stat().st_size > MAX_IMAGE_BYTES:
+                raise _bad("image too large")
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise _bad(f"cannot read image file: {exc}") from exc
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise _bad("image too large")
+    try:
+        return Image.open(io.BytesIO(raw)).convert("RGB"), hashlib.sha256(raw).hexdigest()
+    except Exception as exc:                                          # noqa: BLE001
+        raise _bad(f"cannot decode image: {exc}") from exc
 
 
 def pack_sampling(model_dir: str) -> dict[str, float]:
@@ -248,7 +312,7 @@ class ResidentEngine:
     def __init__(self, model_path: str, drafter_path: str | None = None, ndt: int = DEFAULT_NDT,
                  spec_gate: bool = False, ctx: int | None = None,
                  reset_gate_per_request: bool = False,
-                 dynamic_draft: bool = True, draft_confidence: float = 0.6):
+                 dynamic_draft: bool = True, draft_confidence: float = 0.6, vision: bool = True):
         # Lossless speculation: every verify row uses the exact R=1 arithmetic, so
         # speculative output equals plain greedy output (20/20 prompts). Costs about 5 % chat and
         # 12 % code tok/s. EXL3_MIMO_LOSSLESS=0 restores the fast, not bit-identical verify.
@@ -306,6 +370,46 @@ class ResidentEngine:
         self.Job = Job
         self.ctx = ctx or config_max_position(self.config)
         self.num_draft = self.ndt
+        self.vision = None
+        self.emb_cache: collections.OrderedDict = collections.OrderedDict()
+        if vision:
+            self.vision = self._load_vision()
+        self.supports_vision = self.vision is not None
+
+    def _load_vision(self):
+        """The vision tower from <model>/vision/vision.safetensors; None, with a log line, when the pack has none."""
+        t0 = time.perf_counter()
+        try:
+            from vision import load_tower
+            cfg = json.loads((Path(self.model_path) / "config.json").read_text())["vision_config"]
+            startup_health.stage("vision tower")
+            tower = load_tower(self.model_path, cfg, device="cuda:0")
+        except Exception as exc:                                      # noqa: BLE001
+            print(f"msrv: vision tower not loaded ({type(exc).__name__}: {exc}); image input disabled", flush=True)
+            return None
+        print(f"msrv: vision tower loaded in {time.perf_counter() - t0:.1f} s ({tower.nbytes / 2**30:.2f} GiB)", flush=True)
+        return tower
+
+    def image_tokens(self, image: Any) -> int:
+        """Vision tokens one image takes (the tower's resize rule, no GPU)."""
+        from vision import image_grid
+        return image_grid(image.size, self.vision.min_pixels)[2]
+
+    def _embed(self, images: list[tuple[Any, str]]) -> list:
+        """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
+        history turn that repeats an image still matches the paged KV cache; one prompt never holds an object twice."""
+        out, used = [], set()
+        for image, key in images:
+            emb = self.emb_cache.get(key) if key not in used else None
+            if emb is None:
+                emb = self.vision.get_image_embeddings(image)
+            self.emb_cache[key] = emb
+            self.emb_cache.move_to_end(key)
+            used.add(key)
+            out.append(emb)
+        while len(self.emb_cache) > IMAGE_CACHE_SIZE:
+            self.emb_cache.popitem(last=False)
+        return out
 
     def count_tokens(self, text: str) -> int:
         return int(self.tokenizer.encode(text, encode_special_tokens=True).numel())
@@ -324,16 +428,28 @@ class ResidentEngine:
 
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float, top_p: float,
                        stop: list[str], reset_gate: bool = False,
-                       cancel: asyncio.Event | None = None) -> AsyncIterator[str]:
+                       cancel: asyncio.Event | None = None,
+                       images: list | None = None) -> AsyncIterator[str]:
         """Yield incremental decoded text. The caller serializes access to this method.
 
         When `cancel` is set (client gone) the job is cancelled between two generator steps. A step is one
         prefill chunk or one decode step, so a drop during prefill stops at the next chunk boundary."""
         import torch  # noqa: F401  (keeps the ROCm runtime loaded for the worker thread)
         from exllamav3.generator.sampler import ComboSampler, GreedySampler
-        ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
-        if getattr(self, "slot_store", None) is not None:
-            self.slot_store.note_prompt(prompt, ids)
+        embs = []
+        if images:
+            embs = await asyncio.get_running_loop().run_in_executor(None, self._embed, images)
+            for emb in embs:
+                prompt = prompt.replace(IMAGE_PAD, emb.text_alias, 1)
+            ids = self.tokenizer.encode(prompt, encode_special_tokens=True, embeddings=embs)
+            if getattr(self, "slot_store", None) is not None:
+                self.slot_store.erase()   # embedding ids are per process: a saved image slot could never be matched again
+            room = reply_room(self, int(ids.numel()))
+            max_tokens = min(max_tokens, room) if room else max_tokens
+        else:
+            ids = self.tokenizer.encode(prompt, encode_special_tokens=True)
+            if getattr(self, "slot_store", None) is not None:
+                self.slot_store.note_prompt(prompt, ids)
         self.last_stats = {}
         if cancel is not None and cancel.is_set():
             return                          # the client left while the request was queued: no prefill
@@ -342,7 +458,7 @@ class ResidentEngine:
         if reset_gate:
             self.reset_gate()
         job = self.Job(input_ids=ids, max_new_tokens=max_tokens, sampler=sampler,
-                       stop_conditions=list(self.config.eos_token_id_list) + stop)
+                       stop_conditions=list(self.config.eos_token_id_list) + stop, embeddings=embs or None)
         self.generator.enqueue(job)
         loop = asyncio.get_running_loop()
         self.last_rounds = 0
@@ -420,6 +536,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         except Exception:                                        # noqa: BLE001
             gate = None
         return web.json_response({"status": "ok", "source": "kyojin", "model": model_id,
+                                  "vision": bool(getattr(engine, "supports_vision", False)),
                                   "generator": getattr(engine, "generator", None) is not None,
                                   **startup_health.compiler_health(),
                                   "spec_gate": gate})
@@ -445,7 +562,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         temperature=body.get("temperature", SERVE_DEFAULTS["temperature"]),
                         top_p=body.get("top_p", SERVE_DEFAULTS["top_p"]), stop=body.get("_stop", []),
                         reset_gate=body.get("_reset_gate", False),
-                        cancel=body.get("_cancel")):
+                        cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {})):
                         out.put_nowait(delta)
                     request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
@@ -501,8 +618,15 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             stops = body.get("stop", [])
             body["_stop"] = [stops] if isinstance(stops, str) else list(stops)
             body["_reset_gate"] = bool(getattr(app["engine"], "reset_gate_per_request", False))
+            urls = extract_images(body["messages"])
+            if urls and not getattr(engine, "supports_vision", False):
+                raise web.HTTPBadRequest(reason="this server runs without the vision tower (--no-vision or no vision weights in the model folder): it cannot read images")
             prompt = render_prompt(template, body["messages"], body.get("tools"), **template_kwargs(body))
-            prompt_tokens = engine.count_tokens(prompt)
+            if len(urls) != prompt.count(IMAGE_PAD):
+                raise web.HTTPBadRequest(reason="image parts and image placeholders do not match (the chat template must write one image placeholder per image part)")
+            images = [load_image(u) for u in urls]
+            body["_images"] = images or None
+            prompt_tokens = engine.count_tokens(prompt) + sum(engine.image_tokens(im) - 1 for im, _ in images)
             body["_prompt_tokens"] = prompt_tokens
             body["_room"] = reply_room(engine, prompt_tokens)
             body["_prompt"] = prompt
@@ -786,6 +910,7 @@ def main() -> None:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--drafter", default=None,
                         help="drafter directory (default: $MIMO_DRAFTER, <model>/drafter, then <model>-drafter)")
+    parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower (saves 1.5 GB; image requests get HTTP 400)")
     parser.add_argument("--ctx", "-c", type=int, default=0,
                         help="KV cache size in tokens; 0 = min(config max_position, 131072)")
     parser.add_argument("--ndt", type=int, default=DEFAULT_NDT)
@@ -837,7 +962,7 @@ def main() -> None:
             print(f"msrv: no drafter found ({explicit or 'looked in <model>/drafter and <model>-drafter'}); "
                   "decoding without speculation", flush=True)
 
-    stages = (["drafter weights"] if drafter else []) + ["target weights", "engine setup"]
+    stages = (["drafter weights"] if drafter else []) + ["target weights", "engine setup"] + ([] if args.no_vision else ["vision tower"])
     startup_health.check_model_dir("msrv", args.model)
     startup_health.start("mimo", stages, args.host, args.port, routes=ROUTES)
     startup_health.report_compiler()
@@ -847,17 +972,24 @@ def main() -> None:
         ctx = args.ctx or min(config_max_position(probe), 131072)
         engine = ResidentEngine(args.model, drafter, ndt=args.ndt, spec_gate=args.spec_gate, ctx=ctx,
                                 reset_gate_per_request=args.spec_gate_reset_per_request,
-                                dynamic_draft=args.dynamic_draft, draft_confidence=args.draft_confidence)
+                                dynamic_draft=args.dynamic_draft, draft_confidence=args.draft_confidence,
+                                vision=not args.no_vision)
         from exllamav3.generator.slot_store import SlotStore
         engine.slot_store = SlotStore(engine.generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
                                       args.slot_save_path, args.model_id)
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
+        if engine.supports_vision:   # the first tower pass pays kernel setup and allocator growth: not on the first user image
+            from PIL import Image
+            t0 = time.perf_counter()
+            engine._embed([(Image.new("RGB", (448, 448), (127, 127, 127)), "warmup")])
+            engine.emb_cache.clear()
+            print(f"msrv: vision warm-up {time.perf_counter() - t0:.1f} s", flush=True)
     except BaseException as exc:                                  # noqa: BLE001
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
     print(f"msrv: model={args.model} drafter={drafter} ndt={args.ndt} "
           f"spec_gate={engine.spec_gate_on} ctx={ctx} "
-          f"max_position={config_max_position(engine.config)}", flush=True)
+          f"max_position={config_max_position(engine.config)} vision={engine.supports_vision}", flush=True)
     app = create_app(engine, args.model_id, template)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
     if sock is not None:
