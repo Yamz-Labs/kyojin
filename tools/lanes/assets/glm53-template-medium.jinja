@@ -2,7 +2,7 @@
 {%- set glm_medium = (reasoning_effort is defined and reasoning_effort == 'medium') -%}
 {%- set effective_reasoning_effort = 'high' if glm_medium else (reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max') -%}
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
-{%- if glm_medium -%}<|system|>Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer and verify what they rest on, not on alternatives the task does not call for. Gather what the answer needs, then give it.{%- endif -%}
+{%- if glm_medium -%}<|system|>Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on alternatives the task does not call for. Plan in your reasoning, but do not draft the answer there: write code and long text once, in the answer. When you have settled a point, keep it and move on.{%- endif -%}
 {%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
 {%- if tools -%}
 {%- macro tool_to_json(tool) -%}

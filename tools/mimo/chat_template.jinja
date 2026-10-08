@@ -68,7 +68,7 @@
 {%- endmacro -%}
 
 {%- if reasoning_effort is defined and reasoning_effort == 'medium' -%}
-    {{- '<|im_start|>system\nMatch the depth of your work to the difficulty of the task: spend it on the points that decide the answer and verify what they rest on, not on alternatives the task does not call for. Gather what the answer needs, then give it.<|im_end|>' -}}
+    {{- '<|im_start|>system\nMatch the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on alternatives the task does not call for. Plan in your reasoning, but do not draft the answer there: write code and long text once, in the answer. When you have settled a point, keep it and move on.<|im_end|>' -}}
 {%- endif -%}
 {%- if tools is defined and tools is iterable and tools | length > 0 -%}
     {{- '<|im_start|>system\n' ~ render_tools(tools) ~ '<|im_end|>' -}}
