@@ -27,6 +27,8 @@ THINK_TEMPLATE = ("{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content
                   "{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n"
                   "{% else %}<think>\n{% endif %}{% endif %}"
                   "{% if reasoning_effort is defined %}EFFORT={{ reasoning_effort }}{% endif %}")
+# THINK_TEMPLATE prints the effort after the generation prompt: the HTTP tests run without a default effort.
+NO_EFFORT_DEFAULTS = dict(serve.load_defaults("/x"), reasoning_effort=None)
 TOOLS = [{"type": "function", "function": {"name": "get_weather", "parameters": {
     "type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"},
                                      "opts": {"type": "object"}}}}}]
@@ -65,7 +67,7 @@ def with_client(engine, fn, template=THINK_TEMPLATE, defaults=None):
     from aiohttp.test_utils import TestClient, TestServer
 
     async def go():
-        client = TestClient(TestServer(serve.create_app(engine, "m", template, defaults or serve.load_defaults("/x"))))
+        client = TestClient(TestServer(serve.create_app(engine, "m", template, defaults or NO_EFFORT_DEFAULTS)))
         await client.start_server()
         try:
             return await fn(client)
@@ -126,6 +128,7 @@ class ParserTests(unittest.TestCase):
 
 class RequestTests(unittest.TestCase):
     def test_template_kwargs_precedence(self):
+        self.assertEqual(serve.resolve_template_kwargs({}, serve.load_defaults("/x")), {"reasoning_effort": "medium"})
         d = {"enable_thinking": None, "reasoning_effort": "low"}
         self.assertEqual(serve.resolve_template_kwargs({}, d), {"reasoning_effort": "low"})
         self.assertEqual(serve.resolve_template_kwargs({"reasoning_effort": "high"}, d), {"reasoning_effort": "xhigh"})

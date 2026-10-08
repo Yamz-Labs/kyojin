@@ -24,7 +24,9 @@ Defaults: `--ndt 7 --dynamic-draft --draft-confidence 0.6`, no spec gate. The dr
 
 Flags: `--host --port --model --model-id --drafter --ctx --ndt`
 (`--dflash`/`--no-dflash`, `--dynamic-draft`/`--no-dynamic-draft`, `--draft-confidence`, `--spec-gate`/`--no-spec-gate`, `--spec-gate-reset-per-request`,
-`--default-temperature`, `--default-top-p`: used when a request omits or nulls the field; the lane passes 1.0 / 0.95).
+`--default-temperature`, `--default-top-p`: used when a request omits or nulls the field; default = the pack's `generation_config.json`, 1.0 / 0.95;
+`--default-reasoning-effort medium|none`: `medium` (default) adds one effort instruction as a leading system block, `none` leaves the model's own prompt;
+`--chat-template`: default `tools/mimo/chat_template.jinja`, the model's template plus that `medium` level).
 
 `tools/lanes/serve_mimo.sh` runs the lane configuration (speculation on, `MIMO_SPEC=0` for plain decode, model-card sampling).
 Tool calls: a block body is JSON or `<parameter=k>v</parameter>` XML, typed by the request's tool schema; one block may hold several `<function=...>` elements; a malformed body is passed through raw; a cut-off trailing call is dropped.

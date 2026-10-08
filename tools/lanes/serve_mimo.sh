@@ -5,7 +5,7 @@
 # Greedy output is not token-identical to plain decode (near-tied logits can flip under the batched verify);
 # MIMO_SPEC=0 gives plain decode. With no drafter found the lane logs one line and decodes plain.
 # Sampling: model-card / generation_config.json defaults T1.0, top_p 0.95 (agent clients often send neither; greedy decoding is not recommended).
-# Chat template: the pack's own chat_template.jinja (read by serve.py).
+# Chat template: tools/mimo/chat_template.jinja, the model's template plus a medium effort level (serve.py default).
 # Tool calls: serve.py parses <parameter=k>v</parameter> XML and JSON bodies, typed by the request's tool schema.
 # Knobs (env):
 #   MIMO_MODEL   pack dir (default ~/models/MiMo-V2.6-Flash-MOPD-EXL3-Yamz; MUST exist: fail fast)
@@ -35,7 +35,6 @@ FREE_FLOOR_GIB=${LANE_MIN_FREE_GIB:-10}
 KV_BYTES_PER_TOKEN=23040
 die() { echo "serve_mimo: $*" >&2; exit 3; }
 [ -f "$MODEL/config.json" ] || die "model pack missing: $MODEL"
-[ -f "$MODEL/chat_template.jinja" ] || die "no chat_template.jinja in $MODEL"
 [ -f "$SERVE" ] || die "serve.py missing: $SERVE"
 [ -d "$LANE_ROOT/exllamav3" ] || die "engine worktree missing: $LANE_ROOT"
 grep -q -- "--default-temperature" "$SERVE" || die "$SERVE lacks --default-temperature (lane would be greedy)"

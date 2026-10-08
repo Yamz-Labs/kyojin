@@ -15,7 +15,9 @@ hf download yamz-labs/GLM-5.3-Flash-EXL3-Yamz --local-dir ./glm-pack
 python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
 ```
 
-GLM reasons at maximum effort by default. With a small `max_tokens`, the reasoning can use the whole budget: `content` is then empty and `finish_reason` is `length`. Send `"reasoning_effort": "low"` in the request (or start the server with `--default-reasoning-effort low`), or allow at least 1000 tokens. The server defaults to greedy sampling when a request gives no temperature; set the sampling values of the model card in your client, or with `--default-temperature` and `--default-top-p`.
+All three servers answer a request that sets nothing with the sampling its model card recommends (read from the pack's `generation_config.json`: temperature 1.0, top_p 0.95, plus top_k 20 for Qwen) and with thinking effort `medium`. Medium is our own level: each model's chat template with one added instruction that ties the depth of the reasoning to the difficulty of the task. Without it, GLM reasons at its maximum level and can spend a very long time on an open request. A request can still send `temperature`, `top_p` and `reasoning_effort` (`low`, `high`, `max` for GLM; `low`, `xhigh` for Qwen), and `--default-temperature`, `--default-top-p`, `--default-reasoning-effort` change the server defaults. `--chat-template <pack>/chat_template.jinja` serves the model's unchanged template.
+
+With a small `max_tokens`, the reasoning can use the whole budget: `content` is then empty and `finish_reason` is `length`. Allow at least 1000 tokens, or send `"reasoning_effort": "low"`.
 
 GLM: the pack ships `mtp_eh_proj.st`, an unquantized MTP `eh_proj` (64 MiB). The server loads it automatically from the model folder; it raises draft acceptance and decode speed (26.7 -> 31.6 tok/s greedy on the card protocol). Details in `tools/glm/SERVE.md`.
 

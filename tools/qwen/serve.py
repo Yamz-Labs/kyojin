@@ -60,6 +60,10 @@ IMAGE_PAD = "<|image_pad|>"
 MAX_IMAGE_BYTES = 20 * 1024**2
 # Used when generation_config.json is missing (values of the Qwen3.8 card).
 FALLBACK_DEFAULTS: dict[str, Any] = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0}
+# Thinking effort when a request names none. The model's own template defines xhigh and low only;
+# chat_template.jinja next to this file is that template plus a medium level.
+DEFAULT_EFFORT = "medium"
+DEFAULT_TEMPLATE = Path(__file__).with_name("chat_template.jinja")
 # OpenAI effort names -> the Qwen template names (xhigh, medium, low).
 EFFORT_ALIASES = {"high": "xhigh", "minimal": "low"}
 
@@ -336,7 +340,7 @@ def load_defaults(model_dir: str, args: argparse.Namespace | None = None) -> dic
     if gc.is_file():
         cfg = json.loads(gc.read_text())
         d.update({k: cfg[k] for k in ("temperature", "top_p", "top_k") if k in cfg})
-    d.update({"enable_thinking": None, "reasoning_effort": None})
+    d.update({"enable_thinking": None, "reasoning_effort": DEFAULT_EFFORT})
     if args is not None:
         for key in ("temperature", "top_p", "top_k", "min_p"):
             v = getattr(args, "default_" + key, None)
@@ -1694,7 +1698,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
 def load_all(args: argparse.Namespace):
     """Everything before the port opens: template, defaults, engine, slot store, warm-up."""
     model_dir = str(Path(args.model).expanduser())
-    template = (Path(model_dir) / "chat_template.jinja").read_text(encoding="utf-8")
+    template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
     defaults = load_defaults(model_dir, args)
     t0 = time.time()
     print(f"qserve: starting, model={model_dir} ctx={args.ctx} sessions={args.sessions} draft_policy={args.draft_policy} "
@@ -1709,6 +1713,9 @@ def load_all(args: argparse.Namespace):
     startup_health.stage("warm-up")
     with Heartbeat("warm-up (first decode steps)"):
         engine.warmup()
+    if os.environ.get("EXL3_SWAP_IN", "1") != "0":
+        from exllamav3.util.memory import swap_in_process
+        print(f"qserve: process pages swapped out during the load, read back before READY: {swap_in_process()}", flush=True)
     return engine, template, defaults, model_dir, t0
 
 
@@ -1731,8 +1738,11 @@ def main() -> None:
     parser.add_argument("--default-top-p", type=float, default=None)
     parser.add_argument("--default-top-k", type=int, default=None)
     parser.add_argument("--default-min-p", type=float, default=None)
+    parser.add_argument("--chat-template", default=None,
+                        help="Jinja chat template file (default: chat_template.jinja next to this script; "
+                             "<model>/chat_template.jinja is the model's unchanged one)")
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "xhigh"), default=None,
-                        help="thinking effort when a request omits it (template default: xhigh)")
+                        help=f"thinking effort when a request omits it (default: {DEFAULT_EFFORT})")
     parser.add_argument("--no-thinking", action="store_true", help="thinking off unless a request turns it on")
     parser.add_argument("--default-max-tokens", type=int, default=32768, help="when a request omits max_tokens")
     parser.add_argument("--slot-save-path", default="~/cache/llama-slots")
