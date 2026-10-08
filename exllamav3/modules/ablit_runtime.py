@@ -69,10 +69,11 @@ def _load(path: str, source: str = "env"):
         if r_file:
             r_file = r_file if os.path.isabs(r_file) else os.path.join(d, r_file)
         else:
-            cands = [os.path.splitext(path)[0] + ".safetensors"]
+            # The direction sits next to the spec, as <spec>.safetensors or under the bundled name.
+            cands = [os.path.splitext(path)[0] + ".safetensors", os.path.join(d, BUNDLED_DIRECTION)]
             if source == "bundled":
-                cands.insert(0, os.path.join(d, BUNDLED_DIRECTION))
-            r_file = next((c for c in cands if os.path.isfile(c)), cands[-1])
+                cands.reverse()
+            r_file = next((c for c in cands if os.path.isfile(c)), cands[0])
         if not os.path.isfile(r_file):
             raise FileNotFoundError(f"ablit runtime: direction file not found: {r_file} (spec {path})")
         from safetensors import safe_open
