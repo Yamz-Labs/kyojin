@@ -139,6 +139,26 @@ def ram_gib():
     return "unknown"
 
 
+POWER_PROFILE = Path("/sys/firmware/acpi/platform_profile")
+POWER_SUPPLIES = Path("/sys/class/power_supply")
+
+
+def power_mode(limit=None, profile=POWER_PROFILE, supplies=POWER_SUPPLIES):
+    """Power line of the report: the limit the user passed with --power-limit (the sustained package limit is
+    not readable without root), the platform profile, and mains or battery. "unknown" when nothing answers."""
+    parts = [limit.strip()] if limit and limit.strip() else []
+    prof = read_version(profile)
+    if prof:
+        parts.append(f"profile {prof}")
+    try:
+        mains = [read_version(d / "online") for d in sorted(Path(supplies).iterdir()) if read_version(d / "type") == "Mains"]
+    except OSError:
+        mains = []
+    if mains:
+        parts.append("on mains" if "1" in mains else "on battery")
+    return ", ".join(parts) or "unknown"
+
+
 def server_compiler(base, model=None):
     """(compiler line, warning or None) the server reports on /health (the server root, one level above /v1).
     Behind a proxy such as llama-swap the root /health is the proxy's own, so /upstream/<model>/health is tried next."""
@@ -258,6 +278,7 @@ def main():
     ap.add_argument("--reps", type=int, default=3, help="runs per measurement (default 3)")
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--corpus", help="text file for the prefill prompt (default: Markdown files of this repository)")
+    ap.add_argument("--power-limit", help="sustained power limit of the machine, as text (example: \"71 W\"); printed in the report")
     ap.add_argument("--json", action="store_true", help="also print the measurements as a fenced JSON block")
     a = ap.parse_args()
     base = a.base.rstrip("/")
@@ -309,7 +330,7 @@ def main():
     if comp[1]:
         print(comp[1], file=sys.stderr)
     info = {"model": model, "cpu": cpu_name(), "ram": ram_gib(), "gpu_target": gpu_name(), "kernel": platform.release(),
-            "rocm": rocm_version(), "kernel_compiler": comp[0], "server": base, "date": time.strftime('%Y-%m-%d')}
+            "rocm": rocm_version(), "power": power_mode(a.power_limit), "kernel_compiler": comp[0], "server": base, "date": time.strftime('%Y-%m-%d')}
     prefill_med = med([t for _, t in pf])
     lines = [
         "### Kyojin benchmark",
@@ -320,6 +341,7 @@ def main():
         f"- GPU target: {info['gpu_target']}",
         f"- Kernel: {info['kernel']}",
         f"- ROCm: {info['rocm']}",
+        f"- Power: {info['power']}",
         f"- Kernel compiler: {info['kernel_compiler']}",
         f"- Server: {info['server']}",
         f"- Date: {info['date']}",

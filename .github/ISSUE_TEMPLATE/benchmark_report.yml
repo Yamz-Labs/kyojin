@@ -17,7 +17,7 @@ body:
     id: hardware
     attributes:
       label: Machine
-      description: Product name, RAM size and speed, cooling or power mode if you changed it.
+      description: Product name, RAM size and speed, power limit in watts if you know it (it changes the figures a lot between machines), cooling or power mode if you changed it.
     validations:
       required: true
   - type: input
