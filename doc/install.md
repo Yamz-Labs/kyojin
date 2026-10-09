@@ -19,6 +19,10 @@ curl http://localhost:8000/v1/models
 ```
 In every new shell, before serving: activate the venv, run `export EXL3_ROCM_SDK=$(rocm-sdk path --root)` again, then `source tools/strix_halo/env.sh`. The engine builds some of its GPU kernels on first use, and the server prints at start which compiler it used. The SDK compiler from the export is the fast one; the server also finds it by itself when `rocm-sdk` is installed in the same venv, but the export is the safe way. If the log shows a warning that the system compiler is in use, prefill can be about 20 % slower, so export the line above and restart. Without the export, `env.sh` falls back to a system ROCm that may not match the wheel (`undefined symbol: hsa_ext_image_create_v2`).
 If a step fails, see [troubleshooting.md](troubleshooting.md).
+Newer ROCm: AMD also publishes a multi-arch index with more recent builds. Replacing the torch line above with the one below also installs, builds and passes the check on gfx1151 (verified on a fresh clone, Python 3.12, with the Qwen pack: same prefill and decode speed up to 32K). The published figures were measured with the line above, which stays the default; generated text can differ slightly between the two builds.
+```bash
+pip install --pre --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ "torch[device-gfx1151]==2.14.0+rocm10.1.0a20260822" "rocm[devel,device-gfx1151]==10.1.0a20260822"
+```
 Status: build and MiMo serving were verified from a fresh clone on a second Strix Halo machine (build in 8 to 10 minutes). Both published packs were checked there against `SHA256SUMS` and served (one chat request each); `env.sh --check` has not been run there yet. The first request after a build is slow while the kernels warm up.
 
 First GLM launch: the server tunes its dense GEMM kernels before it opens the port. This takes about 10 minutes, and the port stays closed during that time (the log prints a progress line every 30 seconds). The next one or two launches can repeat it for the shapes still missing; later launches start fast.
