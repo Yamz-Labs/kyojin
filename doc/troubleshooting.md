@@ -30,6 +30,17 @@ If `env.sh` prints `[env.sh] WARNING: no libhsa-runtime64.so.1 found`, none of i
 
 The server prints one line at start, `[kyojin] HIP kernel compiler: ...`, and `/health` shows the same text (field `hip_compiler`). If it points to `/opt/rocm` or another system compiler and a `WARNING` line follows, the engine built its kernels with the system ROCm instead of the SDK compiler. Run `export EXL3_ROCM_SDK=$(rocm-sdk path --root)` and restart. The kernel cache is keyed by compiler version, so the new start rebuilds the kernels once; the old files stay in `~/.cache/exllamav3` and can be deleted by hand. Please include that line in a performance report.
 
+## `CUDA error: invalid kernel file` and the check prints `gfx1100`
+
+`bash tools/strix_halo/env.sh --check` must print `gfx1151` on the device line. If it prints `gfx1100` (or any other name), the variable `HSA_OVERRIDE_GFX_VERSION` is set somewhere, usually left from an older ROCm set-up. The runtime then loads kernels built for another GPU and stops with `hipErrorInvalidKernelFile`, whatever the torch or ROCm version.
+
+```bash
+echo "${HSA_OVERRIDE_GFX_VERSION:-unset}"   # must print "unset"
+unset HSA_OVERRIDE_GFX_VERSION               # then remove it from ~/.bashrc, ~/.profile or /etc/environment
+```
+
+If the same line shows about half of your memory (for example 62.5 GiB on a 128 GB machine), the kernel GTT limit is still at its default. Raise it with `ttm.pages_limit` and `ttm.page_pool_size` on the kernel command line, then reboot.
+
 ## `HIP error: invalid device function` on every kernel
 
 Cause: ROCm 6.4 or older. It has no code object for gfx1151.
