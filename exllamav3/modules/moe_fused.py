@@ -286,7 +286,8 @@ def check_barrier(model, every: int = 8, force: bool = False) -> None:
     _CHK["n"] += 1
     if not force and _CHK["n"] % every:
         return
-    fhs = [(m.key, m._moe_fused) for m in getattr(model, "modules", []) if getattr(m, "_moe_fused", None) is not None]
+    fhs = [(m.key, m._moe_fused) for m in getattr(model, "modules", []) if getattr(m, "_moe_fused", None) is not None
+           and m._moe_fused.supported]     # no kernel for this pack shape: no workspace, nothing to check
     if not fhs:
         return
     rec = torch.cat([f.ws[8:44].view(torch.int32) for _, f in fhs]).cpu().view(len(fhs), 9)   # ctl words 2..10
