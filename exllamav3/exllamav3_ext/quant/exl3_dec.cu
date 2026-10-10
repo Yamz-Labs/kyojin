@@ -1941,7 +1941,7 @@ static int env_int(const char* name, int dflt)
 inline int kb2_of(double K)
 {
     const int kb2 = (int) (K * 2.0 + 0.5);
-    TORCH_CHECK(kb2 >= 4 && kb2 <= 12 && (double) kb2 == K * 2.0, "exl3_dec: unsupported K ", K);
+    TORCH_CHECK(kb2 >= 4 && kb2 <= 14 && (double) kb2 == K * 2.0, "exl3_dec: unsupported K ", K);
     return kb2;
 }
 
@@ -1954,6 +1954,7 @@ inline int kb2_of(double K)
         case 8:  { constexpr int KB2 = 8;  __VA_ARGS__; } break;                     \
         case 10: { constexpr int KB2 = 10; __VA_ARGS__; } break;                     \
         case 12: { constexpr int KB2 = 12; __VA_ARGS__; } break;                     \
+        case 14: { constexpr int KB2 = 14; __VA_ARGS__; } break;                     \
         default: TORCH_CHECK(false, "exl3_dec: unsupported K*2 ", kb2);              \
     }
 
@@ -1981,6 +1982,7 @@ inline void launch_gemv_cb(int kb2, int blocks, const half* xp, const Jobs& jobs
         case 8:  gemv_kernel<8, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         case 10: gemv_kernel<10, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         case 12: gemv_kernel<12, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
+        case 14: gemv_kernel<14, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         default: TORCH_CHECK(false, "exl3_dec_gemv: unsupported K*2 ", kb2);
     }
 }
