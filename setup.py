@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import sys
 
 from setuptools import setup
 
@@ -74,13 +75,43 @@ extra_compile_args = {
 library_dir = "exllamav3"
 sources_dir = os.path.join(library_dir, extension_name)
 
-from exllamav3.exllamav3_ext.build_config import get_sources as _get_sources
+# NOTE (nix/uv lock): setup.py self-imports exllamav3 for source discovery and
+# arch detection. During isolated metadata builds (uv lock, PEP 517
+# get_requires) the package isn't installed and torch is absent, and importing
+# the top-level exllamav3 package raises (it requires torch). So load
+# build_config.py directly by file path, bypassing exllamav3/__init__.py.
+# The real build re-runs with torch present and behaves as before.
+def _load_get_sources():
+    try:
+        _cfg_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            library_dir, extension_name, "build_config.py",
+        )
+        _spec = importlib.util.spec_from_file_location(
+            "exllamav3_build_config", _cfg_path
+        )
+        if _spec is None or _spec.loader is None:
+            return None
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        return _mod.get_sources
+    except (ImportError, OSError):
+        if torch:
+            raise  # a real build must fail loudly, never produce an empty extension
+        return None
+
+
+_get_sources = _load_get_sources()
 
 is_rocm = bool(torch and torch_version.hip)
 if is_rocm:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from exllamav3.util.arch_list import maybe_set_arch_list_env
     maybe_set_arch_list_env()
-sources = _get_sources(sources_dir, is_rocm, base_dir=os.path.dirname(__file__))
+if _get_sources is not None:
+    sources = _get_sources(sources_dir, is_rocm, base_dir=os.path.dirname(__file__))
+else:
+    sources = []
 
 setup_kwargs = (
     {

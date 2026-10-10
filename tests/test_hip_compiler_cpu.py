@@ -26,8 +26,11 @@ _REAL_SDK_FROM_PACKAGE = hip_compiler._sdk_from_package
 
 def fake_hipcc(path: Path, version: str, log: Path | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # NOTE: POSIX sh, not bash: the fakes run wherever pytest runs
+    # (sandboxes and NixOS hosts have no /bin/bash). Only POSIX
+    # constructs are used below.
     path.write_text(
-        "#!/bin/bash\n"
+        "#!/bin/sh\n"
         f'if [ "$1" = "--version" ]; then echo "{version}"; exit 0; fi\n'
         + (f'echo "$0" >> {log}\n' if log else "")
         + 'while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then echo built > "$2"; fi; shift; done\n')

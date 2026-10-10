@@ -28,6 +28,10 @@ dependencies = [
     "marisa_trie",
     "pydantic",
     "llguidance>=1.7.0",
+    # Required by tools/{glm,mimo,qwen}/serve.py (already in
+    # requirements.txt, was missing here so the Nix venv lacked them).
+    "aiohttp",
+    "jinja2",
     "triton-windows; platform_system == 'Windows'",
 ]
 
