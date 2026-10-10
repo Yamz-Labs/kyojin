@@ -681,6 +681,12 @@
           kyojinImage = pkgs.dockerTools.buildLayeredImage {
             name = "kyojin";
             tag = "1.5.0";
+            # Layer root is the cwd here: relative paths only. /tmp must
+            # exist (Python tempfile, torch cuda shims); the model volume
+            # supplies persistence, container /tmp stays ephemeral.
+            extraCommands = ''
+              mkdir -p tmp var/tmp etc
+            '';
             contents = [
               kyojinServe
               kyojinEnv
