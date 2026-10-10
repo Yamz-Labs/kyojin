@@ -102,7 +102,7 @@ template <class S> void mf_launch
 }
 }  // namespace
 
-#define MF_SHAPES(X) X(mf::QwenShape) X(mf::SmallTestShape) X(mf::SmallK3Shape) X(mf::QwenK3S4) X(mf::QwenK3S5) X(mf::QwenK4S4) X(mf::QwenK4S5) X(mf::SmallK3S4) X(mf::SmallK3S5) X(mf::SmallK4S4) X(mf::SmallK4S5) X(mf::QwenK6S6) X(mf::SmallK6S6)
+#define MF_SHAPES(X) X(mf::QwenShape) X(mf::SmallTestShape) X(mf::SmallK3Shape) X(mf::QwenK3S4) X(mf::QwenK3S5) X(mf::QwenK4S4) X(mf::QwenK4S5) X(mf::SmallK3S4) X(mf::SmallK3S5) X(mf::SmallK4S4) X(mf::SmallK4S5) X(mf::QwenK6S6) X(mf::SmallK6S6) X(mf::QwenK4S6) X(mf::QwenK5S6) X(mf::SmallK4S6) X(mf::SmallK5S6)
 
 bool exl3_moe_fused_supported(int64_t D, int64_t H, int64_t LR, int64_t NEXP, int64_t TOPK, int64_t INTER, int64_t RB, int64_t SB)
 {
