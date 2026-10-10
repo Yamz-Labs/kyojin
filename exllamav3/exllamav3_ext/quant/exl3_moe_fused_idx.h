@@ -49,6 +49,11 @@ struct SmallK4S4 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK
 struct QwenK6S6 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TOPK = 10, INTER = 640, RB = 6, SB = 6; };   // the MTP drafter layer of the public pack (routed K6, shared K6)
 struct SmallK6S6 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 6, SB = 6; };
 struct SmallK4S5 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 4, SB = 5; };
+// 4 bpw and 5 bpw routed experts with a K6 shared expert (the layout of the public 4.05 bpw pack; K5S6 is its 5 bpw sibling), and small twins
+struct QwenK4S6 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TOPK = 10, INTER = 640, RB = 4, SB = 6; };
+struct QwenK5S6 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TOPK = 10, INTER = 640, RB = 5, SB = 6; };
+struct SmallK4S6 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 4, SB = 6; };
+struct SmallK5S6 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 5, SB = 6; };
 
 template <class S>
 struct Dm
