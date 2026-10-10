@@ -104,6 +104,8 @@ def _load_get_sources():
         _spec.loader.exec_module(_mod)
         return _mod.get_sources
     except (ImportError, OSError):
+        if torch:
+            raise  # a real build must fail loudly, never produce an empty extension
         return None
 
 
@@ -111,12 +113,9 @@ _get_sources = _load_get_sources()
 
 is_rocm = bool(torch and torch_version.hip)
 if is_rocm:
-    try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from exllamav3.util.arch_list import maybe_set_arch_list_env
-        maybe_set_arch_list_env()
-    except (ImportError, RuntimeError):
-        pass
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from exllamav3.util.arch_list import maybe_set_arch_list_env
+    maybe_set_arch_list_env()
 if _get_sources is not None:
     sources = _get_sources(sources_dir, is_rocm, base_dir=os.path.dirname(__file__))
 else:
