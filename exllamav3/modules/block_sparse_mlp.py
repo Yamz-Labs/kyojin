@@ -781,7 +781,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         )
 
         # Grouped WMMA prefill (gfx11.5, exl3_moe_prefill.cu): any expert shape with 128-aligned
-        # widths, any top-k, K 2 / 2.5 / 3 / 4, either codebook, and a clamped SwiGLU limit
+        # widths, any top-k, K 2 / 2.5 / 3 / 4 / 5 / 6, either codebook, and a clamped SwiGLU limit
         # (checked once the pointer tables exist below). Full expert layers only;
         # EXL3_MOE_WMMA=0 disables it per forward.
         hip_wmma_device = False
@@ -832,7 +832,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # bitrate and gate/up/down share it (the allocator assigns per layer).
             ks = {multi.K for multi in (self.multi_gate, self.multi_up, self.multi_down)}
             self.support_hip_grouped = self.support_hip_grouped and len(ks) == 1 and all(
-                multi.K in (2, 2.5, 3, 4) and multi.mul1 and not multi.mcg
+                multi.K in (2, 2.5, 3, 4, 5, 6) and multi.mul1 and not multi.mcg
                 for multi in (self.multi_gate, self.multi_up, self.multi_down)
             )
             # The prefill kernel (exl3_moe_gfx12_k3_prefill) is still Qwen3.8-only: K=3, top-10 and
@@ -880,7 +880,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Ipad, 8*H) for this model's shapes; a TORCH_CHECK in the kernel catches it if a
                 # future shape needs more.
             self.support_hip_wmma = self.support_hip_wmma and all(
-                multi.K in (2, 2.5, 3, 4) and (multi.mul1 != multi.mcg)
+                multi.K in (2, 2.5, 3, 4, 5, 6) and (multi.mul1 != multi.mcg)
                 for multi in (self.multi_gate, self.multi_up, self.multi_down)
             ) and self.multi_gate.K == self.multi_up.K
             # Codebook: mpw_gemm is templated on it and takes one flag for all three projections

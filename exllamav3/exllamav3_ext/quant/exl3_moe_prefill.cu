@@ -1521,6 +1521,8 @@ void launch_gemm_cb
             case 6: MPW2_K(3, false)
             case 7: MPW2_K(3, true)
             case 8: MPW2_K(4, false)
+            case 10: MPW2_K(5, false)
+            case 12: MPW2_K(6, false)
             default: TORCH_CHECK(false, "exl3_moe_prefill_wmma: unsupported K ", K);
         }
         #undef MPW2_D
@@ -1545,6 +1547,8 @@ void launch_gemm_cb
         case 6: MPW_K(3, false)
         case 7: MPW_K(3, true)
         case 8: MPW_K(4, false)
+        case 10: MPW_K(5, false)
+        case 12: MPW_K(6, false)
         default: TORCH_CHECK(false, "exl3_moe_prefill_wmma: unsupported K ", K);
     }
     #undef MPW_K

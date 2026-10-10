@@ -748,13 +748,16 @@ static void launch_moe_grouped_k
     int size_k, int size_n, int experts, int assignments, hipStream_t stream
 )
 {
-    // k2 = 2 * K: 4 -> K2, 5 -> K2.5, 6 -> K3, 8 -> K4
+    // k2 = 2 * K: 4 -> K2, 5 -> K2.5, 6 -> K3, 8 -> K4, 10 -> K5, 12 -> K6
     switch (k2)
     {
     case 4: launch_moe_grouped<2, false, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
     case 5: launch_moe_grouped<2, true,  FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
     case 6: launch_moe_grouped<3, false, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
-    default: launch_moe_grouped<4, false, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
+    case 8: launch_moe_grouped<4, false, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
+    case 10: launch_moe_grouped<5, false, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
+    case 12: launch_moe_grouped<6, false, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
+    default: TORCH_CHECK(false, "exl3_moe_gfx12_k3: unsupported expert bitrate (K*2 = ", k2, ")");
     }
 }
 
@@ -808,8 +811,8 @@ void exl3_moe_gfx12_k3
     TORCH_CHECK(exl3_gemv_wmma_family(device) != 0,
                 "exl3_moe_gfx12_k3 requires a WMMA GEMV arch (gfx1200/1201 or gfx1150/1151/1152)");
     const int k2 = (int) (2.0 * K + 0.25);
-    TORCH_CHECK(k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8,
-                "exl3_moe_gfx12_k3 expert bitrate K must be 2, 2.5, 3 or 4");
+    TORCH_CHECK(k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12,
+                "exl3_moe_gfx12_k3 expert bitrate K must be 2, 2.5, 3, 4, 5 or 6");
 
     TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
                 A.dim() == 2 && A.size(1) % 128 == 0 &&

@@ -5,7 +5,7 @@
 // Grouped EXL3 MoE prefill for gfx11.5 (RDNA3.5 WMMA): tokens are sorted by expert and every
 // projection runs as ONE launch over all experts. Trellis tiles are decoded in the GEMM (to LDS),
 // no fp16 weight materialization. Gate+up share a launch. Any hidden / intermediate width that
-// is a multiple of 128, any top-k, K = 2, 2.5, 3, 4, both codebooks (mcg / mul1).
+// is a multiple of 128, any top-k, K = 2, 2.5, 3, 4, 5, 6, both codebooks (mcg / mul1).
 void exl3_moe_prefill_wmma
 (
     const at::Tensor& A,              // fp16 [rows, H]
