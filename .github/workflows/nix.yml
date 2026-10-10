@@ -1,0 +1,34 @@
+name: Nix
+run-name: Nix flake check + fmt
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  nix:
+    name: flake check and fmt gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - name: Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      # Full evaluation + pre-commit hooks + CPU test subset. Deliberately
+      # does NOT build packages.exllamav3 (8-10 min ROCm ext compile, ~9 GB
+      # SDK closure): engine builds stay local, see doc/nix.md.
+      - name: nix flake check
+        run: nix flake check --print-build-logs
+
+      # nix fmt doubles as the clean-tree gate: the formatter exits non-zero
+      # when hooks fail OR rewrite files, so this fails the job on both.
+      - name: nix fmt (clean-tree gate)
+        run: nix fmt
