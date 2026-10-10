@@ -581,8 +581,22 @@
                 mkdir -p $out/share/kyojin/$flavor
                 cp $src/tools/$flavor/serve.py $src/tools/$flavor/serve_metrics.py \
                   $out/share/kyojin/$flavor/
+                # chat templates live next to the scripts (qwen/mimo) or in
+                # lanes/assets (glm); the servers resolve them relative to
+                # their own file, so ship them at the same relative paths.
+                for tmpl in $src/tools/$flavor/chat_template.jinja; do
+                  [ -e "$tmpl" ] && cp "$tmpl" $out/share/kyojin/$flavor/
+                done
               done
+              mkdir -p $out/share/kyojin/lanes/assets
+              cp $src/tools/lanes/assets/glm53-template-medium.jinja \
+                $out/share/kyojin/lanes/assets/
               cp $src/tools/startup_health.py $out/share/kyojin/
+              # startup_health loads exllamav3.util.hip_compiler by path
+              # (without importing exllamav3, to avoid latching engine env);
+              # mirror the repo-root layout it expects.
+              mkdir -p $out/share/exllamav3/util
+              cp $src/exllamav3/util/hip_compiler.py $out/share/exllamav3/util/
               for flavor in glm mimo qwen; do
                 makeWrapper ${kyojinEnv}/bin/python $out/bin/kyojin-serve-$flavor \
                   --add-flags "$out/share/kyojin/$flavor/serve.py" \
