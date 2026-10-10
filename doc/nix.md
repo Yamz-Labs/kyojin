@@ -99,11 +99,15 @@ with a raised memlock limit is the usual setup for GPU inference runtimes.
 
 The entrypoint downloads the model into the volume on first start and skips
 the download when a pack is already there. Both flavor and repo are required
-and fail fast; there are no silent 50 GB pulls. Tuning cache
-(`~/.cache/exllamav3`) lives under `HOME`, which the entrypoint points at
-`/models/home` (override with `KYOJIN_HOME`) so a fresh container does not
-re-tune. First start still tunes GEMM kernels (around 10 minutes with the
-port closed), same as bare metal. The servers answer `/health` from the
+and fail fast; there are no silent 50 GB pulls. Each flavor gets its own slot
+(`/models/qwen`, `/models/glm`, `/models/mimo`, overridable with
+`KYOJIN_MODEL_DIR`), and a marker file records which repo filled it, so
+switching repos under the same flavor errors out instead of serving a stale
+pack. Tuning cache (`~/.cache/exllamav3`) lives under `HOME`, which the
+entrypoint points at `/models/home` (override with `KYOJIN_HOME`) so a fresh
+container does not re-tune. First start still tunes GEMM kernels (around
+10 minutes with the port closed), same as bare metal. The servers answer
+`/health` from the
 first second (503 while loading, 200 when ready), so it works as a
 readiness check, and `/v1/models` answers once serving.
 

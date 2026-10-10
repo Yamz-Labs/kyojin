@@ -625,16 +625,26 @@
               echo "kyojin-entrypoint: set KYOJIN_MODEL_REPO (e.g. yamz-labs/GLM-5.3-Flash-EXL3-Yamz)" >&2
               exit 2
             fi
-            model_dir="''${KYOJIN_MODEL_DIR:-/models/current}"
+            model_dir="''${KYOJIN_MODEL_DIR:-/models/$flavor}"
             # Tuning cache (e.g. GLM's dense GEMM tune, ~8 min first launch)
             # must survive container replacement: keep HOME on the volume.
             export HOME="''${KYOJIN_HOME:-/models/home}"
             mkdir -p "$HOME" "$model_dir"
+            # One slot per flavor; the marker records which repo filled it so
+            # switching repos under the same flavor fails loudly instead of
+            # serving a stale pack.
+            marker="$model_dir/.kyojin-repo"
             if [ -f "$model_dir/config.json" ]; then
+              if [ -f "$marker" ] && [ "$(cat "$marker")" != "$repo" ]; then
+                echo "kyojin-entrypoint: $model_dir holds $(cat "$marker"), not $repo;" >&2
+                echo "  set KYOJIN_MODEL_DIR or empty the directory" >&2
+                exit 2
+              fi
               echo "kyojin-entrypoint: model present at $model_dir, skipping download" >&2
             else
               echo "kyojin-entrypoint: downloading $repo into $model_dir (first start is slow)" >&2
               hf download "$repo" --local-dir "$model_dir"
+              printf '%s' "$repo" > "$marker"
             fi
             echo "kyojin-entrypoint: serving $flavor from $model_dir" >&2
             exec "''${KYOJIN_BIN:-/bin/kyojin-serve-$flavor}" --model "$model_dir" "$@"
@@ -685,7 +695,6 @@
                 "/models" = { };
               };
               Env = [
-                "KYOJIN_MODEL_DIR=/models/current"
                 "PATH=/bin:/usr/bin"
                 "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
                 "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
