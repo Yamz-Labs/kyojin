@@ -17,19 +17,34 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/kyojin
 RUN python3 -m venv .venv
 ENV PATH=/opt/kyojin/.venv/bin:$PATH
-COPY requirements.txt .
-COPY . .
-# One layer on purpose: the pip downloads and the unpruned SDK tree never reach an image layer.
+# Layers run from least to most often changed: dependencies, then the HIP extension, then the Python source.
+# Editing Python code (or version.py, which CI stamps from the git tag) only re-runs the final COPY.
+
+# Dependencies. One layer on purpose: the pip downloads and the unpruned SDK tree never reach an image layer.
 # The SDK (hipcc, headers) stays, pruned of test binaries, profiler data and client samples.
+COPY requirements.txt .
 RUN pip install --pre torch rocm-sdk-devel --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ \
     && pip install -r requirements.txt \
     && rocm-sdk init \
+    && cd "$(rocm-sdk path --root)" && rm -rf clients share/rocprofiler-sdk share/hipblaslt share/rocdecode share/rocsparse bin/*gtest* bin/*-test bin/*-bench bin/*-gemm-tune bin/*test* \
+    && rm -rf /root/.cache
+
+# The HIP extension, built from only the files the compile reads, so it re-runs only when they change.
+# rebuild.sh pip-installs the package to a scratch dir and keeps just exllamav3_ext*.so in /opt/kyojin, so the
+# README and version.py that the package metadata wants are stubs here; the real ones arrive with the source below.
+COPY pyproject.toml setup.py build.sh ./
+COPY tools/strix_halo/env.sh tools/strix_halo/rebuild.sh tools/strix_halo/
+COPY exllamav3/util/arch_list.py exllamav3/util/
+COPY exllamav3/exllamav3_ext/ exllamav3/exllamav3_ext/
+RUN touch README.md && printf '__version__ = "0"' > exllamav3/version.py \
     && export EXL3_ROCM_SDK=$(rocm-sdk path --root) \
     && source tools/strix_halo/env.sh \
     && ./build.sh \
     && python -c "import torch, exllamav3_ext" \
-    && rm -rf build .rebuild.* .sdk-deps /root/.cache \
-    && cd "$EXL3_ROCM_SDK" && rm -rf clients share/rocprofiler-sdk share/hipblaslt share/rocdecode share/rocsparse bin/*gtest* bin/*-test bin/*-bench bin/*-gemm-tune bin/*test*
+    && rm -rf build .rebuild.* .sdk-deps *.egg-info README.md exllamav3/version.py /root/.cache
+
+# The Python source.
+COPY . .
 ENV EXL3_ROCM_SDK=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel \
     EXL3_HIPCC=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipcc \
     EXL3_HSA_LIB=/opt/kyojin/.venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib/libhsa-runtime64.so.1
