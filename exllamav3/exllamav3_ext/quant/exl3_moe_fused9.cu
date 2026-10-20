@@ -100,6 +100,16 @@ void mf9_half(at::Tensor& x, const at::Tensor& fn, const at::Tensor& fn_scale, c
         TORCH_CHECK(!timing, "mf9: wide launches (rows 5..8) have no timing build");
         const int64_t vv = variant & 0x1f0000;
         TORCH_CHECK(vv == 0x160000, "mf9: wide launches (rows 5..8) exist for the default variant 0x160000 (six stage launches) only");
+        // K6/K8 wide experiment: native, six-stage, no ablations.
+        if (Match7<mf::QwenK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB) ||
+            Match7<mf::SmallK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) {
+            TORCH_CHECK(native == 1 && (variant & ~0x1000LL) == 0x160000,
+                        "mf9: wide K6S8 requires native six-stage launches without ablations");
+            if (Match7<mf::QwenK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB))
+                L7(mf::Wide<mf::QwenK6S8>, false, 4, 1);
+            else L7(mf::Wide<mf::SmallK6S8>, false, 4, 1);
+            return;
+        }
 #define XW(SH) if (Match7<mf::Wide<SH>>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) { L7(mf::Wide<SH>, false, 4, 1); return; }
         XW(mf::QwenShape) XW(mf::SmallTestShape) XW(mf::QwenK3S4) XW(mf::QwenK3S5) XW(mf::QwenK4S4) XW(mf::QwenK4S5)
         XW(mf::SmallK3S4) XW(mf::SmallK3S5) XW(mf::SmallK4S4) XW(mf::SmallK4S5)
