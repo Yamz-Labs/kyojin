@@ -127,6 +127,12 @@ void mf9_half(at::Tensor& x, const at::Tensor& fn, const at::Tensor& fn_scale, c
         switch ((variant >> 8) & 3) { case 1: L7A(mf::QwenK4S5, true, 2, 1, 1); break; case 2: L7A(mf::QwenK4S5, true, 2, 1, 2); break; default: L7A(mf::QwenK4S5, true, 2, 1, 3); } return; }
     X9D(mf::QwenK3S4) X9D(mf::QwenK3S5) X9D(mf::QwenK4S4) X9D(mf::QwenK4S5)
     X9D(mf::QwenK6S6) X9D(mf::SmallK6S6)
+    if (Match7<mf::QwenK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB) || Match7<mf::SmallK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) {
+        TORCH_CHECK((variant & ~0x1000LL) == 0x160000 && !timing, "mf9: experimental K6S8 supports only six-stage launches without timing or ablations");
+        if (Match7<mf::QwenK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) L7(mf::QwenK6S8, false, 4, 1);
+        else L7(mf::SmallK6S8, false, 4, 1);
+        return;
+    }
     X9D(mf::QwenK4S6) X9D(mf::QwenK5S6) X9D(mf::SmallK4S6) X9D(mf::SmallK5S6)
     X9D(mf::SmallK3S4) X9D(mf::SmallK3S5) X9D(mf::SmallK4S4) X9D(mf::SmallK4S5)
 #undef X9D
