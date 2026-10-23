@@ -74,7 +74,11 @@ for module in selected:
     module.load(dev)
     try:
         inner = module.inner
-        assert inner.K == args.bits and inner.mul1 and not inner.mcg
+        if getattr(inner, "K", None) != args.bits:   # only reachable for --bits other than 8 (fp16 or other-K projections)
+            assert args.bits != 8, f"{module.key} is not K8"
+            print("Skipping (not K%d):" % args.bits, module.key, flush=True)
+            continue
+        assert inner.mul1 and not inner.mcg
         assert inner.dec_ok and inner.bc is None
         if args.bits == 8:
             os.environ["EXL3_DENSE_K8"] = "0"
@@ -120,12 +124,14 @@ for module in selected:
                             "exact": torch.equal(got, ref),
                             "max_abs": error.abs().max().item(),
                             "rel_l2": (error.norm()/ref.double().norm().clamp_min(1e-30)).item()})
-            # Larger batches must still use the existing path.
+            # Larger batches must still use the existing path. For K8 that path is reconstruct + hgemm, so it matches the
+            # reference bit for bit. For other K the existing path can be the HIP GEMV, so only the dispatch is checked.
             before = sum(calls)
             ref9 = inner.forward(base, {"reconstruct": True}).clone()
             got9 = inner.forward(base, {"dflash_verify": True}).clone()
             torch.cuda.synchronize()
-            assert sum(calls) == before and torch.equal(ref9, got9), "Nine-row fallback changed"
+            assert sum(calls) == before, "Nine-row fallback used the direct kernel"
+            assert args.bits != 8 or torch.equal(ref9, got9), "Nine-row fallback changed"
             guards()
         finally:
             ext.exl3_dec_gemv, ext.exl3_dec_gemv_r = originals
