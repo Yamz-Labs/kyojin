@@ -25,6 +25,10 @@ def test_actual_tile_format_and_windows(tmp_path):
 #define __forceinline__ inline
 static uint32_t __builtin_amdgcn_ubfe(uint32_t x,int o,int w) {return (x>>o)&((1u<<w)-1);}
 static uint32_t __builtin_amdgcn_alignbit(uint32_t h,uint32_t l,int s) {return uint32_t(((uint64_t(h)<<32)|l)>>s);}
+#ifndef PORT_UBFE16  // newer exl3_dec.cu goes through the port macros
+#define PORT_UBFE16(w, s) __builtin_amdgcn_ubfe(w, s, 16)
+#define PORT_ALIGNBIT(hi, lo, s) __builtin_amdgcn_alignbit(hi, lo, s)
+#endif
 '''
     body = r'''
 template<int B, size_t... P> bool check(const uint32_t* w,std::index_sequence<P...>) {
