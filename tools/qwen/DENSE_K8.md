@@ -8,6 +8,21 @@ Supported input/output sizes are 2560/512, 2560/6144, 2560/10240,
 2560/12288, and 6144/2560. Weights must use K8 and the mul1 codebook.
 Routed MoE eligibility does not change.
 
+The list is a Python-side choice, not a kernel limit: the C++ side accepts
+any K8 mul1 matrix once the variable is set. It holds every K8 matrix of the
+tested K6-routed / K8-shared pack that is not an expert: k_proj and v_proj
+(2560/512), in_proj_z (2560/6144), in_proj_qkv (2560/10240), q_proj
+(2560/12288), and o_proj / out_proj (6144/2560). The shared-expert
+projections (2560/640 and 640/2560) are left out on purpose. Add a shape
+only together with a real-weight run of `check_dense_k8.py`.
+
+The variable must not change after the model is loaded. Python reads it once
+per projection at load time to decide whether the direct path is eligible.
+The C++ launch reads it again on every launch and refuses K8 when it is
+not `1`. Setting it after the model is loaded has no effect (the projections
+were already marked not eligible). Unsetting it or changing it after a load
+that used it makes the next K8 launch raise an error.
+
 ## Checks
 
 ```sh

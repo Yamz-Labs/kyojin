@@ -6,6 +6,11 @@ import argparse
 parser = argparse.ArgumentParser(description="Check dense K8 projections with real weights.")
 parser.add_argument("--model", required=True)
 parser.add_argument("--output", required=True)
+parser.add_argument("--bits", type=int, default=8,
+                    help="K of the projections to check. 8 checks the five K8 shapes. Another value is a baseline run of the "
+                         "existing direct path on dense projections of that K, picked with --match.")
+parser.add_argument("--match", default="",
+                    help="with --bits other than 8: substring of the module keys to check, for example indexer.index_qk_proj")
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 out = Path(args.output)
@@ -32,14 +37,21 @@ dev = torch.device("cuda:0")
 print("GPU:", torch.cuda.get_device_name(dev), flush=True)
 cfg = Config.from_directory(args.model)
 models = [Model.from_config(cfg), Model.from_config(cfg, component="mtp")]
-groups = {shape: [] for shape in q._DENSE_K8_SHAPES}
+if args.bits == 8:
+    groups = {shape: [] for shape in q._DENSE_K8_SHAPES}
+else:
+    assert args.match, "--bits other than 8 needs --match"
+    groups = {}
 for model in models:
     for module in model:
         if isinstance(module, Linear) and (".self_attn." in module.key or ".linear_attn." in module.key):
             shape = (module.in_features, module.out_features)
-            if shape in groups:
-                groups[shape].append(module)
-assert all(groups.values()), "Not all five projection shapes were found"
+            if args.bits == 8:
+                if shape in groups:
+                    groups[shape].append(module)
+            elif args.match in module.key:
+                groups.setdefault(shape, []).append(module)
+assert groups and all(groups.values()), "Not all projection shapes were found"
 selected = []
 for shape in sorted(groups):
     members = groups[shape]
@@ -62,11 +74,12 @@ for module in selected:
     module.load(dev)
     try:
         inner = module.inner
-        assert inner.K == 8 and inner.mul1 and not inner.mcg
+        assert inner.K == args.bits and inner.mul1 and not inner.mcg
         assert inner.dec_ok and inner.bc is None
-        os.environ["EXL3_DENSE_K8"] = "0"
-        assert not q.dec_supported(inner), "Opt-out guard failed"
-        os.environ["EXL3_DENSE_K8"] = "1"
+        if args.bits == 8:
+            os.environ["EXL3_DENSE_K8"] = "0"
+            assert not q.dec_supported(inner), "Opt-out guard failed"
+            os.environ["EXL3_DENSE_K8"] = "1"
         calls = [0, 0]
         originals = [ext.exl3_dec_gemv, ext.exl3_dec_gemv_r]
         def spy(index):
