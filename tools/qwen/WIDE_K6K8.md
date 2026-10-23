@@ -14,9 +14,12 @@ Run from the repository root:
 
 ```sh
 python -m pytest --noconftest -q tests/test_moe_fused_wide_k6k8_cpu.py
-g++ -O1 -g -std=c++17 -fsanitize=address,undefined -fno-sanitize-recover=all -Iexllamav3/exllamav3_ext/quant tests/moe_fused/moe8_bounds.cpp -o /tmp/moe8-bounds
-/tmp/moe8-bounds
 ```
+
+The test file also builds `tests/moe_fused/moe8_bounds.cpp` with ASan and
+UBSan in a pytest temporary directory and runs it (it is skipped when g++ is
+missing). It checks that `K6S8_WIDE_SHAPES` in `moe_fused.py` is the list of
+K6S8 shapes in `exl3_moe_fused_idx.h`.
 
 On an idle ROCm GPU, with the built extension:
 

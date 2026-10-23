@@ -66,6 +66,12 @@ def _rep(tr: torch.Tensor) -> torch.Tensor:
     return tr.reshape(kt, nt // 2, 2 * nw).permute(1, 0, 2).contiguous()
 
 
+# (D, H, LR, NEXP, TOPK, INTER, RB, SB) of the wide K6S8 instantiations: QwenK6S8 and SmallK6S8 in exl3_moe_fused_idx.h.
+# tests/test_moe_fused_wide_k6k8_cpu.py reads this constant and checks it against those two structs.
+K6S8_WIDE_SHAPES = ((2560, 4, 320, 512, 10, 640, 6, 8),
+                    (256, 4, 32, 64, 4, 128, 6, 8))
+
+
 class FusedMoEHalf:
     """Static plan + workspace of one qwen4_exp-style MoE half-layer (HC sites, BlockSparseMLP + shared expert)."""
 
@@ -192,8 +198,7 @@ class FusedMoEHalf:
         """Native wide launches; K6/K8 requires its own experimental opt-in."""
         v = MF9["variant"]
         k6s8 = (os.environ.get("EXL3_MOE_R8_K6S8", "0") == "1"
-                and self.shape in ((2560, 4, 320, 512, 10, 640, 6, 8),
-                                   (256, 4, 32, 64, 4, 128, 6, 8))
+                and self.shape in K6S8_WIDE_SHAPES
                 and (v & ~0x1000) == 0x160000)
         return bool(self.native and ((self.RB <= 5 and self.SB <= 5) or k6s8)
                     and hasattr(torch.ops, "mf9") and hasattr(torch.ops.mf9, "half")
