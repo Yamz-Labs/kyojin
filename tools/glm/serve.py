@@ -620,7 +620,7 @@ class ResidentEngine:
     row_budget = 0
 
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
-                 vision: bool = True, sessions: int = 1,
+                 vision: bool = True, sessions: int = 1, cache_bits: int = 0,
                  image_cache_bytes: int | None = None, image_cache_items: int = 0,
                  image_cache_format: str = "fp32",
                  image_cache_dir: str | None = IMAGE_CACHE_DIR_DEFAULT,
@@ -663,6 +663,10 @@ class ResidentEngine:
         max_position = int(self.config.config_dict.get("max_position_embeddings") or self.config.config_dict.get("text_config", {}).get("max_position_embeddings") or 32768)
         ctx = min(max_position, max_ctx)
         self.ctx = ctx
+        # cache_bits 0 (default) = the fp16 MLA latent pages; 8 (--cache-bits 8) = packed int8 latent pages. The DSA
+        # indexer and k-pool planes and the rope key stay fp16, so the saving is smaller than the latent-only ratio.
+        from exllamav3 import CacheLayer_quant
+        qkw = dict(layer_type=CacheLayer_quant, k_bits=cache_bits, v_bits=cache_bits) if cache_bits else {}
         slots = max(sessions, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
         # GLM_NGRAM = "gram,K,match[,cmin]": n-gram lookup of tools/qwen/spec_policy.install_lookup. When the
         # last `match` tokens occurred before, the round verifies the K tokens that followed them instead of the drafter's
@@ -677,7 +681,7 @@ class ResidentEngine:
             max_history = max(max_history, self.lookup[1])
         self.lookup_stats: dict[str, int] = {}
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
-                           max_history=max_history, max_batch_size=slots)
+                           max_history=max_history, max_batch_size=slots, **qkw)
         from exllamav3.util import jit_log, kernel_seed
         kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
         jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
@@ -686,7 +690,7 @@ class ResidentEngine:
         if num_draft > 0:
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
-                                     max_history=max_history, max_batch_size=slots)
+                                     max_history=max_history, max_batch_size=slots, **qkw)
             startup_health.stage("drafter weights")
             self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         else:   # --num-draft 0: plain decode, no drafter
@@ -2056,6 +2060,10 @@ def main() -> None:
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
+    parser.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
+                        help="bits per element of the MLA latent cache pages (0 = fp16, the default; 8 = packed int8; the DSA "
+                             "indexer and k-pool planes and the rope key stay fp16; output differs token-wise from fp16; slot "
+                             "files do not cross cache modes, and a cross-mode restore is rejected)")
     parser.add_argument("--image-cache-mb", type=int, default=IMAGE_CACHE_MB_DEFAULT,
                         help=f"host memory for the decoded image embeddings, in MiB; 0 = no byte limit. Like -c this "
                              f"is one pool shared by every --sessions request (default {IMAGE_CACHE_MB_DEFAULT}): "
@@ -2100,6 +2108,10 @@ def main() -> None:
               f"(per-session window = -c / sessions when all are busy); greedy output is not guaranteed equal to the same "
               f"request run alone; slot save/restore waits for every running request and acts on the last prompt noted",
               file=sys.stderr, flush=True)
+    if args.cache_bits and args.sessions > 1:
+        print(f"serve: --cache-bits {args.cache_bits} with --sessions {args.sessions}: the packed int8 MLA pages are not "
+              f"row-invariant, so batched decode changes greedy output versus a single session (the rows still agree with "
+              f"each other). Slot files also do not cross cache modes.", file=sys.stderr, flush=True)
     if os.environ.get("EXL3_SCHED_CHUNK_IL", "0") == "1":
         # chunked-prefill interleave (exllamav3/generator/chunk_il.py): needs another request running beside the big prefill
         print("serve: chunk_il ON " + ("" if args.sessions > 1 else "(no effect: needs --sessions >= 2)"), file=sys.stderr, flush=True)
@@ -2129,7 +2141,7 @@ def main() -> None:
         image_cache_size = (f"{args.image_cache_mb} MiB of host memory (--image-cache-mb)" if image_cache_bytes
                             else "no byte limit (--image-cache-mb 0)")
         engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
-                              vision=not args.no_vision, sessions=args.sessions,
+                              vision=not args.no_vision, sessions=args.sessions, cache_bits=args.cache_bits,
                               image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items,
                               image_cache_format=args.image_cache_format,
                               image_cache_dir=args.image_cache_dir, image_cache_dir_max_gb=args.image_cache_dir_max_gb,
@@ -2138,6 +2150,7 @@ def main() -> None:
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
+        print(f"serve: cache={'int' + str(args.cache_bits) + ' (slot files do not cross cache modes)' if args.cache_bits else 'fp16'}", flush=True)
         print(f"serve: image cache {image_cache_size}, {'no count cap' if not engine.emb_cache.max_items else str(engine.emb_cache.max_items) + ' pictures max'}, "
               f"{args.image_cache_format} rows, {engine.emb_cache.policy} policy, shared by {args.sessions} session(s)", flush=True)
         if engine.emb_disk is not None:
