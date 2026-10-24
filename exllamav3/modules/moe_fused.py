@@ -53,6 +53,8 @@ class FusedMoEHalf:
         if not hasattr(ext, "exl3_moe_fused_half"):
             return "extension has no exl3_moe_fused_half"
         gr, mlp = block.mlp_hc, block.mlp
+        if getattr(mlp, "tier", None) is not None:
+            return "tiered experts (expert store): the half-layer kernel bakes the expert pointers"
         if gr is None or mlp is None or block.mlp_norm is not None:
             return "needs mlp_hc, mlp and no mlp_norm"
         if not getattr(gr, "use_q8", False) or gr.hc_mult != 4:
@@ -180,9 +182,10 @@ class FusedMoEHalf:
                                self.wt, self.svt, self.ws, gr.rms_eps, 1, 0, MF9["variant"] | (0x1000 if MF9["tk2"] else 0), *self.shape)
             return x
         if x.shape[0] * x.shape[1] > MAX_ROWS:
-            assert x.shape[0] == 1
-            for lo in range(0, x.shape[1], MAX_ROWS):
-                self(x[:, lo:lo + MAX_ROWS])
+            # several jobs (b > 1, e.g. the MTP drafter at 5+ sessions) split over their rows like one job: rows are independent
+            xf = x.view(1, x.shape[0] * x.shape[1], *x.shape[2:])
+            for lo in range(0, xf.shape[1], MAX_ROWS):
+                self(xf[:, lo:lo + MAX_ROWS])
             return x
         gr = self.gr
         fq, fsc, uq, usc = gr.q8_set()

@@ -23,6 +23,7 @@ import re
 import sys
 import time
 import uuid
+import functools
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,13 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
+# serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
+# KYOJIN_SSE_PING_S while a stream has nothing to send yet (off by default), so a long prefill does
+# not look like a hung server to a client that only watches its socket.
+from serve_ping import ServePing
+# serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: off unless
+# KYOJIN_REQLOG_DIR names a directory. Its output accounting also feeds the end-of-stream summary here.
+from serve_reqlog import Lifecycle, ReqLog, StreamWriter, refusal_text, sanitize
 from image_cache import ImageEmbeddingCache, digest
 
 DEFAULT_MODEL = os.path.expanduser("~/models/mimo26-exl3")
@@ -131,9 +139,8 @@ TOOL_CLOSE = "</tool_call>"
 # ---------------------------------------------------------------------------- template
 
 
-def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
-                  **kwargs: Any) -> str:
-    """Render the model's own Jinja chat template (MiMo chat_template.jinja)."""
+def _template_env() -> Any:
+    """One Jinja environment per process."""
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
                                         extensions=["jinja2.ext.loopcontrols"])
     env.filters["tojson"] = lambda value, ensure_ascii=False, indent=None, separators=None, \
@@ -141,17 +148,37 @@ def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dic
                                     separators=separators, sort_keys=sort_keys)
     def raise_exception(msg): raise ValueError(msg)
     env.globals["raise_exception"] = raise_exception
+    return env
+
+
+_COMPILED_TEMPLATES: dict[str, Any] = {}   # template source -> compiled Template (render is thread-safe)
+
+
+def _compiled_template(template: str) -> Any:
+    """The compiled chat template, cached: compiling it per request costs ~24 ms."""
+    hit = _COMPILED_TEMPLATES.get(template)
+    if hit is None:
+        hit = _template_env().from_string(template)
+        _COMPILED_TEMPLATES[template] = hit
+    return hit
+
+
+def render_prompt(template: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+                  **kwargs: Any) -> str:
+    """Render the model's own Jinja chat template (MiMo chat_template.jinja)."""
     # OpenAI sends tool-call arguments as a JSON string; the MiMo template accepts a dict or a
     # string, but normalizing keeps `tool_call.function.arguments` round-tripping exact.
     fixed = []
     for m in messages:
+        if m.get("role") == "developer":                               # OpenAI's newer name for the system role
+            m = dict(m, role="system")
         if m.get("tool_calls"):
             m = dict(m, tool_calls=[
                 dict(c, function=dict(c["function"], arguments=_json_value(c["function"]["arguments"])))
                 if isinstance(c.get("function", {}).get("arguments"), str) else c
                 for c in m["tool_calls"]])
         fixed.append(m)
-    return env.from_string(template).render(
+    return _compiled_template(template).render(
         messages=fixed, tools=tools or [], add_generation_prompt=True, **kwargs)
 
 
@@ -502,6 +529,26 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     processing = 0  # admitted requests; closure, app config is immutable after startup
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
     app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
+    # SSE keep-alive: off unless KYOJIN_SSE_PING_S names an interval (see tools/strix_halo/serve_ping.py).
+    # A request copies this pinger, so its timers are its own; the start-up line reports the setting.
+    ping = ServePing.from_env()
+    app.update(ping=ping)
+    # Request log: off unless KYOJIN_REQLOG_DIR names a directory (numbers and event names only). The name is bound
+    # here, not only stored on the app: the streaming route logs from inside its own scope, and an unbound
+    # name there raises after the reply is complete, which costs the client its connection.
+    reqlog = ReqLog.from_env(server="mimo")
+    app.update(reqlog=reqlog)
+    background: dict[str, Any] = {}      # the heartbeat task, created at start-up (nothing when the log is off)
+
+    # The request lifecycle is logged by one shared implementation (tools/strix_halo/serve_reqlog.py).
+    # This server says when a phase begins and which counters it keeps; everything else — the request
+    # table, the id on every line, the 'alive' heartbeat, the route wrapper and the summary line — is
+    # the same code the other two servers run. `processing` is this server's only live count.
+    lifecycle = Lifecycle(reqlog, ping=ping, counters=lambda: {"processing": processing})
+
+    def reqid() -> str | None:
+        """The log id of the request being handled (None outside a logged route)."""
+        return lifecycle.reqid()
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
         accepted = int(st.get("accepted_draft_tokens", 0))
@@ -538,7 +585,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         while True:
             body, out, request_stats = await queue.get()
             cancel = body.get("_cancel")
+            rid = body.get("_reqid")
+            # `started` is when generation begins (what job_done reports as elapsed_s); the queue wait is
+            # the difference, and it is logged on its own as wait_s.
+            wait = time.perf_counter() - (body.get("_queued_at") or time.perf_counter())
+            started = time.perf_counter() - wait
             if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
+                lifecycle.job_skipped(rid, wait)
                 out.put_nowait(None)
                 queue.task_done()
                 continue
@@ -548,6 +601,10 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 async with lock:
                     if store is not None:
                         store.busy = True
+                    lifecycle.job_started(rid, wait, prompt_tokens=body.get("_prompt_tokens"),
+                                          images=len(body.get("_images") or ()),
+                                          messages=len(body.get("messages") or ()), processing=processing)
+                    first_token = False    # flipped once, so the log gets exactly one job_first_token line
                     async for delta in engine.generate(
                         body["_prompt"],
                         max_tokens=token_limit(body),
@@ -555,12 +612,17 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         top_p=body.get("top_p", SERVE_DEFAULTS["top_p"]), stop=body.get("_stop", []),
                         reset_gate=body.get("_reset_gate", False),
                         cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {})):
+                        if not first_token:
+                            first_token = True
+                            lifecycle.first_token(rid, started, prompt_tokens=body.get("_prompt_tokens"))
                         out.put_nowait(delta)
                     request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
                         observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
+                    lifecycle.job_done(rid, request_stats, started, prompt_tokens=body.get("_prompt_tokens"))
                     out.put_nowait(None)
             except Exception as exc:                             # noqa: BLE001
+                lifecycle.job_error(rid, exc, started)
                 out.put_nowait(exc)
             finally:
                 processing -= 1
@@ -570,19 +632,39 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
     async def start(_: web.Application) -> None:
         app["worker_task"] = asyncio.create_task(worker())
+        if reqlog.enabled and reqlog.heartbeat_s > 0:
+            background["heartbeat"] = asyncio.create_task(lifecycle.heartbeat_forever())
 
     async def close(app_: web.Application) -> None:
         app_["worker_task"].cancel()
+        beat = background.pop("heartbeat", None)
+        if beat is not None:
+            beat.cancel()
+        reqlog.close()
 
-    async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue) -> AsyncIterator[str]:
+    async def drain(request: web.Request, cancel: asyncio.Event, out: asyncio.Queue,
+                    writer: StreamWriter | None = None, ping: ServePing | None = None,
+                    ping_at: float = 0.0, rid: str | None = None) -> AsyncIterator[str]:
         """Items the worker produced for one request. Nothing is written to the client while a job is
         queued or prefilling (and never, for a non-streaming reply), so a client that hung up is noticed
-        by polling the transport. Raises ConnectionResetError and sets `cancel` when it has left."""
+        by polling the transport. Raises ConnectionResetError and sets `cancel` when it has left.
+        `ping` (a streaming request) is asked before every poll whether a keep-alive comment is due,
+        and `ping_at` is the moment the client's wait started: a comment is the only thing it can see
+        while the engine works on a prompt (or on a tool call) it has not answered yet."""
         while True:
             tr = request.transport
             if tr is None or tr.is_closing():
                 cancel.set()
+                if ping is not None:
+                    ping.limit()
+                lifecycle.client_left("/v1/chat/completions", "waiting", rid=rid)
                 raise ConnectionResetError("client left")
+            if ping is not None:
+                try:                              # before the wait, so a stall is covered from its start
+                    await ping.comment(writer, ping_at)
+                except ConnectionResetError:
+                    cancel.set()
+                    raise
             try:
                 item = await asyncio.wait_for(out.get(), 0.5)
             except asyncio.TimeoutError:
@@ -595,6 +677,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
     def client_left(cancel: asyncio.Event, path: str) -> web.Response:
         cancel.set()
+        lifecycle.client_left(path)
         print(f"serve: client left {path}, job cancelled", file=sys.stderr, flush=True)
         return web.Response(status=499)
 
@@ -641,11 +724,22 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         out: asyncio.Queue = asyncio.Queue()
         request_stats: dict[str, Any] = {}
         cancel = body["_cancel"] = asyncio.Event()
+        body["_reqid"] = reqid()
+        body["_queued_at"] = time.perf_counter()
+        ahead = queue.qsize()                     # requests already waiting when this one arrived
         await queue.put((body, out, request_stats))
+        lifecycle.queued(body["_reqid"], "/v1/chat/completions", queued_ahead=ahead,
+                         prompt_tokens=prompt_tokens, messages=len(body.get("messages") or ()),
+                         images=len(body.get("_images") or ()), stream=bool(body.get("stream")))
         # MiMo's generation prompt is "<|im_start|>assistant\n": no implicit <think> block.
+        # This request's SSE keep-alive and the moment its wait started (see tools/strix_halo/serve_ping.py);
+        # None for a JSON reply, which has nobody to write a comment to. `deltas` takes the reply's stream
+        # per call: closing over one that a non-streaming request never sets leaves the cell unbound.
+        ping = app["ping"].per_request() if body.get("stream", False) else None
+        ping_at = time.perf_counter()
 
-        def deltas() -> AsyncIterator[str]:
-            return drain(request, cancel, out)
+        def deltas(writer: StreamWriter | None = None) -> AsyncIterator[str]:
+            return drain(request, cancel, out, writer, ping, ping_at, body.get("_reqid"))
 
         def usage(raw: str) -> dict[str, int]:
             completion_tokens = engine.count_tokens(raw)
@@ -674,6 +768,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream",
                                                   "Cache-Control": "no-cache"})
             await response.prepare(request)
+            writer = lifecycle.stream_started(body["_reqid"], "/v1/chat/completions", response,
+                                              prompt_tokens=prompt_tokens)
             # Reasoning and prose stream as they decode. Tool calls are parsed only from complete
             # XML, so everything from <tool_call> on is held and sent once at the end.
             text, done, mode = "", 0, "content"
@@ -681,6 +777,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             # MiMo opens a turn with "<think>" only when the template asked for it, but a
             # <think>...</think> pair can appear in the output either way, so both tags are watched.
             tag_mode = {"<think>": "reasoning", "</think>": "content", TOOL_OPEN: "tool"}
+            # A mutable cell, not a flag: the nested flush() assigns it, and a plain name assigned there
+            # would be local to that closure (UnboundLocalError) instead of shared with the handler.
+            seen = {"text": False}   # flipped at the first frame with text: the client's first sign of life
 
             async def flush(final: bool) -> None:
                 nonlocal done, mode
@@ -691,7 +790,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     piece = stop_text(text[done:end], body["_stop"])[0]
                     if piece:
                         key = "reasoning_content" if mode == "reasoning" else "content"
-                        await response.write(sse(event({key: piece})))
+                        if not seen["text"]:
+                            seen["text"] = True
+                            lifecycle.first_content(body["_reqid"], body["_queued_at"])
+                        await writer.write(sse(event({key: piece})))
+                        ping.note_output()   # the client has text: comments wait for the next silence
                     done = end
                     if not hits:
                         return
@@ -700,8 +803,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                     mode = tag_mode[tag]
 
             try:
-                await response.write(sse(event({"role": "assistant", "content": ""})))
-                async for delta in deltas():
+                await writer.write(sse(event({"role": "assistant", "content": ""})))
+                ping.note_output()
+                async for delta in deltas(writer):
                     text += delta
                     await flush(False)
                 text, _ = stop_text(text, body["_stop"])
@@ -709,11 +813,12 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 message = parse_completion(text, body.get("tools"))
                 if "tool_calls" in message:
                     for n, call in enumerate(message["tool_calls"]):   # one stream message per call (clients that read one call per message)
-                        await response.write(sse(event({"tool_calls": [dict(call, index=n)]})))
-                await response.write(sse(event({}, finish_for(message, text)) |
-                                         {"usage": usage(text), "timings": timings()}))
-                await response.write(b"data: [DONE]\n\n")
+                        await writer.write(sse(event({"tool_calls": [dict(call, index=n)]})))
+                await writer.write(sse(event({}, finish_for(message, text)) |
+                                       {"usage": usage(text), "timings": timings()}))
+                await writer.write(b"data: [DONE]\n\n")
                 await response.write_eof()
+                lifecycle.stream_done(body["_reqid"], int(request_stats.get("new_tokens") or 0))
             except ConnectionResetError:
                 client_left(cancel, "stream")                        # client left: nothing to send
                 return response
@@ -722,12 +827,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 raise
             except Exception as exc:                                   # noqa: BLE001
                 cancel.set()
+                lifecycle.stream_error(body["_reqid"], exc)
                 # Fail inside the stream, but still end it the OpenAI way: clients such as OpenCode report
                 # "stream ended without finish_reason" and retry when the connection just drops.
                 try:
-                    await response.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
-                    await response.write(sse(event({}, "error")))
-                    await response.write(b"data: [DONE]\n\n")
+                    await writer.write(sse({"error": {"message": f"{type(exc).__name__}: {exc}"}}))
+                    await writer.write(sse(event({}, "error")))
+                    await writer.write(b"data: [DONE]\n\n")
                     await response.write_eof()
                 except ConnectionError:
                     pass
@@ -788,7 +894,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             if room:
                 n_predict = min(n_predict, room)
             stops = body.get("stop", [])
-            job = {"_prompt": prompt, "max_tokens": n_predict,
+            job = {"_reqid": reqid(), "_queued_at": time.perf_counter(),
+                   "_prompt": prompt, "max_tokens": n_predict,
                    "temperature": float(body.get("temperature", SERVE_DEFAULTS["temperature"])),
                    "top_p": float(body.get("top_p", SERVE_DEFAULTS["top_p"])),
                    "_stop": [stops] if isinstance(stops, str) else list(stops),
@@ -869,9 +976,9 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     app.router.add_get("/v1/models", models)
     app.router.add_get("/health", health)
     app.router.add_get("/metrics", metrics_view)
-    app.router.add_post("/v1/chat/completions", completions)
+    app.router.add_post("/v1/chat/completions", lifecycle.wrapped(completions))
     app.router.add_post("/apply-template", apply_template)
-    app.router.add_post("/completion", completion)
+    app.router.add_post("/completion", lifecycle.wrapped(completion))
     app.on_startup.append(start)
     app.on_cleanup.append(close)
     return app
@@ -983,6 +1090,8 @@ def main() -> None:
           f"spec_gate={engine.spec_gate_on} ctx={ctx} "
           f"max_position={config_max_position(engine.config)} vision={engine.supports_vision}", flush=True)
     app = create_app(engine, args.model_id, template)
+    print(f"msrv: {app['ping'].describe()}", flush=True)
+    print(f"msrv: {app['reqlog'].describe()}", flush=True)
     sock = startup_health.finish()                                # the early listener's open socket: no refused connection
     if sock is not None:
         web.run_app(app, sock=sock)

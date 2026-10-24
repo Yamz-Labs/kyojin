@@ -4,7 +4,7 @@ wt = sys.argv[1]; out = sys.argv[2]
 LENS = [int(x) for x in sys.argv[3:]] or [5000, 7000]
 sys.path.insert(0, wt); sys.path.insert(0, wt + "/tools/glm")
 import torch
-MODEL = '/home/yaniss/hermes-work/v14g/run/home/models/GLM-5.3-Flash-EXL3-Yamz'
+MODEL = os.environ.get('KYOJIN_GLM_MODEL', 'models/GLM-5.3-Flash-EXL3-Yamz')
 import serve
 for _k, _v in serve.SPEED_ENV.items(): os.environ.setdefault(_k, _v)   # what serve.py main() does
 os.environ.setdefault('EXL3_MOE_UNION_V2', '1'); serve.apply_eh_sidecar_default(MODEL)

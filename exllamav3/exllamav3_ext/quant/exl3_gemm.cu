@@ -69,7 +69,7 @@ uint64_t gemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) MIN(roundup_pow2(size_m), 16));
+    mix((uint64_t) (size_m <= 16 ? roundup_pow2(size_m) : MIN(CEIL_DIVIDE(size_m, 16) * 16, 64)));
     mix((uint64_t) size_k);
     mix((uint64_t) size_n);
     mix((uint64_t) K);

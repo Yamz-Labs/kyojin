@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -138,6 +139,11 @@ class ServeTests(unittest.TestCase):
         out = serve.render_prompt(TEMPLATE, [{"role": "user", "content": "hi"}],
                                   [{"type": "function"}])
         self.assertEqual(out, "<|im_start|>user\nhi<|im_end|>TOOLS=1<|im_start|>assistant\n")
+
+    def test_developer_role_renders_as_system(self):
+        dev = serve.render_prompt(TEMPLATE, [{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        sys_ = serve.render_prompt(TEMPLATE, [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        self.assertEqual(dev, sys_)
 
     def test_tool_call_arguments_string_is_normalized(self):
         # OpenAI sends arguments as a JSON string; the template must not double-encode it.
@@ -628,6 +634,98 @@ class ImageEmbeddingReuseTests(unittest.TestCase):
         self.assertIs(a[0], b[0])
         self.assertNotEqual(b[0].first_index, b[1].first_index)
         self.assertEqual(len(calls), 2)
+
+
+class SSEKeepAliveTests(unittest.TestCase):
+    """KYOJIN_SSE_PING_S: a stream that has nothing to send yet writes a ':' comment (off by default)."""
+
+    def setUp(self):
+        os.environ.pop("KYOJIN_SSE_PING_S", None)
+        self.addCleanup(os.environ.pop, "KYOJIN_SSE_PING_S", None)
+
+    def test_a_ping_reaches_the_client_before_the_first_token(self):
+        os.environ["KYOJIN_SSE_PING_S"] = "0.2"
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.9)          # a prefill the client has to sit through
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            chunks = []
+            while True:
+                try:
+                    data = await asyncio.wait_for(r.content.readany(), 5)
+                except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+            await client.close()
+            return b"".join(chunks)
+
+        body = run(check())
+        pings = [line for line in body.split(b"\n") if line.startswith(b":")]
+        self.assertTrue(pings, body[:400])
+        self.assertLess(body.index(b": waiting"), body.index(b"hello"))   # before the first token
+        self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))          # the stream still ends the OpenAI way
+
+    def test_a_streaming_reply_does_not_cost_the_client_its_connection(self):
+        """The streaming route logs its summary while the reply is being closed: a name that is not
+        bound there raises after the body is complete, and the client loses the connection it was
+        reusing (the next request on it dies with ServerDisconnectedError, and the server logs a
+        traceback per stream). Three streams on one client session must all succeed."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.3)
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            dropped = 0
+            for _ in range(3):
+                try:
+                    response = await client.post("/v1/chat/completions", json={
+                        "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+                    await response.read()
+                except Exception:                                     # noqa: BLE001  the bug drops the socket
+                    dropped += 1
+            await client.close()
+            return dropped
+
+        self.assertEqual(run(check()), 0)
+
+    def test_nothing_is_written_when_the_switch_is_off(self):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.5)
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", TEMPLATE)))
+            await client.start_server()
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            body = await r.read()
+            await client.close()
+            return body
+
+        body = run(check())
+        self.assertEqual([line for line in body.split(b"\n") if line.startswith(b":")], [])
+        self.assertIn(b"hello", body)
 
 
 if __name__ == "__main__":

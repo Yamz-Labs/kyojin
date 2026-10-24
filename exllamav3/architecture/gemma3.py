@@ -13,6 +13,7 @@ from ..modules import (
     Embedding,
     TransformerBlock,
     Attention,
+    SlidingAttention,
     GatedMLP,
     Linear,
     Conv,
@@ -22,6 +23,8 @@ from ..modules import (
 )
 from ..modules.arch_specific.gemma3 import Gemma3MMPool
 from ..modules.attn import prepare_for_attn
+from ..modules.sliding_attn import SWAState
+from ..cache.recurrent_util import prepare_for_recurrence
 from ..tokenizer import Tokenizer, MMEmbedding
 from types import SimpleNamespace
 from PIL import Image
@@ -243,9 +246,11 @@ class Gemma3Model(Model):
         self,
         config: Gemma3Config | Gemma3TextConfig,
         key_prefix = "language_model",
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.swa_full = swa_full
 
         self.modules += [
             Embedding(
@@ -270,7 +275,9 @@ class Gemma3Model(Model):
                     rms_norm_eps = config.rms_norm_eps,
                     constant_bias = 1.0,
                 ),
-                attn = Attention(
+                # Sliding-window layers keep their KV in a per-slot window ring (SlidingAttention) instead of
+                # full-length paged KV, so KV memory and decode traffic stop growing with context on them
+                attn = (SlidingAttention if (not swa_full and config.swa_pattern[idx] > 0) else Attention)(
                     config = config,
                     key = f"{key_prefix}.model.layers.{idx}.self_attn",
                     layer_idx = idx,
@@ -360,9 +367,20 @@ class Gemma3Model(Model):
 
         self.logit_layer_idx = len(self.modules) - 1
 
+        # SWA layers are recurrent (window ring state), optionally
+        self.recurrent_state_cls = None
+        if not self.swa_full:
+            self.caps.update({
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 6144,
+            })
+            self.recurrent_state_cls = SWAState
+
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
+        if not self.swa_full:
+            prepare_for_recurrence(input_ids, params, self)
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
 

@@ -105,7 +105,7 @@ void BC_GatedMLP::run_bszN
 
     Graph& g = graph_bszN[graphidx];
 
-    if (g.disabled || (!g.ready && !g.ready_to_record))
+    if (g.disabled || graph_outer_capture(stream) || (!g.ready && !g.ready_to_record))
     {
         run_bszN_gr(x, d, num_tokens, nullptr);
         g.ready_to_record = true;
@@ -194,7 +194,7 @@ void BC_MLP::run_bsz1
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
+    if (graph_bsz1.disabled || graph_outer_capture(stream) || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
     {
         run_bsz1_gr(x, d, nullptr);
         graph_bsz1.ready_to_record = true;

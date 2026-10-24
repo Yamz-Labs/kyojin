@@ -1644,6 +1644,13 @@ def dsa_attn(
     return out
 
 
+# GLM-5.3 prefill scorer (H_i 32, D_i 128, R >= 64 rows): 32x128 tiles, 4 warps, 2 stages. pf500 sweep (R 256, paged pooled keys,
+# 27 configs): 37.0-37.5 TFLOP/s against 35.1-35.8 for 64x128 / 8 warps / 2 stages, scores bitwise equal in all 54 cases
+# (T 32768 and 125000). EXL3_DSA_IDX_CFG="bm,bn,warps,stages" overrides, "0" restores 64,128,8,2.
+_idx_cfg_env = os.environ.get("EXL3_DSA_IDX_CFG", "32,128,4,2")
+_IDX_CFG_GLM = None if _idx_cfg_env == "0" else tuple(int(x) for x in _idx_cfg_env.split(","))
+
+
 def dsa_indexer_scores(
     q_idx,                   # (R, H_i, D_i) fp16, rope applied
     weights,                 # (R, H_i) fp16 raw head weights (H_i ** -0.5 folded in-kernel)
@@ -1653,10 +1660,10 @@ def dsa_indexer_scores(
     compress_rate,
     bound_max,               # entry count clamp (valid pool entries)
     scores = None,
-    block_m = 64,
-    block_n = 128,
-    num_warps = 8,
-    num_stages = 2,
+    block_m = None,          # None: 64 / 128 / 8 warps / 2 stages, or the GLM-5.3 prefill config below
+    block_n = None,
+    num_warps = None,
+    num_stages = None,
     block_table = None,      # (npr,) or (1, npr) i32 page table of the (single) job
     epp = 0,                 # pool entries per page (paged mode)
     scale = None,            # None: D_i ** -0.5 * H_i ** -0.5 (DSA); QSA passes dk ** -0.5
@@ -1666,6 +1673,11 @@ def dsa_indexer_scores(
     R, H_i, D_i = q_idx.shape
     if scale is None:
         scale = D_i ** -0.5 * H_i ** -0.5
+    cfg = _IDX_CFG_GLM if (H_i == 32 and D_i == 128 and R >= 64) else None
+    block_m = block_m if block_m is not None else (cfg[0] if cfg else 64)
+    block_n = block_n if block_n is not None else (cfg[1] if cfg else 128)
+    num_warps = num_warps if num_warps is not None else (cfg[2] if cfg else 8)
+    num_stages = num_stages if num_stages is not None else (cfg[3] if cfg else 2)
     T = bound_max
     if block_table is None:
         T = k_idx.shape[0]

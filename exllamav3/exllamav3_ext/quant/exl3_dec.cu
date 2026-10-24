@@ -12,7 +12,7 @@
 //   - mul1 codebook: v = fp16(0x6400 + bytesum(w * 0x83DCD12D)) * fp16(0x1eee) + fp16(0xc931)
 //   - W = diag(suh) H128 W_hat H128 diag(svh), H128 the normalised Sylvester Hadamard per 128 block
 
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || defined(EXL3_PORT_DEC)
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -30,6 +30,7 @@
 #include <ATen/ops/empty.h>
 #include "exl3_dec.cuh"
 #include "../util.cuh"
+#include "../port.cuh"
 
 // QWG_ABLATE=1 compiles runtime ablation arms into the dense gemv (env EXL3_QWG_DABL; timing only, garbage results by design):
 // bit 1 = no trellis decode (loads kept alive by an xor), bit 2 = no DRAM stream (every k-tile read is k-row 0..ktw-1), bit 4 = no epilogue
@@ -39,8 +40,13 @@
 
 namespace exl3dec {
 
+#if defined(USE_ROCM)
 typedef _Float16 f16x2 __attribute__((ext_vector_type(2)));
 typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+#else
+typedef __half2 f16x2;
+typedef uint4 u32x4;
+#endif
 
 constexpr int WPB = 8;              // waves per block
 constexpr int THREADS = WPB * 32;
@@ -96,11 +102,11 @@ __device__ __forceinline__ uint32_t window(const uint32_t* w)
     constexpr int o = s & 31;
     constexpr int W = Fmt<KB2>::WORDS;
     if constexpr (o <= 16)
-        return __builtin_amdgcn_ubfe(w[i], 16 - o, 16);
+        return PORT_UBFE16(w[i], 16 - o);
     else if constexpr (MASK)
-        return __builtin_amdgcn_alignbit(w[i], w[(i + 1) % W], 48 - o) & 0xffffu;
+        return PORT_ALIGNBIT(w[i], w[(i + 1) % W], 48 - o) & 0xffffu;
     else
-        return __builtin_amdgcn_alignbit(w[i], w[(i + 1) % W], 48 - o);
+        return PORT_ALIGNBIT(w[i], w[(i + 1) % W], 48 - o);
 }
 
 // Product variants for p = (x & 0xffff) * 0x83DCD12D mod 2^32:
@@ -121,8 +127,10 @@ constexpr bool PROD_MASK = EXL3_DEC_PROD != 2;
 // carrying a 32-bit literal (the fully unrolled tile decode is instruction-cache bound on gfx1151,
 // bytes matter). The mcg codebook's decode yields the final fp16 weight directly, so its affine
 // fold (kinv2/kbias2, applied in pair_dot/block_reduce) is the identity.
-#if !defined(EXL3_DEC_SCONST)
+#if !defined(EXL3_DEC_SCONST) && defined(USE_ROCM)
 #define EXL3_DEC_SCONST 1
+#elif !defined(EXL3_DEC_SCONST)
+#define EXL3_DEC_SCONST 0   // CUDA: the s_mov asm is AMDGPU only
 #endif
 struct DecConst
 {
@@ -196,8 +204,8 @@ __device__ __forceinline__ uint32_t mul1_pair(uint32_t w0, uint32_t w1, const De
 #else
     const uint32_t p0 = mul1_prod(w0, c);
     const uint32_t p1 = mul1_prod(w1, c);
-    const uint32_t s0 = __builtin_amdgcn_sad_u8(p0, 0u, c.sadacc);
-    return __builtin_amdgcn_sad_hi_u8(p1, 0u, s0);
+    const uint32_t s0 = PORT_SAD_U8(p0, c.sadacc);
+    return PORT_SAD_HI_U8(p1, s0);
 #endif
 }
 
@@ -243,6 +251,20 @@ __device__ __forceinline__ uint32_t pair_decode(uint32_t w0, uint32_t w1, const 
 // at the noise floor (-0.015 +- 0.068 %, 8 x 1024 tok @4K). EXL3_DEC_MOE_FOLD=0 restores the exact path.
 template <int CB> constexpr bool dec_exact() { return CB == 3 ? false : (bool) EXL3_DEC_EXACT; }
 
+// Which (K, codebook) pairs get the fully unrolled decode. ROCm: all. CUDA: cicc needs minutes and GBs per pair, so an
+// EXL3_PORT_DEC build compiles the masks below (bit kb2 / bit cb; default K3 and K4, mul1) and traps on the others
+#if defined(USE_ROCM)
+template <int KB2, int CB> constexpr bool dec_built() { return true; }
+#else
+#if !defined(EXL3_PORT_DEC_KB2_MASK)
+#define EXL3_PORT_DEC_KB2_MASK ((1 << 6) | (1 << 8))
+#endif
+#if !defined(EXL3_PORT_DEC_CB_MASK)
+#define EXL3_PORT_DEC_CB_MASK (1 << 2)
+#endif
+template <int KB2, int CB> constexpr bool dec_built() { return ((EXL3_PORT_DEC_KB2_MASK >> KB2) & 1) && ((EXL3_PORT_DEC_CB_MASK >> CB) & 1); }
+#endif
+
 template <int KB2, int M, int CB = 2>
 __device__ __forceinline__ void pair_dot(const uint32_t* w, const f16x2* xp, float* acc, const DecConst& c)
 {
@@ -253,17 +275,17 @@ __device__ __forceinline__ void pair_dot(const uint32_t* w, const f16x2* xp, flo
     // multiplies the full 32-bit window, so it always needs the masked form.
     constexpr bool MASK = (CB >= 2) ? PROD_MASK : true;
     const uint32_t h2 = pair_decode<CB>(window<KB2, 2 * M, MASK>(w), window<KB2, 2 * M + 1, MASK>(w), c);
-    f16x2 h = __builtin_bit_cast(f16x2, h2);
+    f16x2 h = PORT_AS_F16X2(h2);
     if constexpr (dec_exact<CB>())
-        h = __builtin_elementwise_fma(h, __builtin_bit_cast(f16x2, c.kinv2), __builtin_bit_cast(f16x2, c.kbias2));
+        h = PORT_HFMA2(h, PORT_AS_F16X2(c.kinv2), PORT_AS_F16X2(c.kbias2));
     constexpr int t = M >> 2;
     constexpr int jj = M & 3;
     constexpr int q = (t & 3) + ((jj & 1) ? 4 : 0);
     constexpr int col = (t >> 2) + ((jj & 2) ? 8 : 0);
-    acc[col] = __builtin_amdgcn_fdot2(h, xp[q], acc[col], false);
+    acc[col] = PORT_FDOT2_F32(h, xp[q], acc[col]);
     // Scheduling fence every SB pairs: left free, the scheduler hoists the window/product work of a
     // whole tile ahead of the dot products and spills (hundreds of VGPRs)
-    if constexpr ((M % EXL3_DEC_SB) == EXL3_DEC_SB - 1) __builtin_amdgcn_sched_barrier(0);
+    if constexpr ((M % EXL3_DEC_SB) == EXL3_DEC_SB - 1) PORT_SCHED_BARRIER();
     if constexpr (M + 1 < 128) pair_dot<KB2, M + 1, CB>(w, xp, acc, c);
 }
 
@@ -282,7 +304,8 @@ __device__ __forceinline__ void tile_dot(const uint32_t* w, const f16x2* xp, flo
     for (int i = 0; i < Fmt<KB2>::WORDS; ++i) t ^= w[i];
     acc[0] += (float) (t & 0xff) * (float) xp[0][0];
 #else
-    pair_dot<KB2, 0, CB>(w, xp, acc, c);
+    if constexpr (dec_built<KB2, CB>()) pair_dot<KB2, 0, CB>(w, xp, acc, c);
+    else PORT_TRAP();
 #endif
 }
 
@@ -296,23 +319,23 @@ __device__ __forceinline__ void pair_dot_r(const uint32_t* w, const f16x2 (*xp)[
 {
     constexpr bool MASK = (CB >= 2) ? PROD_MASK : true;
     const uint32_t h2 = pair_decode<CB>(window<KB2, 2 * M, MASK>(w), window<KB2, 2 * M + 1, MASK>(w), c);
-    f16x2 h = __builtin_bit_cast(f16x2, h2);
+    f16x2 h = PORT_AS_F16X2(h2);
     if constexpr (dec_exact<CB>())
-        h = __builtin_elementwise_fma(h, __builtin_bit_cast(f16x2, c.kinv2), __builtin_bit_cast(f16x2, c.kbias2));
+        h = PORT_HFMA2(h, PORT_AS_F16X2(c.kinv2), PORT_AS_F16X2(c.kbias2));
     constexpr int t = M >> 2;
     constexpr int jj = M & 3;
     constexpr int q = (t & 3) + ((jj & 1) ? 4 : 0);
     constexpr int col = (t >> 2) + ((jj & 2) ? 8 : 0);
     #pragma unroll
     for (int j = 0; j < RM; ++j)
-        acc[j][col] = __builtin_amdgcn_fdot2(h, xp[j][q], acc[j][col], false);
-    if constexpr ((M % EXL3_DEC_SB) == EXL3_DEC_SB - 1) __builtin_amdgcn_sched_barrier(0);
+        acc[j][col] = PORT_FDOT2_F32(h, xp[j][q], acc[j][col]);
+    if constexpr ((M % EXL3_DEC_SB) == EXL3_DEC_SB - 1) PORT_SCHED_BARRIER();
     if constexpr (M + 1 < 128) pair_dot_r<KB2, M + 1, CB, RM>(w, xp, acc, c);
 }
 
 // fp16 codebook constants (codebook.cuh decode_3inst<2>)
-__device__ __forceinline__ float cb_kinv() { return (float) __builtin_bit_cast(_Float16, (unsigned short) 0x1eee); }
-__device__ __forceinline__ float cb_kbias() { return (float) __builtin_bit_cast(_Float16, (unsigned short) 0xc931); }
+__device__ __forceinline__ float cb_kinv() { return PORT_F16_BITS_TO_F32(0x1eee); }
+__device__ __forceinline__ float cb_kbias() { return PORT_F16_BITS_TO_F32(0xc931); }
 
 // The mcg decode is its own affine map (identity), so EXL3_DEC_EXACT 0 (affine folded into the
 // block sums) and 1 (folded per value) coincide there.
@@ -327,10 +350,10 @@ __device__ __forceinline__ void load_tile(const u32x4* p, u32x4* r)
     const int ln = threadIdx.x & 31;
     const u32x4* base = p - ln * Fmt<KB2>::VEC;
     #pragma unroll
-    for (int v = 0; v < Fmt<KB2>::VEC; ++v) r[v] = __builtin_nontemporal_load(base + v * 32 + ln);
+    for (int v = 0; v < Fmt<KB2>::VEC; ++v) r[v] = PORT_LD_STREAM(base + v * 32 + ln);
 #else
     #pragma unroll
-    for (int v = 0; v < Fmt<KB2>::VEC; ++v) r[v] = __builtin_nontemporal_load(p + v);
+    for (int v = 0; v < Fmt<KB2>::VEC; ++v) r[v] = PORT_LD_STREAM(p + v);
 #endif
 }
 
@@ -375,7 +398,7 @@ __device__ __forceinline__ void lane_gemv(const u32x4* tiles, size_t tstride, co
             #pragma unroll
             for (int q = 0; q < 8; ++q) xp[q] = xq[q];
             tile_dot<KB2, CB>(reinterpret_cast<const uint32_t*>(cur), xp, acc, dc);
-            __builtin_amdgcn_sched_barrier(0);
+            PORT_SCHED_BARRIER();
         }
         return;
     }
@@ -397,7 +420,7 @@ __device__ __forceinline__ void lane_gemv(const u32x4* tiles, size_t tstride, co
             if constexpr (NODEC) { uint32_t xx = 0; for (int v = 0; v < VEC; ++v) xx ^= buf[r][v].x ^ buf[r][v].y ^ buf[r][v].z ^ buf[r][v].w; acc[0] += __uint_as_float(xx & 0x3fffffff); }
             else tile_dot<KB2, CB>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
             if (i + RING < n) load_tile<KB2>(tiles + (i + RING) * tstride, buf[r]);
-            __builtin_amdgcn_sched_barrier(0);   // keep the scheduler from interleaving tiles (VGPR blowup)
+            PORT_SCHED_BARRIER();   // keep the scheduler from interleaving tiles (VGPR blowup)
         }
     }
 }
@@ -440,7 +463,7 @@ __device__ __forceinline__ void lane_gemv_r(const u32x4* tiles, size_t tstride, 
                 tile_dot<KB2, CB>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc[j], dc);
             }
             if (i + RING < n) load_tile<KB2>(tiles + (i + RING) * tstride, buf[r]);
-            __builtin_amdgcn_sched_barrier(0);
+            PORT_SCHED_BARRIER();
         }
     }
 }
@@ -470,9 +493,10 @@ __device__ __forceinline__ void lane_gemv_r1(const u32x4* tiles, size_t tstride,
                 #pragma unroll
                 for (int q = 0; q < 8; ++q) xp[j][q] = xq[q];
             }
-            pair_dot_r<KB2, 0, CB, RM>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
+            if constexpr (dec_built<KB2, CB>()) pair_dot_r<KB2, 0, CB, RM>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
+            else PORT_TRAP();
             if (i + RING < n) load_tile<KB2>(tiles + (i + RING) * tstride, buf[r]);
-            __builtin_amdgcn_sched_barrier(0);
+            PORT_SCHED_BARRIER();
         }
     }
 }
@@ -489,7 +513,7 @@ __device__ __forceinline__ void fwht128(float* v, int lane)
         #pragma unroll
         for (int i = 0; i < 4; ++i)
         {
-            const float o = __shfl_xor(v[i], m);
+            const float o = PORT_SHFL_XOR(v[i], m);
             v[i] = (lane & m) ? (o - v[i]) : (v[i] + o);
         }
     }
@@ -503,7 +527,7 @@ __device__ __forceinline__ half sat_half(float f)
 __device__ __forceinline__ float wave_sum(float v)
 {
     #pragma unroll
-    for (int m = 1; m < 32; m <<= 1) v += __shfl_xor(v, m);
+    for (int m = 1; m < 32; m <<= 1) v += PORT_SHFL_XOR(v, m);
     return v;
 }
 
@@ -620,7 +644,7 @@ __device__ __forceinline__ void k_split(int G, int kb, int kbs, int& k0, int& kt
 
 __device__ __forceinline__ float ld_coherent(const float* p)
 {
-    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    return PORT_LD_COHERENT(p);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -638,11 +662,14 @@ struct Job
     int block_base; // first block of this job
     int part_base;  // float offset into scratch
     int ctr_base;   // int offset into counters
+    int x_off;      // half offset of this job's input inside x (0: all jobs share x[0..K))
 };
+
+constexpr int MAXJ = 8;   // matrices per dense GEMV launch
 
 struct Jobs
 {
-    Job j[4];
+    Job j[MAXJ];
     int count;
     int K;
     int kbs;        // k blocks
@@ -669,7 +696,7 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
 
     int ji = 0;
     #pragma unroll
-    for (int i = 1; i < 4; ++i) if (i < jobs.count && (int) blockIdx.x >= jobs.j[i].block_base) ji = i;
+    for (int i = 1; i < MAXJ; ++i) if (i < jobs.count && (int) blockIdx.x >= jobs.j[i].block_base) ji = i;
     const Job& job = jobs.j[ji];
     const int local = blockIdx.x - job.block_base;
     const int strip = local / jobs.kbs;
@@ -679,7 +706,7 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
     k_split(jobs.K / 128, kb, jobs.kbs, k0, ktw);
 
     // Input rotation for this block's ktw * 128 input values
-    prologue_x(x, job.suh, k0, ktw * 128, xs, s_xsum, wave, lane, jobs.x_gstride);
+    prologue_x(x + job.x_off, job.suh, k0, ktw * 128, xs, s_xsum, wave, lane, jobs.x_gstride);
     __syncthreads();
     float xsum = 0.0f;
     for (int c = 0; c < ktw; ++c) xsum += s_xsum[c];
@@ -1586,8 +1613,8 @@ void router_kernel(const half* __restrict__ x, RouterNorm rn, const half* __rest
         #pragma unroll
         for (int m = 16; m >= 1; m >>= 1)
         {
-            const float ov = __shfl_xor(bv, m);
-            const int oi = __shfl_xor(bi, m);
+            const float ov = PORT_SHFL_XOR(bv, m);
+            const int oi = PORT_SHFL_XOR(bi, m);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         const int pb = j & 1;
@@ -1758,8 +1785,8 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
         #pragma unroll
         for (int m = 16; m >= 1; m >>= 1)
         {
-            const float ov = __shfl_xor(bv, m);
-            const int oi = __shfl_xor(bi, m);
+            const float ov = PORT_SHFL_XOR(bv, m);
+            const int oi = PORT_SHFL_XOR(bi, m);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         const int pb = j & 1;
@@ -1942,6 +1969,9 @@ inline int kb2_of(double K)
 {
     const int kb2 = (int) (K * 2.0 + 0.5);
     TORCH_CHECK(kb2 >= 4 && kb2 <= 14 && (double) kb2 == K * 2.0, "exl3_dec: unsupported K ", K);
+#if !defined(USE_ROCM)
+    TORCH_CHECK((EXL3_PORT_DEC_KB2_MASK >> kb2) & 1, "exl3_dec: K ", K, " not in this build's EXL3_PORT_DEC_KB2_MASK");
+#endif
     return kb2;
 }
 
@@ -2128,23 +2158,31 @@ static void dec_gemv_impl
     const std::vector<double>& K,
     int64_t Kdim_strided,
     int64_t x_gstride,
-    bool mcg
+    bool mcg,
+    int64_t x_job_stride = 0,   // > 0: job i reads its own input x[i * x_job_stride ..), K = x_job_stride (x is [n, K])
+    int64_t strips_hint = 0     // > 0: pick ktw as if the launch had this many strips (the strips of ONE equivalent single call)
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     const int n = trellis.size();
-    TORCH_CHECK(n >= 1 && n <= 4, "exl3_dec_gemv: 1..4 matrices");
+    TORCH_CHECK(n >= 1 && n <= MAXJ, "exl3_dec_gemv: 1..", MAXJ, " matrices");
+    TORCH_CHECK(n <= 4 || x_job_stride > 0 || strips_hint > 0, "exl3_dec_gemv: more than 4 matrices need x_job_stride or strips_hint");
     TORCH_CHECK(x.dtype() == at::kHalf && x.is_contiguous(), "exl3_dec_gemv: x must be contiguous fp16");
-    const int Kdim = x_gstride ? (int) Kdim_strided : (int) x.size(-1);
-    TORCH_CHECK(x_gstride ? (x_gstride >= 128 && x.numel() >= (int64_t) (Kdim / 128 - 1) * x_gstride + 128)
-                          : x.numel() == x.size(-1), "exl3_dec_gemv: x must be fp16 [1, K] (or cover the strided groups)");
+    const int Kdim = x_job_stride ? (int) x_job_stride : x_gstride ? (int) Kdim_strided : (int) x.size(-1);
+    if (x_job_stride) {
+        TORCH_CHECK(!x_gstride && x.numel() == (int64_t) n * x_job_stride, "exl3_dec_gemv: x must be fp16 [n, K] for per-job inputs");
+    } else {
+        TORCH_CHECK(x_gstride ? (x_gstride >= 128 && x.numel() >= (int64_t) (Kdim / 128 - 1) * x_gstride + 128)
+                              : x.numel() == x.size(-1), "exl3_dec_gemv: x must be fp16 [1, K] (or cover the strided groups)");
+    }
     TORCH_CHECK(Kdim % 512 == 0, "exl3_dec_gemv: K must be a multiple of 512");
     const int kb2 = kb2_of(K[0]);
     int strips_total = 0;
     for (int i = 0; i < n; ++i) strips_total += (out[i].size(-1) + STRIP - 1) / STRIP;
     const int min_blocks = env_int("EXL3_DEC_MIN_BLOCKS", 32);
     const int forced = env_int("EXL3_DEC_KTW", 0);
+    if (strips_hint > 0) strips_total = (int) strips_hint;
     const int ktw = pick_ktw(Kdim / 16, strips_total, ring_of_kb2(kb2), min_blocks, forced);
     Jobs jobs;
     jobs.count = n;
@@ -2173,6 +2211,7 @@ static void dec_gemv_impl
         j.block_base = blocks;
         j.part_base = part;
         j.ctr_base = ctr;
+        j.x_off = x_job_stride ? (int) (i * x_job_stride) : 0;
         blocks += j.strips * jobs.kbs;
         part += jobs.kbs * N;
         ctr += j.strips;
@@ -2200,6 +2239,24 @@ void exl3_dec_gemv_multi
 )
 {
     dec_gemv_impl(x, trellis, suh, svh, out, scratch, counters, K, 0, 0, mcg);
+}
+
+void exl3_dec_gemv_x
+(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& trellis,
+    const std::vector<at::Tensor>& suh,
+    const std::vector<at::Tensor>& svh,
+    const std::vector<at::Tensor>& out,
+    at::Tensor& scratch,
+    at::Tensor& counters,
+    const std::vector<double>& K,
+    bool mcg,
+    int64_t x_job_stride,
+    int64_t strips_hint
+)
+{
+    dec_gemv_impl(x, trellis, suh, svh, out, scratch, counters, K, 0, 0, mcg, x_job_stride, strips_hint);
 }
 
 void exl3_dec_gemv

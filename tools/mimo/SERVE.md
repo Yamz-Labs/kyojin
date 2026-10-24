@@ -37,7 +37,8 @@ Model id in requests: `MiMo-2.6-EXL3`.
 The server loads the vision tower from `<model>/vision/vision.safetensors` at start (1.4 GiB GPU memory, about 2 s).
 The file is in the hub pack; a pack downloaded before it was added needs `hf download` again. An image goes in a user
 message as an OpenAI `image_url` part; the URL is a `data:` URI or a local file path (the server does not fetch remote
-URLs). One image takes 24 to about 1,100 tokens depending on its size (capped at 2,097,152 pixels, `MIMO_IMAGE_MAX_PIXELS`). `--no-vision`
+URLs). One image takes 24 to about 1,100 tokens depending on its size (capped at 2 097 152 pixels by
+`MIMO_IMAGE_MAX_PIXELS`, [doc/env_vars.md](../../doc/env_vars.md)). `--no-vision`
 skips the tower; an image request then gets HTTP 400, also when the file is missing. Audio and video are not supported.
 
 `--ctx 0` (default) takes the max context from the model config, following `text_config` when the
@@ -59,6 +60,15 @@ top-level config does not carry `max_position_embeddings` — the GLM fix.
   decode steps (one verification round each while speculating), an upper bound when
   `--spec-gate` falls back to plain. A request cancelled mid-stream is not counted in this
   first version.
+
+## Diagnostics: the request log
+
+The log and the stream keep-alive are shared code: switches, format, every event and how to read the
+output accounting are documented once, in [doc/logging.md](../../doc/logging.md). This server writes the
+same events as GLM except for `serve_start` and `img_cache` (GLM's image cache and its disk tier)
+and `sse_ping` (this server's pinger writes no log line); `tools/test_serve_logging.py` checks the shared
+part against all three servers at once. Turn it on with `KYOJIN_REQLOG_DIR=<directory>` (or `1`) and hold a silent
+stream open with `KYOJIN_SSE_PING_S=<seconds>`; a run writes its own log file (`requests-<run>.log`, newest 20 kept), and both switches are in [doc/env_vars.md](../../doc/env_vars.md).
 
 ## Start-up progress on `/health`
 

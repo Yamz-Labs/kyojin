@@ -1,4 +1,5 @@
-py::class_<TritonKernel, std::shared_ptr<TritonKernel>>(m, "TritonKernel").def
+py::class_<TritonKernel, std::shared_ptr<TritonKernel>>(m, "TritonKernel")
+    .def_readwrite("grid_y", &TritonKernel::grid_y).def
 (
     py::init<py::bytes, std::string, int, int>(),
     py::arg("cubin"),
@@ -155,6 +156,7 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("k_update"),
     py::arg("block_n"),
     py::arg("splits_cap"),
+    py::arg("programs"),
     py::arg("xp"),
     py::arg("yp")
 )

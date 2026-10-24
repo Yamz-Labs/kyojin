@@ -13,7 +13,7 @@
 // The two templates decode bit-identically to their codebook's reference decode; only the
 // summation order differs from the reconstruct+hgemm path.
 
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || defined(EXL3_PORT_DEC)
 
 // y[N] = x[K] @ W, x fp16 [1, K], out fp16 or fp32 [1, N]. `scratch` is a float32 workspace and
 // `counters` an int32 workspace (zeroed once, left zeroed by every call), see exl3_dec_workspace.
@@ -45,6 +45,24 @@ void exl3_dec_gemv_strided
     int64_t in_features,
     int64_t x_gstride,
     bool mcg = false
+);
+
+// Up to 8 GEMVs in one launch with per-launch control of the k-split. x_job_stride > 0: x is [n, K] and matrix i reads row i
+// (grouped projections, e.g. the 8 o_a groups); 0: all matrices share x [1, K]. strips_hint > 0: ktw/kbs are chosen as for a
+// launch of that many 512-column strips (pass the strips of ONE equivalent single call to stay bit-identical to separate calls).
+void exl3_dec_gemv_x
+(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& trellis,
+    const std::vector<at::Tensor>& suh,
+    const std::vector<at::Tensor>& svh,
+    const std::vector<at::Tensor>& out,
+    at::Tensor& scratch,
+    at::Tensor& counters,
+    const std::vector<double>& K,
+    bool mcg,
+    int64_t x_job_stride,
+    int64_t strips_hint
 );
 
 // Up to 4 GEMVs sharing one input x in one launch (e.g. q/k/v projections). All matrices must

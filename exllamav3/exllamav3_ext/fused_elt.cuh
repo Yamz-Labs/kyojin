@@ -48,6 +48,14 @@ void fused_silu_mul
     double act_limit
 );
 
+void silu_mul_pitched
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    double act_limit
+);
+
 // KDA gates: beta = bf16(sigmoid(b * beta_scale)), g = lb * sigmoid(exp(a_log) * (f + dt_bias))
 // (or -exp(a_log) * softplus20(f + dt_bias) when has_lb is false). All inputs fp32.
 void kda_gate

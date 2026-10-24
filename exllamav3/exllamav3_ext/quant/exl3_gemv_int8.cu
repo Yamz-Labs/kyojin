@@ -159,6 +159,8 @@ static bool exl3_gemv_int8_sq
     if (!fn) return false;
 
     int rows_max = gemv_int8_sq_rows_max(M, residual);
+    static const int rows_ovr = [] { const char* e = getenv("EXL3_GEMV_ROWS"); return e ? atoi(e) : 0; }();
+    static const int policy = [] { const char* e = getenv("EXL3_GEMV_POLICY"); return e ? atoi(e) : 1; }();
 
     // Mirror of the kernel's work decomposition (single-wave rule with a half-wave floor)
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
@@ -170,6 +172,18 @@ static bool exl3_gemv_int8_sq
         rows_per = MAX(rows_per, SQ_MINROWS);
         rows_per = MIN(rows_per, rows_max);
         rows_per = MIN(rows_per, (rows_total + 7) & ~7);
+        if (rows_ovr > 0) rows_per = MIN(MIN(rows_ovr, rows_max), (rows_total + 7) & ~7);
+        else if (policy && (K == 4 || K == 5))
+        {
+            // Taller slices than the single-wave rule picks: units well below the grid but >= ~2 per SM keep DRAM
+            // saturated while the per-slice prologue, partial traffic and serial epilogue combine shrink
+            // (3090 sweep: 5120x17408 K4 72 -> 63 us, K5 88 -> 76 us; flat for shapes already near 2 units/SM)
+            int ks_t = MAX(1, CEIL_DIVIDE(2 * num_sms, nb256));
+            int rp_new = (CEIL_DIVIDE(rows_total, ks_t) + 7) & ~7;
+            rp_new = MIN(rp_new, rows_max);
+            rp_new = MIN(rp_new, (rows_total + 7) & ~7);
+            rows_per = MAX(rows_per, rp_new);
+        }
         ksplit = CEIL_DIVIDE(rows_total, rows_per);
     };
     auto smem_for = [&] (int rows_per) -> size_t
@@ -221,6 +235,7 @@ static bool exl3_gemv_int8_sq
     }
 #endif
     decomp(grid, ksplit, rows_per);
+    int rows_eff = rows_per;    // the kernel takes the host's slice height (single source of truth)
     size_t smem = smem_for(rows_per);
     if (ksplit > SQ_KSPLIT_CAP) return false;
     if (size_n / 256 > SQ_COUNTERS_CAP) return false;
@@ -240,7 +255,8 @@ static bool exl3_gemv_int8_sq
         (void*) &ws_ptr,
         (void*) &suh_ptr,
         (void*) &A_had_ptr,
-        (void*) &svh_ptr
+        (void*) &svh_ptr,
+        (void*) &rows_eff
     };
 
     cudaError_t err = cudaLaunchKernel(fn, dim3(grid), dim3(NUM_THREADS), kernelArgs, smem, stream);

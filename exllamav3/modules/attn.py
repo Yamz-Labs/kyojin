@@ -132,6 +132,24 @@ def prepare_flash_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     return input_ids
 
 
+def split_params_by_sequence(params: dict, bsz: int) -> list[dict]:
+    """One params dict per sequence of a paged batch: the block table row, the cache length and the positions of that
+    sequence (views, made once per forward and shared by all attention layers). Run after prepare_inputs, which makes
+    the positions an alias of the cache lengths."""
+    assert params.get("position_ids") is None, "per-sequence attention does not take position_ids"
+    positions = params.get("positions")
+    out = []
+    for b in range(bsz):
+        p = dict(params)
+        p.pop("dev_cache", None)
+        p["block_table"] = params["block_table"][b:b + 1]
+        p["cache_seqlens"] = params["cache_seqlens"][b:b + 1]
+        if positions is not None:
+            p["positions"] = p["cache_seqlens"] if positions is params["cache_seqlens"] else positions[b:b + 1]
+        out.append(p)
+    return out
+
+
 def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
     """
     Add attn parameters to state
@@ -445,6 +463,7 @@ class Attention(Module):
         self.prealloc_qkvh_1 = None
         self.prealloc_qkv_out_1 = None
         self.prealloc_qkv_cptrs_1 = None
+        self.prealloc_qkv_m = {}
         self.prealloc_qkv_carrier = None
 
 
@@ -634,6 +653,7 @@ class Attention(Module):
         self.prealloc_qkvh_1 = None
         self.prealloc_qkv_out_1 = None
         self.prealloc_qkv_cptrs_1 = None
+        self.prealloc_qkv_m = {}
         self.prealloc_qkv_carrier = None
 
 
@@ -654,7 +674,16 @@ class Attention(Module):
             attn_mode = params.get("attn_mode", "flash_attn_nc")
             match attn_mode:
                 case "flash_attn":
-                    x = self.decode_flash_attn(x, bsz, seqlen, params)
+                    if bsz > 1 and params.get("row_inv_per_seq"):
+                        # Row-invariant multi-job step (generator/row_groups.py): the attention block of each sequence is the
+                        # block it would run alone. The split plan of the paged decode, the QSA selection and the graph path
+                        # all follow the batch size and the longest sequence of the batch.
+                        seq_params = params.get("row_inv_seq_params")
+                        if seq_params is None:
+                            seq_params = params["row_inv_seq_params"] = split_params_by_sequence(params, bsz)
+                        x = torch.cat([self.decode_flash_attn(x[b:b + 1], 1, seqlen, seq_params[b]) for b in range(bsz)], dim = 0)
+                    else:
+                        x = self.decode_flash_attn(x, bsz, seqlen, params)
                 case "flash_attn_nc":
                     x = self.decode_flash_attn_nc(x, bsz, seqlen, params)
                 case _:
@@ -664,6 +693,11 @@ class Attention(Module):
 
         if x is None:
             return None                          # kv_only, see decode_flash_attn
+        # EXL3_NC2_ATTN_F16 (default off): the block asked for fp16 y (pfe_y_half) and o_proj returned it; keep it
+        # instead of the fp32 widen to self.out_dtype (the residual apply / ablit project_widen widen in-kernel)
+        if out_dtype is None and x.dtype == torch.half and params.get("pfe_y_half") and \
+                os.environ.get("EXL3_NC2_ATTN_F16", "0") == "1":
+            return x
         return to2(x, out_dtype, self.out_dtype)
 
 
@@ -897,13 +931,19 @@ class Attention(Module):
             qg, kv = self.prealloc_qkv_out_1
             c_ptrs = self.prealloc_qkv_cptrs_1
         else:
-            qkvh = torch.empty((mq.num_src, m, self.q_proj.in_features), dtype = torch.half, device = x.device)
-            if self.interleaved_gate:
-                qg = torch.empty((1, m, 2 * n_q), dtype = torch.half, device = x.device)
-            else:
-                qg = torch.empty((2, m, n_q), dtype = torch.half, device = x.device)
-            kv = torch.empty((2, m, n_kv), dtype = torch.half, device = x.device)
-            c_ptrs = mq.c_ptrs([qg[0], kv[0], kv[1]] + ([qg[1]] if self.g_proj is not None else []))
+            # Per-m buffers + output-pointer table, built once: the pointer upload is a host-to-device copy, which a CUDA graph
+            # capture of an m > 1 step (batched decode, MTP / ngram verify) cannot contain, and the addresses stay stable
+            pre = self.prealloc_qkv_m.get((m, x.device))
+            if pre is None:
+                qkvh = torch.empty((mq.num_src, m, self.q_proj.in_features), dtype = torch.half, device = x.device)
+                if self.interleaved_gate:
+                    qg = torch.empty((1, m, 2 * n_q), dtype = torch.half, device = x.device)
+                else:
+                    qg = torch.empty((2, m, n_q), dtype = torch.half, device = x.device)
+                kv = torch.empty((2, m, n_kv), dtype = torch.half, device = x.device)
+                c_ptrs = mq.c_ptrs([qg[0], kv[0], kv[1]] + ([qg[1]] if self.g_proj is not None else []))
+                pre = self.prealloc_qkv_m[(m, x.device)] = (qkvh, qg, kv, c_ptrs)
+            qkvh, qg, kv, c_ptrs = pre
         ext.exl3_mgemm(
             x,
             mq.ptrs_trellis,
@@ -1300,6 +1340,13 @@ class Attention(Module):
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
             # quantized-cache prefill size its staging to the window instead of the job's pages
             max_kv_len = int(qsa_seqlens_cpu.max().item()) if qsa_seqlens_cpu is not None else None
+            # CUDA: prefill-sized chunks take the bound from the host copy of cache_seqlens (built on the CPU by the
+            # generator, no sync), as upstream exllamav3 1.6.0 (MIT) attn.py does. Without it the quantized-cache prefill
+            # stages (dequantizes) the job's whole page span for every chunk (+19.8 % TTFT on a 178K-token prompt, RTX 3090)
+            if max_kv_len is None and seqlen > 16 and not torch.version.hip:
+                cs_host = params.get("cache_seqlens")
+                if isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and cs_host.numel():
+                    max_kv_len = int(cs_host.max())
             if (
                 1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and
                 os.environ.get("EXL3_VERIFY_ATTN_LOOP", "0") != "0"

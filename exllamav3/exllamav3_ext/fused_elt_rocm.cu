@@ -295,12 +295,16 @@ void pad_copy
 __device__ __forceinline__ float fe_clamp_max(float v, float hi) { return v > hi ? hi : v; }
 __device__ __forceinline__ float fe_clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-template <bool F32, bool LIM>
+// PITCHED (nc2 S1-rest, EXL3_NC2_SILU_PAD): z rows sit at row pitch `pitch` (>= cols), x / y contiguous (rows, cols);
+// same per-element math, only the store address differs
+template <bool F32, bool LIM, bool PITCHED = false>
 __global__ __launch_bounds__(SM_THREADS)
-void fused_silu_mul_kernel(const void* __restrict__ x, const void* y, half* z, const size_t n, const float lim)
+void fused_silu_mul_kernel(const void* __restrict__ x, const void* y, half* z, const size_t n, const float lim,
+                           const size_t cols = 0, const size_t pitch = 0)
 {
     for (size_t i = (size_t) blockIdx.x * SM_THREADS + threadIdx.x; i < n; i += (size_t) gridDim.x * SM_THREADS)
     {
+        const size_t zi = PITCHED ? (i / cols) * pitch + i % cols : i;
         if (F32)
         {
             float s = fe_silu(((const float*) x)[i]);
@@ -308,7 +312,7 @@ void fused_silu_mul_kernel(const void* __restrict__ x, const void* y, half* z, c
             if (LIM) { s = fe_clamp_max(s, lim); yv = fe_clamp(yv, -lim, lim); }
             float r = s * yv;
             r = r < -65504.0f ? -65504.0f : (r > 65504.0f ? 65504.0f : r);
-            z[i] = __float2half_rn(r);
+            z[zi] = __float2half_rn(r);
         }
         else
         {
@@ -320,7 +324,7 @@ void fused_silu_mul_kernel(const void* __restrict__ x, const void* y, half* z, c
                 s = __half2float(__float2half_rn(fe_clamp_max(s, lim)));
                 yv = __half2float(__float2half_rn(fe_clamp(yv, -lim, lim)));
             }
-            z[i] = __float2half_rn(s * yv);
+            z[zi] = __float2half_rn(s * yv);
         }
     }
 }
@@ -348,6 +352,40 @@ void fused_silu_mul
     const float lim = (float) act_limit;
     const bool f32 = x.dtype() == at::kFloat;
     #define SM_LAUNCH(F, L) fused_silu_mul_kernel<F, L><<<blocks, SM_THREADS, 0, stream>>>(x.data_ptr(), y.data_ptr(), (half*) z.data_ptr(), n, lim)
+    if (act_limit != 0.0) { if (f32) SM_LAUNCH(true, true);  else SM_LAUNCH(false, true); }
+    else                  { if (f32) SM_LAUNCH(true, false); else SM_LAUNCH(false, false); }
+    #undef SM_LAUNCH
+    cuda_check(hipPeekAtLastError());
+}
+
+// nc2 S1-rest: fused_silu_mul into z = (rows, cols) row view of a (rows, pitch) buffer; x, y contiguous (rows, cols)
+void silu_mul_pitched
+(
+    const at::Tensor& x,
+    const at::Tensor& y,
+    at::Tensor& z,
+    double act_limit
+)
+{
+    const at::Device device = x.device();
+    c10::cuda::OptionalCUDAGuard device_guard(device);
+    hipStream_t stream = c10::hip::getCurrentHIPStream(device.index()).stream();
+
+    TORCH_CHECK(x.dtype() == at::kHalf || x.dtype() == at::kFloat, "silu_mul_pitched: x must be f16/f32");
+    TORCH_CHECK(y.dtype() == x.dtype(), "silu_mul_pitched: x/y dtype mismatch");
+    TORCH_CHECK_DTYPE(z, kHalf);
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "silu_mul_pitched: x, y must be contiguous");
+    TORCH_CHECK(z.dim() == 2 && z.stride(1) == 1 && z.stride(0) >= z.size(1), "silu_mul_pitched: z must be a 2D row view");
+    const size_t rows = z.size(0), cols = z.size(1), pitch = z.stride(0);
+    TORCH_CHECK(x.numel() == (int64_t) (rows * cols) && y.numel() == x.numel(), "silu_mul_pitched: shape mismatch");
+    TORCH_CHECK((z.storage_offset() + (int64_t) ((rows - 1) * pitch + cols)) * 2 <= (int64_t) z.storage().nbytes(),
+                "silu_mul_pitched: z overruns its storage");
+    const size_t n = x.numel();
+    if (n == 0) return;
+    const int blocks = (int) std::min<size_t>((n + SM_THREADS - 1) / SM_THREADS, 4096);
+    const float lim = (float) act_limit;
+    const bool f32 = x.dtype() == at::kFloat;
+    #define SM_LAUNCH(F, L) fused_silu_mul_kernel<F, L, true><<<blocks, SM_THREADS, 0, stream>>>(x.data_ptr(), y.data_ptr(), (half*) z.data_ptr(), n, lim, cols, pitch)
     if (act_limit != 0.0) { if (f32) SM_LAUNCH(true, true);  else SM_LAUNCH(false, true); }
     else                  { if (f32) SM_LAUNCH(true, false); else SM_LAUNCH(false, false); }
     #undef SM_LAUNCH

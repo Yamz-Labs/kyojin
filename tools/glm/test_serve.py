@@ -12,6 +12,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 import serve
 
 
+
+def _write_draft2s_pack(path, vocab, width):
+    """A header-only draft2s pack (tools/qwen/draft2s_pack.py metadata layout) for the sidecar tests."""
+    import json as _json, struct
+    hdr = _json.dumps({"__metadata__": {"format": "draft2s-v1", "vocab": str(vocab), "in_features": str(width), "m": "512"}}).encode()
+    path.write_bytes(struct.pack("<Q", len(hdr)) + hdr)
+
+
 class FakeGenerator:
     num_draft_tokens = 2  # /metrics derives the round count from the engine's window
 
@@ -24,6 +32,13 @@ class FakeEngine:
 
     def count_tokens(self, text: str) -> int:
         return len(text.split())
+
+    def prompt_ids(self, prompt: str):
+        """The ids the routes count prompt tokens with (the real engines read them from an encode cache).
+
+        Placeholders of count_tokens() length: the routes only ask for numel()."""
+        import torch
+        return torch.zeros(self.count_tokens(prompt), dtype=torch.long)
 
     async def generate(self, prompt: str, **kwargs):
         self.prompts.append(prompt)
@@ -120,6 +135,33 @@ class ServeTests(unittest.TestCase):
         self.assertNotIn("EXL3_MTP_EH_FP16", serve.SPEED_ENV)
         self.assertFalse(serve.EH_SIDECAR_IN_PACK.endswith(".safetensors"))
 
+    def test_draft2s_sidecar_source_order(self):
+        import os, tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {}):
+            pack = Path(d)
+            (pack / "config.json").write_text(json.dumps({"text_config": {"vocab_size": 154880, "hidden_size": 4096}}))
+            os.environ.pop("EXL3_DRAFT2S", None)
+            self.assertEqual(serve.apply_draft2s_default(str(pack)), "absent")
+            self.assertNotIn("EXL3_DRAFT2S", os.environ)
+            # a pack built for another model (Qwen's head) is not used
+            _write_draft2s_pack(pack / serve.DRAFT2S_IN_PACK, 248320, 2560)
+            self.assertEqual(serve.apply_draft2s_default(str(pack)), "mismatch")
+            self.assertNotIn("EXL3_DRAFT2S", os.environ)
+            _write_draft2s_pack(pack / serve.DRAFT2S_IN_PACK, 154880, 4096)
+            self.assertEqual(serve.apply_draft2s_default(str(pack)), "pack")
+            self.assertEqual(os.environ["EXL3_DRAFT2S"], str(pack / "draft2s.st"))
+            # explicit path never touched; "0" / "off" / "" = off (empty, so the engine's truthiness check skips the head)
+            os.environ["EXL3_DRAFT2S"] = "/nope/x.st"
+            self.assertEqual(serve.apply_draft2s_default(str(pack)), "explicit")
+            self.assertEqual(os.environ["EXL3_DRAFT2S"], "/nope/x.st")
+            for value in ("0", "off", ""):
+                os.environ["EXL3_DRAFT2S"] = value
+                self.assertEqual(serve.apply_draft2s_default(str(pack)), "off")
+                self.assertEqual(os.environ["EXL3_DRAFT2S"], "")
+        self.assertNotIn("EXL3_DRAFT2S", serve.SPEED_ENV)
+        self.assertFalse(serve.DRAFT2S_IN_PACK.endswith(".safetensors"))
+
     def test_stream_engine_error_still_ends_with_finish_reason(self):
         from aiohttp.test_utils import TestClient, TestServer
 
@@ -207,6 +249,11 @@ class ServeTests(unittest.TestCase):
     def test_template_rendering(self):
         out = serve.render_prompt(self.template, [{"role": "user", "content": "hi"}], [{"type": "function"}])
         self.assertEqual(out, "<|im_start|>user: hi<|im_end|>TOOLS=1")
+
+    def test_developer_role_renders_as_system(self):
+        dev = serve.render_prompt(self.template, [{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        sys_ = serve.render_prompt(self.template, [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hi"}], None)
+        self.assertEqual(dev, sys_)
 
     def test_parse_thinking_and_tool_calls(self):
         text = ('<think>reasoning with\nlines</think>Visible '
@@ -844,6 +891,17 @@ class VllmCompatTests(unittest.TestCase):
             self.assertEqual(body["usage"]["prompt_tokens"], 4)
             self.assertEqual(body["usage"]["prompt_tokens_details"], {"cached_tokens": 4})   # engine said 99: clamped
             self.assertEqual((body["choices"][0]["text"], body["choices"][0]["finish_reason"]), ("abc", "length"))
+
+    def test_loop_guard_opt_out_reaches_the_engine(self):
+        # per-request loop_guard=false (as on the Qwen server): passed to generate(); absent when the request says nothing
+        eng = self.Eng()
+        for path, payload in (("/v1/completions", {"model": "m", "prompt": [1, 2], "max_tokens": 4}),
+                              ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 4})):
+            self.assertEqual(self.one(eng, path, payload)[0], 200, path)
+            self.assertNotIn("loop_guard", eng.calls[-1][1])
+            self.assertEqual(self.one(eng, path, payload | {"loop_guard": False})[0], 200, path)
+            self.assertIs(eng.calls[-1][1]["loop_guard"], False)
+            self.assertEqual(self.one(eng, path, payload | {"loop_guard": "no"})[0], 400, path)
 
     def test_stream_ends_with_usage_and_done(self):
         eng = self.Eng()

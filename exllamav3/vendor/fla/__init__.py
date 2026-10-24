@@ -104,6 +104,18 @@ def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, 
     with torch.cuda.device(q.device.index):
         qn = _gdn_pf.l2norm_strided(q)
         kn = _gdn_pf.l2norm_strided(k)
+        # EXL3_GDN_HF=1 (default off, read per call): 16-row-chunk WY kernel adapted from hipfire (hip/gdn_hf.hip) replaces
+        # kkt_solve + the chunk kernel, incl. the prefix-cache checkpoint side-write; takes the raw log decay (its own chunk
+        # cumsum). Not bitwise (f16 WMMA operands)
+        from .hip.gdn_hf_hip import gdn_hf_ok, chunk_gdn_hf
+        if gdn_hf_ok(q, v, qn, kn, g, beta, initial_state):
+            try:
+                return chunk_gdn_hf(q, v, qn, kn, g, beta, scale, initial_state, output_final_state, ckpt=ckpt)
+            except Exception as e:
+                print(f" -- EXL3_GDN_HF failed, Triton/HIP chain for the rest of the process: {e!r}", flush=True)
+        if isinstance(ckpt, (list, tuple)) and len(ckpt) > 2:
+            # the fused chain below side-writes 2 rows (the HF kernel above takes 8): keep the two deepest, the others stay unwritten
+            ckpt = sorted(ckpt, key = lambda c: c["chunk"])[-2:]
         g = chunk_local_cumsum(g, chunk_size = chunk_size, scale = RCP_LN2)
         if os.environ.get("EXL3_GDN_FUSE", "0") == "1":
             from .gdn_fused import chunk_gdn_fused
@@ -165,6 +177,16 @@ def chunk_kda(
     # keep the fla chain: the one-program-per-head fused loop is ~0.14 ms slower there (T=255 sweep).
     fuse = int(os.environ.get("EXL3_KDA_FUSE", "3")) if K <= 128 and chunk_size == 64 and T >= 512 else 0
     if fuse:
+        # EXL3_KDA_HF=1 (default off, read per call): 16-row-chunk WY kernel (hip/kda_hf.hip, derived from hipfire's GDN kernel,
+        # diagonal blocks computed in the kernel); replaces the intra kernels + kda_fused_h_o, incl. the prefix-cache
+        # checkpoint side-write. Not bitwise (f16 / bf16 WMMA operands)
+        from .hip.kda_hf_hip import kda_hf_ok, chunk_kda_hf
+        if kda_hf_ok(q, k, v, g, beta, initial_state, chunk_size):
+            try:
+                o, final_state = chunk_kda_hf(q, k, v, g, beta, scale, initial_state, output_final_state, ckpt = ckpt)
+                return o.to(q.dtype), final_state
+            except Exception as e:
+                print(f" -- EXL3_KDA_HF failed, Triton/HIP chain for the rest of the process: {e!r}", flush = True)
         # EXL3_KDA_INTRA (read per call): 2 = fla's two intra kernels with pinned gfx1151 configs (bitwise
         # equal to 0), 1 = one-kernel intra (diagonal blocks computed in the inter/solve program, no
         # token_parallel pass, no Akkd round trip; ties 2 on gfx1151, not bitwise), 0 = fla autotune. Default 2 (step 11)

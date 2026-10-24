@@ -57,12 +57,19 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 #define EXL3_GEMM_SHAPE_2     16,     32,    128,     4,     3
 #define EXL3_GEMM_SHAPE_3     16,     32,    256,     4,     3
 #define EXL3_GEMM_SHAPE_4     16,     16,    512,     4,     3
+// Multi-row tile: all 32 rows share each decoded B fragment, where the 16-row shapes decode the whole
+// weight matrix again for every 16 rows (17..144-row calls: batched decode, wide verify, short prefill chunks).
+// N = 256 as shape 3, the best 16-row tile on GA102: at equal grid it is bitwise equal to shape 3 (same k-slicing,
+// same fp16 accumulation span); the N = 128 multi-row tiles of upstream 1.6.0 double each block's fp16 span
+// (2x KLD at 120 rows) and are left out. The CUDA inner implements TILESIZE_M > 16; ROCm builds none of this
+#define EXL3_GEMM_SHAPE_5     32,     32,    256,     4,     3
 
-#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16
-#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512
-#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256
+#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32
+#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32
+#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 256
+#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256, 512
 
-#define EXL3_GEMM_NUM_SHAPES 4
+#define EXL3_GEMM_NUM_SHAPES 5
 
 // Shape 1 not currently used anywhere
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
@@ -70,14 +77,16 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>, \
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_5>
 
 #define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>, \
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_5>
 
 #define EXL3_GEMM_BASE_THREADS 256
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 from ..util.tensor import to2
 from ..model.config import Config
@@ -155,7 +156,11 @@ class TransformerBlock(Module):
                 if hc_pending is not None and not self.mlp_norm and not gr_pend:
                     HyperConnection.flush_pending(x, hc_pending)
                     hc_pending = None
-                fused = self.mlp_hc.mix_norm(x, params, self.mlp_norm, hc_pending) if self.mlp_norm else None
+                params["hc_pad_ok"] = "mlp"         # MLP site: GEMMs and the MoE gather take a row-padded input
+                try:
+                    fused = self.mlp_hc.mix_norm(x, params, self.mlp_norm, hc_pending) if self.mlp_norm else None
+                finally:
+                    params.pop("hc_pad_ok", None)
                 if fused is not None:
                     hc_post, hc_comb, y = fused
                 else:
@@ -255,7 +260,11 @@ class TransformerBlock(Module):
 
         if self.attn:
             if self.attn_hc:
-                fused = self.attn_hc.mix_norm(x, params, self.attn_norm, hc_pending) if self.attn_norm else None
+                params["hc_pad_ok"] = True          # the attention site accepts a row-padded block input
+                try:
+                    fused = self.attn_hc.mix_norm(x, params, self.attn_norm, hc_pending) if self.attn_norm else None
+                finally:
+                    params.pop("hc_pad_ok", None)
                 if fused is not None:
                     hc_post, hc_comb, y = fused
                 else:
@@ -274,8 +283,10 @@ class TransformerBlock(Module):
                 y = x.half()
             # EXL3_PFE_OPROJ: this site's residual apply (hc_apply) reads fp16 or fp32 y alike, so the
             # attention output projection may skip its fp32 widen (see GatedDeltaNet / Attention.project_o)
-            pfe_half = bool(self.attn_hc) and not self.ablit and self.attn_resid_scalar is None \
-                and not export_state and "pfe_y_half" not in params
+            # EXL3_NC2_ABLIT_F16: an ablit block widens + projects the fp16 output in one exact pass (project_widen)
+            pfe_half = bool(self.attn_hc) and self.attn_resid_scalar is None \
+                and not export_state and "pfe_y_half" not in params and \
+                (not self.ablit or os.environ.get("EXL3_NC2_ABLIT_F16", "0") == "1")
             if pfe_half:
                 params["pfe_y_half"] = True
             try:
@@ -290,7 +301,10 @@ class TransformerBlock(Module):
             if params.get("prefill") and not export_state:
                 return x
             if self.ablit:
-                ablit_runtime.project(y, self.ablit[0], *self.ablit[2:])
+                if pfe_half and y.dtype == torch.half and self.ablit[0] != 0.0:
+                    y = ablit_runtime.project_widen(y, self.ablit[0], *self.ablit[2:])
+                else:
+                    ablit_runtime.project(y, self.ablit[0], *self.ablit[2:])
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
             if self.attn_hc:

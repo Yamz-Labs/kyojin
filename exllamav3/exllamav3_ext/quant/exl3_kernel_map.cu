@@ -79,6 +79,7 @@ int exl3_gemm_num_kernel_shapes()
     return EXL3_GEMM_NUM_SHAPES;
 }
 
+int exl3_gemm_tilesize_m[] = {EXL3_GEMM_TILESIZE_M};
 int exl3_gemm_tilesize_k[] = {EXL3_GEMM_TILESIZE_K};
 int exl3_gemm_tilesize_n[] = {EXL3_GEMM_TILESIZE_N};
 int exl3_gemm_blockdim[] = {EXL3_GEMM_BLOCKDIM};
@@ -87,6 +88,8 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
 {
     int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
+    // A wider row tile only pays once it replaces at least two 16-row passes
+    if (exl3_gemm_tilesize_m[shape_idx] > 16 && size_m <= exl3_gemm_tilesize_m[shape_idx] / 2) return false;
     return (size_k % tilesize_k == 0) && (size_n % tilesize_n == 0);
 }
 

@@ -263,11 +263,29 @@ class BCAttn:
     def _configure(self, bsz: int, q_len: int, causal: bool, regime: int):
         import triton
         from .triton_paged import (
+            ATTN16,
             _paged_attn_decode_split_kernel,
             _paged_attn_decode_combine_kernel,
             _paged_kv_update_kernel,
             _normalize_window,
         )
+        # The 1.6 kernels for a quantized cache, a sliding window (the DFlash2 drafter: trace0, 300 vs 17 us per call at
+        # 20K) or single-token decode (equal kernel time in attn1, and the 1.6 path carries the :16 hints: ab5 MoE -2.5 %
+        # at 2.5K context on the hint-less pre-1.6 kernels); with fp16 K/V, no window, at q_len 8 the pre-1.6 kernels are
+        # faster (attn1)
+        ATTN16 = ATTN16 and (self.quant or _normalize_window(self.window_size)[0] >= 0 or q_len == 1)
+        if os.environ.get("EXL3_ATTN16_DEBUG") == "1":
+            print(" -- attn16 BC configure", (bsz, q_len, self.num_q_heads, self.num_kv_heads, self.head_dim, self.window_size, self.quant), "new" if ATTN16 else "old", flush = True)
+        if ATTN16:
+            # Upstream exllamav3 1.6.0 (MIT) decode kernels: dense (query, head) rows, sliding-window split
+            # range, sub-tiled combine (triton_paged_cu.py). EXL3_ATTN16=0 keeps the kernels above
+            from .triton_paged_cu import (
+                _paged_attn_decode_split_kernel,
+                _paged_attn_decode_combine_kernel,
+                attn_decode_config,
+                combine_subtiles,
+                decode_row_layout,
+            )
 
         dev = self.device
         hd = self.head_dim
@@ -275,11 +293,15 @@ class BCAttn:
         qh, kvh = self.num_q_heads, self.num_kv_heads
         group_size = qh // kvh
 
-        block_n = max(16, 8192 // hd_pad)
-        block_m = triton.next_power_of_2(q_len)
-        block_h = max(16 // block_m, 1)
-        block_rows = block_m * block_h
-        h_blocks = triton.cdiv(group_size, block_h)
+        if ATTN16:
+            block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
+            block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad, block_rows)
+        else:
+            block_n, split_warps, split_stages = max(16, 8192 // hd_pad), 4, 2
+            block_m = triton.next_power_of_2(q_len)
+            block_h = max(16 // block_m, 1)
+            block_rows = block_m * block_h
+            h_blocks = triton.cdiv(group_size, block_h)
         programs = bsz * kvh * h_blocks
 
         # The live split count and split length are runtime kernel arguments derived from the
@@ -289,39 +311,71 @@ class BCAttn:
         window_left, window_right = _normalize_window(self.window_size)
 
         cache_t = "*i32" if self.quant else "*fp16"
+        # 1.6 path: upstream's 16-byte divisibility hints (whole allocations: cache tensors, graph statics, partials, the
+        # generator's block table), which keep the AOT kernel's vectorized loads (trace0: 324 vs 257 us per call without)
+        a16 = ":16" if ATTN16 else ""
         sig = {
-            "q": "*fp16", "k_cache": cache_t, "v_cache": cache_t,
-            "block_table": "*i32", "cache_seqlens": "*i32", "out": "*fp16",
-            "partial_o": "*fp32", "partial_ml": "*fp32",
-            "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16",
+            "q": "*fp16" + a16, "k_cache": cache_t + a16, "v_cache": cache_t + a16,
+            "block_table": "*i32" + a16, "cache_seqlens": "*i32", "out": "*fp16" + a16,
+            "partial_o": "*fp32" + a16, "partial_ml": "*fp32" + a16,
+            "k_scales": "*fp16" + a16, "v_scales": "*fp16" + a16, "h32": "*fp16" + a16,
             "split_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
             "sinks": "*fp32",
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
-            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
+            "SOFTCAP", "FINAL", "HAS_SINKS") + (() if ATTN16 else ("BLOCK_M", "BLOCK_H")) + ("BLOCK_ROWS", "BLOCK_N")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
-            BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
+            BLOCK_ROWS = block_rows, BLOCK_N = block_n,
         )
-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, 4, 2)
+        if not ATTN16:
+            consts |= dict(BLOCK_M = block_m, BLOCK_H = block_h)
+        qcfg = None
+        if ATTN16 and self.quant and self.k_bits > 0 and self.v_bits > 0:
+            from . import qdec_cuda
+            qcfg = None if not qdec_cuda.GRAPH_ENABLED else qdec_cuda.make_cfg(q_len, qh, kvh, hd, self.k_bits, self.v_bits, PAGE_SIZE, causal, self.sm_scale,
+                                      block_rows, window_left, window_right, self.softcap or 0.0, q_len)
+        if qcfg is not None and h_blocks != 1 and not qcfg.get("rows_kernel"):
+            qcfg = None
+        if qcfg is not None and qcfg.get("rows_kernel"):
+            block_rows, h_blocks = qcfg["block_rows"], 1        # one program per kv head holds all its rows (cu/qdec_rows.cu)
+            programs = bsz * kvh
+        if qcfg is not None:
+            # CUDA tensor-core split kernel (cu/qdec.cu): same argument list as the Triton one; 16-token slabs, one
+            # CTA per SM-share instead of two
+            key = ("qdec", dev.index, tuple(sorted(qcfg.items())))
+            k_split = _kernel_cache.get(key)
+            if k_split is None:
+                k_split = _kernel_cache[key] = ext.TritonKernel(
+                    qdec_cuda.cubin_for(qcfg), "qdec_split_rows" if qcfg.get("rows_kernel") else "qdec_split", qcfg["nw"], qdec_cuda.geometry(qcfg)["shared"])
+            block_n = 16
+            splits_cap = max(1, min(qdec_cuda.split_cap(qcfg, dev, programs), 128))
+        else:
+            k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages)
 
         sig_c = {
-            "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
+            "partial_o": "*fp32" + a16, "partial_ml": "*fp32" + a16, "out": "*fp16" + a16, "h32": "*fp16" + a16,
             "num_splits": "i32", "sinks": "*fp32",
         } | {n: "constexpr" for n in (
-            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
-            "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
+            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD")
+            + (("V_DIM", "BLOCK_ROWS", "ROWS_SUB", "D_SUB") if ATTN16 else ("BLOCK_M", "BLOCK_H", "BLOCK_ROWS"))}
         consts_c = dict(
             QCV = self.v_bits, HAS_SINKS = self.sinks is not None, q_len = q_len,
             n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad,
-            BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
         )
+        if ATTN16:
+            rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
+            consts_c |= dict(V_DIM = hd, BLOCK_ROWS = block_rows, ROWS_SUB = rows_sub, D_SUB = d_sub)
+        else:
+            consts_c |= dict(BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows)
         k_combine = _compile_kernel(dev, _paged_attn_decode_combine_kernel, sig_c, consts_c, 4, 1)
+        if ATTN16:
+            k_combine.grid_y = (block_rows // rows_sub) * (hd_pad // d_sub)
 
         k_update = None
         if not self.quant:
@@ -379,7 +433,7 @@ class BCAttn:
             q, kv, o, partial_o, partial_ml,
             gate_a, gate_b,
             k_split, k_combine, k_update,
-            block_n, splits_cap,
+            block_n, splits_cap, programs,
             xp, yp,
         )
 

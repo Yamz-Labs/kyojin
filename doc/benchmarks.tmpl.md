@@ -9,7 +9,7 @@ The figures of the three models come from a run set up like yours:
 - the public code at the commit named in `doc/figures.json`, built from the README install;
 - an empty home directory, the published packs downloaded from the hub, the default environment (no private flags);
 - greedy decoding, thinking off, the four card prompts for each of chat, prose and code, 256 tokens, median of 3 repetitions (`tools/bench.sh` runs the same prompts);
-- prefill and decode by context: cold prompts of 8K to 256K tokens (MiMo: to 128K), an essay request of 256 tokens, after one discarded 8K request; prefill is the speed the server reports for the request. Decode: Qwen, like the other engines in the comparison below, is timed by the client from the first to the last streamed token; GLM and MiMo use the server's own decode counters (`/metrics`), because their streams arrive in bursts that a client clock misreads. Qwen and GLM: {{LADDER}}; MiMo: two requests per depth, the second one reported. GLM and MiMo are started with a context large enough for the longest prompt (`-c 272384` and `-c 163840`);
+- prefill and decode by context: cold prompts of 8K to 256K tokens and, for Qwen and GLM, one of 500K (499,712 tokens) (MiMo: to 128K), an essay request of 256 tokens, after one discarded 8K request; prefill is the speed the server reports for the request. Decode: Qwen, like the other engines in the comparison below, is timed by the client from the first to the last streamed token; GLM and MiMo use the server's own decode counters (`/metrics`), because their streams arrive in bursts that a client clock misreads. Qwen and GLM: {{LADDER}}; MiMo: two requests per depth, the second one reported. GLM and MiMo are started with a context large enough for the longest prompt (`-c 272384` and `-c 163840`); the 500K point of Qwen and GLM is a separate start with `-c 524288` (Qwen also with `--cache-bits 8`);
 - speculative decode is the default server mode and returns the same tokens as plain decode.
 - the server log of each run has no `fallback`, `disabled`, `unavailable`, `not tuned` or `No module` line.
 
@@ -18,6 +18,11 @@ The figures of the three models come from a run set up like yours:
 Tokens per second; prefill by context, speculative decode by kind of text.
 
 {{TABLE}}
+Kyojin 1.5, same recipe on a second Ryzen AI Max+ 395 with 128 GB: Qwen3.8-Flash-Next 1486 / 1478 / 1454 / 1397 / 1349
+prefill and 45.8 / 48.3 / 67.0 decode; GLM-5.3-Flash 623 / 629 / 602 prefill at 8K / 32K / 64K and 26.3 / 30.8 / 33.0
+decode. Since 1.5 the GLM server starts without the dense GEMM tuner (first start 95 s instead of about 13 minutes);
+the GLM row above was taken with it, and `EXL3_DENSE_GEMM_TUNE=1` brings it back.
+GLM with `--sessions 4`: 30 tok/s for one request, 37.5 in total for two at once, 40.6 for four.
 
 ![Prefill against context, three models](img/prefill.svg)
 

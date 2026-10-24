@@ -702,6 +702,27 @@ _qc_staging = int(os.environ.get("EXL3_QC_STAGING", "1"))
 # path reads less gmem (short trailing chunks over long contexts, low bitrates)
 _qc_prefill_two_pass_min_q = int(os.environ.get("EXL3_QC_PF_TWO_PASS_MIN_Q", "256"))
 
+# CUDA, 128 < head_dim <= 256, one sequence: after the staging pass the window is contiguous fp16, so the chunk runs as one
+# FlashAttention-2 call (torch SDPA flash backend) over past + chunk keys with a bottom-right aligned causal mask. RTX 3090,
+# Qwen3.8 geometry (hd 256), whole 64K prompt in 2048-row chunks: x0.80 of the Triton kernel per layer, error vs an fp32
+# reference within x1.06 of the Triton kernel's; at hd 128 the Triton kernel is faster (x1.15-1.27), so it keeps those.
+# EXL3_PF_FA2=0 restores the Triton kernel
+_pf_fa2 = os.environ.get("EXL3_PF_FA2", "1") == "1" and torch.version.hip is None
+
+def _prefill_fa2_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    from torch.nn.attention.bias import causal_lower_right
+    q_len = q.shape[1]
+    k1 = kd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
+    v1 = vd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
+    with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+        o = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k1.transpose(1, 2), v1.transpose(1, 2),
+            attn_mask = causal_lower_right(q_len, past + q_len), scale = scale, enable_gqa = True,
+        )
+    out.copy_(o.transpose(1, 2))
+    return out
+
 def _get_h32(device):
     if device not in _h32_cache:
         h = torch.ones(1, 1, dtype = torch.float32)
@@ -1068,6 +1089,12 @@ def _paged_attn_decode_combine_kernel(
 
 _decode_sm_count = {}
 
+# A/B switch, read once at import: CUDA decode runs the upstream exllamav3 1.6.0 (MIT) kernels in triton_paged_cu.py;
+# EXL3_ATTN16=0 keeps the kernels in this file. ROCm always keeps them
+ATTN16 = (not torch.version.hip) and os.environ.get("EXL3_ATTN16", "1") != "0"
+_ATTN16_DEBUG = os.environ.get("EXL3_ATTN16_DEBUG") == "1"; _ATTN16_SEEN = set()   # one line per new call shape
+
+
 def paged_attn_triton_decode(
     q: torch.Tensor,
     k: torch.Tensor | None,
@@ -1095,6 +1122,30 @@ def paged_attn_triton_decode(
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
     second pass. GQA sibling q heads share K/V tiles within a program."""
+    if qc is not None and not os.environ.get("FLINT_ATTN_KEEP"):
+        # quantized cache decode (3090, head_dim 128, k/v 4-8 bit): 64-key tiles, single stage = -15..-25 % kernel time
+        # vs the 16-bit-sized default (profile at 60K ctx: kv8 2.47 -> 1.90 ms, kv4 2.22 -> 1.69 ms, 49 layers)
+        if block_n is None: block_n = 64
+        if num_stages == 2: num_stages = 1
+    if os.environ.get("FLINT_ATTN_BN"): block_n = int(os.environ["FLINT_ATTN_BN"])
+    if os.environ.get("FLINT_ATTN_NW"): num_warps = int(os.environ["FLINT_ATTN_NW"])
+    if os.environ.get("FLINT_ATTN_NS"): num_stages = int(os.environ["FLINT_ATTN_NS"])
+    # attn1 (3090): the 1.6 kernels win with a sliding window (x3-10 at 20-64K) or a quantized cache (x1.25-1.31 at q_len 8,
+    # 20-64K) but lose with an fp16 cache at q_len 8 (x0.66-0.85): there the pre-1.6 kernels stay
+    if _ATTN16_DEBUG:
+        _k = (tuple(q.shape), tuple(k_cache.shape), str(window_size), qc is not None, split_batch)
+        if _k not in _ATTN16_SEEN:
+            _ATTN16_SEEN.add(_k); print(" -- attn16 eager decode", _k, "new" if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0) else "old", flush = True)
+    if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0):
+        from .triton_paged_cu import paged_attn_triton_decode_cu, NoFittingConfig
+        try:
+            return paged_attn_triton_decode_cu(
+                q, k, v, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size,
+                softcap, sinks, out, block_n, num_splits, max_kv_len, qc, pre_appended_len,
+                n_kv_heads_override, num_warps, num_stages, split_batch)
+        except NoFittingConfig:
+            if _ATTN16_DEBUG: print(" -- attn16 NoFittingConfig -> pre-1.6 kernels", flush = True)
+            pass   # nothing fits this device's shared memory: the pre-1.6 kernels below
     _check_tensor("q", q)
     _check_tensor("block_table", block_table, None)
     _check_tensor("cache_seqlens", cache_seqlens, None)
@@ -1174,7 +1225,9 @@ def paged_attn_triton_decode(
             _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
         target = 2 * _decode_sm_count[dev]
         programs_split = programs if split_batch is None else programs // bsz * split_batch
-        num_splits = max(1, min(target // programs_split, triton.cdiv(max_k_len, 4 * block_n), 128))
+        # CUDA: >= 1 key block per split (upstream exllamav3 1.6.0, MIT; same rule as libtorch/attention.cpp split_config),
+        # so short contexts fill the SMs; ROCm keeps 4
+        num_splits = max(1, min(target // programs_split, triton.cdiv(max_k_len, (4 if torch.version.hip else 1) * block_n), 128))
     split_len = triton.cdiv(triton.cdiv(max_k_len, num_splits), block_n) * block_n
 
     if num_splits > 1:
@@ -1876,6 +1929,13 @@ def paged_attn_triton_prefill(
             qc = None
             k_scales, v_scales, qck, qcv = q, q, 0, 0
             h32 = q
+            if (_pf_fa2 and bsz == 1 and max_kv_len is not None and kv_append_len == q_len
+                    and 128 < head_dim <= 256 and head_dim % 8 == 0 and v_dim == head_dim
+                    and window_left < 0 and window_right < 0 and not softcap and not has_sinks
+                    and num_splits is None and block_m is None and q.is_contiguous()):
+                if out is None:
+                    out = torch.empty_like(q)
+                return _prefill_fa2_contig(q, kd, vd, max_kv_len, n_kvh, head_dim, softmax_scale, out)
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
@@ -1884,14 +1944,18 @@ def paged_attn_triton_prefill(
     # prefers narrower kv tiles (measured: 167 vs 153 TFLOPS on RTX 5090 at BN 32 vs 64)
     blackwell = torch.cuda.get_device_capability(q.device)[0] >= 10
     if hd_pad <= 128:
-        cfg = (128, 32, 8, 2) if blackwell else (128, 64, 8, 2)
+        # CUDA: four warps over the tile like upstream exllamav3 1.6.0 (MIT; "eight warps split the rows below the 16-row MMA
+        # granularity and stall the dots", issue #384); ROCm keeps its eight
+        cfg = (128, 32, 8, 2) if blackwell else ((128, 64, 8, 2) if torch.version.hip else (128, 32, 4, 2))
     elif hd_pad <= 256:
         # gfx1151, MiMo geometry (qk 192 -> 256 tile, 16 q heads per kv head), 2048-row chunk:
         # (128, 32, 8, 2) runs 3-4x faster than (64, 32, 8, 2) at every past length measured
         # (tools/prefill/attn_bench.py: 62.7 vs 194 ms at 14k past with v_dim 128)
-        cfg = (128, 32, 8, 2) if torch.version.hip else (64, 32, 8, 2)
+        cfg = (128, 32, 8, 2) if torch.version.hip else (64, 32, 4, 2)
     else:
-        cfg = (32, 16, 4, 2)
+        # CUDA, head_dim 512 (Gemma-4 global layers): 32-key tiles run x1.25-1.35 over 16 keys at 512-4096-row chunks on an
+        # RTX 3090 (fp16 staged window, 21.8K-token prompt); ROCm keeps its tile
+        cfg = (32, 16, 4, 2) if torch.version.hip else (32, 32, 4, 2)
     _cfg_env = os.environ.get("EXL3_ATTN_PREFILL_CFG")
     if _cfg_env:
         cfg = tuple(int(x) for x in _cfg_env.split(","))
@@ -1956,6 +2020,13 @@ def paged_attn_triton_prefill(
                 num_warps=2, num_stages=3,
             )
 
+        # 8-bit K+V, head_dim 128, 128-key tile: left alone, ptxas caps the kernel at 40 registers with ~3250 spill
+        # slots (255 regs / ~560 spills when uncapped; same math, only the register allocation differs). The driver
+        # then sizes local memory for every resident thread: +1.3 GiB of non-torch device memory the first time a short
+        # chunk (q_len < 256, the direct path) runs, which made Flint kv 8,8 OOM at 256K on a 24 GiB card.
+        # EXL3_QC_PF_MAXNREG overrides the cap (0 = compiler default)
+        _maxnreg = int(os.environ.get("EXL3_QC_PF_MAXNREG", "255" if qc is not None and qck + qcv >= 16 else "0"))
+        _launch_opts = {"maxnreg": _maxnreg} if _maxnreg else {}
         grid = (q_blocks, bsz * n_q_heads, num_splits)
         # int64 index math only when an element offset can actually cross 2^31 (q/out, or the
         # fp32 partial buffer); common geometries keep pure int32 codegen
@@ -1974,7 +2045,7 @@ def paged_attn_triton_prefill(
                 bool(causal), int(window_left), int(window_right),
                 window_left >= 0, window_right >= 0, float(softcap or 0.0),
                 has_sinks, wide_index, block_m, block_n,
-                num_warps=num_warps, num_stages=ns,
+                num_warps=num_warps, num_stages=ns, **_launch_opts,
             )
 
         if qc is not None and not num_stages_forced:

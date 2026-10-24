@@ -1031,7 +1031,8 @@ void exl3_gemv_int8_sq_kernel
     int* __restrict__ locks,
     const half* __restrict__ suh,
     half* __restrict__ A_had,
-    const half* __restrict__ svh
+    const half* __restrict__ svh,
+    const int rows_ovr      // 0 = automatic slice height, else forced (multiple of 8)
 )
 {
     extern __shared__ uint32_t shmem[];
@@ -1048,6 +1049,7 @@ void exl3_gemv_int8_sq_kernel
     rows_per = MAX(rows_per, SQ_MINROWS);
     rows_per = MIN(rows_per, gemv_int8_sq_rows_max(M, residual));
     rows_per = MIN(rows_per, (rows_total + 7) & ~7);
+    if (rows_ovr > 0) rows_per = MIN(rows_ovr, (rows_total + 7) & ~7);
     int ksplit = CEIL_DIVIDE(rows_total, rows_per);
     int units = nb256_total * ksplit;
     int slice_stride = rows_per * 16;

@@ -77,6 +77,7 @@ def _find_nth_prime_after(start: int, count: int) -> int:
 
 PREFETCH_ENABLED = os.environ.get("EXL3_NGRAM_PREFETCH", "1") != "0"   # debug/A-B switch
 PREFETCH_MIN_TOKENS = 256   # positions (bsz * seq) below which prefetch() declines (decode-sized)
+WARM_TOKENS = int(os.environ.get("EXL3_NGRAM_WARM_TOKENS", "8192"))   # look-ahead window of warm() in prompt positions; 0 = off
 MAX_PIN_SETS = 2            # staging sets: one with the last forward's uploads in flight, one being staged
 
 
@@ -100,6 +101,24 @@ class _PinSet:
             self.inverse = torch.empty(n, dtype = torch.int64, pin_memory = True)
             self.heads = torch.empty(n, dtype = torch.int32, pin_memory = True)
             self.packed = torch.empty((n, row_words), dtype = row_dtype, pin_memory = True)
+
+
+RAM_MARGIN_BYTES = 48 << 30
+
+
+def decide_ngram_stream(requested, table_bytes: int, avail_bytes):
+    """Placement of the n-gram table: returns (stream_from_disk, reason).
+    Disk streaming is the default. RAM is used only when explicitly requested (requested is False): host memory
+    sampled while the rest of the pack is still loading says nothing about what remains afterwards, so no automatic
+    RAM choice is made. An explicit RAM request on a host without table + margin is honored but flagged."""
+    if requested is None:
+        return True, "default: disk streaming"
+    if requested:
+        return True, "requested: disk streaming"
+    if avail_bytes is not None and avail_bytes < table_bytes + RAM_MARGIN_BYTES:
+        return False, (f"requested: RAM, WARNING only {avail_bytes / 2**30:.1f} GiB available, "
+                       f"table + {RAM_MARGIN_BYTES >> 30} GiB margin = {(table_bytes + RAM_MARGIN_BYTES) / 2**30:.1f} GiB")
+    return False, "requested: RAM"
 
 
 class NGramEmbedding(Module):
@@ -151,6 +170,7 @@ class NGramEmbedding(Module):
         self._pins = []             # pinned staging sets for the fast path (see _PinSet)
         self._pending = []          # queued prefetches, oldest first: {"history", "pin", "future"}
         self._executor = None
+        self._warm_pin = None       # private staging set of warm(), touched only by the worker thread
         self.prefetch_stats = {"hit": 0, "miss": 0, "retired": 0}
         self._row_dtype = None      # stored row dtype of the unquantized table
 
@@ -247,13 +267,12 @@ class NGramEmbedding(Module):
         if stream_from_disk is None:
             infer_params = getattr(self.config, "infer_params", None)
             stream_from_disk = infer_params.ngram_stream_from_disk if infer_params is not None else None
-        if stream_from_disk is None:
-            # Auto: per-token row preads cost ~0.8 ms of GPU idle per decode token (tokplan1), so hold
-            # the table in RAM when it fits with a wide margin; otherwise stream from disk
-            from ..util.memory import host_memory_available
-            avail = host_memory_available()
-            tbl = self.num_rows * (words_per_row(self.K) * 2 if quantized else ROW_DIM * 2)
-            stream_from_disk = avail is None or avail < tbl + (48 << 30)
+        from ..util.memory import host_memory_available
+        avail = host_memory_available()
+        tbl = self.num_rows * (words_per_row(self.K) * 2 if quantized else ROW_DIM * 2)
+        stream_from_disk, why = decide_ngram_stream(stream_from_disk, tbl, avail)
+        print(f"[ngram] placement: {'disk' if stream_from_disk else 'ram'} ({why}); table {tbl / 2**30:.1f} GiB, "
+              f"host MemAvailable {'?' if avail is None else f'{avail / 2**30:.1f}'} GiB", flush=True)
         if stream_from_disk:
             self.mode = "trellis_disk" if quantized else "fp16_disk"
             self.handles = [stc.get_tensor_handle(k) for k in keys]
@@ -304,7 +323,7 @@ class NGramEmbedding(Module):
             from ..util.memory import host_memory_available
             av = host_memory_available()
             print(f"[ngram] table mode {self.mode}: {self.num_rows} rows, host MemAvailable "
-                  f"{'?' if av is None else f'{av / 2**30:.1f}'} GiB at load (RAM mode needs table + 48 GiB; "
+                  f"{'?' if av is None else f'{av / 2**30:.1f}'} GiB at load (RAM mode is opt-in, EXL3_NGRAM_STREAM=0; "
                   f"disk mode = every prefill chunk reads its rows from the file, a busy disk or a cold page cache stalls it)",
                   flush=True)
 
@@ -578,6 +597,36 @@ class NGramEmbedding(Module):
             "pin": pin,
             "future": self._executor.submit(self._stage, history, pin),
         })
+
+    @torch.inference_mode()
+    def _warm_stage(self, history: torch.Tensor):
+        """Hash + gather into the private set and drop the rows: the point is the page cache."""
+        pin = self._warm_pin
+        if pin is None:
+            pin = self._warm_pin = _PinSet()
+        n = (history.shape[1] - self.context_len) * self.num_heads
+        trellis = self.mode.startswith("trellis")
+        pin.grow(n, words_per_row(self.K) if trellis else ROW_DIM, torch.int16 if trellis else self._row_dtype)
+        self._stage(history, pin)
+
+    def warm(self, history: torch.Tensor):
+        """
+        Read the table rows of a later part of the prompt into the page cache, on the prefetch
+        worker (queued behind the stage of the chunk being issued, so it never competes with it
+        for the disk). `history` is (1, context + seq) ids as for prefetch(). Disk modes only:
+        a cold gather is IOPS-bound (~0.4 s per 4096-token chunk) and otherwise stalls the GPU at
+        the head of every chunk; warmed, the same gather costs a few ms. Changes no result.
+        """
+        if not PREFETCH_ENABLED or self.mode is None or self.handles is None or history.dim() != 2:
+            return
+        if history.shape[1] - self.context_len < PREFETCH_MIN_TOKENS:
+            return
+        history = history.to("cpu", torch.int64).contiguous().clone()
+        for h in self.handles:
+            h._ensure_open()
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers = 1, thread_name_prefix = "ngram_prefetch")
+        self._executor.submit(self._warm_stage, history)
 
     @override
     def forward(

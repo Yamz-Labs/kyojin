@@ -18,7 +18,10 @@ DEC_GEMV_R_LOOP_MIN_K = int(os.environ.get("EXL3_DEC_GEMV_R_LOOP_MIN_K", "99"))
 # (mlp.py). Rows stay bit-exact vs R batch-1 dec_gemv calls (the R=1 plain-decode math). R=1 untouched.
 # Mutable at run time for one-load A/B: set VERIFY_FUSE["on"] (the harness also calls block_graph.purge()).
 VERIFY_FUSE = {"on": os.environ.get("EXL3_VERIFY_FUSE", "0") != "0"}
-AUTO_RECONSTRUCT_THRESHOLD = 144
+# With the 32-row GEMM tile (EXL3_GEMM_SHAPE_5) the GEMM path beats reconstruct + hgemm up to ~192-256
+# rows on Ampere (Qwen3.8-27B TTFT 160 / 192 tokens 278 -> 238 / 320 -> 279 ms; at 256 reconstruct wins 344 vs 362 ms).
+# Without that patch 144 is right (16-row passes: threshold 512 is slower at every T > 144).
+AUTO_RECONSTRUCT_THRESHOLD = 192 if not torch.version.hip else 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
@@ -109,6 +112,22 @@ def row_pad_pitch(lin, k: int, rows: int, params: dict) -> int:
 # NOTE: the knobs are read per call, not at import: the A/B harness (glm_base --ab-sets)
 # flips os.environ between variants inside one process, so an import-time read would
 # silently measure the base arm four times.
+def _dense_mpw2_ok(lin, x, rows):
+    """EXL3_DENSE_MPW2=<max rows> (default 0 = off): forwards of AUTO_RECONSTRUCT_THRESHOLD + 1 .. max rows run the big
+    K 3 / 4 mul1 shapes (in * out >= EXL3_DENSE_MPW2_MINKN, default 16 M) through the expert prefill kernel as one group
+    (ext.exl3_dense_mpw2): the weight is decoded per tile, no fp16 reconstruct. 29-32 TF against 16-23 TF for reconstruct +
+    rocBLAS at 256-512 rows; small shapes and >= 1024 rows lose. Same inner product up to fp32
+    summation order. Read per call: the A/B harnesses flip it in-process."""
+    mx = int(os.environ.get("EXL3_DENSE_MPW2", "0"))
+    if not mx or rows > mx or rows <= AUTO_RECONSTRUCT_THRESHOLD:
+        return False
+    return (bool(torch.version.hip) and hasattr(ext, "exl3_dense_mpw2") and x.is_contiguous()
+            and lin.mul1 and not lin.mcg and lin.K in (3, 4)
+            and lin.in_features % 32 == 0 and lin.out_features % 256 == 0
+            and lin.in_features * lin.out_features >= int(os.environ.get("EXL3_DENSE_MPW2_MINKN", "16777216"))
+            and lin.suh is not None and lin.svh is not None and lin.trellis.dtype == torch.int16)
+
+
 def had_pf_fast():
     return os.environ.get("EXL3_HAD_PF_FAST", "0") != "0"
 
@@ -339,7 +358,10 @@ class LinearEXL3:
         self.suh = suh if suh is not None else self.unpack_bf(su)
         self.svh = svh if svh is not None else self.unpack_bf(sv)
         self.trellis = trellis
-        self.K = trellis.shape[-1] / 16
+        # Integral K stays an int (the CUDA BC objects and kernels take int K); half-integer K stays a float.
+        # Same rule as upstream exllamav3 1.6.0 (MIT, modules/quant/exl3.py:68).
+        K = trellis.shape[-1] / 16
+        self.K = int(K) if float(K).is_integer() else K
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
@@ -356,6 +378,7 @@ class LinearEXL3:
         self.dec_ok = dec_supported(self)
         self.dec_ok_moe = dec_moe_supported(self)
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
+        # The CUDA BC object takes an integer K; half-integer K tensors keep the Python path
         self.bc = ext.BC_LinearEXL3(
             self.trellis,
             self.suh,
@@ -365,7 +388,7 @@ class LinearEXL3:
             self.mcg,
             self.mul1,
             g_tensor_cache.get(*self.bsz1_xh_args)
-        )
+        ) if isinstance(self.K, int) else None
 
 
     def unload(self):
@@ -589,6 +612,18 @@ class LinearEXL3:
         else:
             y_ = y.view(rows, self.out_features)
 
+        # EXL3_DENSE_MPW2 (see _dense_mpw2_ok): the expert prefill kernel as a one-group GEMM on the trellis
+        if _dense_mpw2_ok(self, x, rows):
+            xh = torch.empty_like(x)
+            ext.had_r_128(x, xh, self.suh, None, 1.0)
+            ext.exl3_dense_mpw2(xh, y_, self.trellis, self.K)
+            ext.had_r_128(y_, y_, None, self.svh, 1.0)
+            if via_f16:
+                y.view(rows, self.out_features).copy_(y_)
+            if self.bias is not None:
+                y += self.bias
+            return y
+
         # Fused path: reconstruct emits ORIGINAL-basis weights (both Hadamards + sign
         # vectors folded into the memory-bound reconstruct kernel), so the gemm runs on the
         # raw input and the standalone input/output had_r_128 launches disappear (~14% of
@@ -602,7 +637,8 @@ class LinearEXL3:
 
         # The fused kernel costs ~4x plain reconstruct (k*n-proportional) while the saved
         # had launches scale with rows*(k+n); breakeven is rows ~400-900 across shapes
-        use_fused = self._fused_reconstruct and rows >= 1024
+        # EXL3_FUSED_MIN_ROWS: the fused reconstruct was no slower than the unfused one on every GLM dense shape from 512 rows
+        use_fused = self._fused_reconstruct and rows >= int(os.environ.get("EXL3_FUSED_MIN_ROWS", "1024"))
 
         if use_fused:
             xh = pad_copy_in(x, self.in_features)

@@ -6,12 +6,15 @@ from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
 from .deepseek_v4 import DeepseekV4Model
+from .deepseek_v41 import DeepseekV41Model
 from .dflash import DFlashModel
+from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
 from .ernie4_5_moe import Ernie4_5MoEModel
 from .exaone4 import Exaone4Model
+from .flint import FlintModel
 from .gemma2 import Gemma2Model
 from .gemma3 import Gemma3Model, Gemma3TextModel
 from .gemma4 import Gemma4TextModel, Gemma4UnifiedTextModel
@@ -34,6 +37,7 @@ from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
 from .mimo_v2 import MiMoV2Model
+from .minicpm_v47 import MiniCPMV47TextModel
 from .minimax_m2 import MiniMaxM2Model
 from .ministral3 import Ministral3Model
 from .mistral import MistralModel
@@ -42,6 +46,7 @@ from .mixtral import MixtralModel
 from .muse_glimmer import MuseGlimmerTextModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantModel
 from .nemotronh import NemotronHModel
+from .nemotronh_puzzle import NemotronHPuzzleModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
@@ -75,12 +80,15 @@ ARCHITECTURES = {
         DeciLMModel,
         DeepseekV3Model,
         DeepseekV4Model,
+        DeepseekV41Model,
         DFlashModel,
+        DFlash2Model,
         DFlashLagunaModel,
         Dots1Model,
         Ernie4_5Model,
         Ernie4_5MoEModel,
         Exaone4Model,
+        FlintModel,
         Gemma2Model,
         Gemma3Model,
         Gemma3TextModel,
@@ -105,6 +113,7 @@ ARCHITECTURES = {
         LlamaModel,
         MiMoModel,
         MiMoV2Model,
+        MiniCPMV47TextModel,
         MiniMaxM2Model,
         Ministral3Model,
         MistralModel,
@@ -113,6 +122,7 @@ ARCHITECTURES = {
         MuseGlimmerTextModel,
         MuseGlimmerAssistantModel,
         NemotronHModel,
+        NemotronHPuzzleModel,
         Olmo3Model,
         OlmoHybridModel,
         Phi3Model,

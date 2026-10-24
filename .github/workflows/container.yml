@@ -1,0 +1,186 @@
+name: Build & Publish Container Images
+run-name: Build & Publish Container Images (${{ inputs.ref || github.ref_name }})
+
+# Builds docker/Dockerfile once per model and pushes ghcr.io/<owner>/kyojin-<model>, the images
+# doc/container.md tells people to pull.
+#
+# Triggers:
+#   - push of a v* tag: builds and pushes; the tag is written into exllamav3/version.py first
+#   - workflow_dispatch: builds `ref` (a branch, tag or commit hash; empty is the selected branch)
+#     and only pushes when `push` is ticked. `override_version` writes `version` into
+#     exllamav3/version.py before the build, whatever the checked out ref says
+#   - pull_request that changes this file: build only, never pushes, so edits to the workflow can
+#     be tested before they are merged
+#
+# amd64 only: the image targets Strix Halo (gfx1151), so there is no multi-arch manifest to join.
+# All models build in ONE job on purpose. Only the last layer (ARG MODEL) differs between them, so
+# the first build pays for the torch/SDK/extension layers (about 17 minutes on a cold cache) and the
+# others are seconds.
+# A matrix would put each model on its own runner and compile everything again.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - '.github/workflows/container.yml'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or commit hash to build, e.g. main, v1.5.5 or 3f2a9c1. Empty builds the selected branch'
+        default: ''
+        required: false
+        type: string
+      override_version:
+        description: 'Write the version below into exllamav3/version.py instead of keeping the one in the checkout'
+        default: false
+        required: true
+        type: boolean
+      version:
+        description: 'Version to bake in when override_version is ticked, e.g. 1.5.6 or 1.5.6-rc1'
+        default: ''
+        required: false
+        type: string
+      push:
+        description: 'Push the images to ghcr.io'
+        default: false
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Models to publish, see docker/kyojin_args.py. mimo is left out like in doc/container.md.
+  MODELS: qwen glm
+
+jobs:
+  build:
+    name: build and push
+    runs-on: ubuntu-latest
+    # GitHub's hard cap is 360m; stop short of it so an overrun is reported as a timeout
+    timeout-minutes: 330
+    steps:
+      # The build layer peaks well above the free space of a stock runner (about 14 GB of wheels
+      # plus the unpruned ROCm SDK tree)
+      # Skipped under act (local testing), where it would only strip the act container
+      - name: Free Disk Space
+        if: ${{ !env.ACT }}
+        uses: jlumbroso/free-disk-space@3f13feab2962a87273d379ebc36ea159527e6cc9 # v1.3.2
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      # Two steps rather than `ref: ${{ inputs.ref }}`: act only uses the local working copy when
+      # checkout has no ref at all, so a plain checkout keeps pushes testable locally
+      - name: Checkout
+        if: ${{ !inputs.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #7.0.1
+
+      - name: Checkout ${{ inputs.ref }}
+        if: ${{ inputs.ref }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+
+      # The version baked into exllamav3/version.py, so the package inside the image reports the
+      # version the image is tagged with:
+      #   - override_version: the `version` input
+      #   - pushed tag: the tag
+      #   - anything else: the file as checked out
+      - name: Resolve version
+        id: version
+        env:
+          OVERRIDE: ${{ inputs.override_version }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          requested=""
+          if [[ "$OVERRIDE" == "true" ]]; then
+            requested="$INPUT_VERSION"
+            if [[ -z "$requested" ]]; then
+              echo "::error file=container.yml::override_version is ticked but version is empty"
+              exit 1
+            fi
+          elif [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_EVENT_NAME" == "push" ]]; then
+            requested="$GITHUB_REF_NAME"
+          fi
+          if [[ -n "$requested" ]]; then
+            version="${requested#v}"
+            # The version lands in Python source and in image tags: digits first, no quotes
+            if [[ ! "$version" =~ ^[0-9][0-9A-Za-z.-]*$ ]]; then
+              echo "::error file=container.yml::$requested is not a version (expected 1.2.3 or v1.2.3)"
+              exit 1
+            fi
+            printf '__version__ = "%s"' "$version" > exllamav3/version.py
+          fi
+          version=$(sed -nE 's/^__version__ = "([^"]+)"/\1/p' exllamav3/version.py)
+          if [[ -z "$version" ]]; then
+            echo "::error file=container.yml::Could not parse version from exllamav3/version.py"
+            exit 1
+          fi
+          echo "::notice file=container.yml,title=Image Version::$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 #v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        if: ${{ !env.ACT }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f #v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Tags: <version> always; <major.minor> and latest only for plain X.Y.Z releases, so a
+      # pre-release tag never moves them. Never pushes under act.
+      # Layer cache lives in ghcr.io/<owner>/kyojin-buildcache: a fresh runner has no local cache, and
+      # without it every release recompiles the dependency and extension layers even when only the
+      # Python source changed. Read on every build; written only by pushing builds, and only for the
+      # first model, since the others differ from it in the last layer alone.
+      - name: Build and push images
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          OWNER: ${{ steps.version.outputs.owner }}
+          PUSH: ${{ !env.ACT && (github.event_name == 'push' || inputs.push) }}
+        run: |
+          push_flag=""
+          [[ "$PUSH" == "true" ]] && push_flag="--push"
+          cache="ghcr.io/${OWNER}/kyojin-buildcache:latest"
+          cache_to=()
+          [[ "$PUSH" == "true" ]] && cache_to=(--cache-to "type=registry,ref=${cache},mode=max")
+
+          for model in $MODELS; do
+            image="ghcr.io/${OWNER}/kyojin-${model}"
+            tags=(-t "${image}:${VERSION}")
+            if [[ "$VERSION" =~ ^([0-9]+\.[0-9]+)\.[0-9]+$ ]]; then
+              tags+=(-t "${image}:${BASH_REMATCH[1]}" -t "${image}:latest")
+            fi
+
+            echo "::group::${model}: ${tags[*]}"
+            docker buildx build \
+              -f docker/Dockerfile \
+              --platform linux/amd64 \
+              --build-arg "MODEL=${model}" \
+              "${tags[@]}" \
+              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --label "org.opencontainers.image.version=${VERSION}" \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --cache-from "type=registry,ref=${cache}" \
+              "${cache_to[@]}" \
+              ${push_flag} \
+              .
+            echo "::endgroup::"
+            cache_to=()
+          done
+
+      - name: Disk usage
+        if: always()
+        run: df -h

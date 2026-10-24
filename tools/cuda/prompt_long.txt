@@ -1,0 +1,178 @@
+> ## 🟥 AMD port — adds RDNA 3.5 (gfx1151 / Strix Halo) support
+>
+> **This branch adds AMD GPU functionality that is not in upstream ExLlamaV3.** Upstream targets
+> CUDA; the [`sdougbrown/exllamav3`](https://github.com/sdougbrown/exllamav3) base this is built on
+> adds a ROCm/HIP decode path for **gfx12 (RDNA 4)** only. This branch extends that path to
+> **gfx11.5 (RDNA 3.5)** — the Ryzen AI Max+ 395 / Radeon 8060S iGPU in the Framework Desktop.
+>
+> **What's added for AMD:** RDNA3.5 WMMA GEMV kernel (oracle-verified fragment layout), grouped-MoE
+> and fused-router paths enabled for gfx11.5, an int8-activation GEMV HIP port (`cp.async` → register
+> staging), `v_sad_u8` trellis decode, a CPU expert-offload port, and an LDS bank-conflict fix in the
+> WMMA staging buffer.
+>
+> **Measured** on Qwen3.8-Flash-Next-EXL3 (3.05 bpw) on one gfx1151: decode **4.27 → 34.9 tok/s mean**
+> (41.1 peak), perplexity unchanged at 4.2259.
+>
+> 👉 **See [`README.strix-halo.md`](README.strix-halo.md)** for the AMD build instructions, env knobs,
+> benchmark harnesses and measured results. The Installation section below is upstream's and is
+> **CUDA-specific** — do not follow it for AMD.
+>
+> NVIDIA/CUDA code paths are untouched; everything here is behind `USE_ROCM` / arch guards.
+
+<p align="center">
+  <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
+</p>
+
+[Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
+
+ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
+
+- **Quantization** - [EXL3](doc/exl3.md), based on QTIP, plus 2–8 bit cache quantization.
+- **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
+- **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
+- **Generation** - Continuous, dynamic batching, speculative decoding, multimodal support.
+- **Integrations** - Broad [HF model support](#architecture-support), a [Transformers plugin](examples/transformers_integration.py), and an OpenAI-compatible API via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/).
+
+> [!TIP]
+> **Looking for a server?** [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is the official and recommended backend server. It provides an OpenAI-compatible API for local or remote inference, HF model downloading, embedding model support, and HF Jinja2 chat templates. Its startup script manages and installs prerequisites to help you get started.
+
+<p align="center">
+  <img src="doc/qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
+</p>
+
+## Installation
+
+Start by making sure you have the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/) installed (CUDA 12.4 or later) since the Torch dependency is not automatically handled by `pip`. Then pick a method below:
+
+### Prebuilt wheel · recommended
+
+Pick a wheel from the [releases page](https://github.com/turboderp-org/exllamav3/releases), then e.g.:
+
+```sh
+pip install https://github.com/turboderp-org/exllamav3/releases/download/v0.0.6/exllamav3-0.0.6+cu128.torch2.8.0-cp313-cp313-linux_x86_64.whl
+```
+
+### Install from PyPI
+
+```sh
+pip install exllamav3
+```
+Note that the PyPI package does not contain a prebuilt extension and requires the CUDA toolkit and build prerequisites (i.e. VS Build Tools on Windows, gcc on Linux, `python-dev` headers etc.).
+
+### Build from source
+
+<details>
+<summary>Source installation with uv or pip</summary>
+
+
+`exllamav3` declares a minimum `torch` version (>= 2.6.0) and CUDA version (>= 12.4), but beyond that the user is free to select a version of `torch` that is compatible with their environment.
+
+`torch` can be installed in three ways (from least to most effort):
+1. **with `uv`, setting only `--extra cuXXX`** installs `torch` automatically with the specified CUDA version, `torch` version is selected by `uv` from compatible versions in the specific index associated with the chosen CUDA version (options 1 and 2)
+2. **with `uv`, creating a thin project that depends on `exllamav3[cuXXX]` and pins a specific `torch` version** — like (1) but `torch` is pinned in the thin project's `pyproject.toml`, see [pinning a specific PyTorch version (optional)](#pinning-a-specific-pytorch-version-optional) for details
+3. Manually with `uv pip` or `pip` (options 3 and 4)
+
+The flavor extras (`--extra`) are `cu124`, `cu126`, `cu128`, `cu129`, `cu130`, and `cu132` — pick the one matching your installed CUDA build. Both `uv sync` and `pip install .` build the package in an isolated environment where your `torch` is not visible, so they install the extension sources and compile them at first import (JIT, a few minutes once per torch version). For a precompiled install run `pip install --no-build-isolation .` in an environment that already has `torch`, or use the release wheels. Selecting a flavor installs the matching CUDA build of `torch`.
+
+**Option 1 — Working in the cloned repo directly (`uv sync`):**
+
+```sh
+git clone https://github.com/turboderp-org/exllamav3
+cd exllamav3
+# (Optional) switch to dev branch for latest in-progress features
+git checkout dev
+
+uv venv
+uv sync --extra cu130
+# add --extra examples and/or --extra eval for those extra dependencies
+```
+
+**Option 2 — Using `exllamav3` as a dependency from another project (`uv add`):**
+
+```sh
+# `uv add` works inside an existing project (a directory with a pyproject.toml).
+# `uv init` creates one if you're starting a new project, if integrating into
+# an existing project skip `uv init`.
+uv init my-project
+cd my-project
+
+# local checkout
+uv add 'path/to/exllamav3[cu130]'               # non-editable
+uv add 'path/to/exllamav3[cu130]' --editable    # editable
+
+# straight from GitHub
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]'                 # default branch
+uv add 'git+https://github.com/turboderp-org/exllamav3.git[cu130]' --branch dev    # specific branch
+```
+
+**Option 3 — Bring your own `torch` and let `uv` pick the backend automatically:**
+
+```sh
+uv venv            # or: uv venv --python-preference only-managed
+source .venv/bin/activate
+uv pip install torch --torch-backend=auto
+uv pip install .
+```
+
+`--torch-backend=auto` inspects your system and installs the matching PyTorch CUDA build; see [Automatic backend selection](https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection).
+
+**Option 4 — With `pip`:**
+
+On Windows, you also need the `triton-windows` package (declared as a dependency in `pyproject.toml`); the attention, cache and recurrent kernels are Triton and ExLlamaV3 does not import without it.
+
+```sh
+# install a CUDA-enabled torch first so it matches your setup, e.g.:
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install .
+```
+
+</details>
+
+<details>
+<summary>Pinning a specific PyTorch version (optional)</summary>
+
+#### Pinning a specific PyTorch version (optional)
+
+The flavor extra picks the *index*, but by default torch resolves to the latest version on that
+index that satisfies `>=2.6.0`. To pin a specific torch version while developing on `exllamav3`,
+create a **"thin" project** that consumes your local checkout as an editable install and declares
+the exact `torch` version itself. This keeps the pin out of the `exllamav3` pyproject, so
+you can change the torch version freely without touching the repo.
+
+```
+my-exllamav3-dev/          # thin project (uv init)
+├── pyproject.toml
+└── src/                  # package sources (auto-generated)
+```
+
+In `pyproject.toml`:
+
+```toml
+[project]
+name = "my-exllamav3-dev"
+version = "0.1.0"
+description = "Dev environment for exllamav3"
+requires-python = ">=3.10.11"
+dependencies = [
+    "exllamav3[cu130]",   # select correct CUDA version
+    "torch==2.13.0",      # pin the exact torch version you need
+]
+
+[tool.uv.sources]
+exllamav3 = { path = "../exllamav3", editable = true }
+```
+
+Adjust `../exllamav3` to point at your local checkout, then a plain `uv sync` sets up an
+environment with the correct PyTorch index (routed via the `cuXXX` extra),
+the pinned version of `torch` from that index (as long as it exists), and an editable install of `exllamav3` so code
+changes apply immediately. Switch CUDA flavors by changing the extra (`exllamav3[cu124]`,
+`exllamav3[cu128]`, …) and/or the torch pin in the thin project.
+
+Or, if you're installing torch manually with `uv pip install torch` (e.g. as in Option 3 above),
+specify the version directly, e.g. `uv pip install "torch==2.11.0" --torch-backend=auto`.
+
+</details>
+
+After installing with one of the options above, you should be able to run the conversion, eval and 
+example scripts from the main repo directory, e.g., `uv run python convert.py -i ...` or, for manual
+installations once the venv is active

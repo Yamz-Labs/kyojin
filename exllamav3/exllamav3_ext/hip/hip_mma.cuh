@@ -239,6 +239,45 @@ __device__ __forceinline__ HipFp16x16 assemble_a_frag_gfx115(const FragB& a01, c
     return a;
 }
 
+// m == 1 (MMODE 0, the whole decode hot path): only A row 0 is live, and the gfx11.5 operand
+// layout puts row 0 in lane 0 with all 16 k, so the assembled operand is 8 consecutive half2
+// of A's row 0 in lane 0 and zero everywhere else. assemble_a_frag_gfx115 has to stage the
+// per-lane a01/a23 fragments through LDS for lane 0 to gather them out of lanes 0..3; here it
+// reads them straight from A instead. Same operand bits, so the GEMV is bit for bit identical,
+// and the per-k-slice store/load round trip (~4 stores + 8 loads, a quarter of this kernel's
+// LDS traffic, and LDS is what limits the low-bitrate trellises) disappears.
+//
+// kslice is the kernel's k index; A2 is A viewed as half2, row 0, so the operand lives at
+// A2 + kslice*8. vec_ok is the caller's one-time test of A2's alignment (the per-slice address
+// changes, so testing it here would emit a branch per k-slice); when it holds, the operand is
+// two 128-bit loads, otherwise eight 32-bit ones.
+__device__ __forceinline__ HipFp16x16 assemble_a_frag_gfx115_m1
+(
+    const half2* A2, int kslice, bool vec_ok
+)
+{
+    HipFp16x16 a = {};
+    uint32_t* aw = reinterpret_cast<uint32_t*>(&a);
+    if ((int)(threadIdx.x & 31) == 0)
+    {
+        const half2* p = A2 + (size_t) kslice * 8;
+        if (vec_ok)
+        {
+            const int4* v = reinterpret_cast<const int4*>(p);
+            const int4 a0 = v[0], a1 = v[1];
+            aw[0] = a0.x; aw[1] = a0.y; aw[2] = a0.z; aw[3] = a0.w;
+            aw[4] = a1.x; aw[5] = a1.y; aw[6] = a1.z; aw[7] = a1.w;
+        }
+        else
+        {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j)
+                aw[j] = reinterpret_cast<const uint32_t*>(p)[j];
+        }
+    }
+    return a;
+}
+
 // Build the gfx11.5 B operand (16 halves = full k) from the decoded tile halves.
 // CUDA semantics: lane l holds col g = l>>2 (b_hi) and g+8 (b_lo), same k pattern.
 __device__ __forceinline__ HipFp16x16 assemble_b_frag_gfx115(const FragB& b_hi, const FragB& b_lo)

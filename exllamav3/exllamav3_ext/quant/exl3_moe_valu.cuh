@@ -1,6 +1,7 @@
 #pragma once
-// VALU grouped-MoE decode matvec (gfx11.5, opt-in EXL3_MOE_VALU=1). Replaces the WMMA/LDS body of the grouped and
-// expert-dedup decode launches for K2 and K4 experts, one launch per projection as before.
+// VALU grouped-MoE decode matvec (gfx11.5, default on for K1/K2/K3 experts, opt-in via
+// EXL3_MOE_VALU=1 for K4). Replaces the WMMA/LDS body of the grouped and
+// expert-dedup decode launches for K2, K3 and K4 experts, one launch per projection as before.
 //
 // Numerics: v_wmma_f32_16x16x16_f16 equals a chain of 8 v_dot2_f32_f16 over k ascending from the running accumulator, so a lane that
 // owns a whole 16-k column per k-slice reproduces the engine's WMMA body bit for bit. The 16 k-chunks (WK = 16) are reduced in chunk
@@ -42,7 +43,11 @@ __device__ __forceinline__ void mv_tile
     {
         w[0] = B32[mv::wrap(BITS, ntiles, tile, g8, s)];
         const uint32_t* p = B32 + mv::own(BITS, ntiles, tile, g8, s);
-        if constexpr (BITS == 2) { const uint2 v = *(const uint2*) p; w[1] = v.x; w[2] = v.y; }
+        if constexpr (BITS == 1) { w[1] = p[0]; }
+        else if constexpr (BITS == 2) { const uint2 v = *(const uint2*) p; w[1] = v.x; w[2] = v.y; }
+        // K3: 3*g8 u32s = 12*g8 bytes is not 8-byte aligned for odd g8, so three scalar
+        // loads (same reason as the fused kernel's mf_tile); see scratch/bounds_k3.md.
+        else if constexpr (BITS == 3) { w[1] = p[0]; w[2] = p[1]; w[3] = p[2]; }
         else { const uint4 v = *(const uint4*) p; w[1] = v.x; w[2] = v.y; w[3] = v.z; w[4] = v.w; }
     };
     auto ldst = [&](uint32_t (&w)[VU][NWD], int rnd, int sg0)
@@ -76,7 +81,14 @@ __device__ __forceinline__ void mv_tile
                     #pragma unroll
                     for (int t = 0; t < 4; ++t)
                     {
-                        if constexpr (BITS == 2) exl3_gemv_ns::dq8_regs_2bits<2>(wa[u][t >> 1], wa[u][1 + (t >> 1)], t << 3, f0[t], f1[t]);
+                        // K1: lane (g8, t) owns word g8 and takes its predecessor (g8 - 1 mod 8) from the wrap word; shift = 24 - 8t.
+                        if constexpr (BITS == 1) exl3_gemv_ns::dq8_regs_1bit<2>(wa[u][0], wa[u][1], t << 3, f0[t], f1[t]);
+                        else if constexpr (BITS == 2) exl3_gemv_ns::dq8_regs_2bits<2>(wa[u][t >> 1], wa[u][1 + (t >> 1)], t << 3, f0[t], f1[t]);
+                        // K3: lane (g8, t) is the engine's lane 4*g8 + t, whose (a, b, s2) are
+                        // (w[0],w[1],8), (w[1],w[2],16), (w[2],w[3],24), (w[2],w[3],0) in the
+                        // order wrap, own0, own1, own2 (re-derived from the engine's lane
+                        // formulas in scratch/bounds_k3.md; same mapping as mf_tile).
+                        else if constexpr (BITS == 3) exl3_gemv_ns::dq8_regs_3bits<2>(wa[u][t == 0 ? 0 : (t == 1 ? 1 : 2)], wa[u][t == 0 ? 1 : (t == 1 ? 2 : 3)], t == 0 ? 8 : (t == 1 ? 16 : (t == 2 ? 24 : 0)), f0[t], f1[t]);
                         else exl3_gemv_ns::dq8_regs_4bits<2>(wa[u][t], wa[u][t + 1], f0[t], f1[t]);
                     }
                     #pragma unroll

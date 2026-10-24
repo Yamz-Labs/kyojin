@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from .module import Module
 from .linear import Linear
 from .rmsnorm import RMSNorm
-from .ngram_embedding import NGramEmbedding
+from .ngram_embedding import NGramEmbedding, WARM_TOKENS
 from ..ext import exllamav3_ext as ext
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..model.config import Config
@@ -396,6 +396,24 @@ class PLELayer(Module):
         """
         history, _, _ = self._state_history(self._prepare_ids(input_ids), params)
         self.ple_embedding.prefetch(history)
+        ahead = params.get("pf_ahead")
+        if ahead is not None and WARM_TOKENS > 0 and self.ple_embedding.handles is not None:
+            self._warm_ahead(*ahead)
+
+    def _warm_ahead(self, seq, end: int):
+        """Warm the page cache for the rows of the next WARM_TOKENS prompt positions after this chunk
+        (seq.sequence_ids, chunk ends at `end`), in windows of at most one 4096-row chunk; every
+        position is warmed once per sequence (high-water mark on seq)."""
+        total = len(seq.sequence_ids) - 1
+        lo = max(end, getattr(seq, "_ngram_warm_to", 0))
+        hi = min(total, end + WARM_TOKENS)
+        ctx = self.ple_embedding.context_len
+        while lo < hi and lo >= ctx:
+            nxt = min(hi, lo + 4096)
+            ids = self._prepare_ids(seq.sequence_ids.torch_slice(lo - ctx, nxt))
+            self.ple_embedding.warm(ids)
+            lo = nxt
+        seq._ngram_warm_to = max(lo, getattr(seq, "_ngram_warm_to", 0))
 
     @override
     def forward(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None = None):

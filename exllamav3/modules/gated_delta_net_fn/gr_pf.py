@@ -107,3 +107,26 @@ def gr_apply_norm(x: torch.Tensor, y: torch.Tensor, post: torch.Tensor, w_h: tor
     # fma=True is bit-identical to ext.hc_apply (hipcc contracts post * y + x; checked on GPU, R=1..2048)
     _gr_apply_norm_kernel[(rows,)](x, y, post, w_h, normed, float(eps), y_pitch, D, H, triton.next_power_of_2(D), fma,
                                    num_warps = 8, enable_fp_fusion = False)
+
+
+@triton.jit
+def _shgate_add_kernel(f_ptr, y_ptr, s_ptr, D: tl.constexpr, BD: tl.constexpr):
+    # EXL3_SHGATE_FUSE: f[r] += float(y[r]) * s[r], the arithmetic of the shared expert's fp32 widen + add_sigmoid_gate's
+    # torch fallback (z.add_(x * sigmoid(y))): exact widen, one fp32 multiply, one fp32 add (no fma: enable_fp_fusion = False)
+    r = tl.program_id(0).to(tl.int64)
+    o = tl.program_id(1) * BD + tl.arange(0, BD)
+    m = o < D
+    s = tl.load(s_ptr + r)
+    y = tl.load(y_ptr + r * D + o, mask = m, other = 0.0).to(tl.float32)
+    f = tl.load(f_ptr + r * D + o, mask = m, other = 0.0)
+    tl.store(f_ptr + r * D + o, f + y * s, mask = m)
+
+
+def shgate_add(f: torch.Tensor, y: torch.Tensor, s: torch.Tensor):
+    """f (R, D) fp32 contiguous, updated in place; y (R, D) fp16 contiguous (the shared expert's down output); s (R,) or (R, 1)
+    fp32 = torch.sigmoid(gate). Bit-identical to f.add_(y.float() * s)."""
+    R, D = f.shape
+    assert f.dtype == torch.float32 and f.is_contiguous() and y.dtype == torch.float16 and y.is_contiguous() and y.shape == f.shape
+    assert s.dtype == torch.float32 and s.is_contiguous() and s.numel() == R
+    BD = 1024
+    _shgate_add_kernel[(R, triton.cdiv(D, BD))](f, y, s, D, BD, num_warps = 4, enable_fp_fusion = False)

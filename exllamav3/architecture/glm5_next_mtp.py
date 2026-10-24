@@ -281,7 +281,20 @@ class Glm5NextMTPModel(Model):
         ll = self.attached_model().logit_layer_idx
         lm = self.attached_model().modules[ll]
         logits = lm.prepare_for_device(state, params)
+        # EXL3_DRAFT2S: two-stage draft head (modules/draft2s.py) for 1-row draft steps (not for sampled jobs: they need the full law); conf = the exact argmax logit
+        lead = logits.shape[:-1]
+        if lead.numel() == 1 and os.environ.get("EXL3_DRAFT2S") and not params.get("export_draft_logits"):
+            from ..modules import draft2s
+            d2s = draft2s.head_for(lm, self.attached_model().config.vocab_size)
+            if d2s is not None:
+                ids, p, conf = d2s(logits)
+                params["draft_p"] = p.clone()
+                if params.get("export_draft_conf"):
+                    params["draft_conf"] = conf.clone().view(lead)
+                return ids.clone().view(lead)
         logits = lm.forward(logits, params)
+        if params.get("export_draft_logits"):
+            params["draft_logits"] = logits   # spec_sample: the drafter's law for sampled jobs
         if params.get("export_draft_conf"):
             # Per-position confidence for the generator's draft truncation: the argmax logit
             # value, over the unpadded vocabulary
