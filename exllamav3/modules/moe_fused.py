@@ -36,6 +36,35 @@ def enabled_by_env() -> bool:
     return bool(torch.version.hip) and os.environ.get("EXL3_MOE_FUSED", "0") not in ("", "0")
 
 
+def _first_k(module):
+    """K of the first expert projection, or None when the module has no EXL3 projection with a K (such a block falls back)."""
+    gates = getattr(module, "gates", None)
+    return getattr(getattr(gates[0], "inner", None), "K", None) if gates else None
+
+
+def _k6s8_support_reason(mlp) -> str | None:
+    """Enable experimental K6/K8 only with an explicit setting.
+
+    EXL3_MOE_FUSED_K6S8=1 enables native-layout, six-stage launches only.
+    Validate every projection: the fused shape has one bit width per expert class.
+    """
+    if _first_k(mlp) != 6 or _first_k(getattr(mlp, "shared_experts", None)) != 8:
+        return None
+    if os.environ.get("EXL3_MOE_FUSED_K6S8", "0") != "1":
+        return "experimental K6/K8 fusion requires EXL3_MOE_FUSED_K6S8=1"
+    if os.environ.get("EXL3_MOE_FUSED_LAYOUT", "native") != "native":
+        return "experimental K6/K8 fusion requires native layout"
+    if MF9["variant"] & ~0x1000 != 0x160000 or MF9["timing"]:
+        return "experimental K6/K8 fusion requires the default six-stage variant without timing"
+    for module, bits in ((mlp, 6), (mlp.shared_experts, 8)):
+        for projections in (module.gates, module.ups, module.downs):
+            for projection in projections:
+                inner = getattr(projection, "inner", None)
+                if getattr(inner, "K", None) != bits or not getattr(inner, "mul1", False) or getattr(inner, "mcg", True):
+                    return "experimental K6/K8 fusion needs uniform K6 routed / K8 shared mul1 projections"
+    return None
+
+
 def _rep(tr: torch.Tensor) -> torch.Tensor:
     """(kt, nt, nw) int16 trellis -> (nt/2, kt, 2*nw) int16: one 32-column group per leading index, k-slice major."""
     kt, nt, nw = tr.shape
@@ -65,7 +94,7 @@ class FusedMoEHalf:
             return "router bias / shared post norm"
         if len(mlp.gates) != mlp.num_experts or len(mlp.ups) != mlp.num_experts or len(mlp.downs) != mlp.num_experts:
             return "experts are not one linear each"
-        return None
+        return _k6s8_support_reason(mlp)
 
     def __init__(self, block):
         t0 = time.time()
