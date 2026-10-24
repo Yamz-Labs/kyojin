@@ -1975,6 +1975,19 @@ inline int kb2_of(double K)
     return kb2;
 }
 
+// Keep the routed-MoE formats unchanged. K8 is an opt-in dense mul1 experiment.
+inline int dense_kb2_of(double K, bool mcg)
+{
+    if (K == 8.0)
+    {
+        const char* enabled = getenv("EXL3_DENSE_K8");
+        TORCH_CHECK(enabled && enabled[0] == '1' && enabled[1] == '\0' && !mcg,
+                    "exl3_dec: dense K8 requires mul1 and EXL3_DENSE_K8=1");
+        return 16;
+    }
+    return kb2_of(K);
+}
+
 #define EXL3_DEC_DISPATCH_KB2(kb2, ...)                                             \
     switch (kb2)                                                                     \
     {                                                                                \
@@ -2013,6 +2026,12 @@ inline void launch_gemv_cb(int kb2, int blocks, const half* xp, const Jobs& jobs
         case 10: gemv_kernel<10, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         case 12: gemv_kernel<12, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
         case 14: gemv_kernel<14, CB><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp); break;
+        case 16:
+            if constexpr (CB == 2)
+                gemv_kernel<16, 2><<<blocks, THREADS, 0, stream>>>(xp, jobs, sp, cp);
+            else
+                TORCH_CHECK(false, "exl3_dec_gemv: K8 requires mul1");
+            break;
         default: TORCH_CHECK(false, "exl3_dec_gemv: unsupported K*2 ", kb2);
     }
 }
@@ -2177,7 +2196,7 @@ static void dec_gemv_impl
                               : x.numel() == x.size(-1), "exl3_dec_gemv: x must be fp16 [1, K] (or cover the strided groups)");
     }
     TORCH_CHECK(Kdim % 512 == 0, "exl3_dec_gemv: K must be a multiple of 512");
-    const int kb2 = kb2_of(K[0]);
+    const int kb2 = dense_kb2_of(K[0], mcg);
     int strips_total = 0;
     for (int i = 0; i < n; ++i) strips_total += (out[i].size(-1) + STRIP - 1) / STRIP;
     const int min_blocks = env_int("EXL3_DEC_MIN_BLOCKS", 32);
@@ -2195,7 +2214,7 @@ static void dec_gemv_impl
     int blocks = 0, part = 0, ctr = CTR_GEMV;
     for (int i = 0; i < n; ++i)
     {
-        TORCH_CHECK(kb2_of(K[i]) == kb2, "exl3_dec_gemv: all matrices must share K");
+        TORCH_CHECK(dense_kb2_of(K[i], mcg) == kb2, "exl3_dec_gemv: all matrices must share K");
         const int N = out[i].size(-1);
         TORCH_CHECK(N % 128 == 0 && out[i].numel() == N && out[i].is_contiguous(), "exl3_dec_gemv: out must be [1, N], N % 128 == 0");
         TORCH_CHECK(trellis[i].size(0) == Kdim / 16 && trellis[i].size(1) == N / 16 && trellis[i].size(2) == kb2 * 8,
@@ -2482,7 +2501,7 @@ static void dec_gemv_r_impl
     const int Kdim = (int) x.size(1);
     TORCH_CHECK(R >= 1 && R <= MOE_R_MAX, "exl3_dec_gemv_r: R must be 1..MOE_R_MAX");
     TORCH_CHECK(Kdim % 512 == 0, "exl3_dec_gemv_r: K must be a multiple of 512");
-    const int kb2 = kb2_of(K[0]);
+    const int kb2 = dense_kb2_of(K[0], mcg);
     int strips_total = 0;
     for (int i = 0; i < n; ++i) strips_total += ((int) out[i].size(-1) + STRIP - 1) / STRIP;
     // Identical to dec_gemv_impl's own ktw/kbs choice (same pick_ktw/kbs_of call, same args) --
@@ -2519,7 +2538,7 @@ static void dec_gemv_r_impl
     int blocks = 0, part = 0, ctr = 0;
     for (int i = 0; i < n; ++i)
     {
-        TORCH_CHECK(kb2_of(K[i]) == kb2, "exl3_dec_gemv_r: all matrices must share K");
+        TORCH_CHECK(dense_kb2_of(K[i], mcg) == kb2, "exl3_dec_gemv_r: all matrices must share K");
         const int N = (int) out[i].size(-1);
         TORCH_CHECK(N % 128 == 0 && out[i].size(0) == R && out[i].is_contiguous(),
                     "exl3_dec_gemv_r: out must be [R, N], N % 128 == 0");
@@ -2554,6 +2573,18 @@ static void dec_gemv_r_impl
         {
             if (kb2 == 8) { auto kfn = gemv_kernel_r<8, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
             else          { auto kfn = gemv_kernel_r<10, CB, 6, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+        });
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+    if (kb2 == 16)
+    {
+        EXL3_DEC_DISPATCH_RM(rpb,
+        {
+            if (RM > 1 && env_int("EXL3_GEMV_R_DEC1", 0) == 1)
+            { auto kfn = gemv_kernel_r<16, 2, RM, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+            else
+            { auto kfn = gemv_kernel_r<16, 2, RM>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
         });
         cuda_check(cudaPeekAtLastError());
         return;
