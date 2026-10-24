@@ -36,11 +36,46 @@ def enabled_by_env() -> bool:
     return bool(torch.version.hip) and os.environ.get("EXL3_MOE_FUSED", "0") not in ("", "0")
 
 
+def _first_k(module):
+    """K of the first expert projection, or None when the module has no EXL3 projection with a K (such a block falls back)."""
+    gates = getattr(module, "gates", None)
+    return getattr(getattr(gates[0], "inner", None), "K", None) if gates else None
+
+
+def _k6s8_support_reason(mlp) -> str | None:
+    """Enable experimental K6/K8 only with an explicit setting.
+
+    EXL3_MOE_FUSED_K6S8=1 enables native-layout, six-stage launches only.
+    Validate every projection: the fused shape has one bit width per expert class.
+    """
+    if _first_k(mlp) != 6 or _first_k(getattr(mlp, "shared_experts", None)) != 8:
+        return None
+    if os.environ.get("EXL3_MOE_FUSED_K6S8", "0") != "1":
+        return "experimental K6/K8 fusion requires EXL3_MOE_FUSED_K6S8=1"
+    if os.environ.get("EXL3_MOE_FUSED_LAYOUT", "native") != "native":
+        return "experimental K6/K8 fusion requires native layout"
+    if MF9["variant"] & ~0x1000 != 0x160000 or MF9["timing"]:
+        return "experimental K6/K8 fusion requires the default six-stage variant without timing"
+    for module, bits in ((mlp, 6), (mlp.shared_experts, 8)):
+        for projections in (module.gates, module.ups, module.downs):
+            for projection in projections:
+                inner = getattr(projection, "inner", None)
+                if getattr(inner, "K", None) != bits or not getattr(inner, "mul1", False) or getattr(inner, "mcg", True):
+                    return "experimental K6/K8 fusion needs uniform K6 routed / K8 shared mul1 projections"
+    return None
+
+
 def _rep(tr: torch.Tensor) -> torch.Tensor:
     """(kt, nt, nw) int16 trellis -> (nt/2, kt, 2*nw) int16: one 32-column group per leading index, k-slice major."""
     kt, nt, nw = tr.shape
     assert nt % 2 == 0
     return tr.reshape(kt, nt // 2, 2 * nw).permute(1, 0, 2).contiguous()
+
+
+# (D, H, LR, NEXP, TOPK, INTER, RB, SB) of the wide K6S8 instantiations: QwenK6S8 and SmallK6S8 in exl3_moe_fused_idx.h.
+# tests/test_moe_fused_wide_k6k8_cpu.py reads this constant and checks it against those two structs.
+K6S8_WIDE_SHAPES = ((2560, 4, 320, 512, 10, 640, 6, 8),
+                    (256, 4, 32, 64, 4, 128, 6, 8))
 
 
 class FusedMoEHalf:
@@ -65,7 +100,7 @@ class FusedMoEHalf:
             return "router bias / shared post norm"
         if len(mlp.gates) != mlp.num_experts or len(mlp.ups) != mlp.num_experts or len(mlp.downs) != mlp.num_experts:
             return "experts are not one linear each"
-        return None
+        return _k6s8_support_reason(mlp)
 
     def __init__(self, block):
         t0 = time.time()
@@ -168,9 +203,14 @@ class FusedMoEHalf:
         return 1 <= x.shape[0] * x.shape[1] <= (8 if R8["on"] else SPLIT_MAX_ROWS)
 
     def _wide_ok(self) -> bool:
-        """The one-launch 5..8 row path exists for this block: mf9 at the default variant 0x160000 (six stage launches), native layout, no timing. The wide instantiations cover K2..K5 only (the K6 drafter layer takes the split path)."""
-        v = MF9["variant"] & 0x1f0000
-        return bool(self.native and self.RB <= 5 and self.SB <= 5 and hasattr(torch.ops, "mf9") and hasattr(torch.ops.mf9, "half") and v == 0x160000 and not MF9["timing"])
+        """Native wide launches; K6/K8 requires its own experimental opt-in."""
+        v = MF9["variant"]
+        k6s8 = (os.environ.get("EXL3_MOE_R8_K6S8", "0") == "1"
+                and self.shape in K6S8_WIDE_SHAPES
+                and (v & ~0x1000) == 0x160000)
+        return bool(self.native and ((self.RB <= 5 and self.SB <= 5) or k6s8)
+                    and hasattr(torch.ops, "mf9") and hasattr(torch.ops.mf9, "half")
+                    and (v & 0x1f0000) == 0x160000 and not MF9["timing"])
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """x (b, s, H, D) fp32 residual stack, updated in place and returned."""

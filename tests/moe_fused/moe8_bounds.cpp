@@ -183,6 +183,8 @@ template <class S> void prove(const char* name)
 int main()
 {
     prove<QwenShape>("Qwen"); prove<QwenK3S4>("QwenK3S4"); prove<QwenK4S5>("QwenK4S5"); prove<SmallTestShape>("SmallTest"); prove<SmallK4S4>("SmallK4S4"); prove<SmallK3S5>("SmallK3S5");
+    prove<Wide<QwenK6S8>>("Wide QwenK6S8");
+    prove<Wide<SmallK6S8>>("Wide SmallK6S8");
     printf("checks %lld fails %lld\n", checks, fails);
     return fails ? 1 : 0;
 }
