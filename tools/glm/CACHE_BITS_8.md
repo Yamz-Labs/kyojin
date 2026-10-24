@@ -1,7 +1,23 @@
 # GLM-5.3 `--cache-bits 8`: measured on the Strix Halo
 
 Measurements for the packed int8 MLA latent cache added in `32951fa` ("Add `--cache-bits 8`").
-Default fp16 behaviour is unchanged (verified: step 8).
+Default fp16 behaviour is unchanged (verified: See section 8).
+
+## TL;DR
+Measured on the NicSir 2.72bpw pack (Ryzen AI Max+ 395): the latent is 1024 → 544 B/token (packed qk 512 B + fp16 scales
+32 B) against 512 B + 64 B of fp16 indexer and k-pool planes that do not change, so an MLA layer
+is 1600 → 1120 B/token (−30 %). With the 11 MLA target layers and the 1-layer MTP draft cache the
+paged pool is 17.6 → 12.3 KB/token: 825 → 578 MiB at `-c 40960` and, extrapolated linearly in the
+token budget, 2475 → 1733 MiB at `-c 131072` and 9.4 → 6.6 GiB at `-c 524288`. Decode is about
+3 % slower (greedy + MTP: 25.20 → 24.44 tok/s medians) with the same draft acceptance (85.2 %);
+`EXL3_MLA_QC_BN=32` recovers about half of it (24.86 tok/s, acceptance 86.9 %; `BN >= 128` fails
+with a shared-memory `OutOfResources`) but the engine default is unchanged. PPL is unchanged
+(2.868039 both modes) but `tools/glm/ppl7.py` forwards cacheless (`attn_mode=flash_attn_nc`), so
+it cannot see the quantiser; needle-in-haystack recall at 40K is 9/9 in both modes. Greedy output
+differs token-wise from fp16, and the packed pages are not row-invariant: at `--sessions 2` the
+two batched rows agree with each other but differ from the same request run alone, so the server
+prints a warning when `--cache-bits 8` meets `--sessions` > 1. Slot files do not cross cache
+modes. The startup line prints `serve: cache=int8 (slot files do not cross cache modes)`.
 
 ## Environment and commits
 
@@ -11,8 +27,8 @@ Default fp16 behaviour is unchanged (verified: step 8).
 | repo (box) | `~/engines/kyojin` (the plan said `~/kyojin`) |
 | branch | `feat/glm-kv-q8` |
 | feature commit | `32951fa` ("Add `--cache-bits 8`"), parent (pre-change) `18cdd3c` |
-| HEAD at measurement | `9eb14ce` (`c105ba7` + the harness commit below) |
-| harness commit | `9eb14ce` — `--cache-bits`/`--temp` in `tools/strix_halo/bench_mtp.py`, new `tools/glm/niah.py` |
+| HEAD at measurement | `9eb14ce` (`c105ba7` + the measurement commit below) |
+| measurement commit | `9eb14ce` — the decoding/acceptance harness, retrieval driver and byte-accounting helper used below (measurement branch only, not part of this PR) |
 | env | `source tools/strix_halo/env.sh` from the repo root, before every run |
 
 **Model pack substitution.** The plan's pack `~/models/glm53-exl3-td205` is **not on the box**.
@@ -29,7 +45,7 @@ the throughput/quality numbers are specific to this pack.
 MTP `eh_proj` sidecar not present, draft acceptance is lower than a pack that ships `mtp_eh_proj.st`.
 Acceptance numbers are relative to this pack.
 
-## Step 0 — config dims
+## 0 — config dims
 
 ```
 num_hidden_layers        45
@@ -45,7 +61,7 @@ layer_types              linear_attention x3 then deepseek_sparse_attention, rep
 indexer_types            all 45 = "full"  -> every MLA layer carries its own indexer + k-pool planes
 ```
 
-## Step 1 — byte accounting
+## 1 — byte accounting
 
 ### 1.1 Analytic (per token, per MLA layer, per plane)
 
@@ -68,7 +84,7 @@ Totals (main cache = 11 MLA layers, MTP draft cache = 1 layer):
 | MTP draft (1 layer) | 1600 | 1120 |
 | **target + draft** | **19200 (18.75 KiB)** | **13440 (13.125 KiB)** |
 
-### 1.2 Empirical (`tools/glm/cache_bytes.py`, no weight load)
+### 1.2 Empirical (engine `storage_size()`, no weight load)
 
 `sum(layer.storage_size())` at `max_num_tokens = ctx + 4096`:
 
@@ -108,7 +124,7 @@ absolute saving only matters at very long context — and it is the only lever t
 (64 B/token) stay fp16 and dominate the remaining int8 layer. Quantising them is a separate,
 larger task; the 30 % here is the whole latent plane only.
 
-## Step 2 — PPL
+## 2 — PPL
 
 `tools/glm/ppl7.py` (10 x 4096 rows), run twice with its own (identical) command — it has no
 cache flag:
@@ -125,10 +141,11 @@ the latent quantiser. The corpus `~/bench/ppl/wiki.test.raw` was **absent**; it 
 the deterministic `tools/glm/make_corpus.py` (400000 chars, 82174 tokens), so this PPL is not
 comparable to earlier wikitext numbers (the delta conclusion is unaffected).
 
-## Step 3 — Retrieval (needle-in-haystack)
+## 3 — Retrieval (needle-in-haystack)
 
-`tools/glm/niah.py` against the server (greedy, `temperature 0`, `-c 40960`, `--num-draft 1`,
-`--no-vision`), 40083-token prompts, needle at 10 / 50 / 90 %, 3 trials each, identical seeds:
+A needle-in-haystack probe against the running server (greedy, `temperature 0`, `-c 40960`,
+`--num-draft 1`, `--no-vision`): 40083-token haystacks, the needle at 10 / 50 / 90 %, 3 trials
+each with identical seeds:
 
 | depth | fp16 recall | int8 recall |
 |---|---|---|
@@ -137,11 +154,11 @@ comparable to earlier wikitext numbers (the delta conclusion is unaffected).
 | 90 % | 3/3 | 3/3 |
 | **total** | **9/9** | **9/9** |
 
-## Step 4 — Speed and MTP
+## 4 — Speed and MTP
 
 Trimmed per instruction: **no 16K**, **3 runs total per cell** (fp16/int8 order alternated by
-cell). `tools/strix_halo/bench_mtp.py -n 200 -ndt 1` (MTP depth 1 = GLM's nextn depth),
-one process at a time, no OOM (122+ GB free throughout).
+cell). A standalone decode benchmark (200 tokens, MTP depth 1 = GLM's nextn depth, one process
+at a time), no OOM (122+ GB free throughout).
 
 | ctx | temp | MTP | fp16 tok/s | int8 tok/s | Δ | accept fp16/int8 |
 |---|---|---|---|---|---|---|
@@ -159,7 +176,7 @@ int8, so their deltas are not meaningful. In the deterministic cells the intra-m
 spread is <0.1 %, so the **≈ −3 % int8 decode penalty is real**, with **identical draft
 acceptance (85.2 %)**. Context (4K vs 40K) does not change the picture.
 
-## Step 5 — Knob sweep (triggered: int8 slower beyond noise)
+## 5 — Knob sweep (triggered: int8 slower beyond noise)
 
 16K, greedy, MTP on, int8, `EXL3_MLA_QC_BN` / `EXL3_MLA_QC_TRANS` exported per process
 (medians; BN=32 and the default were run 5x, others 2x):
@@ -185,7 +202,7 @@ acceptance (85.2 %)**. Context (4K vs 40K) does not change the picture.
 here and in `SERVE.md` as an opt-in env setting; changing the tuned kernel default is left to a
 follow-up if wanted.
 
-## Step 6 — Behaviour checks
+## 6 — Behaviour checks
 
 Server, greedy, fixed prompts; each server's `serve: cache=` line noted.
 
@@ -200,24 +217,13 @@ Server, greedy, fixed prompts; each server's `serve: cache=` line noted.
 | 5c | slot cross-mode, int8 file -> fp16 server | **HTTP 400** (same) |
 
 The cross-mode rejection is the existing loud guard in `slot_store.py:143-145` (the int8 MLA
-layer adds `qk`+`sk` where fp16 has `k`, so the per-tensor count/dtype set differs). **No code
-change was needed** for step 7.1 — it already fails loudly, in both directions.
+layer adds `qk`+`sk` where fp16 has `k`, so the per-tensor count/dtype set differs).
+It fails loudly, in both directions.
 
 Check 3 confirms the row-invariance caveat: with `--sessions > 1` the packed int8 pages are not
 row-invariant, so batching changes the greedy text (the rows still agree with each other).
 
-## Step 7 — Fixes
-
-1. **Slot mode guard** — none needed; confirmed loud (6.5b/c). Documented instead.
-2. **Row-invariance caveat (docs)** — the old "does not apply to GLM" wording is gone; `SERVE.md`
-   now states what step 6 showed (rows agree with each other, differ from solo).
-3. **`--cache-bits` help + startup log** — help now notes slot files do not cross cache modes;
-   the startup line prints `serve: cache=int8 (slot files do not cross cache modes)`.
-4. **Startup warning** — `--cache-bits 8` with `-sessions > 1` prints one extra stderr line.
-5. **Docs + report** — `tools/glm/SERVE.md` and `doc/models.md` re-add the measured paragraph /
-   line; this file is the report.
-
-## Step 8 — Regression guard (default fp16 unchanged)
+## 7 — Regression guard (default fp16 unchanged)
 
 `git worktree add /tmp/kyojin-base 18cdd3c`, `cp exllamav3_ext*.so /tmp/kyojin-base/`; serve.py
 at HEAD (`9eb14ce`) and at `18cdd3c`, both fp16 (default), MTP off (`--num-draft 0`), `-c 16384`,
