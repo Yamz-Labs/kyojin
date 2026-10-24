@@ -55,7 +55,8 @@ void BC_GatedDeltaNet::run_bsz1_b
         k_head_dim,
         v_head_dim,
         c10::nullopt,
-        false
+        false,
+        c10::nullopt
     );
 
     norm->run(core_attn_out, core_attn_out_f, z);
@@ -219,6 +220,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     at::Tensor& y,
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
+    at::Tensor& recurrent_base,
     const at::Tensor& slots,
     bool history,
     Slot& s,
@@ -313,6 +315,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         v_head_dim,
         slots,
         history,
+        recurrent_base,
         graph
     );
 
@@ -329,6 +332,7 @@ void BC_GatedDeltaNetSplit::run_bszN
     at::Tensor& y,
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
+    at::Tensor& recurrent_base,
     const at::Tensor& slots,
     bool history
 )
@@ -344,9 +348,9 @@ void BC_GatedDeltaNetSplit::run_bszN
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN: slot not configured");
 
-    if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
+    if (s.graph->disabled || graph_outer_capture(stream) || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, recurrent_base, slots, history, s, nullptr);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
@@ -359,14 +363,14 @@ void BC_GatedDeltaNetSplit::run_bszN
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, recurrent_base, slots, history, s, nullptr);
         return;
     }
 
     if (!s.graph->ready)
     {
         s.graph->capture_begin();
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, s.graph.get());
+        run_bszN_gr(x, y, conv_state, recurrent_state, recurrent_base, slots, history, s, s.graph.get());
         s.graph->capture_end();
     }
 
@@ -382,6 +386,7 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
             PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
             PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_base,  (void*) recurrent_base.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
     else if (qkvz_ptrs_trellis.has_value() && (int) (x.size(0) * x.size(1)) <= 32)
@@ -393,6 +398,7 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
             PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
             PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_base,  (void*) recurrent_base.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
     else
@@ -405,6 +411,7 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
             PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
             PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_base,  (void*) recurrent_base.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
     s.graph->launch(args, stream);
@@ -573,7 +580,7 @@ void BC_Mamba2::run_bszN
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_Mamba2::run_bszN: slot not configured");
 
-    if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
+    if (s.graph->disabled || graph_outer_capture(stream) || (!s.graph->ready && !s.graph->ready_to_record))
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         s.graph->ready_to_record = true;

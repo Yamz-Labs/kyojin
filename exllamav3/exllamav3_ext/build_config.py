@@ -5,7 +5,7 @@ the ROCm source exclusion logic.
 """
 import os
 
-ROCM_EXCLUDE_DIRS = {'parallel', 'comp_units'}
+ROCM_EXCLUDE_DIRS = {'parallel', 'comp_units', 'foreign_quant'}
 
 # Files inside an excluded dir that DO build on ROCm (checked before the dir exclusion). The int8
 # GEMV instances and EXL3 tile-quantizer K1..K8 instances are required by the HIP runtime/converter.
@@ -20,14 +20,14 @@ ROCM_EXCLUDE_FILES = {
     'softcap.cu', 'histogram.cu', 'sam.cpp',
     'cache/q_cache.cu',
     'quant/exl3_gemm.cu',
-    'quant/exl3_moe.cu', 'quant/exl3_moe_coop.cu', 'quant/exl3_kernel_map.cu',
+    'quant/exl3_moe.cu', 'quant/exl3_moe_grouped.cu', 'quant/exl3_moe_coop.cu', 'quant/exl3_kernel_map.cu',
     'quant/coop_autotune.cu',
     'generator/sampling_fused.cu',
     'libtorch/gated_delta_net.cpp', 'libtorch/blocksparse_mlp.cpp',
     'libtorch/mlp.cpp', 'libtorch/attention.cpp', 'libtorch/gated_rmsnorm.cpp',
     'libtorch/linear.cpp', 'libtorch/dsv4_attn.cpp', 'libtorch/dsv4_compressor.cpp',
     'libtorch/mla_attention.cpp',
-    'dsv4_compress.cu', 'dsa_topk.cu', 'ple.cu',
+    'dsv4_compress.cu', 'dsa_topk.cu', 'ple.cu', 'dflash2.cu',
     'cpu/moe_handoff.cu',
 }
 

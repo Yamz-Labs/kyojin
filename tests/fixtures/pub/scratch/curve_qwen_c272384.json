@@ -1,0 +1,107 @@
+{
+ "model": "qwen",
+ "max_tokens": 256,
+ "points": {
+  "8192": {
+   "tag": "point-8192",
+   "usage": {
+    "prompt_tokens": 8192,
+    "completion_tokens": 256,
+    "total_tokens": 8448,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 8192,
+    "predicted_n": 256,
+    "prompt_per_second": 1502.4,
+    "predicted_per_second": 52.44
+   },
+   "target": 8192,
+   "calibrated_tokens": 8192
+  },
+  "32768": {
+   "tag": "point-32768",
+   "usage": {
+    "prompt_tokens": 32771,
+    "completion_tokens": 256,
+    "total_tokens": 33027,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 32771,
+    "predicted_n": 256,
+    "prompt_per_second": 1481.9,
+    "predicted_per_second": 48.07
+   },
+   "target": 32768,
+   "calibrated_tokens": 32768
+  },
+  "65536": {
+   "tag": "point-65536",
+   "usage": {
+    "prompt_tokens": 65539,
+    "completion_tokens": 256,
+    "total_tokens": 65795,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 65539,
+    "predicted_n": 256,
+    "prompt_per_second": 1469.3,
+    "predicted_per_second": 49.31
+   },
+   "target": 65536,
+   "calibrated_tokens": 65536
+  },
+  "131072": {
+   "tag": "point-131072",
+   "usage": {
+    "prompt_tokens": 131075,
+    "completion_tokens": 256,
+    "total_tokens": 131331,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 131075,
+    "predicted_n": 256,
+    "prompt_per_second": 1412.8,
+    "predicted_per_second": 43.02
+   },
+   "target": 131072,
+   "calibrated_tokens": 131072
+  },
+  "262144": {
+   "tag": "point-262144",
+   "usage": {
+    "prompt_tokens": 262147,
+    "completion_tokens": 256,
+    "total_tokens": 262403,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 262147,
+    "predicted_n": 256,
+    "prompt_per_second": 1358.1,
+    "predicted_per_second": 44.27
+   },
+   "target": 262144,
+   "calibrated_tokens": 262144
+  }
+ },
+ "started": "2026-10-17 12:00:00"
+}

@@ -209,6 +209,7 @@ void BC_Attention::configure_slot
     std::shared_ptr<TritonKernel> k_update,
     int block_n,
     int splits_cap,
+    int programs,
     c10::optional<at::Tensor> xp,
     c10::optional<at::Tensor> yp
 )
@@ -308,11 +309,9 @@ void BC_Attention::configure_slot
         s.qkv_c_ptrs = at::tensor(ptrs, at::TensorOptions().dtype(at::kLong)).to(s.q.device());
     }
 
-    int group_size = num_q_heads / num_kv_heads;
-    int block_m = 1; while (block_m < q_len) block_m <<= 1;
-    int block_h = MAX(16 / block_m, 1);
-    int h_blocks = CEIL_DIVIDE(group_size, block_h);
-    s.programs = bsz * num_kv_heads * h_blocks;
+    // Split / combine grid width: the row layout is the Python side's (triton_paged_cu.decode_row_layout, or the
+    // pre-1.6 layout under EXL3_ATTN16=0), which compiled the kernels for it (upstream exllamav3 1.6.0, MIT)
+    s.programs = programs;
     s.upd_grid = dim3(bsz * q_len, num_kv_heads, 1);
 
     s.graph = std::make_unique<Graph>();
@@ -385,11 +384,13 @@ void BC_Attention::configure_slot_qsa
 
 // Live split configuration from the current block-table bound (same formula as the python
 // dispatch path, so the two produce identical numerics)
+// key blocks per split (was 4): short contexts get more CTAs (upstream exllamav3 1.6.0, MIT)
+#define SPLIT_MIN_BLOCKS 1
 static inline void split_config(int bt_width, int page_size, int q_len, int block_n, int splits_cap,
                                 int* num_splits, int* split_len)
 {
     int bound = bt_width * page_size + q_len;
-    *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, 4 * block_n)));
+    *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, SPLIT_MIN_BLOCKS * block_n)));
     *split_len = CEIL_DIVIDE(CEIL_DIVIDE(bound, *num_splits), block_n) * block_n;
 }
 
@@ -802,7 +803,7 @@ void BC_Attention::run_gr
             // HAS_SINKS), dead arg otherwise
             sinks ? (void*) sinks.value().data_ptr() : (void*) s.q.data_ptr(),
         };
-        s.k_combine->launch(s.programs, 1, 1, args, stream);
+        s.k_combine->launch(s.programs, s.k_combine->grid_y, 1, args, stream);
         if (graph)
         {
             graph->record_param(s.k_combine->handle(), GP_attn_num_splits, 4, 4);
@@ -866,6 +867,11 @@ void BC_Attention::run
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
     // captured, then launched below like every later run, with only the I/O pointers patched
+    if (graph_outer_capture(stream))
+    {
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
+        return;
+    }
     if (s.runs == 0)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);

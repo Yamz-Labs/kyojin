@@ -9,6 +9,7 @@ from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
 from ..cache.recurrent_util import advance_recurrent_states
+from . import cuda_graph as _cuda_graph
 import os
 
 class Model(Model_TPMixin, Model_LSMixin):
@@ -230,6 +231,12 @@ class Model(Model_TPMixin, Model_LSMixin):
             advance_recurrent_states(input_ids, params, self)
             return y
         else:
+            if _cuda_graph.CUDA_GRAPH_ENABLED:
+                # opt-in whole-forward CUDA graph (decode only); None = declined, run eager below
+                y = _cuda_graph.maybe_forward(self, x, params)
+                if y is not None:
+                    advance_recurrent_states(input_ids, params, self)
+                    return y
             for m in self._get_prefetch_layers:
                 m.prefetch(x, params)
             y = self.forward_ls(x, params)
@@ -238,6 +245,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     def unload(self):
+        _cuda_graph.purge(self)
         for module in self.modules:
             module.unload()
         # The loader's open slab blocks must not outlive the tensors sliced from them
@@ -492,6 +500,12 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         # Release all global shared tensors (refs still held by modules until model is unloaded)
         g_tensor_cache.drop_all()
+
+        # Tiered experts (EXL3_EXPERT_BUDGET_GIB): the layers only registered their experts while loading; allocate
+        # the slot pools now, after the cache and every other allocation of the load
+        _st = getattr(self.config, "_expert_store", None)
+        if _st is not None:
+            _st.finalize()
 
         # Mark every attached cache usable.
         for ref in self.cache_weakrefs.values():

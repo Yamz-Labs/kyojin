@@ -434,6 +434,48 @@ def print_quantized_linear(config, linear, quant_args, proxy_err, time_str = "")
     )
 
 
+def build_rwh_blends(linears, capture_H):
+    """EXL3_RWH: per-expert Hessian = routed-weighted H (normalised) blended with the all-token H.
+    beta_e = max(beta0, 1 - n_eff/n_ref) with n_eff = (sum w^2)^2 / sum w^4 (effective routed sample size), so rarely
+    routed experts lean on the all-token Hessian. The blend keeps the all-token H's trace."""
+    beta0 = float(os.environ.get("EXL3_RWH_BETA0", "0.15"))
+    n_ref = float(os.environ.get("EXL3_RWH_NREF", "8192"))
+    done = {}
+    stats = []
+    neffs = []
+    for l in linears:
+        if not l.qmap_q or l.qmap_q in capture_H:
+            continue
+        base = capture_H[l.qmap]
+        hr = capture_H.get(l.cap_rkey)
+        if hr is None:        # expert never routed in the calibration set: all-token H
+            capture_H[l.qmap_q] = base
+            stats.append(1.0)
+            continue
+        n_eff = (hr["sw2"] ** 2 / (hr["sw4"] + 1e-30)).item()
+        if l.cap_rkey.endswith(".input") and l.key.endswith("up_proj"):
+            neffs.append((n_eff, hr["count"]))
+        beta = max(beta0, 1.0 - n_eff / n_ref)
+        Ha, Hr = base["H"], hr["H"]
+        Ha = Ha.to(Hr.device) if Ha.device != Hr.device else Ha
+        ta, tr = Ha.diagonal().sum().clamp_min(1e-30), Hr.diagonal().sum().clamp_min(1e-30)
+        Hb = (1.0 - beta) * Hr * (ta / tr) + beta * Ha
+        d = dict(base)
+        d["H"] = Hb
+        d["finalized"] = False
+        capture_H[l.qmap_q] = d
+        stats.append(beta)
+    if stats:
+        import statistics
+        print(f" -- RWH: {len(stats)} expert Hessians blended, beta mean {statistics.mean(stats):.3f} "
+              f"max {max(stats):.3f} (beta0 {beta0}, n_ref {n_ref:.0f})")
+        if neffs:
+            ne = sorted(n for n, _ in neffs); cn = sorted(c for _, c in neffs)
+            q = lambda v, f: v[min(len(v) - 1, int(f * len(v)))]
+            print(f" -- RWH coverage per expert: routed tokens min {cn[0]} p5 {q(cn, .05)} median {q(cn, .5)}; "
+                  f"n_eff min {ne[0]:.0f} p5 {q(ne, .05):.0f} median {q(ne, .5):.0f}")
+
+
 def group_quant_linears(linears, strategy, capture_H, max_cat_cols = 32768, max_stack = 16):
     """
     Partition linears into groups for batched quantization. Tensors sharing a Hessian (same qmap) at the same
@@ -526,7 +568,7 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
             with Timer() as t:
                 proxy_errs = convert_exl3_group(
                     group,
-                    [capture_H[l.qmap] for l in group],
+                    [capture_H[l.qmap_q or l.qmap] for l in group],
                     quant_args_list,
                     progress_str = f" -- <step>: {group_label(group)}",
                 )
@@ -557,7 +599,7 @@ def quantize_linears_single(args, linears, config, strategy, idx, devices, devic
                 sr = os.path.join(args["work_dir"], f"images/{linear.key}.reg.jpg") \
                     if args["image_dump"] else None
                 proxy_err = linear.convert_exl3(
-                    capture_H[linear.qmap] if state else linear.init_H_data(False),
+                    capture_H[linear.qmap_q or linear.qmap] if state else linear.init_H_data(False),
                     quant_args = quant_args,
                     progress_str = f" -- <step>: {linear.key}",
                     verbose = args["verbose"],
@@ -641,7 +683,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                     quant_args_list = [make_quant_args(args, idx, strategy[l.key], [device_idx]) for l in group]
                     proxy_errs = convert_exl3_group(
                         group,
-                        [capture_H[l.qmap] for l in group],
+                        [capture_H[l.qmap_q or l.qmap] for l in group],
                         quant_args_list,
                     )
                     for linear, quant_args_local, proxy_err in zip(group, quant_args_list, proxy_errs):
@@ -656,7 +698,7 @@ def quantize_linears_parallel(args, linears, config, strategy, idx, devices, dev
                 quant_args_local = make_quant_args(args, idx, strategy[linear.key], [device_idx])
 
                 proxy_err = linear.convert_exl3(
-                    capture_H[linear.qmap] if state else linear.init_H_data(False),
+                    capture_H[linear.qmap_q or linear.qmap] if state else linear.init_H_data(False),
                     quant_args = quant_args_local,
                     verbose = args["verbose"],
                     save_reg = False,
@@ -1367,6 +1409,8 @@ def main(args, job_state):
 
             # Get submodules to quantize
             linears = [m for m in module if isinstance(m, Linear) and m.qmap and m.device is not None]
+            if state is not None:
+                build_rwh_blends(linears, capture_H)
             for linear in linears:
                 assert linear.key in strategy, \
                     f" ## Logic error, no quantization strategy for module {linear.key}"

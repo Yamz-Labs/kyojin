@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
+import os
 import torch
 import weakref
 
@@ -228,6 +229,29 @@ class Qwen3_5MTPModel(Model):
         return {}
 
 
+    def _draft_subhead(self, lm):
+        """The draft head restricted to the first EXL3_DRAFT_VOCAB vocabulary rows (a multiple of 128: the head's output
+        Hadamard works on 128-row blocks, so a prefix of whole blocks is a self-contained EXL3 linear with the same
+        trellis tiles). None when off or when the head is not a plain integer-K EXL3 linear. Every draft is verified by the
+        target, so a draft that misses a rare id only costs an accept, never changes the text."""
+        n = int(os.environ.get("EXL3_DRAFT_VOCAB", "0") or 0) // 128 * 128
+        if n <= 0:
+            return None
+        cache = self.__dict__.setdefault("_dsub", {})
+        if n in cache:
+            return cache[n]
+        sub = None
+        inner = getattr(lm, "inner", None)
+        if inner is not None and type(inner).__name__ == "LinearEXL3" and isinstance(inner.K, int) \
+                and inner.bias is None and lm.pre_scale == 1.0 and lm.post_scale == 1.0 and lm.softcap == 0.0 \
+                and n < lm.out_features:
+            from ..modules.quant.exl3 import LinearEXL3
+            sub = LinearEXL3(None, inner.in_features, n, suh = inner.suh, svh = inner.svh[:n].contiguous(),
+                             trellis = inner.trellis[:, :n // 16].contiguous(), mcg = inner.mcg_tensor,
+                             mul1 = inner.mul1_tensor, out_dtype = inner.out_dtype)
+        cache[n] = sub
+        return sub
+
     def sample_from_state(
         self,
         state: torch.Tensor,
@@ -237,6 +261,30 @@ class Qwen3_5MTPModel(Model):
             ll = self.attached_model().logit_layer_idx
             lm = self.attached_model().modules[ll]
             logits = lm.prepare_for_device(state, params)
+            # EXL3_DRAFT_VOCAB=N: 1-row draft steps read only the first N vocabulary rows of the head (the common BPE ids).
+            # Every 8th step runs both heads and compares the argmax: a language whose tokens sit above N (French, CJK ...)
+            # switches the subset off until the probes agree again.
+            sub = self._draft_subhead(lm) if state.shape[0] * state.shape[1] == 1 and not params.get("export_draft_logits") else None
+            if sub is not None:
+                st = self.__dict__.setdefault("_dsub_st", {"calls": 0, "ema": 0.0, "on": True})
+                st["calls"] += 1
+                probe = st["calls"] % 8 == 0
+                if st["on"] or probe:
+                    sl = sub.forward(logits, params)[..., :min(sub.out_features, self.attached_model().config.vocab_size)].float()
+                    conf, ids = torch.max(sl, dim = -1)
+                    pp = (1.0 / torch.exp(sl - conf.unsqueeze(-1)).sum(-1)).reshape(-1)    # max probability over the subset
+                    if probe:
+                        fl = lm.forward(logits, params)[..., :self.attached_model().config.vocab_size].float()
+                        fconf, fids = torch.max(fl, dim = -1)
+                        miss = float((fids != ids).any().item())
+                        st["ema"] = 0.9 * st["ema"] + 0.1 * miss
+                        st["on"] = st["ema"] < (0.12 if st["on"] else 0.04)     # hysteresis: ~1 % misses on English / code, ~20 % on French
+                        conf, ids = fconf, fids
+                        pp = (1.0 / torch.exp(fl - fconf.unsqueeze(-1)).sum(-1)).reshape(-1)
+                    params["draft_p"] = pp
+                    if params.get("export_draft_conf"):
+                        params["draft_conf"] = conf
+                    return ids
             logits = lm.forward(logits, params)
             if params.get("export_draft_conf"):
                 # Per-position confidence for the generator's draft truncation: the argmax logit

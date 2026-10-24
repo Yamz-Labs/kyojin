@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Callable
 import os
+import time
 import torch
 
 from ..modules.attn import prepare_for_attn
@@ -327,6 +328,7 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
+        span = _FWD_SPAN and x.dim() >= 3 and x.shape[1] <= 8   # (batch, rows, ..): decode/verify only, not prefill chunks
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             if module.caps.get("logits_output"):
@@ -336,7 +338,56 @@ class Model_LSMixin(ABC):
                     break
                 if (num := params.get("last_tokens_only")):
                     x = x[..., -num:, :].contiguous()
+            if span:
+                x = _span_module(module, x, params)
+                continue
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
         return x
 
+
+# EXL3_FWD_SPAN=1 (diagnostic, off by default): decode/verify forwards (<= 8 rows) time every module with a
+# device sync on both sides and print the ones over EXL3_FWD_SPAN_MS (default 150). A sampler thread dumps the
+# main thread's Python stack every 250 ms once a module has run past 400 ms, naming the op of a one-time stall.
+_FWD_SPAN = os.environ.get("EXL3_FWD_SPAN") == "1"
+_FWD_SPAN_MS = float(os.environ.get("EXL3_FWD_SPAN_MS", "150"))
+_span_state = {"t0": None, "name": "", "main": None}
+
+
+def _span_sampler():
+    import sys, traceback
+    last = None
+    while True:
+        time.sleep(0.25)
+        t0 = _span_state["t0"]
+        if t0 is None or time.perf_counter() - t0 < 0.4:
+            continue
+        fr = sys._current_frames().get(_span_state["main"])
+        if fr is None:
+            continue
+        st = traceback.extract_stack(fr)[-14:]
+        key = (t0, tuple((f.filename, f.lineno) for f in st))
+        if key == last:
+            continue
+        last = key
+        print(f"span-stack: {_span_state['name']} +{(time.perf_counter() - t0) * 1e3:.0f} ms", flush=True)
+        for f in st:
+            print(f"span-stack:    {f.filename.split('/')[-1]}:{f.lineno} {f.name}: {(f.line or '')[:100]}", flush=True)
+
+
+def _span_module(module, x, params):
+    import threading
+    if _span_state["main"] is None:
+        _span_state["main"] = threading.get_ident()
+        threading.Thread(target = _span_sampler, daemon = True).start()
+    torch.cuda.synchronize()
+    _span_state["name"] = f"{module.key}[{params.get('layer_instance')}]"
+    t0 = _span_state["t0"] = time.perf_counter()
+    x = module.prepare_for_device(x, params)
+    x = module.forward(x, params)
+    torch.cuda.synchronize()
+    ms = (time.perf_counter() - t0) * 1e3
+    _span_state["t0"] = None
+    if ms >= _FWD_SPAN_MS:
+        print(f"span: {_span_state['name']} {type(module).__name__} {ms:.1f} ms rows={x.shape[1] if x.dim() > 2 else 0}", flush=True)
+    return x

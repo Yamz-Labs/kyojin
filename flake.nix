@@ -66,6 +66,27 @@
             "-Xclang -internal-isystem -Xclang ${pkgs.stdenv.cc.libc.dev}/include"
           ];
 
+          # Narrowed source for the native extension compile: the only
+          # repo files setup.py + torch's cpp_extension read (verified:
+          # no #include escapes exllamav3_ext/, setup.py loads
+          # build_config.py and util/arch_list.py by file path, the
+          # version comes from an AST read of version.py, and README.md
+          # feeds the wheel metadata). Python/docs/tests changes leave
+          # this store path untouched, so the cached .so below survives
+          # them (magic-nix-cache) instead of recompiling (~11 min).
+          exllamaNativeSrc = lib.fileset.toSource {
+            root = ./.;
+            fileset = lib.fileset.unions [
+              ./setup.py
+              ./pyproject.toml
+              ./README.md
+              ./exllamav3/__init__.py
+              ./exllamav3/version.py
+              ./exllamav3/util/arch_list.py
+              ./exllamav3/exllamav3_ext
+            ];
+          };
+
           # 1. Load workspace (pyproject.toml + uv.lock at eval time)
           workspace = inputs.uv2nix.lib.workspace.loadWorkspace {
             workspaceRoot = ./.;
@@ -192,6 +213,55 @@
               withCudaPatch = old: (ignoreCuda old) // (cudaSearchHook old);
               # hipSysIncludes lives at perSystem scope (shared with the
               # runtime JIT wrappers below); referenced as ${hipSysIncludes}.
+              # Engine extension compile env, shared by the cached native
+              # build (exllamav3-ext) and the pure wheel (exllamav3):
+              # setup.py imports torch (cpp_extension) and compiles HIP
+              # sources with the SDK toolchain. torch comes from
+              # buildInputs (importable via PYTHONPATH in the pep517
+              # build); providers must be importable too (torch's
+              # _rocm_init preloads through them at import time).
+              exllamaExtBuildInputs =
+                old:
+                (old.buildInputs or [ ])
+                ++ [
+                  final.torch
+                  rocmSdk
+                  # torch's own top-level imports (needed to import torch
+                  # during setup.py's cpp_extension build).
+                  final.filelock
+                  final."typing-extensions"
+                  final.sympy
+                  final.networkx
+                  final.jinja2
+                  final.fsspec
+                ];
+              exllamaExtPreBuild = ''
+                export HOME="$TMPDIR"
+                echo "ENVDBG CPATH=$CPATH CPLUS=$CPLUS_INCLUDE_PATH CINC=$C_INCLUDE_PATH" >&2
+                echo "ENVDBG NIX_CFLAGS=$NIX_CFLAGS_COMPILE" >&2
+                # NOTE: export ROCM_HOME only (torch reads it for -I).
+                # ROCM_PATH/HIP_PATH are deliberately UNSET: hipcc
+                # self-locates its version + data files correctly without
+                # them, but misdetects (HIP 3.5.0) when they point at a
+                # tree whose share/hip/version it can't resolve.
+                export ROCM_HOME="${rocmSdk}"
+                unset ROCM_PATH HIP_PATH
+                export HIP_DEVICE_LIB_PATH="${rocmSdk}/lib/llvm/amdgcn/bitcode"
+                export PYTORCH_ROCM_ARCH="gfx1151"
+                export EXL3_HIP_DEFINES="EXL3_HIP_STG_PAD"
+                export PYTHONPATH="${rocmProviders}/lib/python3.12/site-packages:$PYTHONPATH"
+                export LD_LIBRARY_PATH="${
+                  lib.makeLibraryPath [
+                    pkgs.gcc.cc.lib
+                    rocmSdk
+                    rocmLibs
+                  ]
+                }:$LD_LIBRARY_PATH"
+                # SDK clang runs outside the cc wrapper: system headers for
+                # host and device passes alike (plus NIX_CFLAGS_COMPILE's
+                # python/SDK includes).
+                export HIPCC_COMPILE_FLAGS_APPEND="${hipSysIncludes} $NIX_CFLAGS_COMPILE -v"
+              '';
             in
             lib.genAttrs nvidiaSibs (
               n:
@@ -276,53 +346,44 @@
                   '';
                 }
               );
-              # Engine extension build: setup.py imports torch (cpp_extension)
-              # and compiles HIP sources with the SDK toolchain. torch comes
-              # from buildInputs (importable via PYTHONPATH in the pep517
-              # build); providers must be importable too (torch's _rocm_init
-              # preloads through them at import time).
-              exllamav3 = prev.exllamav3.overrideAttrs (old: {
-                buildInputs = (old.buildInputs or [ ]) ++ [
-                  final.torch
-                  rocmSdk
-                  # torch's own top-level imports (needed to import torch
-                  # during setup.py's cpp_extension build).
-                  final.filelock
-                  final."typing-extensions"
-                  final.sympy
-                  final.networkx
-                  final.jinja2
-                  final.fsspec
-                ];
+              # Native extension, compiled ONLY from the narrowed native
+              # sources (exllamaNativeSrc above). Its store path (and the
+              # magic-nix-cache entry) is untouched by python/docs/tests
+              # changes, so CI reuses the .so instead of recompiling.
+              "exllamav3-ext" = prev.exllamav3.overrideAttrs (old: {
+                src = exllamaNativeSrc;
+                buildInputs = exllamaExtBuildInputs old;
                 nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
                   rocmSdk
                 ];
-                preBuild = ''
-                  export HOME="$TMPDIR"
-                  echo "ENVDBG CPATH=$CPATH CPLUS=$CPLUS_INCLUDE_PATH CINC=$C_INCLUDE_PATH" >&2
-                  echo "ENVDBG NIX_CFLAGS=$NIX_CFLAGS_COMPILE" >&2
-                  # NOTE: export ROCM_HOME only (torch reads it for -I).
-                  # ROCM_PATH/HIP_PATH are deliberately UNSET: hipcc
-                  # self-locates its version + data files correctly without
-                  # them, but misdetects (HIP 3.5.0) when they point at a
-                  # tree whose share/hip/version it can't resolve.
-                  export ROCM_HOME="${rocmSdk}"
-                  unset ROCM_PATH HIP_PATH
-                  export HIP_DEVICE_LIB_PATH="${rocmSdk}/lib/llvm/amdgcn/bitcode"
-                  export PYTORCH_ROCM_ARCH="gfx1151"
-                  export EXL3_HIP_DEFINES="EXL3_HIP_STG_PAD"
-                  export PYTHONPATH="${rocmProviders}/lib/python3.12/site-packages:$PYTHONPATH"
-                  export LD_LIBRARY_PATH="${
-                    lib.makeLibraryPath [
-                      pkgs.gcc.cc.lib
-                      rocmSdk
-                      rocmLibs
-                    ]
-                  }:$LD_LIBRARY_PATH"
-                  # SDK clang runs outside the cc wrapper: system headers for
-                  # host and device passes alike (plus NIX_CFLAGS_COMPILE's
-                  # python/SDK includes).
-                  export HIPCC_COMPILE_FLAGS_APPEND="${hipSysIncludes} $NIX_CFLAGS_COMPILE -v"
+                preBuild = exllamaExtPreBuild;
+              });
+              # Engine wheel: pure-python build (EXLLAMA_NOCOMPILE, seconds
+              # even on a full-src rebuild) plus the cached .so injected
+              # into site-packages, so ext.py finds the precompiled
+              # extension at the same top-level import path as before.
+              exllamav3 = prev.exllamav3.overrideAttrs (old: {
+                buildInputs = exllamaExtBuildInputs old;
+                nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+                  rocmSdk
+                ];
+                preBuild = exllamaExtPreBuild + ''
+                  # Pure wheel only: the native compile is skipped here;
+                  # the .so comes from exllamav3-ext (postInstall below).
+                  export EXLLAMA_NOCOMPILE=1
+                '';
+                postInstall = (old.postInstall or "") + ''
+                  extSo=${final."exllamav3-ext"}/lib/python3.12/site-packages
+                  copied=0
+                  for f in "$extSo"/exllamav3_ext*.so; do
+                    [ -e "$f" ] || continue
+                    cp "$f" $out/lib/python3.12/site-packages/
+                    copied=1
+                  done
+                  if [ "$copied" -eq 0 ]; then
+                    echo "exllamav3: FATAL: no exllamav3_ext*.so in exllamav3-ext output ($extSo)" >&2
+                    exit 1
+                  fi
                 '';
               });
             };
@@ -524,10 +585,12 @@
           };
 
           # 9. kyojin serve package (house pattern 3: stdenv + makeWrapper).
-          # Ships the three serve entry points with their sibling modules
-          # (serve_metrics.py per flavor + shared startup_health.py) under
-          # $out/share/kyojin/, mirroring the repo tools/ layout so the
-          # scripts' sys.path bootstrap keeps working. Wrappers bake in the
+          # Docker parity: $out/share/kyojin IS tools/ (full tree, zero
+          # curation), mirroring docker/Dockerfile's COPY . . so the scripts'
+          # sys.path bootstrap keeps working. Never an allowlist: past
+          # outages (spec_policy, image_cache, serve_compat) all came from
+          # a new sibling import missing its cp line.
+          # Wrappers bake in the
           # engine venv python, provider/engine PYTHONPATH, EXL3_ROCM_SDK
           # and the Trap-1 LD_PRELOAD; CLI args pass straight through.
           # Runtime JIT (gr_mix/gdn/ple/qsa/kda --genco on first serve)
@@ -538,31 +601,20 @@
             pname = "kyojin";
             # Keep in sync with exllamav3/version.py (pyproject-nix reports
             # local-project version as 0.0.0 since it's setuptools-dynamic).
-            version = "1.5.0";
+            version = "1.5.8";
             src = ./.;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             installPhase = ''
               runHook preInstall
               mkdir -p $out/share/kyojin $out/bin
-              for flavor in glm mimo qwen; do
-                mkdir -p $out/share/kyojin/$flavor
-                cp $src/tools/$flavor/serve.py $src/tools/$flavor/serve_metrics.py \
-                  $out/share/kyojin/$flavor/
-                # qwen/serve.py imports spec_policy at draft-build time
-                # (sibling import, resolved relative to its own file).
-                [ "$flavor" = qwen ] && cp $src/tools/$flavor/spec_policy.py \
-                  $out/share/kyojin/$flavor/
-                # chat templates live next to the scripts (qwen/mimo) or in
-                # lanes/assets (glm); the servers resolve them relative to
-                # their own file, so ship them at the same relative paths.
-                for tmpl in $src/tools/$flavor/chat_template.jinja; do
-                  [ -e "$tmpl" ] && cp "$tmpl" $out/share/kyojin/$flavor/
-                done
-              done
-              mkdir -p $out/share/kyojin/lanes/assets
-              cp $src/tools/lanes/assets/glm53-template-medium.jinja \
-                $out/share/kyojin/lanes/assets/
-              cp $src/tools/startup_health.py $out/share/kyojin/
+              # Docker parity (never allowlist): $out/share/kyojin IS tools/.
+              # serve.py resolves siblings via its own dir (script-dir) +
+              # tools/ (HERE.parent), and glm additionally appends ../qwen
+              # for spec_policy — all preserved by construction. -L
+              # dereferences the ../strix_halo symlinks (image_cache,
+              # serve_metrics). No curation: every future sibling ships.
+              cp -rL $src/tools/* $out/share/kyojin/
+              rm -rf $out/share/kyojin/__pycache__ $out/share/kyojin/*/__pycache__
               # startup_health loads exllamav3.util.hip_compiler by path
               # (without importing exllamav3, to avoid latching engine env);
               # mirror the repo-root layout it expects.
@@ -597,7 +649,7 @@
           # --corpus explicitly anywhere else.
           kyojinBench = pkgs.stdenv.mkDerivation {
             pname = "kyojin-bench";
-            version = "1.5.0";
+            version = "1.5.8";
             src = ./.;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             installPhase = ''
@@ -688,7 +740,7 @@
             pyForHub.pkgs.huggingface-hub;
           kyojinImage = pkgs.dockerTools.buildLayeredImage {
             name = "kyojin";
-            tag = "1.5.0";
+            tag = "1.5.8";
             # Layer root is the cwd here: relative paths only. /tmp must
             # exist (Python tempfile, torch cuda shims); the model volume
             # supplies persistence, container /tmp stays ephemeral.
@@ -857,6 +909,9 @@
             rocm-libs = rocmLibs;
             rocm-providers = rocmProviders;
             inherit (pythonSet) exllamav3;
+            # Native extension alone (narrowed sources, cached across
+            # python-only changes); the .so is injected into .#exllamav3.
+            exllama-ext = pythonSet."exllamav3-ext";
             hip-sysroot = hipSysroot;
             kyojin = kyojinServe;
             docker = kyojinImage;

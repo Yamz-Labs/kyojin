@@ -73,6 +73,8 @@ def make_job(prompt_length, sequence_length, replay_start, *, image=True, image_
         cache=None,
         draft_model=None,
         mtp_draft=mtp,
+        tail_ckpt_max=0,      # prompt-tail checkpoints off: Job._tail_ok() reads it before the normal path
+        wide_prefill_chunks=lambda: (False, False),   # Job.prefill asks whether the model takes wide prefill chunks (SWA-only fused MoE)
     )
     if atomic:
         # Gemma 4: chunks ending inside an image span are extended to cover the whole span

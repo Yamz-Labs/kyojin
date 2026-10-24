@@ -78,7 +78,7 @@ void gr_dots_q8r_kernel
             #pragma unroll
             for (int u = 0; u < JT; ++u)
                 f8[u] = (const int2*) (fn + ((size_t) min(j0 + u, M - 1) * H + h) * D);   // clamped: tail rows are discarded
-            #pragma unroll GRR_DOTS_UNROLL
+            PORT_UNROLL(GRR_DOTS_UNROLL)
             for (int c = threadIdx.x; c < D4 / 2; c += GR_THREADS_A)
             {
                 float wv[JT][8];
@@ -230,7 +230,7 @@ void gr_finalize_q8r_kernel
             #pragma unroll
             for (int h = 0; h < H; ++h) g[q][h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 gsc[H];
-        #pragma unroll GRR_FIN_UNROLL
+        PORT_UNROLL(GRR_FIN_UNROLL)
         for (int i = lane; i < LR; i += 32)
         {
             float ti[RT];

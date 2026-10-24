@@ -57,33 +57,50 @@ def warm_dense_gemm(models, max_rows: int = 4096, log=print) -> dict:
     mem0 = torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
     calls = 0
+    # A cold tune cache (no shipped seed for this library version) pays a rocBLAS screening per key, minutes in total.
+    # Past the budget the rest of the warm-up runs untuned (bit-exact, same output); the first request at a class that
+    # is still missing tunes it then. EXL3_WARM_TUNE_BUDGET_S=0 never defers.
+    budget = float(os.environ.get("EXL3_WARM_TUNE_BUDGET_S", "90"))
+    tune_env = os.environ.get("EXL3_DENSE_GEMM_TUNE")
+    deferred = False
     nclass = (max_rows + 255) // 256
-    for model in models:
-        if model is None:
-            continue
-        for lin in _dense_linears(model):
-            k = lin.in_features
-            # The MTP input projection runs per stream: tokens x hc_count rows (4 x 4096 = class 64).
-            mult = 4 if lin.key.endswith("mtp.fc_hidden") else 1
-            rows_list = list(SMALL_ROWS) + [256 * c for c in range(1, nclass * mult + 1)]
-            for rows in rows_list:
-                # unpadded input (contiguous), and the row-padded input a producer gives (only above PAD_MIN_ROWS, and only
-                # for activations of at most one prefill chunk: the per-stream MTP rows are never producer-padded)
-                pitches = [0]
-                if rows <= max_rows:
-                    p = row_pad_pitch(lin, k, rows, {})
-                    if p:
-                        pitches.append(p)
-                for pitch in pitches:
-                    buf = torch.randn((rows, pitch or k), device=lin.device, dtype=torch.half).mul_(0.1)
-                    x = buf[:, :k] if pitch else buf
-                    lin.forward(x, {})
-                    calls += 1
-                    del buf, x
-            torch.cuda.synchronize()
-    torch.cuda.synchronize()
+    try:
+        for model in models:
+            if model is None:
+                continue
+            for lin in _dense_linears(model):
+                k = lin.in_features
+                # The MTP input projection runs per stream: tokens x hc_count rows (4 x 4096 = class 64).
+                mult = 4 if lin.key.endswith("mtp.fc_hidden") else 1
+                rows_list = list(SMALL_ROWS) + [256 * c for c in range(1, nclass * mult + 1)]
+                for rows in rows_list:
+                    # unpadded input (contiguous), and the row-padded input a producer gives (only above PAD_MIN_ROWS, and only
+                    # for activations of at most one prefill chunk: the per-stream MTP rows are never producer-padded)
+                    pitches = [0]
+                    if rows <= max_rows:
+                        p = row_pad_pitch(lin, k, rows, {})
+                        if p:
+                            pitches.append(p)
+                    for pitch in pitches:
+                        buf = torch.randn((rows, pitch or k), device=lin.device, dtype=torch.half).mul_(0.1)
+                        x = buf[:, :k] if pitch else buf
+                        lin.forward(x, {})
+                        calls += 1
+                        if budget > 0 and not deferred and rows > 255 and time.perf_counter() - t0 > budget:
+                            deferred = True
+                            os.environ["EXL3_DENSE_GEMM_TUNE"] = "0"
+                            log(f"warm_dense_gemm: tune budget {budget:.0f} s used, remaining classes tune at first use")
+                        del buf, x
+                torch.cuda.synchronize()
+        torch.cuda.synchronize()
+    finally:   # an error in a forward must not leave the tune switched off for the rest of the process
+        if deferred:
+            if tune_env is None:
+                os.environ.pop("EXL3_DENSE_GEMM_TUNE", None)
+            else:
+                os.environ["EXL3_DENSE_GEMM_TUNE"] = tune_env
     peak = torch.cuda.max_memory_allocated() - mem0
     torch.cuda.empty_cache()
-    st = {"seconds": time.perf_counter() - t0, "calls": calls, "peak_extra_mib": peak / 2**20}
+    st = {"seconds": time.perf_counter() - t0, "calls": calls, "deferred": deferred, "peak_extra_mib": peak / 2**20}
     log(f"warm_dense_gemm: {calls} calls in {st['seconds']:.1f} s, transient peak {st['peak_extra_mib']:.0f} MiB")
     return st

@@ -21,7 +21,7 @@ namespace cg = cooperative_groups;
 #include "../util.cuh"
 #include "exl3_gemv_kernel.cuh"
 #if defined(USE_ROCM)
-#include "exl3_moe_valu.cuh"   // VALU grouped-MoE decode matvec, opt-in EXL3_MOE_VALU=1 (K2 and K4 experts)
+#include "exl3_moe_valu.cuh"   // VALU grouped-MoE decode matvec, opt-in EXL3_MOE_VALU=1 (K2, K3 and K4 experts)
 #endif
 #include "exl3_devctx.cuh"
 #include <cstdio>
@@ -157,14 +157,23 @@ void moe_had_rows_kernel
         );
 }
 
-__global__ void moe_silu_mul_kernel(const half* gate, const half* up, half* output, int count)
+// limit > 0 is the DeepSeek swiglu_limit: silu(min(gate, limit)) * clamp(up, -limit, limit), the clamp applied
+// before the activation (reference inference/model.py Expert.forward). limit == 0 is the unclamped path, bitwise
+// unchanged. limit is a power-of-two-friendly fp16 value (10.0 is exact), so the clamped up stays an exact half.
+__global__ void moe_silu_mul_kernel(const half* gate, const half* up, half* output, int count, float limit)
 {
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < count; idx += blockDim.x * gridDim.x)
     {
-        const float g = __half2float(gate[idx]);
+        float g = __half2float(gate[idx]);
+        half u = up[idx];
+        if (limit > 0.0f)
+        {
+            g = fminf(g, limit);
+            u = __float2half_rn(fminf(fmaxf(__half2float(u), -limit), limit));
+        }
         const half activated = __float2half_rn(g / (1.0f + expf(-g)));
-        output[idx] = __hmul(activated, up[idx]);
+        output[idx] = __hmul(activated, u);
     }
 }
 
@@ -678,13 +687,19 @@ static void launch_moe_grouped_one
 
 // K (the experts' trellis bitrate, integer or half-integer) is a template parameter of the
 // grouped GEMV, so the entry point dispatches on it; MOE_CFG stays the runtime knob it always was.
-// EXL3_MOE_VALU=1: VALU decode matvec (exl3_moe_valu.cuh) for K2/K4 experts instead of the WMMA body. Default off.
+// EXL3_MOE_VALU: VALU decode matvec (exl3_moe_valu.cuh) for K2/K3/K4 experts instead of the WMMA
+// body. K=2 and K=3 default ON (measured on gfx1151, outputs bitwise-identical at CFG0:
+// K=2 +44..118%, K=3 +15..39% bytes/s over the WMMA body); K=4 defaults OFF (its WMMA body
+// already runs at the DRAM floor, and VALU loses 5..9% at the serving CFG=2).
+// Explicit EXL3_MOE_VALU=0/1 still forces off/on for all three, as before.
 static int g_moe_valu_override = -1;   // test hook (exl3_moe_valu_override): -1 = env, 0/1 = forced
+template <int K>
 static inline bool moe_valu_enabled()
 {
     if (g_moe_valu_override >= 0) return g_moe_valu_override != 0;
-    static const bool on = [] { const char* e = getenv("EXL3_MOE_VALU"); return e && atoi(e) != 0; }();
-    return on;
+    static const int env = [] { const char* e = getenv("EXL3_MOE_VALU"); return e ? atoi(e) : -1; }();
+    if (env >= 0) return env != 0;
+    return K == 1 || K == 2 || K == 3;
 }
 void exl3_moe_valu_override(int64_t v) { g_moe_valu_override = (int) v; }
 
@@ -717,9 +732,9 @@ static void launch_moe_grouped
     int size_k, int size_n, int experts, int assignments, hipStream_t stream
 )
 {
-    if constexpr (!HALF && (K == 2 || K == 4))
+    if constexpr (!HALF && (K == 1 || K == 2 || K == 3 || K == 4))
     {
-        if (moe_valu_enabled() && size_k % 16 == 0 && size_n % 32 == 0)
+        if (moe_valu_enabled<K>() && size_k % 16 == 0 && size_n % 32 == 0)
         {
             launch_moe_valu<K, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream);
             return;
@@ -748,9 +763,10 @@ static void launch_moe_grouped_k
     int size_k, int size_n, int experts, int assignments, hipStream_t stream
 )
 {
-    // k2 = 2 * K: 4 -> K2, 5 -> K2.5, 6 -> K3, 8 -> K4, 10 -> K5, 12 -> K6
+    // k2 = 2 * K: 2 -> K1, 4 -> K2, 5 -> K2.5, 6 -> K3, 8 -> K4, 10 -> K5, 12 -> K6
     switch (k2)
     {
+    case 2: launch_moe_grouped<1, false, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
     case 4: launch_moe_grouped<2, false, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
     case 5: launch_moe_grouped<2, true,  FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
     case 6: launch_moe_grouped<3, false, FP32, TWO>(A, selected, dd, t0, t1, C, size_k, size_n, experts, assignments, stream); break;
@@ -778,6 +794,21 @@ static void launch_moe_weighted_reduce
     (rows, selected, weights, output, width, pos_of);
 }
 
+void exl3_moe_silu_mul_limit(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out, double limit)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(gate.device());
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(gate.dtype() == at::kHalf && up.dtype() == at::kHalf && out.dtype() == at::kHalf &&
+                gate.is_contiguous() && up.is_contiguous() && out.is_contiguous() &&
+                gate.numel() == up.numel() && gate.numel() == out.numel(),
+                "exl3_moe_silu_mul_limit: contiguous fp16 tensors of equal size");
+    TORCH_CHECK(limit >= 0.0 && limit <= 65504.0, "exl3_moe_silu_mul_limit: limit must be in [0, 65504]");
+    const int n = (int) gate.numel();
+    moe_silu_mul_kernel<<<CEIL_DIVIDE(n, 256), 256, 0, stream>>>
+    (reinterpret_cast<const half*>(gate.data_ptr()), reinterpret_cast<const half*>(up.data_ptr()),
+     reinterpret_cast<half*>(out.data_ptr()), n, (float) limit);
+}
+
 void exl3_moe_gfx12_k3
 (
     const at::Tensor& A,
@@ -798,10 +829,12 @@ void exl3_moe_gfx12_k3
     at::Tensor& down_had,
     at::Tensor& down_out,
     double K,
-    bool dedup
+    bool dedup,
+    double act_limit
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    TORCH_CHECK(act_limit >= 0.0 && act_limit <= 65504.0, "exl3_moe_gfx12_k3: act_limit must be in [0, 65504]");
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     int device;
     cuda_check(hipGetDevice(&device));
@@ -811,8 +844,8 @@ void exl3_moe_gfx12_k3
     TORCH_CHECK(exl3_gemv_wmma_family(device) != 0,
                 "exl3_moe_gfx12_k3 requires a WMMA GEMV arch (gfx1200/1201 or gfx1150/1151/1152)");
     const int k2 = (int) (2.0 * K + 0.25);
-    TORCH_CHECK(k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12,
-                "exl3_moe_gfx12_k3 expert bitrate K must be 2, 2.5, 3, 4, 5 or 6");
+    TORCH_CHECK(k2 == 2 || k2 == 4 || k2 == 5 || k2 == 6 || k2 == 8 || k2 == 10 || k2 == 12,
+                "exl3_moe_gfx12_k3 expert bitrate K must be 1, 2, 2.5, 3, 4, 5 or 6");
 
     TORCH_CHECK(A.is_cuda() && A.is_contiguous() && A.dtype() == at::kHalf &&
                 A.dim() == 2 && A.size(1) % 128 == 0 &&
@@ -821,8 +854,8 @@ void exl3_moe_gfx12_k3
     const int rows = A.size(0);
     const int hidden = (int) A.size(1);
     const int top_k = (int) selected.size(1);
-    TORCH_CHECK(top_k == 8 || top_k == 10,
-                "exl3_moe_gfx12_k3 top-k must be 8 (MiMo-V2) or 10 (Qwen3.8)");
+    TORCH_CHECK(top_k == 3 || top_k == 6 || top_k == 8 || top_k == 10,
+                "exl3_moe_gfx12_k3 top-k must be 3 (DeepSeek-V4.1 dspark stages), 6 (DeepSeek-V4.1), 8 (MiMo-V2) or 10 (Qwen3.8)");
     const int assignments = rows * top_k;
     TORCH_CHECK(output.device() == A.device() && output.is_contiguous() && output.dtype() == at::kFloat &&
                 output.dim() == 2 && output.size(0) == rows && output.size(1) == hidden,
@@ -927,7 +960,7 @@ void exl3_moe_gfx12_k3
     const int activation_count = assignments * intermediate;
     const half* gu_ptr = reinterpret_cast<const half*>(gu_out.data_ptr());
     moe_silu_mul_kernel<<<CEIL_DIVIDE(activation_count, 256), 256, 0, stream>>>
-    (gu_ptr, gu_ptr + activation_count, reinterpret_cast<half*>(down_had.data_ptr()), activation_count);
+    (gu_ptr, gu_ptr + activation_count, reinterpret_cast<half*>(down_had.data_ptr()), activation_count, (float) act_limit);
 
     moe_had_rows_kernel<true, false><<<dim3(assignments, intermediate / 128), 32, 0, stream>>>
     (down_had.data_ptr(), down_had.data_ptr(), sel_k, dsuh, dsuh,
@@ -943,6 +976,16 @@ void exl3_moe_gfx12_k3
     const int* pos_of = dd ? dd_s.pos_of : nullptr;
     switch (top_k)
     {
+    case 3:
+        launch_moe_weighted_reduce<3>(reinterpret_cast<const float*>(down_out.data_ptr()), selected_ptr,
+                                      weights_ptr, reinterpret_cast<float*>(output.data_ptr()),
+                                      hidden, rows, pos_of, stream);
+        break;
+    case 6:
+        launch_moe_weighted_reduce<6>(reinterpret_cast<const float*>(down_out.data_ptr()), selected_ptr,
+                                      weights_ptr, reinterpret_cast<float*>(output.data_ptr()),
+                                      hidden, rows, pos_of, stream);
+        break;
     case 8:
         launch_moe_weighted_reduce<8>(reinterpret_cast<const float*>(down_out.data_ptr()), selected_ptr,
                                       weights_ptr, reinterpret_cast<float*>(output.data_ptr()),
@@ -1120,7 +1163,7 @@ void exl3_moe_gfx12_k3_prefill
     const int activation_count = assignments * intermediate;
     half* gu_ptr = reinterpret_cast<half*>(gu_out.data_ptr());
     moe_silu_mul_kernel<<<CEIL_DIVIDE(activation_count, 256), 256, 0, stream>>>
-    (gu_ptr, gu_ptr + activation_count, gu_ptr, activation_count);
+    (gu_ptr, gu_ptr + activation_count, gu_ptr, activation_count, 0.0f);
 
     moe_prefill_had_rows_kernel<true, false>
         <<<dim3(assignments, intermediate / 128), 32, 0, stream>>>

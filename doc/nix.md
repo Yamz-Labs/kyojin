@@ -32,7 +32,8 @@ metadata builds (`uv lock --check`, PEP 517 `get_requires`) keep working.
 ## Building
 
 ```bash
-nix build .#exllamav3      # engine wheel + gfx1151 extension, 8-10 min
+nix build .#exllamav3      # engine wheel + gfx1151 extension
+nix build .#exllama-ext    # native extension alone (narrowed sources)
 nix build .#kyojin         # serve wrappers (qwen/glm/mimo)
 nix build .#torch-rocm     # ROCm torch wheel
 nix build .#rocm-sdk       # expanded SDK tree (headers, hipcc, libhsa)
@@ -40,9 +41,27 @@ nix build .#docker         # OCI image tarball, about 5 GB compressed
 nix run .#kyojin-serve-glm -- --help
 ```
 
-`nix flake check` runs the hook suite plus the CPU test subset
-(`checks.kyojin-tests`, GPUs hidden, bounded runtime). `nix fmt` doubles as
-the clean-tree gate: it exits non-zero when a hook fails or rewrites files.
+The engine package is split for CI caching: `.#exllama-ext` compiles the
+native extension from narrowed sources only (`setup.py`,
+`exllamav3/exllamav3_ext/`, `util/arch_list.py`, plus packaging metadata),
+while `.#exllamav3` builds the pure-python wheel (`EXLLAMA_NOCOMPILE`,
+seconds) with the cached `.so` injected into site-packages — same module,
+same top-level import path, so `exllamav3.ext` finds it via
+`is_precompiled_extension_available()` exactly as before. `nix flake check`
+(hook suite + CPU test subset, `checks.kyojin-tests`, GPUs hidden, bounded
+runtime) therefore never compiles the extension unless native sources
+changed: python/docs/tests PRs reuse the cached `.so` through
+magic-nix-cache and finish in minutes, while native changes still rebuild
+and test it. The serve wrappers, the venv, and the container all consume
+the same package, so nothing drifts. First build compiles the extension
+once (8-10 min); afterwards only native changes pay that again.
+Only these paths invalidate the cached extension: `setup.py`,
+`exllamav3/exllamav3_ext/`, `exllamav3/util/arch_list.py`,
+`exllamav3/version.py`, `pyproject.toml`, `README.md`. Every other change
+(python, tests, tools, docs) reuses the cached `.so`.
+
+`nix fmt` doubles as the clean-tree gate: it exits non-zero when a hook
+fails or rewrites files.
 
 ## ROCm pins
 
@@ -85,7 +104,7 @@ podman run -d --name kyojin --replace \
   -v kyojin-models:/models -p 8000:8000 \
   -e KYOJIN_FLAVOR=qwen \
   -e KYOJIN_MODEL_REPO=yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz \
-  kyojin:1.5.0 -- -c 262144
+  kyojin:1.5.8 -- -c 262144
 curl http://localhost:8000/v1/models
 ```
 

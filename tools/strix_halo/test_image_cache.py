@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import os
 import sys
 import threading
 import unittest
@@ -84,6 +85,42 @@ class ImageCacheTests(unittest.TestCase):
         calls = tower.calls
         cache.get_many([("b", "b")], tower)
         self.assertEqual(tower.calls, calls + 1)
+
+    def test_the_default_policy_is_the_lru_a_server_always_had(self):
+        self.assertEqual(image_cache.DEFAULT_POLICY, "head")
+        self.assertEqual(ImageEmbeddingCache().policy, "head")     # nothing asked for: the policy upstream had
+        cache, tower = ImageEmbeddingCache(max_items=2, max_bytes=0), FakeTower()
+        cache.get_many([("a", "a"), ("b", "b")], tower)            # a used, then b
+        cache.get_many([("b", "b"), ("c", "c")], tower)            # b again, then c: a is the oldest use now
+        calls = tower.calls
+        cache.get_many([("a", "a")], tower)                        # ... so a was the one given up
+        self.assertEqual(tower.calls, calls + 1)
+        calls = tower.calls
+        cache.get_many([("c", "c")], tower)
+        self.assertEqual(tower.calls, calls)                       # c survived: no encode
+
+    def test_the_policy_can_be_asked_for_by_the_environment(self):
+        os.environ[image_cache.POLICY_ENV] = "tail"
+        self.addCleanup(os.environ.pop, image_cache.POLICY_ENV, None)
+        self.assertEqual(ImageEmbeddingCache().policy, "tail")
+        os.environ[image_cache.POLICY_ENV] = "nonsense"
+        with self.assertRaises(ValueError):
+            ImageEmbeddingCache()
+        os.environ.pop(image_cache.POLICY_ENV, None)
+        self.assertEqual(ImageEmbeddingCache().policy, "head")
+        self.assertEqual(ImageEmbeddingCache(policy="tail").policy, "tail")   # explicit beats the environment
+
+    def test_tail_policy_gives_up_the_end_of_a_prompt_first(self):
+        cache, tower = ImageEmbeddingCache(max_items=2, max_bytes=0, policy="tail"), FakeTower()
+        first = cache.get_many([("a", "a"), ("b", "b")], tower)    # one prompt: a sits before b
+        cache.get_many([("a", "a"), ("c", "c")], tower)            # room for two of a, b and c
+        calls = tower.calls                                        # a, b, c encoded
+        # a is the head of both prompts and stays; b and c both sit second, and of two pictures at the same
+        # distance from the start the one from the prompt seen longest ago goes first, so b is the one given up.
+        self.assertIs(cache.get_many([("a", "a")], tower)[0], first[0])
+        self.assertEqual(tower.calls, calls)                       # the head survived: no encode
+        cache.get_many([("b", "b")], tower)
+        self.assertEqual(tower.calls, calls + 1)                   # ... and b was the one given up
 
     def test_eviction_by_bytes(self):
         one = image_cache.embedding_nbytes(FakeEmb(4))

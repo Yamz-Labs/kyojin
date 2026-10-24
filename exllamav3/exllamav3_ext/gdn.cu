@@ -454,7 +454,8 @@ void cuda_recurrent_gated_delta_rule_kernel
     const float scale,
     const int* __restrict__ slots,              // [bsz]
     const int history_stride,                   // max_history + 1
-    const float* __restrict__ D                 // [num_v_heads], MAMBA2 only, else nullptr
+    const float* __restrict__ D,                // [num_v_heads], MAMBA2 only, else nullptr
+    const int* __restrict__ state_base          // [num_slots], EXL3_STATE_REBASE only, else nullptr
 )
 {
     int group = num_v_heads / num_k_heads;
@@ -469,6 +470,11 @@ void cuda_recurrent_gated_delta_rule_kernel
     int state_slot = slots ? slots[bi] : bi;
     float* slot_state = recurrent_state + (size_t) state_slot * slot_size;
     float* final_state = slot_state;
+    // EXL3_STATE_REBASE: commit index of the slot state. 0 unless a speculative round rewound: the
+    // accepted state then lives at history index base without being copied back to index 0. The
+    // per-step snapshots are still written to 1..seqlen-1 and the final state to index 0.
+    const int state_base_i = state_base ? state_base[state_slot] : 0;
+    float* committed_state = slot_state + (size_t) state_base_i * state_size;
     core_attn_out +=    bi * seqlen * num_v_heads * v_head_dim;
 
     // Indexing
@@ -521,13 +527,13 @@ void cuda_recurrent_gated_delta_rule_kernel
             bool last = (s == seqlen - 1);
             float* history_r = first ? nullptr : slot_state + (size_t) s * state_size;
             float* history_w = last  ? final_state : slot_state + (size_t) (s + 1) * state_size;
-            gl_rs_r = first ? final_state + head * (k_head_dim * v_head_dim)
-                            : history_r   + head * (k_head_dim * v_head_dim);
-            gl_rs_w = history_w           + head * (k_head_dim * v_head_dim);
+            gl_rs_r = first ? committed_state + head * (k_head_dim * v_head_dim)
+                            : history_r       + head * (k_head_dim * v_head_dim);
+            gl_rs_w = history_w               + head * (k_head_dim * v_head_dim);
         }
         else
         {
-            gl_rs_r = final_state + head * (k_head_dim * v_head_dim);
+            gl_rs_r = committed_state + head * (k_head_dim * v_head_dim);
             gl_rs_w = gl_rs_r;
         }
 
@@ -689,7 +695,8 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     const float scale,
     const int* __restrict__ slots,              // [bsz]
     const int history_stride,                   // max_history + 1
-    const float* __restrict__ D                 // unused, matches the generic kernel signature
+    const float* __restrict__ D,                // unused, matches the generic kernel signature
+    const int* __restrict__ state_base          // [num_slots], EXL3_STATE_REBASE only, else nullptr
 )
 {
 #if QWG_ABL_RT
@@ -713,6 +720,11 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     int state_slot = slots ? slots[bi] : bi;
     float* slot_state = recurrent_state + (size_t) state_slot * slot_size;
     float* final_state = slot_state;
+    // EXL3_STATE_REBASE: commit index of the slot state. 0 unless a speculative round rewound: the
+    // accepted state then lives at history index base without being copied back to index 0. The
+    // per-step snapshots are still written to 1..seqlen-1 and the final state to index 0.
+    const int state_base_i = state_base ? state_base[state_slot] : 0;
+    float* committed_state = slot_state + (size_t) state_base_i * state_size;
     core_attn_out +=    bi * seqlen * num_v_heads * HEAD_DIM;
 
     int t = threadIdx.x;
@@ -749,13 +761,13 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             bool last = (s == seqlen - 1);
             float* history_r = first ? nullptr : slot_state + (size_t) s * state_size;
             float* history_w = last  ? final_state : slot_state + (size_t) (s + 1) * state_size;
-            gl_rs_r = first ? final_state + head * HEAD_STATE_SIZE
-                            : history_r   + head * HEAD_STATE_SIZE;
-            gl_rs_w = history_w           + head * HEAD_STATE_SIZE;
+            gl_rs_r = first ? committed_state + head * HEAD_STATE_SIZE
+                            : history_r       + head * HEAD_STATE_SIZE;
+            gl_rs_w = history_w               + head * HEAD_STATE_SIZE;
         }
         else
         {
-            gl_rs_r = final_state + head * HEAD_STATE_SIZE;
+            gl_rs_r = committed_state + head * HEAD_STATE_SIZE;
             gl_rs_w = gl_rs_r;
         }
 
@@ -893,6 +905,7 @@ void cuda_recurrent_gated_delta_rule_gr
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
+    const c10::optional<at::Tensor>& state_base,
     Graph* graph
 )
 {
@@ -957,6 +970,17 @@ void cuda_recurrent_gated_delta_rule_gr
                     "slots must be on the same device as mixed_qkv");
     }
 
+    // EXL3_STATE_REBASE: optional per-slot committed-state history index (int32 [num_slots]); nullptr
+    // reproduces the pre-rebase read at index 0 exactly.
+    TORCH_CHECK_DTYPE_OPT(state_base, kInt);
+    const int* state_base_ptr = (const int*) OPTPTR(state_base);
+    if (state_base_ptr)
+    {
+        TORCH_CHECK(state_base.value().dim() == 1, "state_base must be [num_slots]");
+        TORCH_CHECK(state_base.value().device() == mixed_qkv.device(),
+                    "state_base must be on the same device as mixed_qkv");
+    }
+
     int v_split = (bsz == 1 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
     // KDA (channelwise) decode: v_split 1 by default. With v_split 4 each block reads 128 B slices of 512 B state
     // rows and only 128 of its 512 threads touch the state: 85 us vs 52 us per layer in scratch/kd3/mb5.py.
@@ -996,9 +1020,11 @@ void cuda_recurrent_gated_delta_rule_gr
         scale,                                  \
         slots_ptr,                              \
         history_stride,                         \
-        QWG_D_ARG
+        QWG_D_ARG,                              \
+        state_base_ptr
 
-    // recurrent_state is kernel param 3 and slots is param 12, patched when running in a graph
+    // recurrent_state is kernel param 3, slots is param 12 and state_base is param 15, patched when
+    // running in a graph
     #define LAUNCH_RULE(...)                                                              \
     {                                                                                     \
         __VA_ARGS__<<<blocks, threads, 0, stream>>>(KERNEL_ARGS);                         \
@@ -1006,6 +1032,7 @@ void cuda_recurrent_gated_delta_rule_gr
         {                                                                                 \
             graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_state, 3);              \
             graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_slots, 12);             \
+            graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_base, 15);              \
             graph->record_param((void*) &__VA_ARGS__, GP_end, 0);                         \
         }                                                                                 \
     }
@@ -1088,12 +1115,13 @@ void cuda_recurrent_gated_delta_rule
     int k_head_dim,
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
-    bool history
+    bool history,
+    const c10::optional<at::Tensor>& state_base
 )
 {
     cuda_recurrent_gated_delta_rule_gr(
         mixed_qkv, g, beta, recurrent_state, core_attn_out,
-        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, nullptr);
+        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, state_base, nullptr);
 }
 
 // Mamba2 decode helper for the BC graph: reads the in_proj output [z, xBC, dt] (float, row
@@ -1315,9 +1343,11 @@ void cuda_recurrent_mamba2_gr
         scale,                                  \
         slots_ptr,                              \
         history_stride,                         \
-        (const float*) D.data_ptr()
+        (const float*) D.data_ptr(),            \
+        (const int*) nullptr
 
-    // recurrent_state is kernel param 3 and slots is param 12, patched when running in a graph
+    // recurrent_state is kernel param 3 and slots is param 12, patched when running in a graph;
+    // state_base (param 15) is always null here (Mamba2 is out of scope for the rebase)
     #define LAUNCH_RULE(...)                                                              \
     {                                                                                     \
         __VA_ARGS__<<<blocks, threads, 0, stream>>>(KERNEL_ARGS);                         \
@@ -1325,6 +1355,7 @@ void cuda_recurrent_mamba2_gr
         {                                                                                 \
             graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_state, 3);              \
             graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_slots, 12);             \
+            graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_base, 15);              \
             graph->record_param((void*) &__VA_ARGS__, GP_end, 0);                         \
         }                                                                                 \
     }

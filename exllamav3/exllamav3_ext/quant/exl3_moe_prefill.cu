@@ -18,16 +18,21 @@
 #include <cuda_fp16.h>
 #endif
 #include <c10/cuda/CUDAGuard.h>
+#include <ATen/ops/empty.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "../util.h"
 #include "../util.cuh"
 #include "hadamard_inner.cuh"
 #if defined(USE_ROCM)
 #include "../hip/hip_mma.cuh"
+#else
+#include "../ptx.cuh"
 #endif
 #include "exl3_dq.cuh"
 #include "exl3_moe_prefill.cuh"
 #include <cstdlib>
+#include <vector>
+#include <algorithm>
 #include <type_traits>
 
 #if defined(USE_ROCM)
@@ -58,7 +63,9 @@ __global__ void mpw_metadata_kernel
     int* num_tiles_out,
     int experts,
     int assignments,
-    int mt
+    int mt,
+    const int* egroup = nullptr,    // mixed-K: only experts with egroup[e] == group get tiles
+    int group = 0
 )
 {
     if (order)
@@ -85,7 +92,8 @@ __global__ void mpw_metadata_kernel
     {
         const int e = base + threadIdx.x;
         const int64_t count = e < experts ? expert_count[e] : 0;
-        const int nch = (int) ((count + mt - 1) / mt);
+        const bool mine = !egroup || e >= experts || egroup[e] == group;
+        const int nch = mine ? (int) ((count + mt - 1) / mt) : 0;
         int64_t so = count; int sc = nch;
         #pragma unroll
         for (int o = 1; o < 32; o <<= 1)
@@ -159,7 +167,9 @@ void mpw_gather_had_kernel
     int assignments,
     int top_k,
     int width,
-    int projections
+    int projections,
+    int lda,                             // A row pitch (elements, >= width)
+    int a_rows                           // rows of A; token rows past it (aligned-layout padding) read as zero
 )
 {
     const int blocks = width / 128;
@@ -170,7 +180,8 @@ void mpw_gather_had_kernel
     const int blk = job % blocks;
     const int r = (job / blocks) % rows;
     const int proj = job / ((int64_t) rows * blocks);
-    const half4 v0 = ((const half4*) (A + (int64_t) r * width + blk * 128))[t];
+    const half4 v0 = r < a_rows ? ((const half4*) (A + (int64_t) r * lda + blk * 128))[t]
+                                : half4(__float2half2_rn(0.f), __float2half2_rn(0.f));
     for (int k = 0; k < top_k; ++k)
     {
         const int64_t orig = (int64_t) r * top_k + k;
@@ -258,7 +269,9 @@ void mpw_reduce_had_kernel
     float* __restrict__ output,
     int rows,
     int top_k,
-    int width
+    int width,
+    const half* __restrict__ addend,
+    int addend_rows
 )
 {
     const int blocks = width / 128;
@@ -284,6 +297,15 @@ void mpw_reduce_had_kernel
         sum.y += h1 * r * __high2float(sc.x);
         sum.z += h2 * r * __low2float(sc.y);
         sum.w += h3 * r * __high2float(sc.y);
+    }
+    // Shared-expert output (fp16 GEMM result) added in the epilogue (EXL3_NC2_SHARED_FUSE): the exact
+    // fp16 -> fp32 widen and the single fp32 add of the `y.copy_(y_)` + `final += y` pair it replaces.
+    // Rows past addend_rows (alignment dummies) skip it.
+    if (addend && row < addend_rows)
+    {
+        const half4 a = ((const half4*) (addend + row * width + blk * 128))[t];
+        sum.x += __low2float(a.x); sum.y += __high2float(a.x);
+        sum.z += __low2float(a.y); sum.w += __high2float(a.y);
     }
     ((float4*) (output + row * width + blk * 128))[t] = sum;
 }
@@ -315,7 +337,9 @@ void mpw_gather_had2_kernel
     const int64_t* __restrict__ suh_1,
     int assignments,
     int top_k,
-    int width
+    int width,
+    int lda,
+    int a_rows
 )
 {
     const int blocks = width / 128;
@@ -334,7 +358,8 @@ void mpw_gather_had2_kernel
         p0_l = suh_0[e];
         p1_l = suh_1[e];
     }
-    const half4 v0 = ((const half4*) (A + r * width + blk * 128))[t];
+    const half4 v0 = r < a_rows ? ((const half4*) (A + (int64_t) r * lda + blk * 128))[t]
+                                : half4(__float2half2_rn(0.f), __float2half2_rn(0.f));
     #pragma unroll 5
     for (int k = 0; k < top_k; ++k)
     {
@@ -1516,6 +1541,7 @@ void launch_gemm_cb
         }
         switch (k2)
         {
+            case 2: MPW2_K(1, false)
             case 4: MPW2_K(2, false)
             case 5: MPW2_K(2, true)
             case 6: MPW2_K(3, false)
@@ -1535,6 +1561,7 @@ void launch_gemm_cb
           else { mpw_gemm_kernel<b, h, OUT_FP32, 0, 2, CB, 0><<<grid, mpw::THREADS, 0, stream>>>(MPW_ARGS); } break; }
     switch (k2)
     {
+        case 2: MPW_K(1, false)
         case 4: MPW_K(2, false)
         case 5:
         {
@@ -1615,17 +1642,24 @@ void exl3_moe_prefill_wmma
     at::Tensor& tiles,
     at::Tensor& tile_count,
     double act_limit,
-    bool mcg
+    bool mcg,
+    const c10::optional<at::Tensor>& addend
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    TORCH_CHECK(A.dtype() == at::kHalf && A.is_contiguous() && A.dim() == 2, "A must be fp16 [rows, H]");
-    const int rows = A.size(0);
+    // A may be a producer's row-padded view (exl3.row_pad_pitch): unit column stride, row pitch >= H, 8-byte rows
+    TORCH_CHECK(A.dtype() == at::kHalf && A.dim() == 2 && A.stride(1) == 1 && A.stride(0) >= A.size(1) &&
+                A.stride(0) % 4 == 0, "A must be fp16 [rows, H] with unit column stride");
+    // A may also be SHORTER than selected (EXL3_MPW_SHORT_A): rows past A.size(0) are the aligned layout's
+    // dummy rows, gathered as zeros (the bytes torch.cat((y, zeros)) appended before)
+    const int rows = selected.size(0);
+    const int a_rows = A.size(0);
     const int H = A.size(1);
+    const int lda = (int) A.stride(0);
     TORCH_CHECK(selected.dtype() == at::kLong && selected.is_contiguous() && selected.dim() == 2 &&
-                selected.size(0) == rows, "selected must be int64 [rows, top_k]");
+                a_rows >= 1 && a_rows <= rows, "selected must be int64 [rows >= A rows, top_k]");
     const int top_k = selected.size(1);
     const int assignments = rows * top_k;
     const int64_t experts = gate_trellis.numel();
@@ -1649,6 +1683,16 @@ void exl3_moe_prefill_wmma
     TORCH_CHECK(down_out.dtype() == at::kFloat && down_out.numel() >= (int64_t) assignments * H, "down_out too small");
     TORCH_CHECK(expert_offsets.dtype() == at::kLong && expert_offsets.numel() >= experts + 1, "expert_offsets");
     TORCH_CHECK(inverse_order.dtype() == at::kLong && inverse_order.numel() >= assignments, "inverse_order");
+    const half* add_ptr = nullptr;
+    int add_rows = 0;
+    if (addend.has_value())
+    {
+        const at::Tensor& ad = addend.value();
+        TORCH_CHECK(ad.dtype() == at::kHalf && ad.is_contiguous() && ad.dim() == 2 && ad.size(1) == H &&
+                    ad.size(0) <= rows && ad.device() == A.device(), "addend must be fp16 [<= rows, H] contiguous");
+        add_ptr = (const half*) ad.data_ptr();
+        add_rows = ad.size(0);
+    }
     const int kern = mpw_kern(assignments, experts);
     const int slots = tile_slots(assignments, experts, kern);
     TORCH_CHECK(tiles.dtype() == at::kInt && tiles.numel() >= slots, "tiles too small");
@@ -1666,20 +1710,20 @@ void exl3_moe_prefill_wmma
     ((const int64_t*) expert_count.data_ptr(), ord, offs, inv, tl, tc, (int) experts, assignments, mpw_mt(kern));
 
     const char* glue_env = getenv("EXL3_MPW_GLUE");   // read per launch (A/B harnesses flip it in-process)
-    const bool glue2 = glue_env && glue_env[0] == '1' && top_k >= 1 && top_k <= MPW_GLUE_TK_MAX;
+    const bool glue2 = glue_env && glue_env[0] == '1' && top_k >= 1 && top_k <= MPW_GLUE_TK_MAX && !add_ptr;
     if (glue2)
     {
         const int64_t g2jobs = (int64_t) (assignments / top_k) * (H / 128);
         mpw_gather_had2_kernel<<<CEIL_DIVIDE(g2jobs, 8), 256, 0, stream>>>
         ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
-         assignments, top_k, H);
+         assignments, top_k, H, lda, a_rows);
     }
     else
     {
     const int64_t gjobs = (int64_t) 2 * (assignments / top_k) * (H / 128);
     mpw_gather_had_kernel<<<CEIL_DIVIDE(gjobs, 8), 256, 0, stream>>>
     ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
-     assignments, top_k, H, 2);
+     assignments, top_k, H, 2, lda, a_rows);
     }
 
     launch_gemm<false>((float) K_gu, dim3(I / mpw::NT, slots, 2), stream,
@@ -1706,9 +1750,153 @@ void exl3_moe_prefill_wmma
     else
     mpw_reduce_had_kernel<<<CEIL_DIVIDE(rjobs, 8), 256, 0, stream>>>
     ((const float*) down_out.data_ptr(), sel, (const float*) weights.data_ptr(), inv, P(down_svh),
-     (float*) output.data_ptr(), rows, top_k, H);
+     (float*) output.data_ptr(), rows, top_k, H, add_ptr, add_rows);
     cuda_check(hipPeekAtLastError());
 }
+
+// Mixed-K layer in ONE pipeline: global expert ids, E-length pointer tables (entry e = the table of the K group
+// that owns expert e), one metadata/gather/act/reduce pass, and only the two GEMMs launched once per K group over
+// that group's tile list (tiles [G, slots], tile_count [G]). Same per-row math and reduce order as one
+// exl3_moe_prefill_wmma call per group on compacted picks.
+void exl3_moe_prefill_wmma_mixed
+(
+    const at::Tensor& A,
+    at::Tensor& output,
+    const at::Tensor& selected,
+    const at::Tensor& weights,
+    const at::Tensor& order,
+    const at::Tensor& expert_count,
+    const at::Tensor& gate_trellis, const at::Tensor& gate_suh, const at::Tensor& gate_svh,
+    const at::Tensor& up_trellis, const at::Tensor& up_suh, const at::Tensor& up_svh,
+    const at::Tensor& down_trellis, const at::Tensor& down_suh, const at::Tensor& down_svh,
+    const at::Tensor& egroup,                 // int32 [E]
+    const std::vector<double>& K_gu,
+    const std::vector<double>& K_down,
+    const std::vector<int64_t>& mcg,
+    const std::vector<int64_t>& group_experts,
+    at::Tensor& gu_had,
+    at::Tensor& gu_out,
+    at::Tensor& down_out,
+    at::Tensor& expert_offsets,
+    at::Tensor& inverse_order,
+    at::Tensor& tiles,                        // int32 [G, slots]
+    at::Tensor& tile_count,                   // int32 [>= G]
+    double act_limit,
+    const c10::optional<at::Tensor>& addend
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    const int G = (int) K_gu.size();
+    TORCH_CHECK(G >= 1 && (int) K_down.size() == G && (int) mcg.size() == G && (int) group_experts.size() == G, "group lists");
+    TORCH_CHECK(A.dtype() == at::kHalf && A.dim() == 2 && A.stride(1) == 1 && A.stride(0) >= A.size(1) &&
+                A.stride(0) % 4 == 0, "A must be fp16 [rows, H] with unit column stride");
+    const int rows = selected.size(0);
+    const int a_rows = A.size(0);
+    const int H = A.size(1);
+    const int lda = (int) A.stride(0);
+    TORCH_CHECK(selected.dtype() == at::kLong && selected.is_contiguous() && selected.dim() == 2 &&
+                a_rows >= 1 && a_rows <= rows, "selected must be int64 [rows >= A rows, top_k]");
+    const int top_k = selected.size(1);
+    const int assignments = rows * top_k;
+    const int64_t experts = gate_trellis.numel();
+    TORCH_CHECK(experts < (1 << (31 - mpw::TILE_SHIFT)), "too many experts");
+    TORCH_CHECK(H % 128 == 0, "hidden width must be a multiple of 128");
+    TORCH_CHECK(output.dtype() == at::kFloat && output.is_contiguous() &&
+                output.size(0) == rows && output.size(1) == H, "output must be fp32 [rows, H]");
+    TORCH_CHECK(weights.dtype() == at::kFloat && weights.is_contiguous() && weights.sizes() == selected.sizes(),
+                "weights must be fp32 [rows, top_k]");
+    TORCH_CHECK(order.dtype() == at::kLong && order.numel() == assignments, "order must be int64 [A]");
+    TORCH_CHECK(expert_count.dtype() == at::kLong && expert_count.numel() >= experts, "expert_count");
+    check_table(gate_trellis, experts, "gate_trellis"); check_table(gate_suh, experts, "gate_suh");
+    check_table(gate_svh, experts, "gate_svh"); check_table(up_trellis, experts, "up_trellis");
+    check_table(up_suh, experts, "up_suh"); check_table(up_svh, experts, "up_svh");
+    check_table(down_trellis, experts, "down_trellis"); check_table(down_suh, experts, "down_suh");
+    check_table(down_svh, experts, "down_svh");
+    TORCH_CHECK(egroup.dtype() == at::kInt && egroup.numel() >= experts, "egroup");
+    TORCH_CHECK(gu_had.dtype() == at::kHalf && gu_had.numel() >= (int64_t) 2 * assignments * H, "gu_had too small");
+    TORCH_CHECK(gu_out.dtype() == at::kHalf && gu_out.dim() == 2 && gu_out.size(0) >= 2 * assignments, "gu_out too small");
+    const int I = gu_out.size(1);
+    TORCH_CHECK(I % 128 == 0, "intermediate width must be a multiple of 128");
+    TORCH_CHECK(down_out.dtype() == at::kFloat && down_out.numel() >= (int64_t) assignments * H, "down_out too small");
+    TORCH_CHECK(expert_offsets.dtype() == at::kLong && expert_offsets.numel() >= experts + 1, "expert_offsets");
+    TORCH_CHECK(inverse_order.dtype() == at::kLong && inverse_order.numel() >= assignments, "inverse_order");
+    const half* add_ptr = nullptr;
+    int add_rows = 0;
+    if (addend.has_value())
+    {
+        const at::Tensor& ad = addend.value();
+        TORCH_CHECK(ad.dtype() == at::kHalf && ad.is_contiguous() && ad.dim() == 2 && ad.size(1) == H &&
+                    ad.size(0) <= rows && ad.device() == A.device(), "addend must be fp16 [<= rows, H] contiguous");
+        add_ptr = (const half*) ad.data_ptr();
+        add_rows = ad.size(0);
+    }
+    const int kern = mpw_kern(assignments, experts);
+    const int slots = tile_slots(assignments, experts, kern);
+    TORCH_CHECK(tiles.dtype() == at::kInt && tiles.dim() == 2 && tiles.size(0) >= G && tiles.size(1) >= slots, "tiles too small");
+    TORCH_CHECK(tile_count.dtype() == at::kInt && tile_count.numel() >= G, "tile_count");
+
+    const int64_t* sel = (const int64_t*) selected.data_ptr();
+    const int64_t* ord = (const int64_t*) order.data_ptr();
+    int64_t* offs = (int64_t*) expert_offsets.data_ptr();
+    int64_t* inv = (int64_t*) inverse_order.data_ptr();
+    int* tl = (int*) tiles.data_ptr();
+    int* tc = (int*) tile_count.data_ptr();
+    const int tstride = (int) tiles.size(1);
+    auto P = [] (const at::Tensor& t) { return (const int64_t*) t.data_ptr(); };
+
+    for (int g = 0; g < G; ++g)
+        mpw_metadata_kernel<<<g == 0 ? CEIL_DIVIDE(assignments, 256) : 1, 256, 0, stream>>>
+        ((const int64_t*) expert_count.data_ptr(), g == 0 ? ord : nullptr, offs, inv, tl + (int64_t) g * tstride, tc + g,
+         (int) experts, assignments, mpw_mt(kern), (const int*) egroup.data_ptr(), g);
+
+    const char* glue_env = getenv("EXL3_MPW_GLUE");
+    const bool glue2 = glue_env && glue_env[0] == '1' && top_k >= 1 && top_k <= MPW_GLUE_TK_MAX && !add_ptr;
+    if (glue2)
+    {
+        const int64_t g2jobs = (int64_t) (assignments / top_k) * (H / 128);
+        mpw_gather_had2_kernel<<<CEIL_DIVIDE(g2jobs, 8), 256, 0, stream>>>
+        ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
+         assignments, top_k, H, lda, a_rows);
+    }
+    else
+    {
+        const int64_t gjobs = (int64_t) 2 * (assignments / top_k) * (H / 128);
+        mpw_gather_had_kernel<<<CEIL_DIVIDE(gjobs, 8), 256, 0, stream>>>
+        ((const half*) A.data_ptr(), (half*) gu_had.data_ptr(), sel, inv, P(gate_suh), P(up_suh),
+         assignments, top_k, H, 2, lda, a_rows);
+    }
+
+    auto gslots = [&] (int g) { return std::min(slots, (int) CEIL_DIVIDE(assignments, mpw_mt(kern)) + (int) group_experts[g]); };
+    for (int g = 0; g < G; ++g)
+        launch_gemm<false>((float) K_gu[g], dim3(I / mpw::NT, gslots(g), 2), stream,
+            (const half*) gu_had.data_ptr(), (int64_t) assignments * H, offs, tl + (int64_t) g * tstride, tc + g,
+            P(gate_trellis), P(up_trellis), gu_out.data_ptr(), (int64_t) assignments * I, H, I, mcg[g] != 0, kern);
+
+    const int64_t ajobs = (int64_t) assignments * (I / 128);
+    mpw_act_kernel<<<CEIL_DIVIDE(ajobs, 8), 256, 0, stream>>>
+        ((half*) gu_out.data_ptr(), sel, ord, P(gate_svh), P(up_svh), P(down_suh), assignments, I,
+         (float) act_limit);
+
+    for (int g = 0; g < G; ++g)
+        launch_gemm<true>((float) K_down[g], dim3(H / mpw::NT, gslots(g), 1), stream,
+            (const half*) gu_out.data_ptr(), 0, offs, tl + (int64_t) g * tstride, tc + g,
+            P(down_trellis), P(down_trellis), down_out.data_ptr(), 0, I, H, mcg[g] != 0, kern);
+
+    const int64_t rjobs = (int64_t) rows * (H / 128);
+#define MPW_RED2M(TKV) mpw_reduce_had2_kernel<TKV><<<CEIL_DIVIDE(rjobs, 8), 256, 0, stream>>> \
+    ((const float*) down_out.data_ptr(), sel, (const float*) weights.data_ptr(), inv, P(down_svh), \
+     (float*) output.data_ptr(), rows, H)
+    if (glue2 && top_k == 10) { MPW_RED2M(10); }
+    else if (glue2 && top_k == 8) { MPW_RED2M(8); }
+    else
+    mpw_reduce_had_kernel<<<CEIL_DIVIDE(rjobs, 8), 256, 0, stream>>>
+    ((const float*) down_out.data_ptr(), sel, (const float*) weights.data_ptr(), inv, P(down_svh),
+     (float*) output.data_ptr(), rows, top_k, H, add_ptr, add_rows);
+#undef MPW_RED2M
+    cuda_check(hipPeekAtLastError());
+}
+
 
 void exl3_moe_prefill_gemm_test
 (
@@ -1751,6 +1939,62 @@ void exl3_moe_prefill_gemm_test
     else
         launch_gemm<false>((float) K, dim3(n_size / mpw::NT, slots, nz), stream,
             (const half*) A.data_ptr(), (int64_t) rows * a_ld, offs, tl, tc, tt, tt, C.data_ptr(), (int64_t) rows * n_size, size_k, n_size, false, kern, a_ld);
+    cuda_check(hipPeekAtLastError());
+}
+
+// One-group tile metadata for exl3_dense_mpw2, built on the device from the row count (no host copy):
+// expert 0 holds every row, m-tile i -> tile id i, table[0] = the trellis pointer.
+__global__ void mpw_dense_metadata_kernel(int64_t* offs, int* tiles, int* num_tiles, int64_t* table,
+                                          int64_t trellis, int rows, int mt)
+{
+    const int n = (rows + mt - 1) / mt;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) tiles[i] = i;
+    if (threadIdx.x == 0) { offs[0] = 0; offs[1] = rows; *num_tiles = n; table[0] = trellis; }
+}
+
+// Dense EXL3 GEMM through the expert prefill kernel (EXL3_DENSE_MPW2, exl3.py): C = A @ W_inner, had domain, no
+// input/output transforms, W decoded from the trellis per tile (no fp16 weight round trip). Same launch as the expert
+// GEMM with one group; bounds proven for MT 128 / NW 2, N % 256 == 0.
+void exl3_dense_mpw2
+(
+    const at::Tensor& A,
+    at::Tensor& C,
+    const at::Tensor& trellis,
+    double K
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(A.dim() == 2 && A.stride(1) == 1 && A.dtype() == at::kHalf, "exl3_dense_mpw2: A must be fp16 [rows, K] rows");
+    const int rows = A.size(0);
+    const int size_k = A.size(1);
+    const int a_ld = (int) A.stride(0);
+    const int size_n = C.size(1);
+    const int bits = (int) K;
+    TORCH_CHECK(K == 3.0 || K == 4.0, "exl3_dense_mpw2: K must be 3 or 4");
+    TORCH_CHECK(trellis.dtype() == at::kShort && trellis.is_contiguous() && trellis.dim() == 3 &&
+                trellis.size(0) * 16 == size_k && trellis.size(1) * 16 == size_n && trellis.size(2) == 16 * bits,
+                "exl3_dense_mpw2: trellis shape");
+    TORCH_CHECK(C.dim() == 2 && C.size(0) == rows && C.is_contiguous() &&
+                (C.dtype() == at::kHalf || C.dtype() == at::kFloat), "exl3_dense_mpw2: C shape");
+    TORCH_CHECK(rows >= 1 && size_k % (mpw::KS * 16) == 0 && size_n % 256 == 0, "exl3_dense_mpw2: unsupported shape");
+    const int kern = 2;
+    const int mt = mpw_mt(kern);
+    TORCH_CHECK(mt == 128 && mpw_nw(size_n) == 2, "exl3_dense_mpw2: needs MT 128 / NW 2 (MPW_MT, MPW_NW, EXL3_MPW2_VARIANT)");
+    const int slots = tile_slots(rows, 1, kern);
+    at::Tensor meta = at::empty({ 3 }, A.options().dtype(at::kLong));
+    at::Tensor tmeta = at::empty({ slots + 1 }, A.options().dtype(at::kInt));
+    int64_t* offs = (int64_t*) meta.data_ptr();
+    int64_t* tt = offs + 2;
+    int* tl = (int*) tmeta.data_ptr();
+    int* tc = tl + slots;
+    mpw_dense_metadata_kernel<<<1, 64, 0, stream>>>(offs, tl, tc, tt, (int64_t) trellis.data_ptr(), rows, mt);
+    if (C.dtype() == at::kFloat)
+        launch_gemm<true>((float) K, dim3(size_n / mpw::NT, slots, 1), stream,
+            (const half*) A.data_ptr(), 0, offs, tl, tc, tt, tt, C.data_ptr(), 0, size_k, size_n, false, kern, a_ld);
+    else
+        launch_gemm<false>((float) K, dim3(size_n / mpw::NT, slots, 1), stream,
+            (const half*) A.data_ptr(), 0, offs, tl, tc, tt, tt, C.data_ptr(), 0, size_k, size_n, false, kern, a_ld);
     cuda_check(hipPeekAtLastError());
 }
 

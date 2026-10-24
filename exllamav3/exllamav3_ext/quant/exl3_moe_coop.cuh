@@ -59,7 +59,8 @@ struct MoeCoopParams
     int* ctr_b;                 // (MAX_BSZN, Ho / 128) completion counters of the down stage
     int ctr_a_len;
     int ctr_b_len;
-    int ksplit_a;               // split-k blocks per chunk per stage (launcher; partial rows at slot + q * slots)
+    int ksplit_a;               // split-k blocks per chunk per stage (launcher; partial rows at slot + q * slots);
+                                // -G: stream-K over a grid of G blocks
     int ksplit_b;
     int dbg;                    // diagnostics (EXL3_MOE_COOP_DBG): 1 skip A epilogue, 2 skip B reduction
     int* runs;                  // run table (bsz > 1): [n_runs, -, run_start[slots_max + 1], order[slots_max]]

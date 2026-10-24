@@ -38,14 +38,16 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     {
         exl3_gemm_kernel_inner
         <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
-        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh);
+        (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, size_n, locks, svh);
 
-        A_ += 16 * size_k;
-        if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
-        else                  C_ = (void*) (((half*) C_) + 16 * size_n);
-        size_m_ -= 16;
+        A_ += TILESIZE_M * size_k;
+        if constexpr (c_fp32) C_ = (void*) (((float*) C_) + TILESIZE_M * size_n);
+        else                  C_ = (void*) (((half*) C_) + TILESIZE_M * size_n);
+        size_m_ -= TILESIZE_M;
 
-        if (size_m_ > 0 || svh)
+        // Rows beyond this tile reuse the column locks, so wait for the whole grid; the output rotation by
+        // svh is done by the last block of each column inside the tile, so nothing follows the last tile
+        if (size_m_ > 0)
             grid.sync();
     }
 
@@ -233,13 +235,13 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
                 exl3_gemm_kernel_inner
                 <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
+                (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
             }
 
-            A_ += 16 * size_k;
-            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * n_stride_j);
-            else                  C_ = (void*) (((half*) C_) + 16 * n_stride_j);
-            size_m_ -= 16;
+            A_ += TILESIZE_M * size_k;
+            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + TILESIZE_M * n_stride_j);
+            else                  C_ = (void*) (((half*) C_) + TILESIZE_M * n_stride_j);
+            size_m_ -= TILESIZE_M;
 
             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
                 group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);

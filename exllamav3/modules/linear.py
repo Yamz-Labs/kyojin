@@ -79,6 +79,10 @@ class Linear(Module):
         no_defer_load: bool = False
     ):
         super().__init__(config, key, qmap)
+        # Routed-weighted Hessians (EXL3_RWH): expert Linears also accumulate a per-expert H over their routed
+        # tokens only, rows scaled by the routing weight; qmap_q is where the quantizer looks the final H up
+        self.cap_rkey = None
+        self.qmap_q = None
 
         self.alt_key = alt_key
         self.in_features_unpadded = in_features
@@ -445,7 +449,11 @@ class Linear(Module):
         mcg = opt(".mcg", "cpu")
         mul1 = opt(".mul1", "cpu")
         bias = opt(".bias", self.device)
-        self.inner = LinearEXL3(
+        cls = LinearEXL3
+        if torch.device(self.device).type == "cpu":      # no CUDA kernels: dense reconstruction (quant/exl3_cpu.py)
+            from .quant.exl3_cpu import CpuLinearEXL3
+            cls = CpuLinearEXL3
+        self.inner = cls(
             self.config,
             self.in_features,
             self.out_features,
@@ -636,6 +644,26 @@ class Linear(Module):
                     pend = []
                     params["_cap_pending"] = pend
                 pend.append((params["capture"][self.qmap], x))
+
+        rw = params.get("_cap_rw")
+        if rw is not None and self.cap_rkey is not None:
+            idx, wv = rw
+            hd = params["capture"].get(self.cap_rkey)
+            if hd is None:
+                hd = self.init_H_data(True)
+                hd["sw2"] = torch.zeros((), dtype = torch.float32, device = self.device)
+                hd["sw4"] = torch.zeros((), dtype = torch.float32, device = self.device)
+                params["capture"][self.cap_rkey] = hd
+            if hd["first_key"] == self.key:
+                xr = x.view(-1, x.shape[-1])[idx] * wv.to(x.dtype).unsqueeze(1)
+                hd["sw2"] += (wv.float() ** 2).sum()
+                hd["sw4"] += (wv.float() ** 4).sum()
+                hd["count"] += int(idx.numel())
+                pend = params.get("_cap_pending")
+                if pend is None:
+                    pend = []
+                    params["_cap_pending"] = pend
+                pend.append((hd, xr))
 
         if _cap_t0 is not None:
             CAP_STAT["wall"] += _time.perf_counter() - _cap_t0

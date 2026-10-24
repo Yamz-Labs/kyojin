@@ -658,6 +658,8 @@ def maybe_graph_forward(block, x: torch.Tensor, params: dict):
             (BLOCK_GRAPH_MLA and isinstance(block.attn, MLAttention))
         ):
             return None  # cheap structural pre-filter; full eligibility checked per call
+        if getattr(block.mlp, "tier", None) is not None:
+            return None  # tiered experts host-sync on the routing result each layer: no capture
         runner = block.block_graph_runner = BlockGraphRunner(block)
         _registry.append(runner)
     if runner._capturing:

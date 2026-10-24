@@ -333,6 +333,7 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& y,
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
+        at::Tensor& recurrent_base,
         const at::Tensor& slots,
         bool history,
         Slot& s,
@@ -345,6 +346,7 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& y,
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
+        at::Tensor& recurrent_base,
         const at::Tensor& slots,
         bool history
     );

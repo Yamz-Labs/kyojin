@@ -29,4 +29,37 @@ First GLM launch: the server tunes its dense GEMM kernels before it opens the po
 
 Memory: GLM at `-c 131072` leaves about 10 GiB free on a 128 GB machine. Close browsers and other large processes first, or use a smaller `-c`.
 
+## System settings for full speed
+
+Our servers run with the three settings below. Each gain was measured on our Strix Halo machines, with the same generated text.
+
+1. **IOMMU off.** Add `amd_iommu=off` to the kernel command line (for example in `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, then `sudo update-grub` and reboot). With the IOMMU on we measured 6 % less prefill and 2.5 % less decode. Note: the NPU needs the IOMMU, so this turns the NPU off.
+2. **GPU clock level `high` while serving.** It holds the GPU clock at its top level instead of letting it drop between kernels: GLM 8K prefill +5.7 %, decode +0.5 to +1.4 % (GLM and Qwen). Set it before you start the server and put it back to `auto` after, so the GPU does not stay at full clock when idle:
+   ```bash
+   echo high | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level
+   # ... serve ...
+   echo auto | sudo tee /sys/class/drm/card*/device/power_dpm_force_performance_level
+   ```
+   Do not use `profile_peak`: it pins every clock, uses the power budget and was 5 to 10 % slower.
+3. **Cooling.** The chip slows itself down when it runs hot. The same machine at 96-99 °C gave 15 to 20 % less GLM prefill than when cool. Keep the air inlets and outlet free; in a closed cabinet, a small fan that moves the hot air out helps.
+
+   **Sixunited AXB35-02 boards** (Bosgame M5, GMKtec EVO-X2, FEVM FA-EX9, Peladn YO1, NIMO, Corsair AI Workstation 300; check with `cat /sys/class/dmi/id/board_name`): the factory fan curve keeps the CPU fans at 60 % up to 83 °C and reaches 80 % only at 95 °C, so the chip sits at its thermal limit and cuts its power. The [ec-su_axb35-linux](https://github.com/cmetz/ec-su_axb35-linux) driver lets Linux set the curve. On a Bosgame M5 in Performance mode, a 3-minute GPU load went from 86-94 W, 2100 MHz and 95-100 °C to 140 W, 2850 MHz and 79-80 °C with the curve below. It is louder under load; at idle the fans still stop.
+   ```bash
+   git clone https://github.com/cmetz/ec-su_axb35-linux && cd ec-su_axb35-linux
+   make && sudo make install && sudo modprobe ec_su_axb35
+   echo ec_su_axb35 | sudo tee /etc/modules-load.d/ec_su_axb35.conf
+   D=/sys/class/ec_su_axb35
+   for f in 1 2; do   # CPU fans: level 1-5 = 20-100 %, thresholds in °C
+     echo curve | sudo tee $D/fan$f/mode
+     echo 50,60,70,78,86 | sudo tee $D/fan$f/rampup_curve
+     echo 40,52,62,72,80 | sudo tee $D/fan$f/rampdown_curve
+   done
+   echo curve | sudo tee $D/fan3/mode   # system fan
+   echo 20,50,65,75,85 | sudo tee $D/fan3/rampup_curve
+   echo 0,42,58,70,80 | sudo tee $D/fan3/rampdown_curve
+   ```
+   The curve is lost at reboot: put the `echo` lines in a script run by a systemd oneshot service. Rebuild the module after a kernel update.
+
+The CPU governor should be `performance` (check `cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`); the GLM server is partly CPU-bound.
+
 Problems: [troubleshooting.md](troubleshooting.md).

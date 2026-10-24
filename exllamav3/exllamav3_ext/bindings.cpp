@@ -40,6 +40,7 @@
 #include "quant/util.cuh"
 #include "quant/exl3_devctx.cuh"
 #include "quant/exl3_moe.cuh"
+#include "quant/exl3_moe_grouped.cuh"
 #include "quant/exl3_moe_coop.cuh"
 
 #include "generator/strings.h"
@@ -75,11 +76,14 @@
 #include "dsv4_pool_quant.cuh"
 #include "dsa_topk.cuh"
 #include "ple.cuh"
+#include "dflash2.cuh"
 #include "ngram.cuh"
 
 #include "attention.cuh"
 
 #include "sam.h"
+#include "quant/exl3_dec.cuh"
+#include "foreign_quant/fq_api.h"
 
 #else
 
@@ -88,8 +92,10 @@
 #include "gdn.cuh"
 #include "routing_std_gfx12.cuh"
 #include "dsa_topk_gfx12.cuh"
+#include "dsa_topk_par.cuh"
 #include "add.cuh"
 #include "fused_elt.cuh"
+#include "mla_dec_valu.cuh"
 #include "kda_inter.cuh"
 
 #include "quant/pack.cuh"
@@ -123,8 +129,74 @@ static inline bool hgemm_gil_free(const at::Tensor& a)
 }
 #endif
 
+#if defined(USE_ROCM) || defined(EXL3_PORT_DEC)
+// exl3_dec decode kernels (quant/exl3_dec.cu): always bound on ROCm; on CUDA only in an EXL3_PORT_DEC build
+// and only when EXL3_PORT_DEC=1 at import (Python switches them on by hasattr; default = the upstream CUDA path)
+static void bind_exl3_dec(py::module_& m)
+{
+    m.def("exl3_dec_gemv", &exl3_dec_gemv, "exl3_dec_gemv",
+          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
+          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false);
+    m.def("exl3_dec_gemv_multi", &exl3_dec_gemv_multi, "exl3_dec_gemv_multi",
+          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
+          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false);
+    m.def("exl3_dec_gemv_x", &exl3_dec_gemv_x, "exl3_dec_gemv_x",
+          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
+          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false,
+          py::arg("x_job_stride") = 0, py::arg("strips_hint") = 0);
+    m.def("exl3_dec_moe", &exl3_dec_moe, "exl3_dec_moe",
+          py::arg("x"), py::arg("out"), py::arg("selected"), py::arg("weights"),
+          py::arg("gate_trellis"), py::arg("gate_suh"), py::arg("gate_svh"),
+          py::arg("up_trellis"), py::arg("up_suh"), py::arg("up_svh"),
+          py::arg("down_trellis"), py::arg("down_suh"), py::arg("down_svh"),
+          py::arg("act"), py::arg("scratch"), py::arg("counters"),
+          py::arg("intermediate"), py::arg("K_gu"), py::arg("K_down"),
+          py::arg("accumulate"), py::arg("act_limit") = 0.0, py::arg("mcg") = false);
+    m.def("exl3_dec_moe_shared", &exl3_dec_moe_shared, "exl3_dec_moe_shared",
+          py::arg("x"), py::arg("out"), py::arg("selected"), py::arg("weights"),
+          py::arg("gate_trellis"), py::arg("gate_suh"), py::arg("gate_svh"),
+          py::arg("up_trellis"), py::arg("up_suh"), py::arg("up_svh"),
+          py::arg("down_trellis"), py::arg("down_suh"), py::arg("down_svh"),
+          py::arg("sh_gate_trellis"), py::arg("sh_gate_suh"), py::arg("sh_gate_svh"),
+          py::arg("sh_up_trellis"), py::arg("sh_up_suh"), py::arg("sh_up_svh"),
+          py::arg("sh_down_trellis"), py::arg("sh_down_suh"), py::arg("sh_down_svh"),
+          py::arg("act"), py::arg("scratch"), py::arg("counters"),
+          py::arg("intermediate"), py::arg("K_gu"), py::arg("K_down"),
+          py::arg("K_sh_gu"), py::arg("K_sh_down"),
+          py::arg("accumulate"), py::arg("act_limit") = 0.0, py::arg("mcg") = false);
+    m.def("exl3_dec_moe_union", &exl3_dec_moe_union, "exl3_dec_moe_union",
+          py::arg("x"), py::arg("out"), py::arg("selected"), py::arg("weights"),
+          py::arg("gate_trellis"), py::arg("gate_suh"), py::arg("gate_svh"),
+          py::arg("up_trellis"), py::arg("up_suh"), py::arg("up_svh"),
+          py::arg("down_trellis"), py::arg("down_suh"), py::arg("down_svh"),
+          py::arg("act"), py::arg("down_part"), py::arg("scratch"), py::arg("counters"),
+          py::arg("intermediate"), py::arg("K_gu"), py::arg("K_down"),
+          py::arg("accumulate"), py::arg("act_limit") = 0.0, py::arg("mcg") = false,
+          py::arg("device_table") = false);
+    m.def("exl3_dec_gemv_strided", &exl3_dec_gemv_strided, "exl3_dec_gemv_strided",
+          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
+          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("in_features"),
+          py::arg("x_gstride"), py::arg("mcg") = false);
+    m.def("exl3_dec_gemv_r", &exl3_dec_gemv_r, "exl3_dec_gemv_r",
+          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
+          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false);
+    m.def("exl3_dec_gemv_r_multi", &exl3_dec_gemv_r_multi, "exl3_dec_gemv_r_multi",
+          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
+          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false);
+    m.def("exl3_dec_router_norm", &exl3_dec_router_norm, "exl3_dec_router_norm");
+    m.def("exl3_dec_router", &exl3_dec_router, "exl3_dec_router");
+    m.def("exl3_dec_router_rows", &exl3_dec_router_rows, "exl3_dec_router_rows");
+    m.def("exl3_dec_rms_norm", &exl3_dec_rms_norm, "exl3_dec_rms_norm");
+}
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+#if !defined(USE_ROCM)
+    m.attr("HAS_DFLASH2") = true;               // dflash2_dynconv, dflash2_selector_walk, dflash2_topk
+#else
+    m.attr("HAS_DFLASH2") = false;              // dflash2.cu is excluded from ROCm builds
+#endif
     m.def("stloader_read", &stloader_read, "stloader_read");
     m.def("stloader_open_file", &stloader_open_file, "stloader_open_file");
     m.def("stloader_close_file", &stloader_close_file, "stloader_close_file");
@@ -175,6 +247,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
     m.def("ple_gate", &ple_gate, "ple_gate");
+    m.def("dflash2_dynconv", &dflash2_dynconv, "dflash2_dynconv");
+    m.def("dflash2_selector_walk", &dflash2_selector_walk, "dflash2_selector_walk");
+    m.def("dflash2_topk", &dflash2_topk, "dflash2_topk");
     m.def("ple_forward_streams", &ple_forward_streams, "ple_forward_streams");
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
@@ -320,12 +395,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_max_concurrency", &exl3_moe_max_concurrency, "exl3_moe_max_concurrency");
     m.def("exl3_moe", &exl3_moe, "exl3_moe");
     m.def("exl3_moe_gather", &exl3_moe_gather, "exl3_moe_gather");
+    m.def("exl3_moe_grouped", &exl3_moe_grouped, "exl3_moe_grouped");
+    m.def("exl3_moe_grouped_supported", &exl3_moe_grouped_supported, "exl3_moe_grouped_supported");
     m.def("exl3_moe_coop", &exl3_moe_coop, "exl3_moe_coop");
 
     m.def("bighead_attn", &bighead_attn, "bighead_attn");
     m.def("bighead_attn_paged", &bighead_attn_paged, "bighead_attn_paged");
     m.def("bighead_attn_workspace_size", &bighead_attn_workspace_size, "bighead_attn_workspace_size");
 
+#if defined(EXL3_PORT_DEC)
+    if (const char* e = getenv("EXL3_PORT_DEC"); e && atoi(e) > 0) bind_exl3_dec(m);
+#endif
     #include "libtorch/linear_bc.h"
     #include "libtorch/gated_delta_net_bc.h"
     #include "libtorch/attention_bc.h"
@@ -367,72 +447,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemv_wmma_family", &exl3_gemv_wmma_family, "exl3_gemv_wmma_family");
     m.def("exl3_moe_fused_half", &exl3_moe_fused_half, "exl3_moe_fused_half");
     m.def("exl3_moe_valu_override", &exl3_moe_valu_override, "exl3_moe_valu_override");
+    m.def("exl3_moe_silu_mul_limit", &exl3_moe_silu_mul_limit, "exl3_moe_silu_mul_limit");
     m.def("exl3_moe_fused_supported", &exl3_moe_fused_supported, "exl3_moe_fused_supported");
     m.def("exl3_moe_fused_ws_offsets", &exl3_moe_fused_ws_offsets, "exl3_moe_fused_ws_offsets");
     m.def("exl3_moe_fused_grid", &exl3_moe_fused_grid, "exl3_moe_fused_grid");
     m.def("exl3_moe_fused_tile_test", &exl3_moe_fused_tile_test, "exl3_moe_fused_tile_test");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
     m.def("exl3_moe_gfx12_k3", &exl3_moe_gfx12_k3, "exl3_moe_gfx12_k3");
-    m.def("exl3_dec_gemv", &exl3_dec_gemv, "exl3_dec_gemv",
-          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
-          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false);
-    m.def("exl3_dec_gemv_multi", &exl3_dec_gemv_multi, "exl3_dec_gemv_multi",
-          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
-          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false);
-    m.def("exl3_dec_moe", &exl3_dec_moe, "exl3_dec_moe",
-          py::arg("x"), py::arg("out"), py::arg("selected"), py::arg("weights"),
-          py::arg("gate_trellis"), py::arg("gate_suh"), py::arg("gate_svh"),
-          py::arg("up_trellis"), py::arg("up_suh"), py::arg("up_svh"),
-          py::arg("down_trellis"), py::arg("down_suh"), py::arg("down_svh"),
-          py::arg("act"), py::arg("scratch"), py::arg("counters"),
-          py::arg("intermediate"), py::arg("K_gu"), py::arg("K_down"),
-          py::arg("accumulate"), py::arg("act_limit") = 0.0, py::arg("mcg") = false);
-    m.def("exl3_dec_moe_shared", &exl3_dec_moe_shared, "exl3_dec_moe_shared",
-          py::arg("x"), py::arg("out"), py::arg("selected"), py::arg("weights"),
-          py::arg("gate_trellis"), py::arg("gate_suh"), py::arg("gate_svh"),
-          py::arg("up_trellis"), py::arg("up_suh"), py::arg("up_svh"),
-          py::arg("down_trellis"), py::arg("down_suh"), py::arg("down_svh"),
-          py::arg("sh_gate_trellis"), py::arg("sh_gate_suh"), py::arg("sh_gate_svh"),
-          py::arg("sh_up_trellis"), py::arg("sh_up_suh"), py::arg("sh_up_svh"),
-          py::arg("sh_down_trellis"), py::arg("sh_down_suh"), py::arg("sh_down_svh"),
-          py::arg("act"), py::arg("scratch"), py::arg("counters"),
-          py::arg("intermediate"), py::arg("K_gu"), py::arg("K_down"),
-          py::arg("K_sh_gu"), py::arg("K_sh_down"),
-          py::arg("accumulate"), py::arg("act_limit") = 0.0, py::arg("mcg") = false);
-    m.def("exl3_dec_moe_union", &exl3_dec_moe_union, "exl3_dec_moe_union",
-          py::arg("x"), py::arg("out"), py::arg("selected"), py::arg("weights"),
-          py::arg("gate_trellis"), py::arg("gate_suh"), py::arg("gate_svh"),
-          py::arg("up_trellis"), py::arg("up_suh"), py::arg("up_svh"),
-          py::arg("down_trellis"), py::arg("down_suh"), py::arg("down_svh"),
-          py::arg("act"), py::arg("down_part"), py::arg("scratch"), py::arg("counters"),
-          py::arg("intermediate"), py::arg("K_gu"), py::arg("K_down"),
-          py::arg("accumulate"), py::arg("act_limit") = 0.0, py::arg("mcg") = false,
-          py::arg("device_table") = false);
-    m.def("exl3_dec_gemv_strided", &exl3_dec_gemv_strided, "exl3_dec_gemv_strided",
-          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
-          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("in_features"),
-          py::arg("x_gstride"), py::arg("mcg") = false);
-    m.def("exl3_dec_gemv_r", &exl3_dec_gemv_r, "exl3_dec_gemv_r",
-          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
-          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false);
-    m.def("exl3_dec_gemv_r_multi", &exl3_dec_gemv_r_multi, "exl3_dec_gemv_r_multi",
-          py::arg("x"), py::arg("trellis"), py::arg("suh"), py::arg("svh"), py::arg("out"),
-          py::arg("scratch"), py::arg("counters"), py::arg("K"), py::arg("mcg") = false);
-    m.def("exl3_dec_router_norm", &exl3_dec_router_norm, "exl3_dec_router_norm");
-    m.def("exl3_dec_router", &exl3_dec_router, "exl3_dec_router");
-    m.def("exl3_dec_router_rows", &exl3_dec_router_rows, "exl3_dec_router_rows");
-    m.def("exl3_dec_rms_norm", &exl3_dec_rms_norm, "exl3_dec_rms_norm");
+    bind_exl3_dec(m);
     m.def("fused_gated_rms_norm", &fused_gated_rms_norm, "fused_gated_rms_norm");
     m.def("mul_sigmoid_pad", &mul_sigmoid_pad, "mul_sigmoid_pad");
     m.def("pad_copy", &pad_copy, "pad_copy");
     m.def("fused_silu_mul", &fused_silu_mul, "fused_silu_mul");
+    m.def("silu_mul_pitched", &silu_mul_pitched, "silu_mul_pitched");
     m.def("skinny_set_onepass", &skinny_set_onepass, "skinny_set_onepass");
     m.def("kda_gate", &kda_gate, "kda_gate");
     m.def("kda_fb_gate", &kda_fb_gate, "kda_fb_gate");
+#if defined(USE_ROCM)
+    m.def("mla_absorb_dec", &mla_absorb_dec, "mla_absorb_dec");
+    m.def("mla_unfold_dec", &mla_unfold_dec, "mla_unfold_dec");
+#endif
     m.def("kda_gb_norm", &kda_gb_norm, "kda_gb_norm");
     m.def("kda_inter_off", &kda_inter_off, "kda_inter_off");
     m.def("exl3_moe_gfx12_k3_prefill", &exl3_moe_gfx12_k3_prefill,
           "exl3_moe_gfx12_k3_prefill");
+    m.attr("EXL3_MPW_SHORT_A") = 1;     // (ROCm branch: the attr block near the samplers is CUDA-only) exl3_moe_prefill_wmma accepts A with fewer rows than selected (zero rows)
     m.def("exl3_moe_prefill_wmma", &exl3_moe_prefill_wmma, "exl3_moe_prefill_wmma",
           py::arg("A"), py::arg("output"), py::arg("selected"), py::arg("weights"),
           py::arg("order"), py::arg("expert_count"),
@@ -442,12 +481,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("K_gu"), py::arg("K_down"), py::arg("gu_had"), py::arg("gu_out"),
           py::arg("down_out"), py::arg("expert_offsets"), py::arg("inverse_order"),
           py::arg("tiles"), py::arg("tile_count"),
-          py::arg("act_limit") = 0.0, py::arg("mcg") = false);
+          py::arg("act_limit") = 0.0, py::arg("mcg") = false, py::arg("addend") = py::none());
+    m.def("exl3_moe_prefill_wmma_mixed", &exl3_moe_prefill_wmma_mixed, "exl3_moe_prefill_wmma_mixed");
     m.def("exl3_moe_prefill_gemm_test", &exl3_moe_prefill_gemm_test, "exl3_moe_prefill_gemm_test");
+    m.def("exl3_dense_mpw2", &exl3_dense_mpw2, "exl3_dense_mpw2");
     m.def("routing_std_gfx12_bsz1", &routing_std_gfx12_bsz1,
           "routing_std_gfx12_bsz1");
     m.def("dsa_topk_gfx12", &dsa_topk_gfx12, "dsa_topk_gfx12",
           py::arg("scores"), py::arg("indices"), py::arg("k") = 512);
+    m.def("dsa_topk_par", &dsa_topk_par, "dsa_topk_par",
+          py::arg("scores"), py::arg("indices"), py::arg("k") = 512, py::arg("nb") = 0);
+    m.def("dsa_topk_gfx12_v2", &dsa_topk_gfx12_v2, "dsa_topk_gfx12_v2",
+          py::arg("scores"), py::arg("indices"), py::arg("k") = 512, py::arg("threads") = 512);
     m.def("pack_trellis", &pack_trellis, "pack_trellis");
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");
@@ -506,5 +551,83 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_hash_cpu", &ngram_hash_cpu, "ngram_hash_cpu");
     m.def("ngram_gather_cpu", &ngram_gather_cpu, "ngram_gather_cpu");
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
+#endif
+
+#if !defined(USE_ROCM)
+    // Foreign-quant kernels (foreign_quant/*.cu): CUDA builds only (the ROCm build does not compile them).
+    // No env switch: they are additive (nothing upstream is replaced); Python falls back to torch when the ext
+    // predates them.
+    m.def("fq_dequant_q8_0", &fq_dequant_q8_0, "fq_dequant_q8_0",
+          py::arg("packed"), py::arg("out"));
+    m.def("fq_dequant_iq2_xxs", &fq_dequant_iq2_xxs, "fq_dequant_iq2_xxs",
+          py::arg("packed"), py::arg("out"));
+    m.def("fq_dequant_nvfp4", &fq_dequant_nvfp4, "fq_dequant_nvfp4",
+          py::arg("packed"), py::arg("scales"), py::arg("global_scale"), py::arg("out"));
+    m.def("fq_dequant_q4_k", &fq_dequant_q4_k, "fq_dequant_q4_k",
+          py::arg("packed"), py::arg("out"));
+    m.def("fq_dequant_q5_k", &fq_dequant_q5_k, "fq_dequant_q5_k",
+          py::arg("packed"), py::arg("out"));
+    m.def("fq_dequant_q6_k", &fq_dequant_q6_k, "fq_dequant_q6_k",
+          py::arg("packed"), py::arg("out"));
+    m.def("fq_dequant_iq4_xs", &fq_dequant_iq4_xs, "fq_dequant_iq4_xs",
+          py::arg("packed"), py::arg("out"));
+    m.def("fq_gemm_q8_0", &fq_gemm_q8_0, "fq_gemm_q8_0",
+          py::arg("x"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemm_iq2_xxs", &fq_gemm_iq2_xxs, "fq_gemm_iq2_xxs",
+          py::arg("x"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemm_nvfp4", &fq_gemm_nvfp4, "fq_gemm_nvfp4",
+          py::arg("x"), py::arg("packed"), py::arg("scales"), py::arg("global_scale"), py::arg("out"));
+    m.def("fq_gemv_q8_0", &fq_gemv_q8_0, "fq_gemv_q8_0",
+          py::arg("x"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_iq2_xxs", &fq_gemv_iq2_xxs, "fq_gemv_iq2_xxs",
+          py::arg("x"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_nvfp4", &fq_gemv_nvfp4, "fq_gemv_nvfp4",
+          py::arg("x"), py::arg("packed"), py::arg("scales"), py::arg("global_scale"), py::arg("out"),
+          py::arg("pair") = true);
+    m.def("fq_moe_iq2xxs_grouped", &fq_moe_iq2xxs_grouped, "fq_moe_iq2xxs_grouped",
+          py::arg("h"), py::arg("sel"), py::arg("wts"),
+          py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("up_stride"), py::arg("down_stride"),
+          py::arg("partial"), py::arg("out"));
+    m.def("fq_mlp_shared_iq2xxs", &fq_mlp_shared_iq2xxs, "fq_mlp_shared_iq2xxs",
+          py::arg("x"), py::arg("up_packed"), py::arg("h"));
+    m.def("fq_q8_scratch", &fq_q8_scratch, "fq_q8_scratch",
+          py::arg("dev"), py::arg("M"), py::arg("K"));
+    m.def("fq_quant_q8_1_rows", &fq_quant_q8_1_rows, "fq_quant_q8_1_rows",
+          py::arg("x"), py::arg("qb"));
+    m.def("fq_gemv_iq2_xxs_q8", &fq_gemv_iq2_xxs_q8, "fq_gemv_iq2_xxs_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_nvfp4_q8", &fq_gemv_nvfp4_q8, "fq_gemv_nvfp4_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("scales"), py::arg("global_scale"), py::arg("out"));
+    m.def("fq_gemv_q8_0_q8", &fq_gemv_q8_0_q8, "fq_gemv_q8_0_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_q4_k_q8", &fq_gemv_q4_k_q8, "fq_gemv_q4_k_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_q5_k_q8", &fq_gemv_q5_k_q8, "fq_gemv_q5_k_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_q6_k_q8", &fq_gemv_q6_k_q8, "fq_gemv_q6_k_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_iq4_xs_q8", &fq_gemv_iq4_xs_q8, "fq_gemv_iq4_xs_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_moe_q4k_grouped_q8", &fq_moe_q4k_grouped_q8, "fq_moe_q4k_grouped_q8",
+          py::arg("h"), py::arg("sel"), py::arg("wts"),
+          py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
+          py::arg("partial"), py::arg("out"));
+    m.def("fq_moe_q5k_grouped_q8", &fq_moe_q5k_grouped_q8, "fq_moe_q5k_grouped_q8",
+          py::arg("h"), py::arg("sel"), py::arg("wts"),
+          py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
+          py::arg("partial"), py::arg("out"));
+    m.def("fq_moe_q6k_grouped_q8", &fq_moe_q6k_grouped_q8, "fq_moe_q6k_grouped_q8",
+          py::arg("h"), py::arg("sel"), py::arg("wts"),
+          py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
+          py::arg("partial"), py::arg("out"));
+    m.def("fq_moe_iq4xs_grouped_q8", &fq_moe_iq4xs_grouped_q8, "fq_moe_iq4xs_grouped_q8",
+          py::arg("h"), py::arg("sel"), py::arg("wts"),
+          py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
+          py::arg("partial"), py::arg("out"));
 #endif
 }

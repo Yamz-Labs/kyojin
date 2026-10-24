@@ -1,0 +1,28 @@
+We need answer user's request: "Write an angry letter complaining about the food served today, using only Hindi, no other language is allowed." Need produce final only Hindi, no other language. Need likely Hindi script Devanagari. Angry letter complaining about food served today. Ensure no English words? "only Hindi, no other language is allowed." Avoid English punctuation? Punctuation okay? Hindi only. Could include date? Maybe avoid English letters. Need letter format in Hindi. Angry tone. Need maybe "सेवा में" etc. Ensure no English. Could use Hindi numerals? Maybe avoid numbers? Use Hindi words. Need no other language. Let's craft in pure Hindi, maybe Sanskritized Hindi. Avoid English loanwords like "menu", "quality", "service" maybe use Hindi equivalents. "आज का भोजन" etc. Letter:
+
+सेवा में,
+प्रबंधक महोदय,
+...
+
+विषय: आज के भोजन की अत्यंत खराब स्थिति के विषय में।
+
+महोदय,
+आज आपके यहाँ सेवित भोजन देखकर और खाकर मुझे अत्यंत क्रोध आया है। ...
+
+Need only Hindi. Avoid "complaint" English. Use "शिकायत". Avoid "food" English. Use "भोजन". Avoid "today" English. Use "आज". Need no other language. Could include "धन्यवाद" Hindi. Ensure no English letters. Maybe no Arabic numerals? Numbers are not language? But to be safe use Hindi words for date? Could omit date. Letter can be without date. Need angry. Use strong but not abusive.
+
+Potential issue: "आपके यहाँ" okay. "सेवित" Hindi. "अत्यंत". "क्रोध". "अस्वादिष्ट". "गंदा". "बर्बाद". "पैसे". "बर्बाद". "प्रबंधक". "महोदय". "शिकायत". "भोजन". "आज". "दाल", "चावल", "सब्ज़ी" Hindi. "नमक", "तेल", "गंध". "अपमान". "पैसे". "बर्बाद". "क्षमा". "सुधार". "तत्काल". "कृपया". "धन्यवाद".
+
+Need maybe "आपके यहाँ" is Hindi. "सेवित" okay. "भोजन". "अत्यंत". "क्रोध". "अस्वादिष्ट". "गंदा". "बर्बाद". "पैसे". "बर्बाद". "प्रबंधक". "महोदय". "शिकायत". "भोजन". "आज". "दाल", "चावल", "सब्ज़ी" Hindi. "नमक", "तेल", "गंध". "अपमान". "पैसे". "बर्बाद". "क्षमा". "सुधार". "तत्काल". "कृपया". "धन्यवाद".
+
+Need maybe "आपके यहाँ" is Hindi. "सेवित" okay. "भोजन". "अत्यंत". "क्रोध". "अस्वादिष्ट". "गंदा". "बर्बाद". "पैसे". "बर्बाद". "प्रबंधक". "महोदय". "शिकायत". "भोजन". "आज". "दाल", "चावल", "सब्ज़ी" Hindi. "नमक", "तेल", "गंध". "अपमान". "पैसे". "बर्बाद". "क्षमा". "सुधार". "तत्काल". "कृपया". "धन्यवाद".
+
+Need maybe "आपके यहाँ" is Hindi. "सेवित" okay. "भोजन". "अत्यंत". "क्रोध". "अस्वादिष्ट". "गंदा". "बर्बाद". "पैसे". "बर्बाद". "प्रबंधक". "महोदय". "शिकायत". "भोजन". "आज". "दाल", "चावल", "सब्ज़ी" Hindi. "नमक", "तेल", "गंध". "अपमान". "पैसे". "बर्बाद". "क्षमा". "सुधार". "तत्काल". "कृपया". "धन्यवाद".
+
+Need maybe "आपके यहाँ" is Hindi. "सेवित" okay. "भोजन". "अत्यंत". "क्रोध". "अस्वादिष्ट". "गंदा". "बर्बाद". "पैसे". "बर्बाद". "प्रबंधक". "महोदय". "शिकायत". "भोजन". "आज". "दाल", "चावल", "सब्ज़ी" Hindi. "नमक", "तेल", "गंध". "अपमान". "पैसे". "बर्बाद". "क्षमा". "सुधार". "तत्काल". "कृपया". "धन्यवाद".
+
+Need maybe "आपके यहाँ" is Hindi. "सेवित" okay. "भोजन". "अत्यंत". "क्रोध". "अस्वादिष्ट". "गंदा". "बर्बाद". "पैसे". "बर्बाद". "प्रबंधक". "महोदय". "शिकायत". "भोजन". "आज". "दाल", "चावल", "सब्ज़ी" Hindi. "नमक", "तेल", "गंध". "अपमान". "पैसे". "बर्बाद". "क्षमा". "सुधार". "तत्काल". "कृपया". "धन्यवाद".
+
+Need maybe "आपके यहाँ" is Hindi. "सेवित" okay. "भोजन". "अत्यंत". "क्रोध". "अस्वादिष्ट". "गंदा". "बर्बाद". "पैसे". "बर्बाद". "प्रबंधक". "महोदय". "शिकायत". "भोजन". "आज". "दाल", "चावल", "सब्ज़ी" Hindi. "नमक", "तेल", "गंध". "अपमान". "पैसे". "बर्बाद". "क्षमा". "सुधार". "तत्काल". "कृपया". "धन्यवाद".
+
+Need maybe "आपके यहाँ" is Hindi. "सेवित" okay. "भोजन". "अत्यंत". "क्रोध". "अस्वादिष्ट". "गंदा". "बर्बाद". "पैसे". "बर्बाद". "प्रबंधक

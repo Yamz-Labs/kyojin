@@ -3,7 +3,7 @@
 
 The RigMark part runs bench.py (read-only, outside this repo) over real HTTP against qwen/serve.py and glm/serve.py with a
 fake engine that keeps a whole-prompt cache and drops it in reset_prefix_cache(). Model-free, CPU only. It is skipped when
-the RigMark source is not at $RIGMARK_SRC (default ~/hermes-work/rigmark/src).
+the RigMark source is not at $RIGMARK_SRC.
 """
 from __future__ import annotations
 
@@ -21,7 +21,24 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import serve_compat
 
-RIGMARK = Path(os.environ.get("RIGMARK_SRC", os.path.expanduser("~/hermes-work/rigmark/src")))
+RIGMARK = Path(os.environ.get("RIGMARK_SRC", "/nonexistent"))
+
+
+class RqBudgetTests(unittest.TestCase):
+    def test_one_session_or_no_ctx_keeps_the_default(self):
+        self.assertIsNone(serve_compat.rq_budget(65536, 1, 1000, 60000))
+        self.assertIsNone(serve_compat.rq_budget(None, 4, 1000, 60000))
+
+    def test_reply_that_fits_the_share_is_untouched(self):
+        self.assertIsNone(serve_compat.rq_budget(65536, 4, 1000, 8000))   # share 16384 - 1000 = 15384
+
+    def test_open_ended_reply_holds_its_share_only(self):
+        self.assertEqual(serve_compat.rq_budget(65536, 4, 1000, 64000), 65536 // 4 - 1000)   # 16384 is whole pages
+
+    def test_long_prompt_gets_the_minimum_span_within_the_page_table(self):
+        self.assertEqual(serve_compat.rq_budget(65536, 4, 30000, 35000), serve_compat.RQ_MIN_TOKENS)
+        self.assertEqual(serve_compat.rq_budget(16384, 4, 40, 9000), 4096 - 40)   # four jobs fit the page table
+        self.assertEqual(serve_compat.rq_budget(65536, 4, 64000, 5000), 65536 - 64000)   # never beyond the cache
 
 
 class HelperTests(unittest.TestCase):

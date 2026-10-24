@@ -63,11 +63,17 @@ __device__ inline half2 decode_mul1_product_2_sad(uint32_t x0, uint32_t x1)
 #if (defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)) && defined(EXL3_MUL1_DECODE_DOT4)
     const uint32_t sum1 = __builtin_amdgcn_udot4(x1, 0x01010101u, 0x6400u, false);
     const uint32_t sum0 = __builtin_amdgcn_udot4(x0, 0x01010101u, 0x6400u, false);
+    const uint32_t packed = (sum1 << 16) + sum0;   // u + 1024 <= 2029: no 16-bit carry
+#elif defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+    // v_sad_hi_u8 D = (SAD(S0, S1) << 16) + S2 does the pair pack: low half = 0x6400 + u0 (no carry, u0 <= 1020),
+    // high half = 0x6400 + u1. Same bits as the three-op form, one VALU op fewer per two weights.
+    uint32_t packed;
+    asm("v_sad_hi_u8 %0, %1, 0, %2" : "=v"(packed) : "v"(x1), "v"(exl3_sad_u8_(x0, 0x64006400u)));
 #else
     const uint32_t sum1 = exl3_sad_u8_(x1, 0x6400u);
     const uint32_t sum0 = exl3_sad_u8_(x0, 0x6400u);
+    const uint32_t packed = (sum1 << 16) + sum0;
 #endif
-    const uint32_t packed = (sum1 << 16) + sum0;   // u + 1024 <= 2029: no 16-bit carry
     half2 k_inv_h2 = __half2half2(__ushort_as_half(0x1eee));
     half2 k_bias_h2 = __half2half2(__ushort_as_half(0xc931));
     half_uint16 h0((uint16_t) packed);
@@ -80,7 +86,14 @@ __device__ inline half2 decode_mul1_product_2_sad(uint32_t x0, uint32_t x1)
 // Keep this expression portable instead of relying on inline PTX.
 __device__ __forceinline__ uint32_t lop3_0x6a(uint32_t a, uint32_t b, uint32_t c)
 {
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__)
+    // CUDA: one explicit lop3, as upstream exllamav3 1.6.0 issues it (EXL3_CB_LOP3, MIT); A/B against the C form
+    uint32_t r;
+    asm ("lop3.b32 %0, %1, %2, %3, 0x6a;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+#else
     return c ^ (a & b);
+#endif
 }
 
 // Ditto mcg (cb 1)
@@ -168,13 +181,19 @@ __device__ inline half2 decode_3inst_2(uint32_t x0, uint32_t x1)
     }
 }
 
-// x * C mod 2^32 for x < 2^16. gfx115x: v_mul_lo_u32 is quarter rate; two full-rate 24-bit multiplies
-// and a shift-add give the same bits: x * C = x * C_lo16 + ((x * C_hi16) << 16) mod 2^32.
+// x * C mod 2^32 for x < 2^16. gfx115x: v_mul_lo_u32 is quarter rate; the identity
+// x * C = x * C_lo16 + ((x * C_hi16) << 16) mod 2^32 (C_lo16 = C & 0xffff, C_hi16 = C >> 16) gives the same bits from
+// full-rate ops only. Written in asm so LLVM cannot fold the split back into one quarter-rate v_mul_lo_u32
+// (exl3_moe_prefill.cu): v_mul_u32_u24 takes the low 24 bits of x and C_lo16 (both < 2^24), then v_mad_u16 with
+// op_sel [0,0,1,1] adds x * C_hi16 into the high half and keeps the low half.
 template <uint32_t C>
 __device__ __forceinline__ uint32_t mul_const_w16(uint32_t x)
 {
 #if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
-    return __umul24(x, C & 0xffffu) + (__umul24(x, C >> 16) << 16);
+    uint32_t d;
+    asm("v_mul_u32_u24 %0, %1, %2" : "=v"(d) : "v"(x), "s"(C & 0xffffu));
+    asm("v_mad_u16 %0, %1, %2, %0 op_sel:[0,0,1,1]" : "+v"(d) : "v"(x), "s"(C >> 16));
+    return d;
 #else
     return x * C;
 #endif

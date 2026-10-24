@@ -209,6 +209,18 @@ def _hip_router_buffers(cfg, rows):
 
 def _routing_std_torch(cfg, y, params, include_bias = False):
     router_logits = torch.matmul(_pad_rows(y), cfg.gate_tensor)
+    # EXL3_ROUTER_TOPK (default 1, read per call): prefill rows select top-k with one Triton pass (router_topk.py)
+    # instead of the stable sort below over all experts; same ids, same values into the same softmax
+    if (router_logits.dim() == 2 and router_logits.shape[0] > 16 and router_logits.is_cuda and router_logits.stride(1) == 1
+            and not (include_bias and cfg.router_bias is not None) and not params.get("activate_all_experts")
+            and cfg.num_experts_per_tok <= 32 and os.environ.get("EXL3_ROUTER_TOPK", "1") != "0"
+            and not torch.cuda.is_current_stream_capturing()):
+        from .router_topk import router_topk
+        top_v, selected_experts = router_topk(router_logits, cfg.num_experts_per_tok)
+        routing_weights = torch.softmax(top_v, dim = -1)
+        if cfg.per_expert_scale is not None:
+            routing_weights = routing_weights * cfg.per_expert_scale.float()[selected_experts]
+        return selected_experts, routing_weights.half()
     router_logits_f = router_logits.float()
     if include_bias and cfg.router_bias is not None:
         router_logits_f = router_logits_f + cfg.router_bias.float()
@@ -243,8 +255,15 @@ def _routing_nogroup_torch(cfg, y, params, scores):
         # at the k-th place, which expert is chosen). Router scores tie often, so identical inputs gave
         # different expert sets from run to run. A stable descending sort keeps the lowest expert index first
         # among equals: same values, reproducible routing.
-        selected_experts = torch.sort(selection_scores, dim = -1, descending = True, stable = True).indices[
-            :, :cfg.num_experts_per_tok].contiguous()
+        if (selection_scores.dim() == 2 and selection_scores.shape[0] > 16 and selection_scores.is_cuda
+                and selection_scores.stride(1) == 1 and cfg.num_experts_per_tok <= 32
+                and os.environ.get("EXL3_ROUTER_TOPK", "1") != "0" and not torch.cuda.is_current_stream_capturing()):
+            # EXL3_ROUTER_TOPK: same ids as the stable sort (router_topk.py)
+            from .router_topk import router_topk
+            selected_experts = router_topk(selection_scores, cfg.num_experts_per_tok)[1]
+        else:
+            selected_experts = torch.sort(selection_scores, dim = -1, descending = True, stable = True).indices[
+                :, :cfg.num_experts_per_tok].contiguous()
     routing_weights = scores.gather(1, selected_experts)
     routing_weights = routing_weights / (routing_weights.sum(dim = -1, keepdim = True) + 1e-20)
     routing_weights = routing_weights * cfg.routed_scaling_factor
@@ -587,13 +606,42 @@ def _routing_sqrtsp_vl(cfg, y, vl, hash_sel):
     return sel.long(), w.half()
 
 
+def _ds41_router_ok(bsz, cfg, y, params):
+    return (
+        bool(torch.version.hip) and os.environ.get("EXL3_DS41_ROUTER", "0") == "1" and y.dtype == torch.half and
+        y.dim() == 2 and y.shape[1] == 5120 and cfg.num_experts % 8 == 0 and cfg.num_experts <= 512 and
+        cfg.num_experts_per_tok <= 16 and cfg.e_score_correction_bias is not None and
+        cfg.gate_tensor.dtype in (torch.float, torch.half, torch.bfloat16) and
+        _vl_rows(cfg, params, bsz, y.device) is None
+    )
+
+
+def _ds41_router(bsz, cfg, y):
+    from .dsv41_fn import dsv41_hip
+    if cfg.gate_tensor_t is None:
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()                      # [E, H], the kernel's row-major gate
+    if getattr(cfg, "ds41_bias32", None) is None:
+        cfg.ds41_bias32 = cfg.e_score_correction_bias.float().contiguous()
+    _, sel, wts = _routing_buffers(cfg, bsz, y.device)
+    scores = g_tensor_cache.get_bucketed(y.device, bsz * cfg.num_experts, torch.float, "ds41_route_scores")
+    dsv41_hip.router(y.contiguous(), cfg.gate_tensor_t, cfg.ds41_bias32, sel, wts, scores.view(bsz, cfg.num_experts),
+                     cfg.num_experts_per_tok, cfg.routed_scaling_factor, 1.0, True)
+    return sel, wts
+
+
 def routing_sqrtsp(bsz, cfg, y, params):
     """DeepSeek-V4 router: sqrt(softplus(logits)) affinity, noaux_tc bias for selection only,
     weights normalized over the selected set, times routed_scaling_factor. The nogroup top-k
     kernel serves every batch size (one block per row); bsz 1 reuses the cached output
     buffers, larger batches allocate per call. activate_all_experts (conversion) stays
     torch-composed."""
-    if params.get("activate_all_experts") or not hasattr(ext, "routing_ds3_nogroup"):
+    if params.get("activate_all_experts"):
+        return _routing_nogroup_torch(cfg, y, params, _sqrtsp_scores(cfg, y))
+    if not hasattr(ext, "routing_ds3_nogroup"):
+        # ROCm builds exclude routing.cu. DS4.1-shaped gates (hidden 5120) take the fused HIP router (2 launches: GEMV + sqrtsoftplus,
+        # top-k, normalise; fp32 bias and scores) instead of ~10 torch launches. Opt-in until validated on the device.
+        if _ds41_router_ok(bsz, cfg, y, params):
+            return _ds41_router(bsz, cfg, y)
         return _routing_nogroup_torch(cfg, y, params, _sqrtsp_scores(cfg, y))
     vl = _vl_rows(cfg, params, bsz, y.device)
     if vl is not None:

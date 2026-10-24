@@ -303,11 +303,23 @@ if torch.version.hip:
     # Keep the public API stable while using the native QSA kernel (k <= 512, moeA5) only for its
     # validated gfx12 wave32 shape. Everything else retains the general PyTorch fallback.
     if hasattr(exllamav3_ext, "dsa_topk_gfx12"):
+        # EXL3_DSA_TOPK_V2=1 (default off; env read per call): the row-in-registers kernel (dsa_topk_gfx12_v2, one memory
+        # pass instead of four, bitwise-identical selection) for rows of 8192 < width <= 32768 with a 16-byte aligned base
+        # (narrower rows are not faster: 82 vs 115 us at 2048). topk_v2_switch['on'] lets a harness flip it without the env.
+        # EXL3_DSA_TOPK_V2_THREADS = 512 | 1024.
+        topk_v2 = {"on": False, "threads": int(os.environ.get("EXL3_DSA_TOPK_V2_THREADS", "512"))}
+        setattr(exllamav3_ext, "topk_v2_switch", topk_v2)
+
         def _dsa_topk_rocm(scores, indices, k, t_ptr = None, t_seq = 0):
             if (
                 hasattr(exllamav3_ext, "dsa_topk_gfx12") and
                 _fb.dsa_topk_gfx12_supported(scores, indices, k, t_ptr, t_seq)
             ):
+                env_v2 = os.environ.get("EXL3_DSA_TOPK_V2")      # read per call so one process can A/B it
+                use_v2 = topk_v2["on"] if env_v2 is None else env_v2 == "1"
+                if (use_v2 and 8192 < scores.shape[1] <= 32768 and scores.data_ptr() % 16 == 0 and
+                        hasattr(exllamav3_ext, "dsa_topk_gfx12_v2")):
+                    return exllamav3_ext.dsa_topk_gfx12_v2(scores, indices, k, topk_v2["threads"])
                 return exllamav3_ext.dsa_topk_gfx12(scores, indices, k)
             return _fb.dsa_topk(scores, indices, k, t_ptr, t_seq)
 

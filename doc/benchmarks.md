@@ -9,7 +9,7 @@ The figures of the three models come from a run set up like yours:
 - the public code at the commit named in `doc/figures.json`, built from the README install;
 - an empty home directory, the published packs downloaded from the hub, the default environment (no private flags);
 - greedy decoding, thinking off, the four card prompts for each of chat, prose and code, 256 tokens, median of 3 repetitions (`tools/bench.sh` runs the same prompts);
-- prefill and decode by context: cold prompts of 8K to 256K tokens (MiMo: to 128K), an essay request of 256 tokens, after one discarded 8K request; prefill is the speed the server reports for the request. Decode: Qwen, like the other engines in the comparison below, is timed by the client from the first to the last streamed token; GLM and MiMo use the server's own decode counters (`/metrics`), because their streams arrive in bursts that a client clock misreads. Qwen and GLM: one request per depth; MiMo: two requests per depth, the second one reported. GLM and MiMo are started with a context large enough for the longest prompt (`-c 272384` and `-c 163840`);
+- prefill and decode by context: cold prompts of 8K to 256K tokens and, for Qwen and GLM, one of 500K (499,712 tokens) (MiMo: to 128K), an essay request of 256 tokens, after one discarded 8K request; prefill is the speed the server reports for the request. Decode: Qwen, like the other engines in the comparison below, is timed by the client from the first to the last streamed token; GLM and MiMo use the server's own decode counters (`/metrics`), because their streams arrive in bursts that a client clock misreads. Qwen and GLM: one request per depth; MiMo: two requests per depth, the second one reported. GLM and MiMo are started with a context large enough for the longest prompt (`-c 272384` and `-c 163840`); the 500K point of Qwen and GLM is a separate start with `-c 524288` (Qwen also with `--cache-bits 8`);
 - speculative decode is the default server mode and returns the same tokens as plain decode.
 - the server log of each run has no `fallback`, `disabled`, `unavailable`, `not tuned` or `No module` line.
 
@@ -17,11 +17,11 @@ The figures of the three models come from a run set up like yours:
 
 Tokens per second; prefill by context, speculative decode by kind of text.
 
-| Model | Pack | Prefill 8K | Prefill 32K | Prefill 64K | Prefill 128K | Prefill 256K | Spec prose | Spec chat | Spec code |
-|---|---|---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 95 GB | 1481 | 1477 | 1436 | 1396 | 1347 | 45.7 | 48.3 | 66.8 |
-| GLM-5.3-Flash | 99.73 GB | 634 | 637 | 613 | 589 | 567 | 26.2 | 31.4 | 33.4 |
-| MiMo-V2.6-Flash | 105.8 GB | 760 | 702 | 599 | 458 | - | 28.9 | 31.2 | 37.0 |
+| Model | Pack | Prefill 8K | Prefill 32K | Prefill 64K | Prefill 128K | Prefill 256K | Prefill 500K | Spec prose | Spec chat | Spec code |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next | 95 GB | 1621 | 1548 | 1542 | 1505 | 1399 | 1224 | 47.5 | 52.8 | 73.2 |
+| GLM-5.3-Flash | 99.73 GB | 652 | 634 | 629 | 649 | 619 | 567 | 27.4 | 30.0 | 36.8 |
+| MiMo-V2.6-Flash | 105.8 GB | 760 | 702 | 599 | 458 | - | - | 28.9 | 31.2 | 37.0 |
 
 Kyojin 1.5, same recipe on a second Ryzen AI Max+ 395 with 128 GB: Qwen3.8-Flash-Next 1486 / 1478 / 1454 / 1397 / 1349
 prefill and 45.8 / 48.3 / 67.0 decode; GLM-5.3-Flash 623 / 629 / 602 prefill at 8K / 32K / 64K and 26.3 / 30.8 / 33.0
@@ -29,18 +29,17 @@ decode. Since 1.5 the GLM server starts without the dense GEMM tuner (first star
 the GLM row above was taken with it, and `EXL3_DENSE_GEMM_TUNE=1` brings it back.
 GLM with `--sessions 4`: 30 tok/s for one request, 37.5 in total for two at once, 40.6 for four.
 
-
 ![Prefill against context, three models](img/prefill.svg)
 
 ### Speculative decode by context
 
 ![Speculative decode against context, three models](img/decode_models.svg)
 
-| Model | 8K | 32K | 64K | 128K | 256K |
-|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 46.5 | 46.4 | 46.4 | 45.1 | 44.3 |
-| GLM-5.3-Flash | 31.1 | 30.7 | 30.0 | 32.1 | 32.3 |
-| MiMo-V2.6-Flash | 29.8 | 23.4 | 17.4 | 12.9 | - |
+| Model | 8K | 32K | 64K | 128K | 256K | 500K |
+|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next | 52.2 | 51.1 | 46.6 | 54.8 | 46.9 | 48.1 |
+| GLM-5.3-Flash | 35.0 | 32.1 | 33.5 | 30.8 | 34.3 | 26.4 |
+| MiMo-V2.6-Flash | 29.8 | 23.4 | 17.4 | 12.9 | - | - |
 
 ## Where each figure comes from
 
@@ -76,7 +75,7 @@ Same machine, one method for every engine we ran: non-thinking chat, an essay re
 
 | tok/s | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Kyojin | 1481 | 1477 | 1436 | 1396 | 1347 |
+| Kyojin | 1621 | 1548 | 1542 | 1505 | 1399 |
 | Gufo v0.8.0, measured by us | 1250 | 1308 | 1289 | 1230 | - |
 
 Strata prefill, independent measurement by Ciru Inference Lab ([report](https://llm.ciru.ai/strataflash/), 6 October 2026; cold prompts of 32K, 64K and 120K tokens; a different machine and different prompts; the lab states that it did not reproduce the publisher's exact workload and that the cause of the gap is not established): 795 / 762 / 709 tok/s at 32K / 64K / 120K.
@@ -87,11 +86,11 @@ Strata prefill, independent measurement by Ciru Inference Lab ([report](https://
 
 | tok/s | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Kyojin | 46.5 | 46.4 | 46.4 | 45.1 | 44.3 |
+| Kyojin | 52.2 | 51.1 | 46.6 | 54.8 | 46.9 |
 | Gufo, measured by us | 35.3 | 31.9 | 35.8 | 31.4 | - |
 | Strata, measured by us | 39.0 | 38.7 | 36.4 | 35.0 | 37.5 |
 
-Card prompts (chat / prose / code): Kyojin 48.3 / 45.7 / 66.8; Gufo 37.3 / 32.5 / 52.3; Strata 46.7 / 41.5 / 61.6 (measured by us, client-timed). Gufo could not take the 256K prompt: the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window.
+Card prompts (chat / prose / code): Kyojin 52.8 / 47.5 / 73.2; Gufo 37.3 / 32.5 / 52.3; Strata 46.7 / 41.5 / 61.6 (measured by us, client-timed). Gufo could not take the 256K prompt: the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window.
 
 ### Fidelity to the original model
 

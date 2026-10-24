@@ -24,9 +24,11 @@ jobs:
       - name: Nix cache
         uses: DeterminateSystems/magic-nix-cache-action@v15
 
-      # Full evaluation + pre-commit hooks + CPU test subset. Deliberately
-      # does NOT build packages.exllamav3 (8-10 min ROCm ext compile, ~9 GB
-      # SDK closure): engine builds stay local, see doc/nix.md.
+      # Full evaluation + pre-commit hooks + CPU test subset. The engine
+      # wheel builds pure-python here (EXLLAMA_NOCOMPILE, seconds); the
+      # ROCm extension .so is reused from the cache and recompiles only
+      # when native sources change (setup.py, exllamav3_ext/, arch_list):
+      # PRs without native changes finish in minutes, see doc/nix.md.
       - name: nix flake check
         run: nix flake check --print-build-logs
 

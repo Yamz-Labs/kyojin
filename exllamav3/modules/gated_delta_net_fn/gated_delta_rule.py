@@ -103,6 +103,7 @@ def gated_delta_rule_fn(
     params: dict = None,
     channelwise_g: bool = False,
     g_cumsum: bool = False,
+    recurrent_base: torch.Tensor = None,
 ):
     # g_cumsum: g already holds fla's chunk-local cumsum (EXL3_KDA_G_FUSED); only valid on the chunk path
     if params is None:
@@ -176,6 +177,7 @@ def gated_delta_rule_fn(
             v_head_dim,
             recurrent_slots,
             history,
+            recurrent_base,
         )
         return core_attn_out
 
@@ -245,6 +247,7 @@ def gated_delta_rule_fn(
             v_head_dim,
             recurrent_slots,
             history,
+            recurrent_base,
         )
 
     return core_attn_out

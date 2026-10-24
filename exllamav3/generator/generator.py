@@ -19,8 +19,17 @@ from ..util.memory import malloc_trim
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
-from .job import Job, _ttrace_begin, _ttrace_end
+from . import chunk_il
+from .job import Job, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
+# EXL3_REPLY_FIRST=1 (default off): a job that finishes inside iterate() is released (deallocate_pages: reply-end tail
+# stash, draft flush, page / slot release) by flush_deferred() AFTER its last results are returned, not before. The server calls it
+# once the results are handed out; every iterate / cancel / clear_queue runs it first, so later work sees the same cache state in
+# the same order (exact by construction). Pays where the stash is a blocking copy (HIP .cpu(), CUDA EXL3_TAIL_PIN=0).
+_REPLY_FIRST = os.environ.get("EXL3_REPLY_FIRST", "0") == "1"
+from . import spec_sample
 from .filter import Filter
+from .row_groups import plan_groups, group_rows_cap, GROUPS as ROW_GROUPS
+from ..util.row_inv import ROW_INV
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
 from .visualizer import CacheVisualizer
@@ -254,11 +263,15 @@ class Generator:
         if max_chunk_size > 65535:
             raise ValueError(f"prefill chunk of {max_chunk_size} rows is not supported: a forward is limited to 65535 rows (mixer kernel grid.y); lower EXL3_PREFILL_CHUNK / max_chunk_size")
         self.max_chunk_size = max_chunk_size
+        # Constructed chunk size: a caller that lowers max_chunk_size at runtime (decode-priority prefill while other
+        # jobs decode, e.g. a serving loop) gets exactly that chunk; adaptive big chunks apply only at this size
+        self.base_chunk_size = max_chunk_size
 
         # Job queues
         self.job_serial = 0
         self.pending_jobs = []
         self.active_jobs = []
+        self.deferred_jobs = []   # EXL3_REPLY_FIRST: finished jobs not yet released
 
         # Filter threads
         self.filter_pool = ThreadPoolExecutor(max_workers = 16)
@@ -302,6 +315,11 @@ class Generator:
         # Exact prompt-end checkpoints (see Job._tail_stash); EXL3_TAIL_CKPT=0 turns them off
         self.tail_ckpts = []
         self.tail_ckpt_max = int(os.environ.get("EXL3_TAIL_CKPT", "8")) if tail_ckpt is None else int(tail_ckpt)
+        # Sub-page prompt-tail checkpoints (EXL3_TAIL_SUB, see Job.sub_ckpt_rows): same entry format as tail_ckpts, kept in
+        # their own list so a long prompt's several entries never push the exact prompt-end checkpoints out. Host memory
+        # bound = sub_ckpt_max x one checkpoint (142 MiB on the KDA model, 75 MiB on the GDN one), oldest dropped first
+        self.sub_ckpts = []
+        self.sub_ckpt_max = max(0, int(os.environ.get("EXL3_TAIL_SUB_MAX", "8")))   # 0 = keep no sub-page entry
         # prompts shorter than this never stash (the stash is 20-40 ms of host copy and 142 MiB per entry)
         self.tail_ckpt_min = int(os.environ.get("EXL3_TAIL_MIN", "512"))
 
@@ -340,12 +358,31 @@ class Generator:
         # leaving the calibrator inert
         self.draft_calibrator = None
         self._draft_conf_round = None
+        # Sampled-draft round (spec_sample): (job, sampler params, draft laws per depth) for the next verify
+        self._spec_round = None
         # Lazy drafter KV catch-up: plain 1-row steps do not feed the drafter cache, they park the
         # target hidden rows here and the next drafting round (or a flush point) writes them in one pass
         self._dkv_pending = None
         self.lazy_dkv = os.environ.get("EXL3_LAZY_DKV", "1") == "1"
         if self.dynamic_draft and self.draft_model is not None:
             self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
+
+    def wide_prefill_chunks(self) -> tuple[bool, bool]:
+        """(attention-only state, fused MoE). attention-only: the recurrent layers are all sliding-window attention rings
+        (no GDN / KDA state, whose checkpoint cadence the chunk plan protects). fused MoE: CUDA block-sparse MoE layers
+        with the fused prefill kernel, which gets more rows per expert from wider chunks."""
+        v = getattr(self, "_wide_prefill_chunks", None)
+        if v is None:
+            from ..modules.block_sparse_mlp import BlockSparseMLP
+            from ..modules.sliding_attn import SlidingAttention
+            swa_only = all(isinstance(m, SlidingAttention) for m in self.model.get_recurrent_layers())
+            moe = not torch.version.hip and any(
+                isinstance(m, BlockSparseMLP) and getattr(m, "fused_mode_buffers", None) is not None
+                for m in self.model
+            )
+            v = self._wide_prefill_chunks = (swa_only, moe)
+        return v
 
 
     def num_remaining_jobs(self):
@@ -461,6 +498,7 @@ class Generator:
         Abort all active and pending jobs
         """
 
+        self.flush_deferred()
         num_jobs = self.num_remaining_jobs()
         for job in self.active_jobs + self.pending_jobs:
             job.deallocate_pages()
@@ -513,6 +551,7 @@ class Generator:
         block tables still depend on the current physical page ordering.
         """
 
+        self.flush_deferred()
         num_jobs = self.num_remaining_jobs()
 
         if job in self.pending_jobs:
@@ -524,12 +563,100 @@ class Generator:
             self.on_queue_drained()
 
 
+    def flush_deferred(self):
+        """
+        EXL3_REPLY_FIRST: release the jobs that finished in the last iterate() (see _REPLY_FIRST). No-op when none.
+        """
+        if not self.deferred_jobs:
+            return
+        jobs, self.deferred_jobs = self.deferred_jobs, []
+        with torch.inference_mode():
+            for job in jobs:
+                job.deallocate_pages()
+        if not self.num_remaining_jobs():
+            self.on_queue_drained()
+
+
     @torch.inference_mode
     def iterate(self) -> list[dict]:
+        self.flush_deferred()
         results = self._iterate_inner()
         if _moe_fused_check is not None:
             _moe_fused_check(self.model)
         return results
+
+    def _cil_views(self) -> list:
+        views = []
+        for job in self.active_jobs:
+            seq = job.sequences[0]
+            done = job.is_prefill_done()
+            cur = max(seq.kv_position, job.cached_pages * PAGE_SIZE)
+            if not done and job.time_first_prefill is None:
+                # no step has run yet: the first one may jump to a tail checkpoint (Job._tail_restore), so a follow-up turn on a
+                # long cached conversation is SHORT, not "big". Peeked once per job (read-only), else it would be parked for good.
+                peek = getattr(job, "_cil_peek", None)
+                if peek is None:
+                    try:
+                        peek = job._tail_peek(seq)
+                    except Exception:                                    # noqa: BLE001
+                        peek = 0
+                    job._cil_peek = peek
+                cur = max(cur, peek)
+            left = 0 if done else max(len(seq.sequence_ids) - 1 - cur, 0)
+            views.append(chunk_il.View(id(job), job.serial_number, left, done,
+                                       0 if done else min(left, self.max_chunk_size), seq.kv_position))
+        return views
+
+    def _cil_parked(self) -> list:
+        """
+        EXL3_SCHED_CHUNK_IL=1: chunked-prefill interleave (chunk_il.ChunkPlanner). Returns the jobs that skip their prefill chunk
+        this step (sets job._cil_skip for the speculation policy, which counts only unparked jobs). Any planner
+        error switches the interleave off for the process (one warning) and serves as without the flag.
+        """
+        for job in self.active_jobs:
+            job._cil_skip = False
+            job._cil_hold = False
+        if getattr(self, "_cil_broken", False) or len(self.active_jobs) < 2:
+            self._cil_plan = None
+            if getattr(self, "_cil", None) is not None:
+                self._cil.solo()                                         # these steps are not interleave time
+            return []
+        try:
+            if getattr(self, "_cil", None) is None:
+                self._cil = chunk_il.ChunkPlanner()
+            views = self._cil_views()
+            self._cil_plan = self._cil.plan_prefill(views)
+            parked = [j for j in self.active_jobs if id(j) in self._cil_plan.parked and not j.is_prefill_done()]
+        except Exception as e:                                           # noqa: BLE001
+            logging.warning("EXL3_SCHED_CHUNK_IL disabled (%r); serving without it", e)
+            self._cil_broken, self._cil_plan = True, None
+            return []
+        for job in parked:
+            job._cil_skip = True
+        return parked
+
+    def _cil_hold(self) -> None:
+        """Generation round: decode-ready jobs the plan holds this step read as not prefill-done (Job._cil_hold), which every
+        draft/verify/sample loop already skips. Undone by _cil_release() at the end of iterate()."""
+        plan = getattr(self, "_cil_plan", None)
+        if plan is None or plan.mode is None or not chunk_il.chunk_il_enabled():
+            return
+        try:
+            held = self._cil.plan_decode(self._cil_views(), plan)
+        except Exception as e:                                           # noqa: BLE001
+            logging.warning("EXL3_SCHED_CHUNK_IL disabled (%r); serving without it", e)
+            self._cil_broken, self._cil_plan = True, None
+            return
+        for job in self.active_jobs:
+            if id(job) in held:
+                job._cil_hold = True
+                job._cil_skip = True
+
+    def _cil_release(self) -> None:
+        if getattr(self, "_cil_plan", None) is None:
+            return
+        for job in self.active_jobs:
+            job._cil_hold = False
 
     def _iterate_inner(self) -> list[dict]:
         """
@@ -618,7 +745,10 @@ class Generator:
 
         # Perform one round of prefill
         _t0 = _ttrace_begin()
+        parked = self._cil_parked() if chunk_il.chunk_il_enabled() else ()
         for job in list(self.active_jobs):
+            if job in parked:
+                continue
             try:
                 job.prefill(results)
             except Exception as e:
@@ -632,6 +762,7 @@ class Generator:
         if self.recurrent_cache is not None:
             self.recurrent_checkpoint()
         _ttrace_end("recurrent_checkpoint", _t0)
+        self._cil_hold()
         _t0 = _ttrace_begin()
 
         # Generation with draft model
@@ -665,6 +796,7 @@ class Generator:
             self.update_visualizer()
 
         # Finished iteration
+        self._cil_release()
         return results
 
 
@@ -804,6 +936,7 @@ class Generator:
     def clear_prompt_ckpts(self):
         """Drop every prompt-end recurrent checkpoint (host memory, ~142 MiB each)."""
         self.tail_ckpts.clear()
+        self.sub_ckpts.clear()
 
 
     def _flush_mtp_defer(self, job, with_tail: bool):
@@ -821,7 +954,7 @@ class Generator:
             pos = job.mtp_defer_end
             self.draft_model.prefill(seq.sequence_ids.torch_slice(pos, pos + 1), {
                 "attn_mode": "flash_attn",
-                "block_table": seq.block_index_tensor,
+                "block_table": seq.prefill_block_table(),
                 "cache": self.draft_cache,
                 "cache_seqlens": torch.tensor([pos], dtype = torch.int32),
                 "target_hidden": job.mtp_defer_carry,
@@ -848,6 +981,7 @@ class Generator:
 
     def iterate_draftmodel_mtp_gen(self, results: list):
 
+        self._spec_round = None
         if self._mtp_defer_gate():
             return None
         self._draft_conf_round = None
@@ -930,6 +1064,16 @@ class Generator:
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
+        # A sampled job (T > 0) draws its drafts from the drafter's law under its own sampler (spec_sample)
+        spec_job = spec_prm = None
+        if spec_sample.SPEC_SAMPLED and batch_size == 1:
+            spec_job = next(j for j in self.active_jobs if j.is_prefill_done())
+            spec_prm = spec_sample.eligible(spec_job)
+        spec_q = []
+        if spec_prm is not None:
+            # Filled depth by depth: a draft policy that stops the loop early (tools/qwen/spec_policy StopDraft) verifies
+            # a prefix of draft_ids_pinned, whose laws are all recorded by then
+            self._spec_round = (spec_job, spec_prm, spec_q)
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -940,6 +1084,8 @@ class Generator:
             }
             if cal is not None:
                 params["export_draft_conf"] = True
+            if spec_prm is not None:
+                params["export_draft_logits"] = True
             if idx == 0 and n_pend and _mtp_fuse_catchup() == 2:
                 params["dflash_verify"] = True
             batch_state = self.draft_model.forward(first_ids if idx == 0 else batch_ids, params)
@@ -948,6 +1094,14 @@ class Generator:
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
             new_ids = self.draft_model.sample_from_state(batch_state, params)
+            if spec_prm is not None:
+                dl = params.pop("draft_logits", None)
+                if dl is None:
+                    spec_prm = self._spec_round = None
+                else:
+                    q = spec_sample.law(dl[0, -1, :], spec_prm)
+                    spec_q.append(q)
+                    new_ids = spec_sample.draw(q, spec_job.rng.random()).view(1, 1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1 + (n_pend if idx == 0 else 0)
@@ -1220,6 +1374,47 @@ class Generator:
         return buf[:rows]
 
 
+    def _row_groups(self, batch_jobs: list, width: int) -> list[tuple[int, int]]:
+        """Job ranges of the forwards that carry one multi-job decode step (see row_groups.py). Every range holds at
+        most the exact-path row count, so each row gets the bits it would get decoded alone."""
+        return plan_groups([len(job.sequences) for job in batch_jobs], width, group_rows_cap())
+
+    def _forward_groups(self, batch_ids: torch.Tensor, params: dict, batch_jobs: list,
+                        groups: list[tuple[int, int]], own_pages: list | None) -> torch.Tensor:
+        """One model forward per job group, concatenated in batch order. A group of several rows runs the verify
+        kernels (params["dflash_verify"]) also when nothing is drafted: the R-row exact paths give each row the bits
+        of the one-row launch. params["export_states"] of the whole step is rebuilt from the groups' lists."""
+        logits = []
+        exports = []
+        r0 = 0
+        for j0, j1 in groups:
+            r1 = r0 + sum(len(job.sequences) for job in batch_jobs[j0:j1])
+            p = dict(params)
+            p["block_table"] = params["block_table"][r0:r1]
+            p["cache_seqlens"] = params["cache_seqlens"][r0:r1]
+            if params.get("positions") is not None:
+                p["positions"] = params["positions"][r0:r1]
+            if params.get("recurrent_states") is not None:
+                p["recurrent_states"] = params["recurrent_states"][j0:j1]
+            if own_pages is not None:
+                p["dflash_table_pages"] = own_pages[r0:r1]
+            if (r1 - r0) * batch_ids.shape[-1] > 1:
+                p["dflash_verify"] = True
+            if r1 - r0 > 1:
+                p["row_inv_per_seq"] = True      # the attention layers run each sequence on its own (Attention.forward)
+            if len(groups) > 1:
+                # The reused pinned staging of the embedding upload (modules/embedding.py) is only safe with a sync point
+                # between two forwards; the forwards of one step follow each other with none, and the next group would
+                # overwrite the rows the previous one has not copied yet
+                p["pinned_staging"] = False
+            logits.append(self.model.forward(input_ids = batch_ids[r0:r1], params = p))
+            if "export_states" in p:
+                exports.append(p["export_states"])
+            r0 = r1
+        if exports:
+            params["export_states"] = [torch.cat(parts, dim = 0) for parts in zip(*exports)]
+        return torch.cat(logits, dim = 0)
+
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
@@ -1338,10 +1533,16 @@ class Generator:
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         _tv0 = _pt()
-        batch_logits = self.model.forward(
-            input_ids = batch_ids,
-            params = params,
-        )
+        groups = None
+        if len(batch_jobs) > 1 and ROW_GROUPS["on"] and ROW_INV["on"] and self.model.caps.get("row_inv_groups") and not active_embeddings:
+            groups = self._row_groups(batch_jobs, batch_ids.shape[-1])
+        if groups is None:
+            batch_logits = self.model.forward(
+                input_ids = batch_ids,
+                params = params,
+            )
+        else:
+            batch_logits = self._forward_groups(batch_ids, params, batch_jobs, groups, own_pages)
         _tv1 = _pt()
         if SPEC_PROF:
             _PROF_CUR["t_verify"] = _tv1 - _tv0
@@ -1472,11 +1673,22 @@ class Generator:
                 # One bulk D2H + one synchronize replaces one sync per position; the consume
                 # loop below is unchanged, so RNG order, accept logic and ids are identical.
                 npos = batch_logits.shape[1]
+                # Sampled-draft round: the draft positions take the spec_sample keep / residual rule, only the last
+                # (bonus) position samples from the target as usual. Applies only to drafts read from the drafter's own
+                # buffer, for which this round recorded a law per position (a lookup round brings its own tensor of
+                # copied tokens: a deterministic draft keeps the argmax rule)
+                spec = None
+                sr = self._spec_round
+                if sr is not None and sr[0] is job and draft_tokens is not None and len(sr[2]) >= npos - 1 and \
+                        draft_tokens.data_ptr() == self.draft_ids_pinned.data_ptr():
+                    spec = [(spec_sample.verify(job_logits[0, pi, :], sr[2][pi], int(draft_tokens[j, pi]), sr[1], job.rng),
+                             None, None, None) for pi in range(npos - 1)]
                 pre = None
                 if draft_tokens is not None and _host_lean() and _lean_verify_job(job, b - a):
                     launched = []
                     for pi in range(npos):
-                        launched.append(job.receive_logits(job_logits[:, pi:pi + 1, :]))
+                        launched.append(spec[pi] if spec is not None and pi < npos - 1 else
+                                        job.receive_logits(job_logits[:, pi:pi + 1, :]))
                     n_dev = sum(1 for s in launched
                                 if s[0] is not None and s[0].is_cuda and s[0].numel() == 1)
                     if n_dev == len(launched):
@@ -1493,6 +1705,8 @@ class Generator:
                     token_logits = job_logits[:, i:i + 1, :]
                     if pre is not None:
                         next_token, next_k_tokens, next_k_probs, next_prob = pre[i]
+                    elif spec is not None and i < npos - 1:
+                        next_token, next_k_tokens, next_k_probs, next_prob = spec[i]
                     else:
                         next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                             token_logits,
@@ -1526,6 +1740,18 @@ class Generator:
                     # The EOS stream event was already built inside receive_sample, so patch its counter too
                     if eos:
                         num_unresolved = batch_logits.shape[1] - 1 - i if draft_tokens is not None else 0
+                        # EXL3_TAIL_REPLY: roll the recurrent state and page positions back to the accepted
+                        # position (as a rejection would) so the finished job can stash an exact reply-end tail
+                        if _TAIL_REPLY_GEN and draft_tokens is not None and batch_states is not None \
+                                and len(job.sequences) == 1:
+                            batch_states[j].rewind(num_unresolved)   # rewind(0) too: it normalises the per-token history
+                            r_ = num_unresolved
+                            seq_ = job.sequences[0]
+                            while r_:
+                                page = seq_.allocated_pages[(seq_.kv_position + r_ - 1) // PAGE_SIZE]
+                                rp = min(page.kv_position, r_)
+                                page.kv_position -= rp
+                                r_ -= rp
                         if num_unresolved:
                             job.rejected_draft_tokens += num_unresolved
                             for r_ in reversed(results):
@@ -1697,7 +1923,10 @@ class Generator:
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
                 job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
-            job.deallocate_pages()
+            if _REPLY_FIRST and job not in requeuing_jobs:
+                self.deferred_jobs.append(job)   # released by flush_deferred() after the results are out
+            else:
+                job.deallocate_pages()
             self.active_jobs.remove(job)
 
         # Requeue jobs. Puts replacement jobs at the front so long generations continue promptly after they yield
@@ -1707,7 +1936,7 @@ class Generator:
             self.pending_jobs.insert(0, rq_job)
 
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
-        if num_jobs and not self.num_remaining_jobs():
+        if num_jobs and not self.num_remaining_jobs() and not self.deferred_jobs:
             self.on_queue_drained()
 
 

@@ -7,6 +7,7 @@ import os, sys, random, unittest
 os.environ.setdefault("HIP_VISIBLE_DEVICES", ""); os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
+import numpy as np
 import spec_policy as sp
 
 def ref_keep(ps, thf=0.6, thv=0.3, maxd=3):
@@ -135,6 +136,151 @@ class T(unittest.TestCase):
         os.environ["QWSPEC_THF"] = "0.5"; os.environ["QWSPEC_MAXD"] = "5"
         try: self.assertEqual(sp.env_defaults(3), (0.5, 0.3, 5))
         finally: del os.environ["QWSPEC_THF"]; del os.environ["QWSPEC_MAXD"]
+
+    def test_ngram_from_env(self):
+        os.environ.pop("QWSPEC_NGRAM", None)
+        self.assertEqual(sp.ngram_from_env(), (2, 7, 16, 3))
+        for v, want in (("2,3,5", (2, 3, 5)), ("off", None), ("0", None), (" 3, 7, 16 ", (3, 7, 16))):
+            os.environ["QWSPEC_NGRAM"] = v
+            try: self.assertEqual(sp.ngram_from_env(), want)
+            finally: del os.environ["QWSPEC_NGRAM"]
+        for v in ("2,7", "17,7,32", "2,0,5", "4,7,3", "2,7,16,3,1", "2,7,16,-1"):
+            os.environ["QWSPEC_NGRAM"] = v
+            try:
+                with self.assertRaises(ValueError): sp.ngram_from_env()
+            finally: del os.environ["QWSPEC_NGRAM"]
+        for v, want in (("2,7,16,3", (2, 7, 16, 3)), ("2,7,16,0", (2, 7, 16, 0))):
+            os.environ["QWSPEC_NGRAM"] = v
+            try: self.assertEqual(sp.ngram_from_env(), want)
+            finally: del os.environ["QWSPEC_NGRAM"]
+
+    def test_install_lookup(self):
+        # lookup-only installer (GLM): a lookup round runs ONE draft forward and returns the copied tokens; any other round
+        # is the generator's own, at its own depth; the window is restored
+        from exllamav3.util.tensor import SeqTensor
+        row = lambda v: list(range(100, 120)) + [v] + [7, 8, 9]
+        def gen(ctx):
+            g = FakeGen(2); dm = FakeDM(g, [0.9] * 8); g.dm, g.lm = dm, FakeLM(dm); dm.chain = [0.9] * 16
+            sid = SeqTensor((1, 1), torch.long, -1, init_cap=256); sid.append(torch.tensor([ctx], dtype=torch.long))
+            g.job.sequences[0].sequence_ids = sid
+            return g
+        st = {}
+        g = gen(row(1000) + list(range(100, 118))); un = sp.install_lookup(g, (2, 3, 16, 1), st)
+        out = g.iterate_draftmodel_mtp_gen([])
+        self.assertEqual((out.tolist(), g.forwards, g.num_draft_tokens, st), ([[118, 119, 1000]], 1, 2, {"ng": 1, "ng_tokens": 3}))
+        g = gen(row(1000) + row(2000) + list(range(100, 118))); sp.install_lookup(g, (2, 3, 16, 1))
+        self.assertEqual(g.iterate_draftmodel_mtp_gen([]).tolist(), [[118, 119]])            # cut where the two rows differ
+        g = gen(row(1000) + row(2000) + list(range(100, 118))); sp.install_lookup(g, (2, 3, 16, 3))
+        self.assertEqual((g.iterate_draftmodel_mtp_gen([]).shape[-1], g.forwards), (2, 2))   # under cmin: the drafter's own round
+        g = gen(list(range(40))); un = sp.install_lookup(g, (2, 3, 16, 1))
+        self.assertEqual((g.iterate_draftmodel_mtp_gen([]).shape[-1], g.forwards), (2, 2))   # no match
+        g.active_jobs = [g.job, FakeJob()]
+        self.assertEqual(g.iterate_draftmodel_mtp_gen([]).shape[-1], 2)                      # two requests: no lookup
+        un(); self.assertNotIn("iterate_draftmodel_mtp_gen", g.__dict__)
+        self.assertNotIn("enqueue", g.__dict__)
+        # the index is primed at enqueue: the first decode round finds it built (no rebuild)
+        g = gen(row(1000) + list(range(100, 118))); fols = []
+        orig_sf = sp.SeqFollower
+        class Spy(orig_sf):
+            def __init__(s, n): orig_sf.__init__(s, n); fols.append(s)
+        sp.SeqFollower = Spy
+        try: sp.install_lookup(g, (2, 3, 16, 1))
+        finally: sp.SeqFollower = orig_sf
+        g.enqueue(g.job)
+        self.assertEqual((fols[0].sid is g.job.sequences[0].sequence_ids, len(fols[0].idx)), (True, 42))
+        self.assertEqual(g.iterate_draftmodel_mtp_gen([]).tolist(), [[118, 119, 1000]])
+
+    def test_plain_lookup_from_env(self):
+        # QWSPEC_PLAIN_LOOKUP = "lmin,K[,cmin[,rows]]"; unset / off / 0 / none -> None; rows defaults to the row_budget argument
+        os.environ.pop("QWSPEC_PLAIN_LOOKUP", None)
+        self.assertIsNone(sp.plain_lookup_from_env())
+        for v in ("off", "0", "none", "OFF", " None "):
+            os.environ["QWSPEC_PLAIN_LOOKUP"] = v
+            try: self.assertIsNone(sp.plain_lookup_from_env())
+            finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        for v, want in (("2,15", (2, 15, 1, 0)), ("2,15,3", (2, 15, 3, 0)), (" 2 , 15 , 1 , 16 ", (2, 15, 1, 16))):
+            os.environ["QWSPEC_PLAIN_LOOKUP"] = v
+            try: self.assertEqual(sp.plain_lookup_from_env(), want)
+            finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        os.environ["QWSPEC_PLAIN_LOOKUP"] = "2,15"                 # 2 fields: rows = the default (row_budget)
+        try: self.assertEqual(sp.plain_lookup_from_env(16), (2, 15, 1, 16))
+        finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        os.environ["QWSPEC_PLAIN_LOOKUP"] = "2,15,3"               # 3 fields: rows = the default
+        try: self.assertEqual(sp.plain_lookup_from_env(16), (2, 15, 3, 16))
+        finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        os.environ["QWSPEC_PLAIN_LOOKUP"] = "2,15,1,4"             # explicit 4th field wins over the default
+        try: self.assertEqual(sp.plain_lookup_from_env(16), (2, 15, 1, 4))
+        finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+        for v in ("2", "2,15,1,4,9", "0,15", "2,0", "2,15,-1", "x,15"):
+            os.environ["QWSPEC_PLAIN_LOOKUP"] = v
+            try:
+                with self.assertRaises(ValueError): sp.plain_lookup_from_env()
+            finally: del os.environ["QWSPEC_PLAIN_LOOKUP"]
+
+    def test_install_plain_lookup(self):
+        # drafter-free lookup: answers iterate_ngram_gen. A match returns its continuation (K cap, cmin cut) as ONE draft per
+        # round and needs NO drafter forward; no match = a plain round (no draft); uninstall restores the generator's slot.
+        from exllamav3.util.tensor import SeqTensor
+        row = lambda v: list(range(100, 120)) + [v] + [7, 8, 9]
+
+        class PJob:
+            def __init__(s, ids):
+                sid = SeqTensor((1, 1), torch.long, -1, init_cap=256)
+                sid.append(torch.tensor([ids], dtype=torch.long))
+                s.sequences = [type("S", (), {"sequence_ids": sid})()]
+            def is_prefill_done(s): return True
+
+        class PGen:
+            def __init__(s):
+                s.active_jobs = []; s.forwards = 0
+            def enqueue(s, j): s.active_jobs.append(j)
+            def iterate_ngram_gen(s, results): s.forwards += 1; return None   # the generator's own slot
+
+        def gen(ids):
+            g = PGen(); st = {}; un = sp.install_plain_lookup(g, (2, 7, 1, 0), st); g.enqueue(PJob(ids)); return g, st, un
+        # one earlier occurrence: the whole continuation (K = 7), one draft row, no drafter forward
+        g1, st1, un = gen(row(1000) + list(range(100, 118)))
+        out = g1.iterate_ngram_gen([])
+        self.assertEqual((out.tolist(), out.shape[-1], g1.forwards, st1),
+                         ([[118, 119, 1000, 7, 8, 9, 100]], 7, 0, {"ng": 1, "ng_tokens": 7}))
+        # the two latest occurrences agree on only 2 tokens: cmin 1 cuts the draft to the common prefix
+        g2, _, _ = gen(row(1000) + row(2000) + list(range(100, 118)))
+        self.assertEqual(g2.iterate_ngram_gen([]).tolist(), [[118, 119]])
+        # no match: no draft, and the generator's own slot was never used
+        g3, _, _ = gen(list(range(40)))
+        self.assertIsNone(g3.iterate_ngram_gen([])); self.assertEqual(g3.forwards, 0)
+        self.assertIn("iterate_ngram_gen", g1.__dict__)                        # the lookup answers the slot
+        un()
+        self.assertNotIn("enqueue", g1.__dict__)
+        self.assertNotIn("iterate_ngram_gen", g1.__dict__)                     # the generator's own slot is back
+        self.assertEqual((g1.iterate_ngram_gen([]), g1.forwards), (None, 1))
+
+    def test_witness_len(self):
+        # a templated list: the constant part is copied, the copy stops at the value that changes from row to row
+        row = lambda v: list(range(100, 120)) + [v, v + 1] + [7, 8, 9]
+        idx = sp.NgramIndex(2)
+        for t in row(1000) + row(2000) + list(range(100, 118)): idx.push(t)
+        L, c = idx.match(7)
+        self.assertEqual((L >= 16, c), (True, [118, 119, 2000, 2001, 7, 8, 9]))
+        self.assertEqual(idx.witness_len(c), 2)
+        # one earlier occurrence only: nothing to compare with, the whole continuation stands
+        idx = sp.NgramIndex(2)
+        for t in row(1000) + list(range(100, 118)): idx.push(t)
+        L, c = idx.match(7)
+        self.assertEqual(idx.witness_len(c), len(c))
+        # against a direct scan on random streams with many repeats
+        import random
+        rng = random.Random(5)
+        for _ in range(300):
+            n = rng.randint(20, 400); per = [rng.randrange(4) for _ in range(rng.randint(3, 40))]
+            ctx = [per[i % len(per)] if rng.random() > 0.03 else rng.randrange(4) for i in range(n)]
+            idx = sp.NgramIndex(2); idx.extend(np.array(ctx))
+            L, c = idx.match(7)
+            if not L or idx._hit is None: continue
+            j, m = idx._hit
+            j2 = next((e for e in range(j - 1, m - 1, -1) if ctx[e - m:e] == ctx[j - m:j]), -1)
+            want = len(c) if j2 < 0 else next((a for a in range(len(c)) if ctx[j2 + a] != c[a]), len(c))
+            self.assertEqual(idx.witness_len(c), want)
 
     def test_online_scale(self):
         r = sp.OnlineRule(0.5, 0.3, 6)

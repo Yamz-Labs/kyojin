@@ -14,6 +14,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 import serve
 
 
+
+def _write_draft2s_pack(path, vocab, width):
+    """A header-only draft2s pack (tools/qwen/draft2s_pack.py metadata layout) for the sidecar tests."""
+    import json as _json, struct
+    hdr = _json.dumps({"__metadata__": {"format": "draft2s-v1", "vocab": str(vocab), "in_features": str(width), "m": "512"}}).encode()
+    path.write_bytes(struct.pack("<Q", len(hdr)) + hdr)
+
+
 class SharedModuleTests(unittest.TestCase):
     def test_serve_metrics_resolves_next_to_the_server(self):
         # serve.py loads tools/mimo/serve.py, which imports serve_metrics from the sys.path of this folder
@@ -49,6 +57,13 @@ class FakeEngine:
     def count_tokens(self, text: str) -> int:
         return len(text.split())
 
+    def prompt_ids(self, prompt: str):
+        """The ids the routes count prompt tokens with (the real engines read them from an encode cache).
+
+        Placeholders of count_tokens() length: the routes only ask for numel()."""
+        import torch
+        return torch.zeros(self.count_tokens(prompt), dtype=torch.long)
+
     def spec_stats(self):
         return {"speculative": True}
 
@@ -81,6 +96,31 @@ def sse_events(raw: str):
 
 
 class ParserTests(unittest.TestCase):
+    def test_draft2s_sidecar(self):
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {}):
+            pack = Path(d)
+            (pack / "config.json").write_text(json.dumps({"vocab_size": 248320, "hidden_size": 2560}))
+            os.environ.pop("EXL3_DRAFT2S", None)
+            self.assertIn("no draft2s.st", serve.configure_draft2s(str(pack)))
+            self.assertNotIn("EXL3_DRAFT2S", os.environ)
+            _write_draft2s_pack(pack / serve.DRAFT2S_IN_PACK, 154880, 4096)       # GLM's head: not this model
+            self.assertIn("does not match", serve.configure_draft2s(str(pack)))
+            self.assertNotIn("EXL3_DRAFT2S", os.environ)
+            _write_draft2s_pack(pack / serve.DRAFT2S_IN_PACK, 248320, 2560)
+            self.assertIn("two-stage", serve.configure_draft2s(str(pack)))
+            self.assertEqual(os.environ["EXL3_DRAFT2S"], str(pack / "draft2s.st"))
+            os.environ["EXL3_DRAFT2S"] = "/nope/x.st"
+            self.assertIn("/nope/x.st", serve.configure_draft2s(str(pack)))
+            self.assertEqual(os.environ["EXL3_DRAFT2S"], "/nope/x.st")
+            for value in ("0", "off", ""):
+                os.environ["EXL3_DRAFT2S"] = value
+                self.assertIn("full head", serve.configure_draft2s(str(pack)))
+                self.assertEqual(os.environ["EXL3_DRAFT2S"], "")
+        self.assertNotIn("EXL3_DRAFT2S", dict(serve.SERVE_ENV))
+        self.assertFalse(serve.DRAFT2S_IN_PACK.endswith(".safetensors"))
+
     def test_reasoning_first_split(self):
         m = serve.split_completion("let me think\nmore\n</think>\n\nThe answer.\n", True, None)
         self.assertEqual(m["reasoning_content"], "let me think\nmore")
@@ -197,12 +237,18 @@ class RequestTests(unittest.TestCase):
             self.assertEqual(serve.render_prompt(tpl, serve.normalize_messages(msgs), tools, **kw), expect)
 
 
+class RoleTests(unittest.TestCase):
+    def test_developer_role_is_the_system_role(self):
+        msgs = serve.normalize_messages([{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}])
+        self.assertEqual([m["role"] for m in msgs], ["system", "user"])
+
+
 class HttpTests(unittest.TestCase):
-    def chat(self, engine, payload, stream=False):
+    def chat(self, engine, payload, stream=False, template=THINK_TEMPLATE):
         async def fn(client):
             r = await client.post("/v1/chat/completions", json={"stream": stream, "model": "m"} | payload)
             return r.status, (await r.text() if stream else await r.json())
-        return with_client(engine, fn)
+        return with_client(engine, fn, template=template)
 
     def test_models_and_health(self):
         async def fn(client):
@@ -334,8 +380,116 @@ class HttpTests(unittest.TestCase):
         st, body = self.chat(eng, {"messages": msgs})
         self.assertIn("vision", body["error"]["message"])
 
+    def test_tool_text_matching_image_placeholder_is_not_an_image(self):
+        eng = FakeEngine("x")
+        marker = serve.IMAGE_PAD
+        st, body = self.chat(eng, {"messages": [{"role": "tool", "content": "tool output: " + marker}]})
+        self.assertEqual(st, 200, body)
+        self.assertEqual(len(eng.calls), 1)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+
+    def test_tool_call_argument_image_url_key_is_escaped(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.tool_calls[0].function.arguments.image_url }}")
+        eng = FakeEngine("x")
+        messages = [{"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_1", "type": "function", "function": {
+                "name": "f", "arguments": {"image_url": marker}}}]}]
+        st, body = self.chat(eng, {"messages": messages}, template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+        self.assertNotIn(marker, eng.calls[0][0])
+
+    def test_input_text_part_matching_image_placeholder_is_not_an_image(self):
+        marker = serve.IMAGE_PAD
+        eng = FakeEngine("x")
+        st, body = self.chat(eng, {"messages": [{"role": "user", "content": [
+            {"type": "input_text", "text": marker}]}]}, template=THINK_TEMPLATE.replace(
+                "{{ m.content }}", "{{ m.content[0].text }}"))
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+
+    def test_tool_schema_property_key_matching_image_placeholder_is_not_an_image(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("TOOLS={{ tools|length }}", "TOOLS={{ tools|tojson }}")
+        eng = FakeEngine("x")
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object", "properties": {marker: {"type": "string"}}}}}]
+        original_tools = json.loads(json.dumps(tools))
+        st, body = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}], "tools": tools},
+                             template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+        self.assertIn(marker, tools[0]["function"]["parameters"]["properties"])
+        self.assertEqual(tools, original_tools)
+
+    def test_tool_schema_description_matching_image_placeholder_is_not_an_image(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("TOOLS={{ tools|length }}", "TOOLS={{ tools[0].function.description }}")
+        eng = FakeEngine("x")
+        tools = [{"type": "function", "function": {"name": "f", "description": marker,
+                  "parameters": {"type": "object", "properties": {}}}}]
+        st, body = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}], "tools": tools},
+                             template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+
+    def test_reasoning_matching_image_placeholder_is_not_an_image(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.reasoning_content }}")
+        eng = FakeEngine("x")
+        messages = [{"role": "assistant", "content": "", "reasoning_content": marker}]
+        st, body = self.chat(eng, {"messages": messages}, template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], [])
+
+    def test_image_part_count_ignores_placeholder_in_tool_text(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.content if m.content is string else '" + marker + "' }}")
+        eng = FakeEngine("x")
+
+        async def fn(client):
+            msgs = [{"role": "tool", "content": marker},
+                    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image"}},
+                                                       {"type": "input_text", "text": "note: " + marker}]}]
+            r = await client.post("/v1/chat/completions", json={"model": "m", "messages": msgs})
+            return r.status
+
+        self.assertEqual(with_client(eng, fn, template=tpl), 200)
+        self.assertEqual(eng.calls[0][1]["images"], ["data:image"])
+
+    def test_image_field_only_parts_are_counted_and_passed_in_order(self):
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.content if m.content is string else '" + marker * 2 + "' }}")
+        eng = FakeEngine("ok")
+        image_urls = ["https://example.test/first.png", "data:second"]
+        messages = [{"role": "user", "content": [
+            {"image": image_urls[0]},
+            {"type": "image_url", "image_url": {"url": image_urls[1]}},
+        ]}]
+        st, body = self.chat(eng, {"messages": messages}, template=tpl)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(eng.calls[0][1]["images"], image_urls)
+
+    def test_tool_property_sanitization_collision_is_rejected_without_mutation(self):
+        marker = serve.IMAGE_PAD
+        escaped_marker = marker[:1] + "\\" + marker[1:]
+        tpl = THINK_TEMPLATE.replace("TOOLS={{ tools|length }}", "TOOLS={{ tools|tojson }}")
+        eng = FakeEngine("x")
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object", "properties": {marker: {"type": "string"},
+                                                  escaped_marker: {"type": "integer"}}}}}]
+        original_tools = json.loads(json.dumps(tools))
+        st, body = self.chat(eng, {"messages": [{"role": "user", "content": "hi"}], "tools": tools},
+                             template=tpl)
+        self.assertEqual(st, 400, body)
+        self.assertIn("collision", body["error"]["message"].lower())
+        self.assertEqual(eng.calls, [])
+        self.assertEqual(tools, original_tools)
+
     def test_images_reach_the_engine_in_order(self):
-        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.content if m.content is string else '<|image_pad|>' }}")
+        marker = serve.IMAGE_PAD
+        tpl = THINK_TEMPLATE.replace("{{ m.content }}", "{{ m.content if m.content is string else '" + marker + "' }}")
         eng = FakeEngine("ok")
 
         async def fn(client):
@@ -942,6 +1096,89 @@ class VllmCompatTests(unittest.TestCase):
         for bad in ("", 5, ["a"], True):
             self.assertEqual(self.post(eng, "/v1/completions", {"model": "m", "prompt": [1], "cache_salt": bad})[0], 400, bad)
         self.assertEqual(self.post(FakeEngine("x"), "/v1/completions", {"model": "m", "prompt": "hi", "cache_salt": "a"})[0], 400)
+
+
+class SSEKeepAliveTests(unittest.TestCase):
+    """KYOJIN_SSE_PING_S: a stream that has nothing to send yet writes a ':' comment (off by default)."""
+
+    def setUp(self):
+        os.environ.pop("KYOJIN_SSE_PING_S", None)
+        self.addCleanup(os.environ.pop, "KYOJIN_SSE_PING_S", None)
+
+    def test_a_ping_reaches_the_client_before_the_first_token(self):
+        os.environ["KYOJIN_SSE_PING_S"] = "0.2"
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kw):
+                # this server polls its queue once a second, so the wait has to outlast a poll
+                await asyncio.sleep(2.3)          # a prefill the client has to sit through
+                async for piece in FakeEngine.generate(self, prompt, **kw):
+                    yield piece
+
+        async def fn(client):
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            chunks = []
+            while True:
+                try:
+                    data = await asyncio.wait_for(r.content.readany(), 5)
+                except (asyncio.IncompleteReadError, asyncio.TimeoutError):
+                    break
+                if not data:
+                    break
+                chunks.append(data)
+            return b"".join(chunks)
+
+        body = with_client(Slow("hello"), fn)
+        self.assertTrue([line for line in body.split(b"\n") if line.startswith(b":")], body[:400])
+        # this template opens a <think> block, so the first visible token is reasoning content ("hel")
+        self.assertLess(body.index(b": waiting"), body.index(b"hel"))   # before the first token
+        self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))          # the stream still ends the OpenAI way
+
+    def test_a_streaming_reply_does_not_cost_the_client_its_connection(self):
+        """The streaming route logs its summary while the reply is being closed: a name that is not
+        bound there raises after the body is complete, and the client loses the connection it was
+        reusing (the next request on it dies with ServerDisconnectedError, and the server logs a
+        traceback per stream). Three streams on one client session must all succeed."""
+        from aiohttp.test_utils import TestClient, TestServer
+
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kwargs):
+                await asyncio.sleep(0.3)
+                async for piece in FakeEngine.generate(self, prompt, **kwargs):
+                    yield piece
+
+        async def check():
+            client = TestClient(TestServer(serve.create_app(Slow("hello"), "m", "{{ messages[0].content }}")))
+            await client.start_server()
+            dropped = 0
+            for _ in range(3):
+                try:
+                    response = await client.post("/v1/chat/completions", json={
+                        "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+                    await response.read()
+                except Exception:                                     # noqa: BLE001  the bug drops the socket
+                    dropped += 1
+            await client.close()
+            return dropped
+
+        self.assertEqual(run(check()), 0)
+
+    def test_nothing_is_written_when_the_switch_is_off(self):
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kw):
+                await asyncio.sleep(1.3)
+                async for piece in FakeEngine.generate(self, prompt, **kw):
+                    yield piece
+
+        async def fn(client):
+            r = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            return await r.read()
+
+        body = with_client(Slow("hello"), fn)
+        self.assertEqual([line for line in body.split(b"\n") if line.startswith(b":")], [])
+        self.assertIn(b"hel", body)
 
 
 if __name__ == "__main__":

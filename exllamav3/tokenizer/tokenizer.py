@@ -89,10 +89,14 @@ class Tokenizer:
         # Remove unspecial added tokens that exist in the base tokenizer already, but only if they decode correctly
         # see https://github.com/huggingface/tokenizers/issues/1392
         ok_tokens = []
+        spm_text = {}
         for p, i in self.unspecial_piece_to_id.items():
             try:
                 itp = self.tokenizer.decode([i], skip_special_tokens = False)
                 if itp == p: ok_tokens.append(p)
+                # SentencePiece whitespace runs stored as added tokens (Gemma 3: "▁▁▁▁" = four spaces): the content is the
+                # raw piece, the decoder's text differs only by the "▁" -> " " replacement, so decode to that text
+                elif "\u2581" in p and itp == p.replace("\u2581", " "): spm_text[i] = itp
             except IndexError:
                 pass
         for t in ok_tokens: del self.unspecial_piece_to_id[t]
@@ -100,6 +104,8 @@ class Tokenizer:
         # Invert extended dictionaries
         self.extended_id_to_piece = {v: k for k, v in self.extended_piece_to_id.items()}
         self.unspecial_id_to_piece = {v: k for k, v in self.unspecial_piece_to_id.items()}
+        self.extended_id_to_piece.update(spm_text)
+        self.unspecial_id_to_piece.update(spm_text)
 
         # Special added tokens the underlying tokenizer doesn't know (declared in
         # tokenizer_config.json or added_tokens.json but missing from tokenizer.json's

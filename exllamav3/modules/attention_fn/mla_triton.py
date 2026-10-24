@@ -657,6 +657,7 @@ def _mla_unfold_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,     # D_v tile (grid axis 2); D_v itself = one tile per head
+    OUT_PITCH: tl.constexpr = 0,   # nc2 S1-rest: row pitch of out in elements (0 = dense H * D_v)
 ):
     """Per-head unfold o_h = o_lat_h @ W_UV_h from the flat layout, emitting token-major
     output so o_proj consumes it without a permute. The V columns are split over grid axis 2
@@ -676,8 +677,12 @@ def _mla_unfold_kernel(
                       mask = valid_m[:, None], other = 0.0)
         w_t = tl.load(w_uv_flat + offs_k[:, None] * (n_q_heads * D_v) + head * D_v + offs_v[None, :])
         acc = tl.dot(o_t, w_t, acc = acc)
-    tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
-             acc.to(tl.float16), mask = valid_m[:, None])
+    if OUT_PITCH:
+        tl.store(out + offs_m[:, None] * OUT_PITCH + head * D_v + offs_v[None, :],
+                 acc.to(tl.float16), mask = valid_m[:, None])
+    else:
+        tl.store(out + (offs_m[:, None] * n_q_heads + head) * D_v + offs_v[None, :],
+                 acc.to(tl.float16), mask = valid_m[:, None])
 
 
 @triton.jit
@@ -1259,12 +1264,55 @@ _PF_UNFOLD = {
 }
 
 
+def _mla_ext():
+    from ...ext import exllamav3_ext
+    return exllamav3_ext
+
+
+_DEC_VALU_WARNED = False
+
+
+def _dec_valu_on() -> bool:
+    """Decode / verify rows (R <= 8) of the MLA absorb and unfold run on the VALU dot2-chain kernels (ext.mla_absorb_dec /
+    mla_unfold_dec), bit-identical to the Triton WMMA kernels. On by default (HIP); EXL3_MLA_DEC_VALU=0 turns it off (read per
+    call). An extension build without the kernels falls back to the Triton path with one log line."""
+    global _DEC_VALU_WARNED
+    if os.environ.get("EXL3_MLA_DEC_VALU", "1") == "0" or torch.version.hip is None:
+        return False
+    ext = _mla_ext()
+    if not (hasattr(ext, "mla_absorb_dec") and hasattr(ext, "mla_unfold_dec")):
+        if not _DEC_VALU_WARNED:
+            _DEC_VALU_WARNED = True
+            print(" -- MLA VALU decode kernels not in this extension build: using the Triton path (rebuild the extension to enable them)")
+        return False
+    return True
+
+
+def _dec_valu_ok(R, w_uk_flat, H, qk_nope, qk_dim, q) -> bool:
+    if R > 8 or not _dec_valu_on() or not hasattr(_mla_ext(), "mla_absorb_dec"):
+        return False
+    return (qk_nope == 256 and w_uk_flat.dtype == torch.half and w_uk_flat.is_contiguous() and w_uk_flat.shape[1] == H * 256 and
+            w_uk_flat.shape[0] % 32 == 0 and q.dtype == torch.half and q.stride(2) == 1 and q.stride(1) == qk_dim and
+            qk_dim % 8 == 0 and q.stride(0) % 8 == 0 and q.data_ptr() % 16 == 0 and w_uk_flat.data_ptr() % 16 == 0)
+
+
+def _dec_valu_unfold_ok(R, o_lat, w_uv_flat, H, v_head_dim) -> bool:
+    if R > 8 or not _dec_valu_on() or not hasattr(_mla_ext(), "mla_unfold_dec"):
+        return False
+    return (v_head_dim == 256 and o_lat.dtype == torch.half and w_uv_flat.dtype == torch.half and o_lat.is_contiguous() and
+            w_uv_flat.is_contiguous() and tuple(w_uv_flat.shape) == (o_lat.shape[2], H * 256) and o_lat.shape[2] % 8 == 0 and
+            o_lat.data_ptr() % 4 == 0 and w_uv_flat.data_ptr() % 4 == 0)
+
+
 def mla_absorb(q: torch.Tensor, w_uk_flat: torch.Tensor, n_q_heads: int, qk_nope_head_dim: int):
     """(R, H, qk_head_dim) token-major queries -> (H, R, kv_lora_rank) head-major absorbed
     queries, W_UK read from the flat layout."""
     R, H, qk_dim = q.shape
     D_c = w_uk_flat.shape[0]
     out = torch.empty((H, R, D_c), dtype = torch.half, device = q.device)
+    if _dec_valu_ok(R, w_uk_flat, H, qk_nope_head_dim, qk_dim, q):
+        _mla_ext().mla_absorb_dec(q, w_uk_flat, out)      # VALU dot2 chain, bitwise equal to the Triton dot
+        return out
     block_m = min(64, triton.next_power_of_2(max(R, 16)))
     # EXL3_MLA_ABSORB_CFG="bn,warps[,stages]" (read per call, default "128,4,2" = legacy): the N tile
     # only splits output columns, the K reduction stays one dot over D_nope
@@ -1318,10 +1366,20 @@ def _unfold_cfg(R: int, v_head_dim: int):
     return block_m, 128, v_head_dim, 2, 4
 
 
-def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int):
-    """(H, R, kv_lora_rank) head-major latent output -> (R, H, v_head_dim) token-major."""
+def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int, out: torch.Tensor = None):
+    """(H, R, kv_lora_rank) head-major latent output -> (R, H, v_head_dim) token-major.
+    out (nc2 S1-rest): optional (R, H * v_head_dim) fp16 row view with unit column stride and any row pitch."""
     H, R, D_c = o_lat.shape
-    out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = o_lat.device)
+    out_pitch = 0
+    if out is not None:
+        assert out.dtype == torch.half and out.dim() == 2 and out.shape == (R, H * v_head_dim) and out.stride(1) == 1 \
+            and out.stride(0) >= H * v_head_dim
+        out_pitch = out.stride(0) if out.stride(0) != H * v_head_dim else 0
+    else:
+        out = torch.empty((R, H, v_head_dim), dtype = torch.half, device = o_lat.device)
+    if out_pitch == 0 and _dec_valu_unfold_ok(R, o_lat, w_uv_flat, H, v_head_dim):
+        _mla_ext().mla_unfold_dec(o_lat, w_uv_flat, out)    # see mla_absorb_dec
+        return out
     block_m, block_k, block_n, stages, warps = _unfold_cfg(R, v_head_dim)
     # A forced/default tile that does not fit in shared memory halves its k tile (probed once
     # per (device, dims, tile) and remembered)
@@ -1334,7 +1392,7 @@ def mla_unfold(o_lat: torch.Tensor, w_uv_flat: torch.Tensor, v_head_dim: int):
                 _mla_unfold_kernel[grid](
                     o_lat, w_uv_flat, out, R,
                     H, D_c, v_head_dim,
-                    block_m, block_k, block_n,
+                    block_m, block_k, block_n, out_pitch,
                     num_warps = warps, num_stages = stages,
                 )
                 _unfold_block_k[fb_key] = block_k

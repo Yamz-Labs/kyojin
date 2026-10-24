@@ -27,6 +27,14 @@ Architecture: `mimo_v2` with a DFlash drafter. Pack: `yamz-labs/MiMo-V2.6-Flash-
 
 `hf download yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz --local-dir ./mimo-pack`, then `python tools/mimo/serve.py --model ./mimo-pack --port 8000 -c 131072`. Speculative decoding (DFlash, 4 bpw drafter, confidence-truncated drafts) is on by default: the server uses the pack's `drafter/` directory (or `$MIMO_DRAFTER`, or `--drafter <dir>`). Without a drafter it logs one line and decodes plain. Set `MIMO_SPEC=0` in the lane script (`tools/lanes/serve_mimo.sh`) or pass `--no-dflash` to `serve.py` for plain decode. Greedy output under speculation is token-identical to plain decode (exact verify arithmetic). `EXL3_MIMO_LOSSLESS=0` selects a slightly faster verify that is not token-identical: near-tied logits can flip. A loaded drafter costs 2 to 4 % prefill. Details: `tools/mimo/SERVE.md`.
 
+## DeepSeek-V4.1-Flash
+
+172 GiB pack, SSD expert tier, Engram tables from the original repository, DSpark drafting. Full page: [DS41.md](DS41.md).
+
+```bash
+DS41_PACK=./ds41-pack DS41_ENGRAM_DIR=./engram_fp8 DS41_DRAFT=5 tools/ds41/ds41_serve.sh
+```
+
 ## Options shared by the servers
 
 - `--sessions N` (Qwen server): decode up to N requests together; the default is 1. Details and measurements: `tools/qwen/SERVE.md`.

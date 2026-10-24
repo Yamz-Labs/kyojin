@@ -178,6 +178,7 @@ def server_compiler(base, model=None):
     return "unknown (server does not report it)" if answered else "unknown", None
 
 
+AMDGPU_VERSION_FILE = os.environ.get("BENCH_AMDGPU_VERSION_FILE", "/sys/module/amdgpu/version")
 ROCM_INFO_FILES = ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev")
 SDK_TREE = "_rocm_sdk_devel"                           # what the rocm-sdk-devel wheel unpacks into site-packages
 
@@ -238,10 +239,16 @@ def rocm_version():
         if v:
             return f"{v} (rocm-sdk)"
     out = sh(f"{sys.executable} -c 'import torch; print(torch.version.hip or \"\")'")
-    return f"HIP {out} (PyTorch)" if out else "unknown"
+    if out:
+        return f"HIP {out} (PyTorch)"
+    out = sh("dpkg-query -W -f='${Version}' rocm-core 2>/dev/null || rpm -q --qf '%{VERSION}' rocm-core 2>/dev/null")
+    if out and " " not in out:
+        return f"{out} (rocm-core package)"
+    out = read_version(AMDGPU_VERSION_FILE)
+    return f"unknown (amdgpu driver {out})" if out else "unknown"
 
 
-KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+KFD_NODES = Path(os.environ.get("BENCH_KFD_DIR", "/sys/class/kfd/kfd/topology/nodes"))
 
 
 def gfx_name(target_version):
@@ -250,10 +257,10 @@ def gfx_name(target_version):
     return f"gfx{major}{minor:x}{stepping:x}"
 
 
-def kfd_gpu_target(nodes=KFD_NODES):
+def kfd_gpu_target(nodes=None):
     """GPU target from the kernel's KFD topology, which needs no ROCm tools. Returns an empty string when no GPU node is found."""
     try:
-        dirs = sorted((d for d in Path(nodes).iterdir() if d.name.isdecimal()), key=lambda d: int(d.name))
+        dirs = sorted((d for d in Path(nodes or KFD_NODES).iterdir() if d.name.isdecimal()), key=lambda d: int(d.name))
     except OSError:
         return ""
     for d in dirs:
@@ -266,9 +273,53 @@ def kfd_gpu_target(nodes=KFD_NODES):
     return ""
 
 
+def torch_gpu(attr):
+    """A property of torch's first GPU (`gcnArchName`, `name`), or an empty string when torch or the GPU is missing."""
+    out = sh(f"{sys.executable} -c 'import torch; p = torch.cuda.get_device_properties(0); print(p.{attr})'")
+    return out.splitlines()[-1].split(":")[0] if out else ""
+
+
 def gpu_name():
     out = sh("rocminfo 2>/dev/null | grep -m1 -o 'gfx[0-9a-z]*'")
-    return out or kfd_gpu_target() or "unknown"
+    return out or kfd_gpu_target() or torch_gpu("gcnArchName") or "unknown"
+
+
+DRM_CARDS = Path(os.environ.get("BENCH_DRM_DIR", "/sys/class/drm"))
+
+
+def drm_gpu_model(root=None):
+    """Product name of the first AMD card in sysfs (vendor 0x1002), when the driver exposes one. Empty string otherwise."""
+    try:
+        cards = sorted(Path(root or DRM_CARDS).glob("card[0-9]*/device"))
+    except OSError:
+        return ""
+    for d in cards:
+        if read_version(d / "vendor") == "0x1002" and read_version(d / "product_name"):
+            return read_version(d / "product_name")
+    return ""
+
+
+def rocminfo_gpu_model(text):
+    """Marketing name of the first GPU agent in `rocminfo` output (the CPU agents come first and are skipped)."""
+    gpu = False
+    for line in text.splitlines():
+        k, _, v = line.partition(":")
+        k, v = k.strip(), v.strip()
+        if k == "Name":
+            gpu = v.startswith("gfx")
+        elif k == "Marketing Name" and gpu and v:
+            return v
+    return ""
+
+
+def gpu_model():
+    """GPU product name: rocminfo, then sysfs, then lspci, then torch. "unknown" when none answers."""
+    out = rocminfo_gpu_model(sh("rocminfo 2>/dev/null"))
+    if not out:
+        out = drm_gpu_model()
+    if not out:
+        out = sh("lspci -d 1002: -mm 2>/dev/null | grep -i -m1 -E 'VGA|Display|3D' | awk -F'\"' '{print $6}'")
+    return out or torch_gpu("name") or "unknown"
 
 
 def main():
@@ -329,7 +380,7 @@ def main():
     comp = server_compiler(base, model)
     if comp[1]:
         print(comp[1], file=sys.stderr)
-    info = {"model": model, "cpu": cpu_name(), "ram": ram_gib(), "gpu_target": gpu_name(), "kernel": platform.release(),
+    info = {"model": model, "cpu": cpu_name(), "ram": ram_gib(), "gpu": gpu_model(), "gpu_target": gpu_name(), "kernel": platform.release(),
             "rocm": rocm_version(), "power": power_mode(a.power_limit), "kernel_compiler": comp[0], "server": base, "date": time.strftime('%Y-%m-%d')}
     prefill_med = med([t for _, t in pf])
     lines = [
@@ -338,6 +389,7 @@ def main():
         f"- Model: `{info['model']}`",
         f"- CPU: {info['cpu']}",
         f"- RAM: {info['ram']}",
+        f"- GPU: {info['gpu']}",
         f"- GPU target: {info['gpu_target']}",
         f"- Kernel: {info['kernel']}",
         f"- ROCm: {info['rocm']}",

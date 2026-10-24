@@ -5,7 +5,7 @@ from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
 from . import Module
-from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX, mm_rows
 from ..model.model_tp_alloc import TPAllocation
 
 class Embedding(Module):
@@ -130,7 +130,9 @@ class Embedding(Module):
                     continue
                 for i in range(bsz):
                     indexed_ids_row = input_ids[i][im[i]] - ie.first_index
-                    combined_emb[i][im[i]] = ie.embeddings[indexed_ids_row].to(out_dtype)
+                    # mm_rows() is the same gather when the rows are a plain tensor, and dequantizes 8 bit
+                    # rows on the device when a server stores them that way (see QuantizedMMRows)
+                    combined_emb[i][im[i]] = mm_rows(ie, indexed_ids_row, out_dtype, combined_emb.device)
 
                     # Prepare deepstack embeddings
                     if ie.deepstack_embeddings is not None:

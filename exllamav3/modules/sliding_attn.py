@@ -241,6 +241,26 @@ class SWALayerState:
         self.v_state[slot, a:b].copy_(v)
 
 
+def swa_graph_prep(cache, swa_mods, rsg, seqlen):
+    """Per-step host work of every sliding layer for the CUDA graph runner, done once outside the capture:
+    the left shift of a full ring (all layers share the decision; each layer shifts its own state) and the
+    in-state lengths (identical across layers). Returns the length list; sets rs.wshift like _decode_state_prep."""
+    S = swa_mods[0][0].kv_state_size
+    if any(rs.position - rs.window_beg + seqlen > S for rs in rsg):
+        for m, inst in swa_mods:
+            k_states, v_states = cache.get_recurrent_layer((m.layer_idx, inst)).get_state_tensors()
+            m._decode_state_prep(rsg, k_states, v_states, seqlen)
+    else:
+        for rs in rsg:
+            rs.wshift = 0
+    # after a shift the lengths come from the post-shift rs.position/window_beg of this step (window_beg moves in post_advance)
+    out = []
+    for rs in rsg:
+        cp = rs.position - rs.window_beg
+        out.append(cp - rs.wshift if rs.wshift else cp)
+    return out
+
+
 class SlidingAttention(Module):
 
     _seqlens_last = None
@@ -917,6 +937,18 @@ class SlidingAttention(Module):
         return x
 
 
+    def _slot_block_table(self, slots):
+        bt = self.bt_cache.get(slots)
+        if bt is None:
+            pps = self.kv_state_size // PAGE_SIZE
+            bt = torch.tensor(
+                [[slot * pps + j for j in range(pps)] for slot in slots],
+                dtype = torch.int32, device = self.device
+            )
+            self.bt_cache[slots] = bt
+        return bt
+
+
     def _decode_state_prep(self, rsg, k_states, v_states, seqlen):
         """Per-row page shift when the window run reaches the end of the state buffer, cached
         per-slot block table, and the in-state sequence lengths for a decode step."""
@@ -935,14 +967,7 @@ class SlidingAttention(Module):
                 rs.wshift = 0
             positions_l.append(cache_pos)
 
-        slots = tuple(rs.slot for rs in rsg)
-        bt = self.bt_cache.get(slots)
-        if bt is None:
-            bt = torch.tensor(
-                [[slot * pps + j for j in range(pps)] for slot in slots],
-                dtype = torch.int32, device = self.device
-            )
-            self.bt_cache[slots] = bt
+        bt = self._slot_block_table(tuple(rs.slot for rs in rsg))
         # Every sliding layer of a decode step has the same in-state lengths: one upload per step
         # instead of one per layer (read-only downstream)
         key = (self.device, tuple(positions_l))
@@ -978,7 +1003,11 @@ class SlidingAttention(Module):
         position = params.get("position", 0)
 
         k_states, v_states = rsl.get_state_tensors()
-        bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
+        swa_cs = params.get("swa_cs")
+        if swa_cs is not None:
+            bt, cache_seqlens = self._slot_block_table(tuple(rs.slot for rs in rsg)), swa_cs
+        else:
+            bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
         return bca.step(x, cache_seqlens, bt, position, positions, position_ids, inv_freq)
 
 
@@ -1107,7 +1136,12 @@ class SlidingAttention(Module):
         if seqlen <= 16 and not non_causal_spans:
             # Decode: append into the state (shifting it left first on the rare step where the
             # window run reaches the end of the buffer) and attend over the pages
-            bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
+            swa_cs = params.get("swa_cs")
+            if swa_cs is not None:
+                # CUDA graph runner: shift + seqlens were prepared outside the capture (swa_graph_prep)
+                bt, cache_seqlens = self._slot_block_table(tuple(rs.slot for rs in rsg)), swa_cs
+            else:
+                bt, cache_seqlens = self._decode_state_prep(rsg, k_states, v_states, seqlen)
 
             # DFlash verify (R rows): a single paged_attn_triton_decode call over all
             # R rows at once tiles/splits the KV span from the batch's (single) cache_seqlens and

@@ -1,0 +1,27 @@
+{
+ "model": "qwen",
+ "max_tokens": 256,
+ "points": {
+  "499712": {
+   "tag": "point-499712",
+   "usage": {
+    "prompt_tokens": 499715,
+    "completion_tokens": 256,
+    "total_tokens": 499971,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "timings": {
+    "cache_n": 0,
+    "prompt_n": 499715,
+    "predicted_n": 256,
+    "prompt_per_second": 1290.6,
+    "predicted_per_second": 36.21
+   },
+   "target": 499712,
+   "calibrated_tokens": 499712
+  }
+ },
+ "started": "2026-10-17 12:00:00"
+}
