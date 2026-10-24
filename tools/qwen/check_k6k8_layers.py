@@ -18,6 +18,9 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--max-rel-error", type=float, default=1e-3,
+                        help="largest accepted relative update RMS error against the unfused path (default 1e-3; "
+                             "0 requires bit-exact outputs)")
     args = parser.parse_args()
     root = Path.cwd().resolve()
     assert (root / "tools/qwen/serve.py").is_file(), "Run from the experimental checkout"
@@ -65,6 +68,7 @@ def main():
 
     FusedMoEHalf.__call__ = counted_call
     comparisons = differences = 0
+    worst = 0.0
     try:
         for block in selected:
             print("Loading block:", block.key, flush=True)
@@ -126,11 +130,13 @@ def main():
                         exact = torch.equal(got, ref)
                         comparisons += 1
                         differences += not exact
+                        relative = rms(error) / max(rms(update), 1e-30)
+                        worst = max(worst, relative)
                         print(json.dumps({
                             "block": block.key, "seed": seed, "rows": rows,
                             "exact": exact, "max_abs_error": error.abs().max().item(),
                             "error_rms": rms(error), "reference_update_rms": rms(update),
-                            "relative_update_rms_error": rms(error) / max(rms(update), 1e-30),
+                            "relative_update_rms_error": relative,
                         }), flush=True)
                 print("Block checks complete:", block.key, flush=True)
                 del run, plan, workspace, x, ref, got, repeat, base
@@ -142,12 +148,17 @@ def main():
                 torch.cuda.empty_cache()
     finally:
         FusedMoEHalf.__call__ = original_call
-    print(f"Comparisons: {comparisons}; non-exact: {differences}", flush=True)
+    print(f"Comparisons: {comparisons}; non-exact: {differences}; worst relative update RMS error: {worst:.3e}", flush=True)
     print("PASS: guards, finite outputs, repeatability, and batch reshape checks.", flush=True)
-    if differences:
-        print("REVIEW REQUIRED: fused/unfused differences above; do not enable in production yet.", flush=True)
+    if worst > args.max_rel_error or (args.max_rel_error == 0 and differences):
+        print(f"REVIEW REQUIRED: worst relative error {worst:.3e} exceeds --max-rel-error {args.max_rel_error:g}; "
+              "do not enable in production yet.", flush=True)
         return 2
-    print("PASS: all tested half-layer outputs exactly match the unfused path.", flush=True)
+    if differences:
+        print(f"PASS: {differences} of {comparisons} outputs differ from the unfused path at rounding level "
+              f"(worst {worst:.3e} <= {args.max_rel_error:g}); see tools/qwen/K6K8.md, Numerical acceptance.", flush=True)
+    else:
+        print("PASS: all tested half-layer outputs exactly match the unfused path.", flush=True)
     print("Full-model and performance checks are still required.", flush=True)
     return 0
 

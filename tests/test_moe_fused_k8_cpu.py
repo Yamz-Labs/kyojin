@@ -45,11 +45,12 @@ def test_k8_oracle_rejects_broken_indexing(tmp_path, old, new):
 def eligibility():
     # Isolate this pure policy helper without importing torch or compiling the HIP extension.
     tree = ast.parse((ROOT / "exllamav3/modules/moe_fused.py").read_text())
-    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
-                    and n.name == "_k6s8_support_reason")
+    functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ("_first_k", "_k6s8_support_reason")]
+    assert len(functions) == 2
     state = {"variant": 0x160000, "timing": 0}
     namespace = {"os": os, "MF9": state}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), "eligibility", "exec"), namespace)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "eligibility", "exec"), namespace)
     def experts(bits, count):
         return SimpleNamespace(**{
             key: [SimpleNamespace(inner=SimpleNamespace(K=bits, mul1=True, mcg=False))
@@ -88,6 +89,39 @@ def test_rejects_mixed_projection_formats(eligibility, monkeypatch, part, projec
     monkeypatch.delenv("EXL3_MOE_FUSED_LAYOUT", raising=False)
     module = model if part == "routed" else model.shared_experts
     setattr(getattr(module, projection)[index].inner, attribute, value)
+    assert "uniform K6" in fn(model)
+
+
+@pytest.mark.parametrize("break_part", ["routed_inner", "routed_k", "shared_inner", "shared_k", "shared_gates", "shared_missing"])
+def test_block_without_k_falls_back(eligibility, monkeypatch, break_part):
+    # A block whose projections have no `.inner.K` (for example a non-EXL3 linear) must fall back, not raise.
+    fn, _, model = eligibility
+    monkeypatch.setenv("EXL3_MOE_FUSED_K6S8", "1")
+    monkeypatch.delenv("EXL3_MOE_FUSED_LAYOUT", raising=False)
+    assert fn(model) is None
+    if break_part == "routed_inner":
+        model.gates[0] = SimpleNamespace()
+    elif break_part == "routed_k":
+        del model.gates[0].inner.K
+    elif break_part == "shared_inner":
+        model.shared_experts.gates[0] = SimpleNamespace()
+    elif break_part == "shared_k":
+        del model.shared_experts.gates[0].inner.K
+    elif break_part == "shared_gates":
+        model.shared_experts = SimpleNamespace()
+    else:
+        model.shared_experts = None
+    assert fn(model) is None
+
+
+def test_missing_attribute_in_a_later_projection_is_a_mismatch_not_an_error(eligibility, monkeypatch):
+    fn, _, model = eligibility
+    monkeypatch.setenv("EXL3_MOE_FUSED_K6S8", "1")
+    monkeypatch.delenv("EXL3_MOE_FUSED_LAYOUT", raising=False)
+    del model.downs[1].inner.mul1
+    assert "uniform K6" in fn(model)
+    model.downs[1].inner.mul1 = True
+    model.shared_experts.ups[0] = SimpleNamespace()
     assert "uniform K6" in fn(model)
 
 
