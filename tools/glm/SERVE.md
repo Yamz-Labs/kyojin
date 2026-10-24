@@ -30,10 +30,31 @@ call, a streamed call, a tool call, and two 400-token benchmark calls.
 | `--default-reasoning-effort` | `medium` | template `reasoning_effort` when a request omits it: `low`, `medium`, `high` or `max` |
 | `--max-history` | `1` | recurrent history slots; must equal draft tokens (1 for MTP). Each extra slot costs ~2.15 GiB |
 | `-c`, `--max-ctx` | `131072` | context window in tokens, shared by all sessions |
+| `--cache-bits` | `0` | `0` = fp16 MLA latent pages (default); `8` = packed int8 latent pages, target and MTP draft caches together. The DSA indexer and k-pool planes and the shared rope key stay fp16, so the saving is a smaller fraction than the latent-only 1.7×. Greedy output stays coherent but differs token-wise from fp16. Slot files do not cross cache modes (a cross-mode restore fails with `slot file cache layout does not match`); with `--sessions` > 1 the packed pages are not row-invariant, so batched decode changes the greedy text (see below). |
 | `--sessions` | `1` | requests decoded together through the one model (multi-user). `1` = one request at a time, others wait |
 | `--row-budget` | `5` when `--sessions` > 1 | caps the verify rows per round by lowering the draft depth when several sessions are busy; `0` = off |
 | `--num-draft` | `2` | draft tokens per speculative round; `0` = plain decode, no drafter |
 | `--exact-prefix-cache` | off | a request resumed from the prompt cache gives the same greedy text as its cold prefill. Costs about 5-12 % of cold prefill speed at 7-14K tokens |
+
+`--cache-bits 8` stores the MLA latent cache — GLM's only paged attention — in the packed int8
+format, the same machinery as the Qwen server's flag, for both the target and the MTP draft
+cache. On GLM-5.3 the latent is the only quantised plane: the DSA indexer key, the k-pool plane
+and the rope key stay fp16, so the saving is smaller than the latent-only ratio. Measured on the
+NicSir 2.72bpw pack (Ryzen AI Max+ 395; full tables, commands and caveats in
+`tools/glm/CACHE_BITS_8.md`): the latent is 1024 → 544 B/token (packed qk 512 B + fp16 scales
+32 B) against 512 B + 64 B of fp16 indexer and k-pool planes that do not change, so an MLA layer
+is 1600 → 1120 B/token (−30 %). With the 11 MLA target layers and the 1-layer MTP draft cache the
+paged pool is 17.6 → 12.3 KB/token: 825 → 578 MiB at `-c 40960` and, extrapolated linearly in the
+token budget, 2475 → 1733 MiB at `-c 131072` and 9.4 → 6.6 GiB at `-c 524288`. Decode is about
+3 % slower (greedy + MTP: 25.20 → 24.44 tok/s medians) with the same draft acceptance (85.2 %);
+`EXL3_MLA_QC_BN=32` recovers about half of it (24.86 tok/s, acceptance 86.9 %; `BN >= 128` fails
+with a shared-memory `OutOfResources`) but the engine default is unchanged. PPL is unchanged
+(2.868039 both modes) but `tools/glm/ppl7.py` forwards cacheless (`attn_mode=flash_attn_nc`), so
+it cannot see the quantiser; needle-in-haystack recall at 40K is 9/9 in both modes. Greedy output
+differs token-wise from fp16, and the packed pages are not row-invariant: at `--sessions 2` the
+two batched rows agree with each other but differ from the same request run alone, so the server
+prints a warning when `--cache-bits 8` meets `--sessions` > 1. Slot files do not cross cache
+modes. The startup line prints `serve: cache=int8 (slot files do not cross cache modes)`.
 
 Env vars the server sets for itself via `os.environ.setdefault` (so an external value
 wins): `EXL3_CONV_GEMM=1`, `EXL3_DENSE_GEMM_TUNE=0`, `EXL3_MOE_UNION_V2=1`, `EXL3_MOE_CFG=2`, `EXL3_HIP_PREFILL_MIN_ROWS=2`,

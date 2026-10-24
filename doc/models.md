@@ -21,6 +21,8 @@ With a small `max_tokens`, the reasoning can use the whole budget: `content` is 
 
 GLM: the pack ships `mtp_eh_proj.st`, an unquantized MTP `eh_proj` (64 MiB). The server loads it automatically from the model folder; it raises draft acceptance and decode speed (26.7 -> 31.6 tok/s greedy on the card protocol). Details in `tools/glm/SERVE.md`.
 
+GLM: `--cache-bits 8` stores the MLA latent cache pages packed int8 (target and MTP draft caches together); the DSA indexer and k-pool planes and the rope key stay fp16, so the memory saving is smaller than the latent-only 1.7× (measured 17.6 -> 12.3 KB/token, -30 %: 825 -> 578 MiB at `-c 40960`, about 9.4 -> 6.6 GiB at `-c 524288`). Decode is about 3 % slower with the same draft acceptance (85.2 %); greedy output stays coherent but differs token-wise from fp16, and slot files do not cross modes. With `--sessions` > 1 the packed pages are not row-invariant. Measured numbers and caveats: `tools/glm/CACHE_BITS_8.md`.
+
 ## MiMo-V2.6-Flash
 
 Architecture: `mimo_v2` with a DFlash drafter. Pack: `yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz`.
