@@ -79,6 +79,10 @@ difference to the unfused path discussed in K6K8.md is the same with and without
 this change. Decode median 16.6 against 16.4 tokens/s at 4K and 17.0 against
 16.6 at 32K; at this sample size that is within noise.
 
+Build: with its prerequisite the extension grows from 134.66 MB (base) to 137.29 MB,
+of which this change adds about 1.1 MB over the prerequisite alone (136.20 MB); a full
+build took 517 s against 469 s for the prerequisite alone (three parallel jobs, machine not idle).
+
 Registers and spills (hipcc `-Rpass-analysis=kernel-resource-usage`, gfx1151).
 The wide launch uses the six stage kernels (`moe_fused9s_kernel`, stage 0 to 5):
 
