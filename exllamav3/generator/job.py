@@ -878,7 +878,13 @@ class Job:
 
         # Decode and buffer output
         id_to_piece = self.generator.tokenizer.get_id_to_piece_list(self.decode_special_tokens)
-        new_text = id_to_piece[next_token.item()]
+        if 0 <= next_token_i < len(id_to_piece):
+            new_text = id_to_piece[next_token_i]
+        else:
+            # An id the tokenizer has no piece for (the padded rows of the head, or worse) must never kill the process:
+            # it decodes to nothing and the first one is logged. The sampler and the drafters mask these ids already
+            new_text = ""
+            self.generator.note_unknown_token(next_token_i, len(id_to_piece))
 
         if self.new_tokens == 0:
             unhealed = id_to_piece[self.prefix_token[0].item()]

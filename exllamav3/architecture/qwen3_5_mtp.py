@@ -286,6 +286,9 @@ class Qwen3_5MTPModel(Model):
                         params["draft_conf"] = conf
                     return ids
             logits = lm.forward(logits, params)
+            lim = getattr(self, "vocab_limit", None)   # set by the Generator: the tokenizer's piece count when the head is padded
+            if lim is not None:
+                logits = logits[..., :lim]   # the padding columns have no piece: a draft there is rejected for sure
             if params.get("export_draft_conf"):
                 # Per-position confidence for the generator's draft truncation: the argmax logit
                 # value, over the unpadded vocabulary
