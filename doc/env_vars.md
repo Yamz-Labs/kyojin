@@ -144,6 +144,46 @@ affects quantized caches.
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
   decode path reads the packed cache directly.
 
+### `EXL3_CK_PAGEDKV` (default: unset)
+
+Optional Composable Kernel sparse prefill for the MiMo global-attention shape on a gfx1151 ROCm
+system. Set to `sparse` before importing the engine to register handlers for both fp16 and 8-bit
+KV caches. The handlers own only batch-one, causal Q/K=192, 64-query-head/4-KV-head, V=128
+prefill chunks; every other shape, decode step, SWA layer, and unaligned past length falls back
+to the normal Triton handler. The option is off by default.
+
+Build the required MIT-licensed CK specialization with local `git`, `cmake`, `nm`,
+`/usr/bin/python3`, and an already-expanded ROCm SDK (including `lib/llvm/bin/clang{,++}`):
+
+```bash
+export EXL3_CK_SOURCE=/path/to/local/composable_kernel
+export EXL3_ROCM_SDK=/path/to/already-expanded/rocm-sdk
+export EXL3_CK_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kyojin/ck-pagedkv"
+tools/strix_halo/build_ck_pagedkv.sh
+```
+
+`EXL3_CK_SOURCE` is a read-only local Git donor containing commit
+`6f44fdf90f69adee742ec3660b95d32963b9bd2d`. The builder ignores its current HEAD and dirty
+worktree, stages that exact commit in the cache, and patches only the staged copy. It never
+fetches implicitly or sources `env.sh`. `EXL3_CK_CACHE` must be disjoint from the donor (neither
+may contain the other): choose a nonexistent directory on first use, or reuse a cache with a
+matching builder/patch/shim/SDK/commit ownership record. Existing unowned or incompatible
+caches are refused.
+
+The output is `$EXL3_CK_CACHE/libck_pagedkv.so` with a digest-bound `receipt.json`. The default
+cache is `${XDG_CACHE_HOME:-$HOME/.cache}/kyojin/ck-pagedkv`; when choosing a different cache,
+set `EXL3_CK_PAGEDKV_SO="$EXL3_CK_CACHE/libck_pagedkv.so"` before importing the engine. Build
+success proves source compilation/linking and export checks only, not native loading or
+numerical correctness. The first implementation stages all used K and V pages from an 8-bit
+cache; selected-V-only staging is not implemented yet.
+
+### `EXL3_CK_SPARSE_RETAIN` (default: `0.5`)
+
+Nominal fraction of total pages (past plus current chunk) retained by the optional CK selector.
+Current-chunk and sink pages are always kept, even if they exceed that budget; the most-recent
+past pages are not forced. This is a quality/performance knob; evaluate it with the same model
+and context before changing the default.
+
 ### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
 
 Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than
