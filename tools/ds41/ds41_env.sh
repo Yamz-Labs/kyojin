@@ -26,8 +26,16 @@ DS41_PACK=${DS41_PACK:-$HOME/models/ds41-1017-yamz}
 DS41_ENGRAM_DIR=${DS41_ENGRAM_DIR-$HOME/models/ds41-1017/engram_fp8}
 DS41_TIER=${DS41_TIER:-auto}
 DS41_VALIDATE=${DS41_VALIDATE:-1}
-# shellcheck disable=SC1091
-source "${DS41_PYENV:-$H/ds41box/pyenv.sh}" "$ROOT" || { echo "ds41: python env ${DS41_PYENV:-$H/ds41box/pyenv.sh} failed" >&2; return 5 2>/dev/null || exit 5; }
+# Python env: DS41_PYENV=<script> (sourced with the repo root) if set, else the repo's standard Strix Halo env (tools/strix_halo/env.sh,
+# venv at $EXL3_VENV or <repo>/.venv; needs ml_dtypes installed in it).
+# shellcheck disable=SC1090,SC1091
+if [ -n "${DS41_PYENV:-}" ]; then
+  source "$DS41_PYENV" "$ROOT" || { echo "ds41: python env $DS41_PYENV failed" >&2; return 5 2>/dev/null || exit 5; }
+else
+  source "$ROOT/tools/strix_halo/env.sh" >/dev/null || { echo "ds41: tools/strix_halo/env.sh failed" >&2; return 5 2>/dev/null || exit 5; }
+  export PATH="$EXL3_VENV/bin:$PATH" PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+  unset CUDA_VISIBLE_DEVICES
+fi
 export HIP_VISIBLE_DEVICES=0
 [ -f "$DS41_PACK/config.json" ] || { echo "ds41: no pack at $DS41_PACK (config.json missing)" >&2; return 2 2>/dev/null || exit 2; }
 if ! ls "$ROOT"/exllamav3_ext*.so >/dev/null 2>&1; then
