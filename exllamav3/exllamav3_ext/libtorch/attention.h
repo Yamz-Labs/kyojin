@@ -174,6 +174,7 @@ struct BC_Attention
         at::Tensor q2, q4, k4, v4, o2, o4, qg2, g2;
         at::Tensor qkv_c_ptrs;   // sliced bundle: per-slice output pointers into the statics
 
+        bool qkv_tri = false;    // q/k/v ran as one int8 GEMV launch (m == 1): the graph patches its activation pointer as a gemm A
         std::shared_ptr<TritonKernel> k_split;
         std::shared_ptr<TritonKernel> k_combine;   // null when num_splits == 1
         std::shared_ptr<TritonKernel> k_update;    // null when quant_cache

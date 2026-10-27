@@ -123,6 +123,20 @@ static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual
     return nullptr;
 }
 
+static void* select_gemv_int8_sq_tri_kernel(int K, bool c_fp32)
+{
+    switch (K)
+    {
+        case 1: return exl3_gemv_int8_sq_tri_sel_k1(c_fp32);
+        case 2: return exl3_gemv_int8_sq_tri_sel_k2(c_fp32);
+        case 3: return exl3_gemv_int8_sq_tri_sel_k3(c_fp32);
+        case 4: return exl3_gemv_int8_sq_tri_sel_k4(c_fp32);
+        case 5: return exl3_gemv_int8_sq_tri_sel_k5(c_fp32);
+        case 6: return exl3_gemv_int8_sq_tri_sel_k6(c_fp32);
+    }
+    return nullptr;
+}
+
 // Fixed-size per-device workspace shared by the sq and coop paths, allocated once and never
 // reallocated: the pointer is baked as a kernel argument into captured CUDA graphs, so growing the
 // buffer would leave every previously captured graph with a dangling workspace pointer (and let a
@@ -160,13 +174,18 @@ static bool exl3_gemv_int8_sq
     int device, int num_sms, cudaStream_t stream, Graph* graph,
     // Second matrix of a dual launch (same shape, K and output type), all null for a single GEMV
     const half* A2_ptr = nullptr, const uint16_t* B2_ptr = nullptr, void* C2_ptr = nullptr,
-    const half* suh2_ptr = nullptr, const half* svh2_ptr = nullptr
+    const half* suh2_ptr = nullptr, const half* svh2_ptr = nullptr,
+    // tri: B2/C2/suh2/svh2 are the second matrix of width n2, the third is (B3, C3, suh3, svh3, n3); same activations, m == 1
+    int n2 = 0, const uint16_t* B3_ptr = nullptr, void* C3_ptr = nullptr,
+    const half* suh3_ptr = nullptr, const half* svh3_ptr = nullptr, int n3 = 0
 )
 {
     if (size_m > 2) return false;
-    const bool dual = B2_ptr != nullptr;
+    const bool tri = B3_ptr != nullptr;
+    const bool dual = B2_ptr != nullptr && !tri;
+    if (tri && (size_m != 1 || residual || c_fp32 || n2 > size_n || n3 > size_n || n2 % 256 || n3 % 256)) return false;
     int M = size_m;
-    void* fn = select_gemv_int8_sq_kernel(K, M, c_fp32, residual, dual);
+    void* fn = tri ? select_gemv_int8_sq_tri_kernel(K, c_fp32) : select_gemv_int8_sq_kernel(K, M, c_fp32, residual, dual);
     if (!fn) return false;
 
     int rows_max = gemv_int8_sq_rows_max(M, residual);
@@ -177,7 +196,7 @@ static bool exl3_gemv_int8_sq
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
     {
         int rows_total = size_k / 16;
-        int nb256 = size_n / 256;
+        int nb256 = (size_n + (tri ? n2 + n3 : 0)) / 256;
         int r = CEIL_DIVIDE(rows_total * nb256, grid_);
         rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
         rows_per = MAX(rows_per, SQ_MINROWS);
@@ -228,7 +247,7 @@ static bool exl3_gemv_int8_sq
     int maxb;
     // A pair takes the grid, and so the slice decomposition, its single-matrix kernel would get: that keeps the pair
     // bit-identical to two launches even where the pair instantiation needs more registers (lower occupancy)
-    void* fn_occ = dual ? select_gemv_int8_sq_kernel(K, M, c_fp32, residual, false) : fn;
+    void* fn_occ = (dual || tri) ? select_gemv_int8_sq_kernel(K, M, c_fp32, residual, false) : fn;
     if (!fn_occ) return false;
     auto occ_key = std::make_pair(fn_occ, smem_guess);
     auto occ_it = gemv_occ_cache[device].find(occ_key);
@@ -253,11 +272,12 @@ static bool exl3_gemv_int8_sq
     int rows_eff = rows_per;    // the kernel takes the host's slice height (single source of truth)
     size_t smem = smem_for(rows_per);
     if (ksplit > SQ_KSPLIT_CAP) return false;
-    if ((dual ? 2 : 1) * (size_n / 256) > SQ_COUNTERS_CAP) return false;      // counters, per matrix
-    if ((dual ? 2 : 1) * ksplit * M > 4 * SQ_KSPLIT_CAP) return false;      // (slice, row) scale entries
+    const int nmat = tri ? 3 : (dual ? 2 : 1);
+    if (tri ? (size_n + n2 + n3) / 256 > SQ_COUNTERS_CAP : nmat * (size_n / 256) > SQ_COUNTERS_CAP) return false;      // counters, per matrix
+    if (nmat * ksplit * M > 4 * SQ_KSPLIT_CAP) return false;      // (slice, row) scale entries
 
     int pstride = size_n * (residual ? 2 : 1);
-    int* ws_ptr = gemv_int8_get_ws(device, SQ_WS_RESERVED + (size_t) (dual ? 2 : 1) * ksplit * M * pstride);
+    int* ws_ptr = gemv_int8_get_ws(device, SQ_WS_RESERVED + (size_t) nmat * ksplit * M * pstride);
     if (!ws_ptr) return false;
 
     void* kernelArgs[] =
@@ -277,7 +297,13 @@ static bool exl3_gemv_int8_sq
         (void*) &B2_ptr,
         (void*) &C2_ptr,
         (void*) &suh2_ptr,
-        (void*) &svh2_ptr
+        (void*) &svh2_ptr,
+        (void*) &n2,
+        (void*) &B3_ptr,
+        (void*) &C3_ptr,
+        (void*) &suh3_ptr,
+        (void*) &svh3_ptr,
+        (void*) &n3
     };
 
     cudaError_t err = cudaLaunchKernel(fn, dim3(grid), dim3(NUM_THREADS), kernelArgs, smem, stream);
@@ -290,7 +316,16 @@ static bool exl3_gemv_int8_sq
     if (exl3_gemv_int8_trace())
         fprintf(stderr, "[exl3_gemv_int8] sq kernel: m=%d k=%d n=%d K=%d residual=%d dual=%d grid=%d rows_per=%d ksplit=%d smem=%zu\n",
                 size_m, size_k, size_n, K, (int) residual, (int) dual, grid, rows_per, ksplit, smem);
-    if (dual)
+    if (tri)
+    {
+        // The outputs are the caller's statics; only the activation pointer changes between replays
+        if (graph)
+        {
+            graph->record_param(fn, GP_gemm_A, 0);
+            graph->record_param(fn, GP_end, 0);
+        }
+    }
+    else if (dual)
     {
         // Only the activation and output pointers change between calls (the weights are static); recorded
         // in the (A, C, A, C) order of two back-to-back single GEMVs so the caller's patch list is the same
@@ -515,4 +550,54 @@ bool exl3_gemv_int8_pair_eager
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     return exl3_gemv_int8_pair(A, B1, C1, suh1, svh1, B2, C2, suh2, svh2, at::cuda::getCurrentCUDAStream().stream(), nullptr);
+}
+
+// q/k/v style triple: three mul1 GEMVs of different widths over one activation row in ONE sq launch (m == 1, fp16 outputs).
+// Not bit-identical to three launches (one slice height for the stack); EXL3_GEMV_TRI=0 disables. Returns false for the caller's fallback.
+bool exl3_gemv_int8_tri
+(
+    const at::Tensor& A,
+    const at::Tensor& B1, at::Tensor& C1, const c10::optional<at::Tensor>& suh1, const c10::optional<at::Tensor>& svh1,
+    const at::Tensor& B2, at::Tensor& C2, const c10::optional<at::Tensor>& suh2, const c10::optional<at::Tensor>& svh2,
+    const at::Tensor& B3, at::Tensor& C3, const c10::optional<at::Tensor>& suh3, const c10::optional<at::Tensor>& svh3,
+    cudaStream_t stream,
+    Graph* graph
+)
+{
+    static const int mode = [] { const char* e = getenv("EXL3_GEMV_TRI"); return e ? atoi(e) : 1; }();
+    if (!mode || !exl3_gemv_int8_enabled()) return false;
+    if (!suh1 || !svh1 || !suh2 || !svh2 || !suh3 || !svh3) return false;
+    if (C1.dtype() != at::kHalf || C2.dtype() != at::kHalf || C3.dtype() != at::kHalf) return false;
+    int K = B1.size(2) / 16;
+    if (B2.size(2) / 16 != K || B3.size(2) / 16 != K || B2.size(0) != B1.size(0) || B3.size(0) != B1.size(0)) return false;
+    int size_k = A.size(-1);
+    int size_n = B1.size(1) * 16, n2 = B2.size(1) * 16, n3 = B3.size(1) * 16;
+    int size_m = A.numel() / size_k;
+    if (size_m != 1 || size_n % 256 || size_k % 128) return false;
+    int device;
+    cudaGetDevice(&device);
+    if (K < 1 || K > exl3_gemv_int8_max_k(device)) return false;
+    bool residual = exl3_gemv_int8_mode() == 1;
+    if (residual) return false;
+    int num_sms = DevCtx::instance().get_num_sms(device);
+    return exl3_gemv_int8_sq(
+        (const half*) A.data_ptr(), (const uint16_t*) B1.data_ptr(), C1.data_ptr(),
+        size_m, size_k, size_n, K, false, residual,
+        (const half*) suh1->data_ptr(), nullptr, (const half*) svh1->data_ptr(),
+        device, num_sms, stream, graph,
+        (const half*) A.data_ptr(), (const uint16_t*) B2.data_ptr(), C2.data_ptr(),
+        (const half*) suh2->data_ptr(), (const half*) svh2->data_ptr(),
+        n2, (const uint16_t*) B3.data_ptr(), C3.data_ptr(), (const half*) suh3->data_ptr(), (const half*) svh3->data_ptr(), n3);
+}
+
+bool exl3_gemv_int8_tri_eager
+(
+    const at::Tensor& A,
+    const at::Tensor& B1, at::Tensor& C1, const c10::optional<at::Tensor>& suh1, const c10::optional<at::Tensor>& svh1,
+    const at::Tensor& B2, at::Tensor& C2, const c10::optional<at::Tensor>& suh2, const c10::optional<at::Tensor>& svh2,
+    const at::Tensor& B3, at::Tensor& C3, const c10::optional<at::Tensor>& suh3, const c10::optional<at::Tensor>& svh3
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    return exl3_gemv_int8_tri(A, B1, C1, suh1, svh1, B2, C2, suh2, svh2, B3, C3, suh3, svh3, at::cuda::getCurrentCUDAStream().stream(), nullptr);
 }
