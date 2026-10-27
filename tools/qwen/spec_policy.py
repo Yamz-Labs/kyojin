@@ -388,6 +388,88 @@ def load_depth_cap(n, table, rows):
     if rows <= 0: return None
     return max(0, rows // n - 1)
 
+# ---------------------------------------------------------------------------------------------- row allocation
+# The multi-job verify is ONE rectangular forward (requests x (width + 1) rows), so rows cannot be shared raggedly between
+# requests; the lever is the common width W of the round. RowAlloc keeps, per request and draft source (lookup / drafter), the
+# running conditional acceptance of each draft position, and picks the W that maximises expected tokens per millisecond:
+#   tokens(W) = sum_i (1 + sum_{k <= min(W, L_i)} prod_{m <= k} c_i,src,m)       (L_i = tokens request i can draft)
+#   ms(W)     = step_ms(N * (W + 1)) + ovh + dms * drafter depth                  (step_ms: measured rows -> ms table)
+# so a round in which only one request has a long lookup match no longer pays 32 rows for four requests, and a round in which
+# nobody's drafts get accepted falls back to a plain step. The table is the measured verify-step cost per row count of the
+# model class (dense CUDA: Qwen3.8-27B on an RTX 3090); QWSPEC_ROW_COST="rows:ms,..." replaces it. No table = no allocation.
+ROW_COST_DENSE_CUDA = "1:21.5,8:31.6,12:34.6,16:36.6,20:45.6,24:48.3,32:55.4"
+
+def parse_row_cost(v):
+    pts = sorted((int(a), float(b)) for a, b in (f.split(":") for f in v.split(",")))
+    if len(pts) < 2: raise ValueError(f"QWSPEC_ROW_COST={v}")
+    return pts
+
+def interp_cost(pts, rows):
+    if rows <= pts[0][0]: return pts[0][1]
+    for (r0, c0), (r1, c1) in zip(pts, pts[1:]):
+        if rows <= r1: return c0 + (c1 - c0) * (rows - r0) / (r1 - r0)
+    (r0, c0), (r1, c1) = pts[-2], pts[-1]
+    return c1 + (c1 - c0) * (rows - r1) / (r1 - r0)
+
+class RowAlloc:
+    DEPTH = 8
+    def __init__(self, pts, rows_max, ovh=7.5, dms=1.3, alpha=0.2, prior_ng=0.95, prior_mtp=0.8):
+        self.pts, self.rows_max, self.ovh, self.dms, self.alpha = pts, rows_max, ovh, dms, alpha
+        self.prior = {"ng": prior_ng, "mtp": prior_mtp}
+        self.c = {}            # (job, src) -> [conditional acceptance at draft position 1..DEPTH]
+        self.pend = {}         # job -> (len(ids) at draft time, src, drafted length)
+        self.rec = None; self.t_last = None
+
+    def forget(self, live):
+        for k in [k for k in self.c if k[0] not in live]: del self.c[k]
+        for k in [k for k in self.pend if k not in live]: del self.pend[k]
+
+    def cond(self, job, src):
+        """Conditional acceptance per draft position. Optimistic where nothing was observed (a position is only tried when the
+        round drafted that deep): it inherits the rate of the position before, so a shallow width cannot freeze a pessimistic prior."""
+        c = self.c.get((job, src))
+        if c is None: c = self.c[(job, src)] = [[self.prior[src], 0] for _ in range(self.DEPTH)]
+        out = []; last = self.prior[src]
+        for v, n in c:
+            last = v if n else last; out.append(last)
+        return out
+
+    def observe(self, job, n_now):
+        """Feed back last round's outcome of this request: accepted = tokens appended - 1 (the bonus token)."""
+        p = self.pend.pop(job, None)
+        if p is None: return None
+        n0, src, L = p
+        if L <= 0: return None
+        acc = max(0, min(L, n_now - n0 - 1))
+        self.cond(job, src); c = self.c[(job, src)]
+        for k in range(min(L, self.DEPTH)):
+            if k > acc: break                       # position k was only tried if k-1 earlier ones were accepted
+            x = 1.0 if k < acc else 0.0
+            c[k][0] = x if c[k][1] == 0 else c[k][0] + self.alpha * (x - c[k][0]); c[k][1] += 1
+        return src, L, acc
+
+    def tokens(self, jobs, srcs, lens, W):
+        t = 0.0
+        for j, s, L in zip(jobs, srcs, lens):
+            t += 1.0; r = 1.0; c = self.cond(j, s)
+            for k in range(min(W, L, self.DEPTH)):
+                r *= c[k]; t += r
+        return t
+
+    def ms(self, n, W, srcs):
+        """Step ms: verify rows + fixed host/sampling part + one drafter forward per depth (a round of lookup drafts only runs one)."""
+        depth = 0 if W == 0 else (1 if all(s == "ng" for s in srcs) else W)
+        return interp_cost(self.pts, n * (W + 1)) + self.ovh + self.dms * depth
+
+    def best(self, jobs, srcs, lens, wmin=0):
+        """Common width W in [wmin, rows_max // N - 1] with the highest expected tokens per ms."""
+        n = len(jobs); wmax = max(wmin, self.rows_max // n - 1)
+        bw, bv = wmin, -1.0
+        for W in range(wmin, wmax + 1):
+            v = self.tokens(jobs, srcs, lens, W) / self.ms(n, W, srcs)
+            if v > bv * 1.0005: bw, bv = W, v
+        return bw
+
 def _unparked(g):
     """Active jobs minus those EXL3_SCHED_CHUNK_IL skips this step (Generator._cil_parked): a short job decoding next to a parked
     big prefill still counts as alone, so its lookup/draft policy is the solo one."""
@@ -582,6 +664,17 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
     # default 32 = the multi-job graph's B x Q limit for a dense CUDA model, off elsewhere): one follower per request
     ngm_rows = int(os.environ.get("QWSPEC_NG_MULTI_ROWS", "") or (2 * dense_cuda_rows(model))) if ngram is not None else 0
     mf = {}
+    # QWSPEC_ROW_ALLOC (default on where a row-cost table exists, 0 = off): the common width of a multi-request round follows the expected accepted tokens per ms (RowAlloc, above);
+    # QWSPEC_ROW_TRACE=file: one JSON line per multi-request round (rows, per-request source / drafted / accepted, step ms), allocation or not
+    ra = None; ra_on = False; ra_trace = os.environ.get("QWSPEC_ROW_TRACE", "")
+    ra_env = os.environ.get("QWSPEC_ROW_ALLOC", "")
+    if ngm_rows and (ra_env != "0" or ra_trace):
+        _cv = os.environ.get("QWSPEC_ROW_COST", "") or (ROW_COST_DENSE_CUDA if dense_cuda_rows(model) else "")
+        if _cv:
+            ra = RowAlloc(parse_row_cost(_cv), ngm_rows, ovh=float(os.environ.get("QWSPEC_ROW_OVH", "") or 7.5))
+            ra_on = ra_env != "0"
+        elif ra_env == "1":
+            print("QWSPEC_ROW_ALLOC: no row-cost table for this model class (set QWSPEC_ROW_COST), off", file=sys.stderr)
     orig_enqueue = g.enqueue
     def enq(job):
         # prime the index at enqueue: its cold build (about 1 s at 192K) lands in time-to-first-token, not in decode
@@ -604,7 +697,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         if st["mode"] == "mtp" and not getattr(rule, "needs_p", True):
             return ids
         if st["mode"] == "mtp":
-            if dp is not None: pt = dp.reshape(())
+            if dp is not None: pt = dp.reshape(-1).max()      # one value per row of a multi-request step: the max, as softmax(cap["lg"]).max() below
             else: pt = torch.softmax(cap["lg"][..., :model.config.vocab_size].float().reshape(-1, model.config.vocab_size), -1).max()
             i = st["i"]
             if fixed is not None:
@@ -640,6 +733,49 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         _n, _v = _c.split(":"); f = _v.split(",")
         cap_n, deep = int(_n), (float(f[0]), float(f[1]), int(f[2]), float(f[3]), float(f[4]))
         base = (rule.thf, rule.thv, rule.maxd, rule.thfd, rule.thvd); cap_ng = os.environ.get("QWSPEC_CAP_NG", "0") != "0"
+    def ra_begin(gj):
+        """Start of a multi-request round: feed last round's outcome back (acceptance per request) and write its trace line."""
+        import time
+        now = time.perf_counter(); rec, ra.rec = ra.rec, None
+        ra.forget(set(gj))
+        res = {j: ra.observe(j, len(j.sequences[0].sequence_ids)) for j in gj if len(j.sequences) == 1}
+        if rec is not None and ra_trace:
+            import json
+            rec["users"] = [res.get(j) for j in rec.pop("jobs")]
+            rec["ms"] = None if ra.t_last is None else round((now - ra.t_last) * 1e3, 2)
+            with open(ra_trace, "a") as f: f.write(json.dumps(rec) + "\n")
+        ra.t_last = now
+    def ra_note(gj, srcs, lens, W):
+        """End of the decision for this round: what was drafted, to be scored at the next round."""
+        for j, s_, L in zip(gj, srcs, lens):
+            if len(j.sequences) == 1: ra.pend[j] = (len(j.sequences[0].sequence_ids), s_, min(L, W))
+        ra.rec = {"N": len(gj), "W": W, "rows": len(gj) * (W + 1), "src": list(srcs), "L": [min(L, W) for L in lens], "jobs": list(gj)}
+    def alloc_round(results, gj, conts, lcap):
+        """The multi-request round under QWSPEC_ROW_ALLOC: width W from RowAlloc.best (W = 0: a plain step), drafter run only as deep as W."""
+        N = len(gj); wcap = ra.rows_max // N - 1
+        srcs = ["ng" if c else "mtp" for c in conts]
+        W = ra.best(gj, srcs, [len(c) if c else wcap for c in conts])
+        if W == 0:
+            ra_note(gj, srcs, [0] * N, 0); return None
+        w = rule.choose() if hasattr(rule, "choose") else win
+        rule_maxd = rule.maxd
+        w = min(w, 1 if all(c for c in conts) else W); rule.maxd = min(rule_maxd, w)
+        g.num_draft_tokens = w
+        try: mtp = orig_draft(results)
+        except StopDraft: mtp = g.draft_ids_pinned[:, :st["keep"]]
+        finally: g.num_draft_tokens = win; rule.maxd = rule_maxd
+        if mtp is None: return None
+        rows = mtp.tolist()
+        lens = [len(c) if c else len(rows[i]) for i, c in enumerate(conts)]
+        W = ra.best(gj, srcs, lens, wmin=1)
+        out = []
+        for i, c in enumerate(conts):
+            t = list(c[:W]) if c else rows[i][:W]
+            out.append(t + [t[-1] if t else 0] * (W - len(t)))
+        ra_note(gj, srcs, lens, W)
+        if stats is not None:
+            stats["ngm"] = stats.get("ngm", 0) + 1; stats["rows"] = stats.get("rows", 0) + N * (W + 1)
+        return torch.tensor(out, dtype=torch.long)
     def multi_conts(gj):
         """The lookup continuation of each decoding request (None = no match), same rule as the single-request round."""
         for k in [k for k in mf if k not in gj]: del mf[k]
@@ -673,6 +809,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
             except StopDraft: mtp = g.draft_ids_pinned[:, :st["keep"]]
             finally: g.num_draft_tokens = win; rule.maxd = rule_maxd
         rows = [] if mtp is None else mtp.tolist()
+        st["mw"] = len(rows[0]) if rows else 0
         W = min(wmax, max(max(len(c) for c in conts if c), len(rows[0]) if rows else 0))
         out = []
         for i, c in enumerate(conts):
@@ -683,6 +820,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         return torch.tensor(out, dtype=torch.long)
     def wrapped(results):
         st.update(i=0, stop=False, keep=None, mode="mtp", ps=[])
+        ra_gj = None
         job = next((j for j in g.active_jobs if j.is_prefill_done()), None)
         cont = None
         n = None
@@ -722,7 +860,15 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
             gj = [j for j in g.active_jobs if j.is_prefill_done()]
             if len(gj) > 1:
                 conts = multi_conts(gj)
-                if any(conts): return multi_draft(results, conts, lcap)
+                if ra is not None: ra_begin(gj)
+                if ra_on: return alloc_round(results, gj, conts, lcap)
+                if any(conts):
+                    out = multi_draft(results, conts, lcap)
+                    if ra is not None:
+                        W = out.shape[-1]; ra_note(gj, ["ng" if c else "mtp" for c in conts], [len(c) if c else st["mw"] for c in conts], W)
+                    return out
+                if ra is not None and lcap == 0: ra_note(gj, ["mtp"] * len(gj), [0] * len(gj), 0)
+                elif ra is not None: ra_gj = gj
         if lcap == 0: return None
         if cont is not None:
             st["mode"] = "ng"; g.num_draft_tokens = 1
@@ -752,6 +898,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
             log.append({"n": n, "ng": False, "ps": list(st["ps"]), "ids": out[0, :log_depth].tolist(), "keep": keep})
             out = out[:, :keep]
         st["drafted"] = out.shape[-1]
+        if ra_gj is not None: ra_note(ra_gj, ["mtp"] * len(ra_gj), [out.shape[-1]] * len(ra_gj), out.shape[-1])
         if stats is not None: stats["mtp"] = stats.get("mtp", 0) + 1; stats["rows"] = stats.get("rows", 0) + 1 + out.shape[-1]
         return out
     lm.forward = lmf; dm.forward = fwd; dm.sample_from_state = sfs

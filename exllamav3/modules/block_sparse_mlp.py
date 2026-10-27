@@ -20,6 +20,7 @@ from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .quant.exl3 import dec_workspace
+from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
@@ -56,6 +57,10 @@ MOEG_ROWS = int(os.environ.get("EXL3_MOE_GROUPED_ROWS", 1 << 20))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+# R-row union MoE (exl3_dec_moe_union): one kernel call carries at most MAX_BSZN (= MOE_R_MAX in exl3_dec.cu) rows; a verify step of 9..UNION_ROWS
+# rows runs as job-aligned slices of at most MAX_BSZN rows (each slice is the exact 2..8 row call, rows are independent in an MoE block).
+# ROCm only (the CUDA fused kernels have their own COOP_ROWS); EXL3_ROW_INV_MAX_ROWS=8 restores the single-call cap.
+UNION_ROWS = max(MAX_BSZN, ROW_INV_MAX_ROWS) if torch.version.hip else MAX_BSZN
 # Row capacity of the fused decode kernels (exl3_moe_coop): up to this many token rows (bounded by 256 slots = rows * top_k) take
 # them instead of the prefill-shaped exl3_moe kernel or row chunks; rows <= MAX_BSZN run exactly as before. The kernels group the
 # slots by expert, so each picked expert is decoded once for all of its rows. CUDA only; EXL3_MOE_COOP_ROWS=8 restores the old cap
@@ -74,6 +79,12 @@ _FUSED_3INST_MIN = int(os.environ.get("EXL3_MOE_FUSED_3INST_MIN", "16"))
 # expert-count readback only up to fused_rows / top_k tokens). EXL3_MOE_SYNC_FREE_TOKENS=0 restores the top-k bound.
 # CUDA default only (measured there); ROCm keeps the top-k bound unless set to 1
 SYNC_FREE_TOKENS = os.environ.get("EXL3_MOE_SYNC_FREE_TOKENS", "1" if torch.version.hip is None else "0") != "0"
+
+
+def _union_slices(x: torch.Tensor, rows: int) -> list:
+    """Row ranges (lo, hi) of the union MoE kernel calls for `rows` token rows: one call up to MAX_BSZN rows, else job-aligned slices
+    (util.row_inv.job_slices). x is the MoE input (jobs, rows per job, H) of a verify forward."""
+    return job_slices(rows, int(x.shape[-2]) if x.dim() >= 3 else 1, MAX_BSZN)
 
 
 # Expert-deduplicated grouped MoE (verify batches decode each picked expert once for all of its
@@ -1024,7 +1035,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 Ipad = self.intermediate_size_padded
                 Ru = MAX_BSZN
                 self.dec_moe_union_out = g_tensor_cache.get(
-                    self.device, (Ru, self.hidden_size), torch.float, "dec_moe_union_out")
+                    self.device, (UNION_ROWS, self.hidden_size), torch.float, "dec_moe_union_out")
                 self.dec_moe_union_act = g_tensor_cache.get(
                     self.device, (Ru * numex, Ipad), torch.half, "dec_moe_union_act")
                 self.dec_moe_union_down_part = g_tensor_cache.get(
@@ -2255,7 +2266,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # build dominates), only R=2..5; EXL3_DEC_MOE_UNION=1 to use it anyway (e.g. to get a
         # bit-exact verify path even before that's fixed).
         elif (
-            1 < bsz <= MAX_BSZN and self.support_dec_moe and self.tp_mode is None and
+            1 < bsz <= UNION_ROWS and self.support_dec_moe and self.tp_mode is None and
             not (_MOE_VALU and self.support_hip_grouped and bsz <= 8) and
             hasattr(ext, "exl3_dec_moe_union") and
             (union_dev or union_v2 or os.environ.get("EXL3_DEC_MOE_UNION", "0") != "0") and params.get("dflash_verify") and
@@ -2276,22 +2287,25 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
             out_buf = res.view(bsz, -1) if fuse_res else self.dec_moe_union_out[:bsz]
             scratch, counters = dec_workspace(y.device)
-            ext.exl3_dec_moe_union(
-                y, out_buf, selected_experts.contiguous(), routing_weights.contiguous(),
-                self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh, self.multi_gate.ptrs_svh,
-                self.multi_up.ptrs_trellis, self.multi_up.ptrs_suh, self.multi_up.ptrs_svh,
-                self.multi_down.ptrs_trellis, self.multi_down.ptrs_suh, self.multi_down.ptrs_svh,
-                self.dec_moe_union_act[:bsz * numex],
-                self.dec_moe_union_down_part[:bsz * numex],
-                scratch, counters,
-                self.intermediate_size_padded,
-                self.multi_up.K,
-                self.multi_down.K,
-                fuse_res,
-                self.act_limit,
-                self.dec_moe_mcg,
-                union_dev or union_v2,
-            )
+            sel_c, wts_c = selected_experts.contiguous(), routing_weights.contiguous()
+            for lo, hi in _union_slices(x, bsz):
+                # one slice = the exact 2..8 row call (_union_slices never leaves a lone row: that would be the batch-1 kernel)
+                ext.exl3_dec_moe_union(
+                    y[lo:hi], out_buf[lo:hi], sel_c[lo:hi], wts_c[lo:hi],
+                    self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh, self.multi_gate.ptrs_svh,
+                    self.multi_up.ptrs_trellis, self.multi_up.ptrs_suh, self.multi_up.ptrs_svh,
+                    self.multi_down.ptrs_trellis, self.multi_down.ptrs_suh, self.multi_down.ptrs_svh,
+                    self.dec_moe_union_act[:(hi - lo) * numex],
+                    self.dec_moe_union_down_part[:(hi - lo) * numex],
+                    scratch, counters,
+                    self.intermediate_size_padded,
+                    self.multi_up.K,
+                    self.multi_down.K,
+                    fuse_res,
+                    self.act_limit,
+                    self.dec_moe_mcg,
+                    union_dev or union_v2,
+                )
             if fuse_res:
                 params["mlp_residual_done"] = True
                 return res
@@ -3057,7 +3071,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Also refuse above MAX_BSZN: prefill calls this with R = chunk size (hundreds+), where
         # R sequential single-row launches would be catastrophically slower than the batched
         # prefill path this falls back to -- this is not what the flag or the kernel is for.
-        if os.environ.get("EXL3_DEC_MOE_UNION", "0") == "0" or R > MAX_BSZN or not params.get("dflash_verify"):
+        if os.environ.get("EXL3_DEC_MOE_UNION", "0") == "0" or R > UNION_ROWS or not params.get("dflash_verify"):
             return None
         try:
             xa.view(R, -1)

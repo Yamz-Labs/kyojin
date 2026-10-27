@@ -229,7 +229,7 @@ qdec_split_rows(
                 for (int e = 0; e < 4; e++) {
                     int tk = n0 + g + ((e >> 1) << 3);
                     int ri = e & 1;
-                    ok[e] = rvalid[o][ri] && tk < n_end && (!CAUSAL || (float)tk <= qabs[o][ri]);
+                    ok[e] = rvalid[o][ri] && tk < n_end && tk >= KEY_LO && (!CAUSAL || (float)tk <= qabs[o][ri]);
                     s[e] = ok[e] ? sv[e] * sl : -INFINITY;
                 }
                 float alpha[2];

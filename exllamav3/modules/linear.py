@@ -41,6 +41,34 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return w.view(blocks.shape[0], -1).half()
 
 
+def _scale_block(n: int, s: int, block: int | None) -> int:
+    """Block length along an axis of n elements covered by s scales (config block first, else exact division)."""
+    if block and -(-n // block) == s:
+        return block
+    assert n % s == 0, f"scale grid {s} does not cover {n} elements (block {block})"
+    return n // s
+
+
+def apply_scale_grid(w: torch.Tensor, scale: torch.Tensor, block: tuple | None = None) -> torch.Tensor:
+    """float32 w [rows, cols] x scale (scalar, [rows], [rows, 1] or a [sr, sc] grid with ceil-div blocks) -> float32.
+    Torch twin of foreign_quant.vendor_input.apply_scales (tests assert bit equality). `block` = (rows, cols)."""
+    w = w.float()
+    scale = scale.float()
+    if scale.numel() == 1:
+        return w * scale.reshape(())
+    rows, cols = w.shape
+    if scale.dim() == 1:
+        assert scale.shape[0] in (rows, cols), f"1D scale {tuple(scale.shape)} fits neither {rows} nor {cols}"
+        return w * (scale[:, None] if scale.shape[0] == rows else scale[None, :])
+    sr, sc = scale.shape
+    bo = _scale_block(rows, sr, block[0] if block else None)
+    bi = _scale_block(cols, sc, block[1] if block else None)
+    if rows % bo == 0 and cols % bi == 0:
+        return (w.view(sr, bo, sc, bi) * scale.view(sr, 1, sc, 1)).view(rows, cols)
+    full = scale.repeat_interleave(bo, 0).repeat_interleave(bi, 1)[:rows, :cols]
+    return w * full
+
+
 class Linear(Module):
 
     def __init__(
@@ -151,30 +179,49 @@ class Linear(Module):
         return padded.contiguous()
 
 
-    # Row scales (Transformers-specific?)
+    def quant_block_(self):
+        """weight_block_size of the checkpoint's quantization_config as (rows, cols) of the CHECKPOINT orientation,
+        swapped when the weight is loaded transposed. None = infer the block from the scale grid."""
+        qc = getattr(self.config, "config_dict", {}).get("quantization_config") or {}
+        b = qc.get("weight_block_size")
+        if not b or len(b) != 2:
+            return None
+        return (b[1], b[0]) if self.transposed_load else (b[0], b[1])
+
+
+    # FP8 scales: per-tensor, per-channel or a block grid (ceil-div), always MULTIPLIED, whether the tensor is
+    # called weight_scale or weight_scale_inv (DeepSeek / Qwen3-FP8 / GLM / MiniMax name the multiplier "inv")
     def apply_fp8_scales_(self, weight: torch.Tensor, scale: torch.Tensor):
-        ws = weight.shape
-        ss = scale.shape
-        assert len(ss) == 0 or len(ws) == len(ss) == 2
-        if len(ss) == 2:
-            if 1 < ss[0] < ws[0]:
-                scale = torch.nn.functional.pad(scale, (0, 0, 0, ws[0] - ss[0]), "constant", 1)
-            if 1 < ss[1] < ws[1]:
-                scale = torch.nn.functional.pad(scale, (0, ws[1] - ss[1]), "constant", 1)
-        weight = weight.float() * scale
-        return weight.view(ws).half()
+        if scale.dim() == 1 and scale.numel() > 1:
+            scale = scale.reshape(1, -1) if self.transposed_load else scale.reshape(-1, 1)    # per output channel, also when square
+        return apply_scale_grid(weight, scale, self.quant_block_()).half()
 
 
     def apply_fp8_scales_inv_(self, weight: torch.Tensor, scale_inv: torch.Tensor):
-        ws = weight.shape
-        ss = scale_inv.shape
-        if len(ss) > 0:
-            assert len(ws) == len(ss) == 2
-            assert all(w == s * 128 for w, s in zip(ws, ss))
-            weight = weight.view(ss[0], 128, ss[1], 128)
-            scale_inv = scale_inv.view(ss[0], 1, ss[1], 1)
-        weight = weight.float() * scale_inv
-        return weight.view(ws).half()
+        return self.apply_fp8_scales_(weight, scale_inv)
+
+
+    # NVFP4: packed e2m1 (U8 [out, in/2], low nibble first) x E4M3 scale per 16 inputs x one fp32 global scale.
+    # ModelOpt: weight / weight_scale / weight_scale_2 (multiplier); compressed-tensors: weight_packed /
+    # weight_scale / weight_global_scale (divisor). Returns (out, in) fp16 in checkpoint orientation, or None.
+    def dequant_nvfp4_(self, key: str, dev) -> torch.Tensor | None:
+        stc = self.config.stc
+        wname = ".weight_packed" if stc.has_tensor(key + ".weight_packed") else ".weight"
+        ws = stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+        if ws is None or ws.dtype != torch.float8_e4m3fn or ws.dim() != 2:
+            return None
+        inv = False
+        g = stc.get_tensor(key + ".weight_scale_2", dev, optional = True, no_defer = True)
+        if g is None:
+            g = stc.get_tensor(key + ".weight_global_scale", dev, optional = True, no_defer = True)
+            inv = g is not None
+        assert g is not None, f"{key}: NVFP4 weight without weight_scale_2 / weight_global_scale"
+        u8 = stc.get_tensor(key + wname, dev, no_defer = True).contiguous().view(torch.uint8)
+        lut = torch.tensor(_MXFP4_LUT, dtype = torch.float, device = u8.device)
+        w = torch.stack((lut[(u8 & 0x0F).long()], lut[(u8 >> 4).long()]), dim = -1).view(u8.shape[0], -1)
+        w = apply_scale_grid(w, ws.float(), None)
+        g = g.float().reshape(-1)[0]
+        return ((w / g) if inv else (w * g)).half()
 
 
     # DeepSeek-V4-style quantized checkpoint tensors, dequantized to FP16 at load (they get
@@ -205,7 +252,8 @@ class Linear(Module):
 
     def load_fp16(self, key: str | list[str]) -> bool:
 
-        if self.config.stc.has_tensor_group(key, ["weight"]):
+        if self.config.stc.has_tensor_group(key, ["weight"]) or \
+                (isinstance(key, str) and self.config.stc.has_tensor(key + ".weight_packed")):
 
             self.used_alt_key = key == self.alt_key
             if self.used_alt_key and isinstance(key, list):
@@ -219,7 +267,8 @@ class Linear(Module):
                 pad1 = (self.out_features,) if not self.is_sliced else None
                 pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
                 scale_q = self.config.stc.get_tensor(key + ".scale", dev, optional = True, no_defer = True)
-                if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
+                nv = self.dequant_nvfp4_(key, dev) if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale") else None
+                if nv is None and scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
                     # MiMo-V2 routed experts: same E8M0 block grid, named "weight_scale" and
                     # stored as U8 exponent bytes. Only 2D uint8 scales route here; float
                     # "weight_scale" tensors keep the per-row/per-tensor fp8 path below. Fetched
@@ -227,10 +276,17 @@ class Linear(Module):
                     ws_q = self.config.stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
                     if ws_q is not None and ws_q.dim() == 2 and ws_q.dtype == torch.uint8:
                         scale_q = ws_q
-                if scale_q is not None and scale_q.dim() == 2:
+                if nv is not None:
+                    # NVFP4 (ModelOpt / compressed-tensors): dequantized in checkpoint orientation above
+                    weight = nv.T if self.transposed_load else nv
+                    weight = weight.contiguous() if self.is_sliced else self.pad_out(weight.contiguous())
+                    bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = True)
+                    scale = scale_inv = None
+                elif scale_q is not None and scale_q.dim() == 2:
                     # DeepSeek-V4 style: fp8/fp4 blocks + E8M0 scale grid, checkpoint
                     # orientation (out, in); dequant first, then orient/pad like a plain load
-                    w_raw = self.config.stc.get_tensor(key + ".weight", dev, no_defer = True)
+                    wname = ".weight_packed" if self.config.stc.has_tensor(key + ".weight_packed") else ".weight"    # compressed-tensors / AutoRound MXFP4
+                    w_raw = self.config.stc.get_tensor(key + wname, dev, no_defer = True)
                     weight = self.dequant_e8m0_blocks_(w_raw, scale_q)
                     if self.transposed_load:
                         weight = weight.T
@@ -241,6 +297,11 @@ class Linear(Module):
                     scale = self.config.stc.get_tensor(key + ".weight_scale", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     scale_inv = self.config.stc.get_tensor(key + ".weight_scale_inv", dev, transpose = self.transposed_load, optional = True, no_defer = True)
                     assert scale is None or scale_inv is None
+                    # MXFP8 (MiniMax-M3): FP8 weights with a U8 weight_scale_inv of E8M0 exponent bytes, one per 32 inputs
+                    if scale_inv is not None and scale_inv.dtype == torch.uint8:
+                        scale_inv = (scale_inv.float() - 127.0).exp2()
+                    if scale is not None and scale.dtype == torch.uint8:
+                        scale = (scale.float() - 127.0).exp2()
                     no_defer = self.no_defer_load or scale is not None or scale_inv is not None or self.weight_scale != 1.0
                     weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
                     bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)

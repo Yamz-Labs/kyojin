@@ -162,6 +162,8 @@ SPEED_ENV = {
     "EXL3_VERIFY_ROW_SPLIT": "2",
     "EXL3_MOE_R8": "1",
     "EXL3_GEMV_R_RM6": "1",
+    # 7..8 rows (4 sessions x 2 draft rows): one decode pass of the dense GEMV instead of two 4-row chunks, bit-identical. 0 = off.
+    "EXL3_GEMV_R_WIDE8": "1",
     # 14/10: sampled requests (temperature > 0) draw the MTP drafts from the drafter's own law and keep them with the exact
     # min(1, p / q) rule (exllamav3/generator/spec_sample.py): same output distribution, greedy untouched. One load, T 1 top_p
     # 0.95, 15 prompts x 3 seeds: prose +5.2 % decode, no measured change on chat / code / structured. 0 = argmax drafts.
@@ -511,6 +513,18 @@ def guard_stats(hit: dict, n_new: int) -> dict:
     return {"eos_reason": "loop_guard", "new_tokens": n_new, "loop_guard": hit}
 
 
+def held_tail(text: str, markers: list[str]) -> int:
+    """Characters at the end of `text` that could still become one of `markers` (a proper prefix of one). A stream holds back only
+    these: holding a marker-length tail delayed the first visible text by several tokens, which under load is several seconds."""
+    best = 0
+    for m in markers:
+        for k in range(min(len(m) - 1, len(text)), best, -1):
+            if text.endswith(m[:k]):
+                best = k
+                break
+    return best
+
+
 def opens_thinking(prompt: str) -> bool:
     """The GLM generation prompt ends in <think>, so the model output starts inside the block."""
     return prompt.rstrip().endswith("<think>")
@@ -686,7 +700,8 @@ class ResidentEngine:
         self.lookup_stats: dict[str, int] = {}
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
                            max_history=max_history, max_batch_size=slots)
-        from exllamav3.util import jit_log, kernel_seed
+        from exllamav3.util import jit_log, kernel_seed, tune_cache
+        tune_cache.install_pack(model_path)   # <pack>/tuning: GEMM autotune winners from qualify --stage autotune
         kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
         jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
         startup_health.stage("target weights")
@@ -1663,7 +1678,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             # Reasoning and prose stream as they decode. Tool calls are parsed only from complete
             # XML, so everything from <tool_call> on is held and sent once at the end.
             text, done, mode = prefix, len(prefix), "reasoning" if prefix else "content"
-            hold = max([len("</think>"), len(TOOL_OPEN)] + [len(x) for x in body["_stop"]]) - 1
+            holds = ["</think>", "<think>", TOOL_OPEN] + [x for x in body["_stop"] if x]
             visible: list[float] = []   # set at the first frame with text in it: the client's first sign of life
 
             async def flush(final: bool) -> None:
@@ -1671,7 +1686,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 while mode != "tool":
                     tags = ["</think>"] if mode == "reasoning" else ["<think>", TOOL_OPEN]
                     hits = [(text.find(t, done), t) for t in tags if text.find(t, done) >= 0]
-                    end = min(hits)[0] if hits else (len(text) if final else max(done, len(text) - hold))
+                    end = min(hits)[0] if hits else (len(text) if final else max(done, len(text) - held_tail(text, holds)))
                     piece = stop_text(text[done:end], body["_stop"])[0]
                     if piece:
                         if not visible:

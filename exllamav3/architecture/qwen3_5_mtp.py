@@ -19,6 +19,18 @@ if TYPE_CHECKING:
     from .qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 
 
+def exl3_block_subhead(inner, blocks):
+    """The EXL3 linear `inner` restricted to the given 128-row output blocks (sorted LongTensor): output column j of the
+    result is column blocks[j // 128] * 128 + j % 128 of `inner`, bit for bit."""
+    from ..modules.quant.exl3 import LinearEXL3
+    dev = inner.trellis.device
+    rows = (blocks.to(dev)[:, None] * 128 + torch.arange(128, device = dev)).reshape(-1)
+    tiles = (blocks.to(dev)[:, None] * 8 + torch.arange(8, device = dev)).reshape(-1)
+    return LinearEXL3(None, inner.in_features, rows.numel(), suh = inner.suh, svh = inner.svh[rows].contiguous(),
+                      trellis = inner.trellis[:, tiles].contiguous(), mcg = inner.mcg_tensor,
+                      mul1 = inner.mul1_tensor, out_dtype = inner.out_dtype)
+
+
 class Qwen3_5MTPModel(Model):
 
     def __init__(
@@ -229,28 +241,119 @@ class Qwen3_5MTPModel(Model):
         return {}
 
 
-    def _draft_subhead(self, lm):
-        """The draft head restricted to the first EXL3_DRAFT_VOCAB vocabulary rows (a multiple of 128: the head's output
-        Hadamard works on 128-row blocks, so a prefix of whole blocks is a self-contained EXL3 linear with the same
-        trellis tiles). None when off or when the head is not a plain integer-K EXL3 linear. Every draft is verified by the
-        target, so a draft that misses a rare id only costs an accept, never changes the text."""
+    @staticmethod
+    def _head_plain(lm):
+        inner = getattr(lm, "inner", None)
+        return inner is not None and type(inner).__name__ == "LinearEXL3" and isinstance(inner.K, int) \
+            and inner.bias is None and lm.pre_scale == 1.0 and lm.post_scale == 1.0 and lm.softcap == 0.0
+
+    def _draft_subhead(self, lm, blocks = None):
+        """The draft head restricted to whole 128-row blocks of the vocabulary (the head's output Hadamard works on 128-row
+        blocks, so any set of whole blocks is a self-contained EXL3 linear with the same trellis tiles). blocks = None: the
+        first EXL3_DRAFT_VOCAB rows. Else a sorted LongTensor of block numbers. None when off or when the head is not a plain
+        integer-K EXL3 linear. Every draft is verified by the target, so a draft that misses a rare id only costs an accept,
+        never changes the text."""
         n = int(os.environ.get("EXL3_DRAFT_VOCAB", "0") or 0) // 128 * 128
         if n <= 0:
             return None
-        cache = self.__dict__.setdefault("_dsub", {})
-        if n in cache:
-            return cache[n]
-        sub = None
-        inner = getattr(lm, "inner", None)
-        if inner is not None and type(inner).__name__ == "LinearEXL3" and isinstance(inner.K, int) \
-                and inner.bias is None and lm.pre_scale == 1.0 and lm.post_scale == 1.0 and lm.softcap == 0.0 \
-                and n < lm.out_features:
-            from ..modules.quant.exl3 import LinearEXL3
-            sub = LinearEXL3(None, inner.in_features, n, suh = inner.suh, svh = inner.svh[:n].contiguous(),
-                             trellis = inner.trellis[:, :n // 16].contiguous(), mcg = inner.mcg_tensor,
-                             mul1 = inner.mul1_tensor, out_dtype = inner.out_dtype)
-        cache[n] = sub
-        return sub
+        if not self._head_plain(lm):
+            return None
+        inner = lm.inner
+        from ..modules.quant.exl3 import LinearEXL3
+        if blocks is None:
+            cache = self.__dict__.setdefault("_dsub", {})
+            if n in cache:
+                return cache[n]
+            sub = None
+            if n < lm.out_features:
+                sub = LinearEXL3(None, inner.in_features, n, suh = inner.suh, svh = inner.svh[:n].contiguous(),
+                                 trellis = inner.trellis[:, :n // 16].contiguous(), mcg = inner.mcg_tensor,
+                                 mul1 = inner.mul1_tensor, out_dtype = inner.out_dtype)
+            cache[n] = sub
+            return sub
+        return exl3_block_subhead(inner, blocks)
+
+    def lazy_vram_bytes(self):
+        """Device memory the adaptive draft-head subset takes at its first build (about 2048 draft rows into the first request),
+        at most EXL3_DRAFT_VOCAB rows of the head. 0 when off, not plain, or already built. The start-up VRAM guard counts it:
+        measured 3090 Qwen3.8-27B (98304 rows): 150 MiB that appeared during the first 32K request and tipped the second
+        distinct 32K prompt into CUDA out of memory, 48 MiB short."""
+        if int(os.environ.get("EXL3_DRAFT_VOCAB", "0") or 0) < 128 or os.environ.get("EXL3_DRAFT_ADAPT", "1") == "0":
+            return 0
+        model = self.attached_model()
+        lm = model.modules[model.logit_layer_idx]
+        if not self._head_plain(lm) or (self.__dict__.get("_dad") or {}).get("sub") is not None:
+            return 0
+        inner = lm.inner
+        n = min(int(os.environ.get("EXL3_DRAFT_VOCAB", "0")) // 128 * 128, lm.out_features)
+        return inner.trellis.numel() * inner.trellis.element_size() * n // lm.out_features + n * inner.svh.element_size()
+
+    def _adapt_state(self, lm):
+        """Adaptive draft-head subset (EXL3_DRAFT_ADAPT, default on when EXL3_DRAFT_VOCAB is set; 0 = the fixed prefix).
+        Counts the head's own argmax ids per 128-id block (every step while the full head runs, the probe steps while the
+        subset runs), then keeps the most frequent blocks that cover EXL3_DRAFT_COVER (default 0.99) of the counts, at most
+        EXL3_DRAFT_VOCAB rows. Keyed on the model's own token statistics, no language or model list."""
+        st = self.__dict__.get("_dad")
+        if st is None:
+            nb = lm.out_features // 128
+            lim = getattr(self, "vocab_limit", None) or self.attached_model().config.vocab_size
+            st = self.__dict__["_dad"] = {
+                "counts": torch.zeros(nb, dtype = torch.float32, device = lm.inner.trellis.device),
+                "seen": 0, "built_at": 0, "numeric": 0.0, "member": None, "probes": 0, "misses": 0.0, "sub": None, "gmap": None, "ok_blocks": lim // 128,
+                "calls": 0, "ema": 0.0, "on": False, "nbuilt": 0, "vs": self.attached_model().config.vocab_size,
+                "warm": int(os.environ.get("EXL3_DRAFT_WARM", "2048") or 2048),
+                "maxmiss": float(os.environ.get("EXL3_DRAFT_MAXMISS", "0.05") or 0.05),
+                "log": bool(os.environ.get("EXL3_DRAFT_ADAPT_LOG")),
+                "every": int(os.environ.get("EXL3_DRAFT_PROBE", "16") or 16),     # the probe runs the full head too: 1.0 ms at 4 rows
+            }
+            path = os.environ.get("EXL3_DRAFT_COUNTS")
+            if path and os.path.exists(path):
+                try:
+                    c = torch.load(path, map_location = st["counts"].device)
+                    if c.shape == st["counts"].shape:
+                        prior = float(os.environ.get("EXL3_DRAFT_PRIOR", "20000") or 20000)    # the file weighs this many rows: the live ids take over
+                        st["counts"] += c.float() * (prior / max(float(c.sum().item()), 1.0))
+                        st["seen"] = int(os.environ.get("EXL3_DRAFT_WARM", "2048") or 2048)     # warm start: the first step builds
+                except Exception as e:
+                    print(f"[draft-head] counts file ignored: {e}", flush = True)
+        return st
+
+    def _adapt_build(self, lm, st):
+        """(Re)build the subset from the counts. Blocks holding ids above the real vocabulary are left out (a draft there
+        is rejected for sure); the counts decay by half so a change of language takes over."""
+        cap = int(os.environ.get("EXL3_DRAFT_VOCAB", "0") or 0) // 128
+        cover = float(os.environ.get("EXL3_DRAFT_COVER", "0.99") or 0.99)
+        c = st["counts"][:st["ok_blocks"]]
+        tot = float(c.sum().item())
+        order = torch.argsort(c, descending = True, stable = True)
+        cum = torch.cumsum(c[order], 0) / max(tot, 1.0)
+        k = int(torch.searchsorted(cum, torch.tensor(cover, device = cum.device)).item()) + 1
+        k = max(int(os.environ.get("EXL3_DRAFT_MINROWS", "49152") or 0) // 128, k)       # a short calibration under-counts the tail
+        k = max(2, min(k + (k & 1), cap, order.numel()))       # an even number of blocks: the 1-2 row int8 GEMV needs n % 256 == 0
+        blocks = torch.sort(order[:k]).values
+        st["sub"] = st["gmap"] = None
+        sub = self._draft_subhead(lm, blocks)
+        if sub is None:
+            return False
+        st["sub"] = sub
+        st["member"] = torch.zeros(st["counts"].numel(), dtype = torch.bool, device = blocks.device)
+        st["member"][blocks] = True
+        st["gmap"] = (blocks[:, None] * 128 + torch.arange(128, device = blocks.device)).reshape(-1)
+        st["built_at"] = st["seen"]
+        st["nbuilt"] += 1
+        path = os.environ.get("EXL3_DRAFT_COUNTS")
+        if path:
+            try:
+                torch.save(st["counts"].cpu(), path + ".tmp"); os.replace(path + ".tmp", path)
+            except OSError:
+                pass
+        st["counts"] *= 0.5
+        st["ema"] = 0.0
+        st["on"] = True
+        if st["log"]:
+            print(f"[draft-head] subset #{st['nbuilt']}: {k * 128} rows, covers {float(cum[k - 1]):.4f} of {int(tot)} counts "
+                  f"(seen {st['seen']})", flush = True)
+        return True
 
     def sample_from_state(
         self,
@@ -261,20 +364,78 @@ class Qwen3_5MTPModel(Model):
             ll = self.attached_model().logit_layer_idx
             lm = self.attached_model().modules[ll]
             logits = lm.prepare_for_device(state, params)
-            # EXL3_DRAFT_VOCAB=N: 1-row draft steps read only the first N vocabulary rows of the head (the common BPE ids).
-            # Every 8th step runs both heads and compares the argmax: a language whose tokens sit above N (French, CJK ...)
-            # switches the subset off until the probes agree again.
-            sub = self._draft_subhead(lm) if state.shape[0] * state.shape[1] == 1 and not params.get("export_draft_logits") else None
+            # EXL3_DRAFT_VOCAB=N: draft steps read only part of the head. Every EXL3_DRAFT_PROBE-th step (16) runs both heads and compares the argmax
+            # per row: a language whose tokens sit outside the subset switches it off until the probes agree again.
+            # Adaptive (default): the subset is the most frequent 128-id blocks of the head's own argmax ids, built after
+            # EXL3_DRAFT_WARM rows and rebuilt when the probes disagree. Fixed (EXL3_DRAFT_ADAPT=0): the first N rows, 1-row steps only.
+            sub = None
+            adapt = None
+            mode = self.__dict__.get("_dmode")
+            if mode is None:        # read once: this runs on every draft step
+                mode = self._dmode = 0
+                if int(os.environ.get("EXL3_DRAFT_VOCAB", "0") or 0) >= 128:
+                    mode = self._dmode = (2 if os.environ.get("EXL3_DRAFT_ADAPT", "1") != "0" else 1) if self._head_plain(lm) else 0
+            if mode and not params.get("export_draft_logits"):
+                if mode == 2:
+                    adapt = self._adapt_state(lm)
+                    sub = adapt["sub"]
+                elif state.shape[0] * state.shape[1] == 1:
+                    sub = self._draft_subhead(lm)
+            vs = adapt["vs"] if adapt is not None else self.attached_model().config.vocab_size
+            if adapt is not None:
+                rows = state.shape[0] * state.shape[1]
+                adapt["calls"] += 1
+                probe = adapt["calls"] % adapt["every"] == 0
+                if sub is None or not adapt["on"] and not probe:
+                    # cold (no subset yet) or off: the full head, counting its argmax
+                    fl = lm.forward(logits, params)[..., :vs].float()
+                    fconf, fids = torch.max(fl, dim = -1)
+                    adapt["counts"].index_add_(0, (fids.reshape(-1) // 128), torch.ones(rows, device = fids.device))
+                    adapt["seen"] += rows
+                    if adapt["seen"] - adapt["built_at"] >= adapt["warm"]:
+                        sub = None      # a rebuild must not hold the old subset while the new one is made (another 150 MiB at 98304 rows)
+                        self._adapt_build(lm, adapt)
+                    if params.get("export_draft_conf"):
+                        params["draft_conf"] = fconf
+                    params["draft_p"] = (1.0 / torch.exp(fl - fconf.unsqueeze(-1)).sum(-1)).reshape(-1)
+                    return fids
+                sl = sub.forward(logits, params).float()
+                conf, li = torch.max(sl, dim = -1)
+                ids = adapt["gmap"][li]
+                pp = (1.0 / torch.exp(sl - conf.unsqueeze(-1)).sum(-1)).reshape(-1)    # max probability over the subset
+                if probe:
+                    fl = lm.forward(logits, params)[..., :vs].float()
+                    fconf, fids = torch.max(fl, dim = -1)
+                    # per row, not "any row". A row whose full argmax sits inside the subset but differs (fp16 tie broken the other way
+                    # by the other GEMV shape) costs nothing: only an argmax outside the subset can never be drafted.
+                    out = ~adapt["member"][fids // 128]
+                    miss, num = (float(v) for v in torch.stack((out.float().mean(), (fids != ids).float().mean())).tolist())
+                    adapt["numeric"] += num - miss
+                    adapt["ema"] += (miss - adapt["ema"]) / 32       # a row that misses costs ~one accepted token in 1.5: the break-even rate is a few %
+                    adapt["counts"].index_add_(0, (fids.reshape(-1) // 128), torch.ones(rows, device = fids.device))
+                    adapt["seen"] += rows
+                    adapt["probes"] += 1
+                    adapt["misses"] += miss
+                    if adapt["log"] and adapt["probes"] % 25 == 0:
+                        print(f"[draft-head] {adapt['probes']} probes, row miss rate {adapt['misses'] / adapt['probes']:.4f} (+{adapt['numeric'] / adapt['probes']:.4f} fp16 ties), "
+                              f"on={adapt['on']}, subset {adapt['sub'].out_features} rows", flush = True)
+                    adapt["on"] = adapt["ema"] < adapt["maxmiss"]
+                    conf, ids = fconf, fids
+                    pp = (1.0 / torch.exp(fl - fconf.unsqueeze(-1)).sum(-1)).reshape(-1)
+                params["draft_p"] = pp
+                if params.get("export_draft_conf"):
+                    params["draft_conf"] = conf
+                return ids
             if sub is not None:
                 st = self.__dict__.setdefault("_dsub_st", {"calls": 0, "ema": 0.0, "on": True})
                 st["calls"] += 1
                 probe = st["calls"] % 8 == 0
                 if st["on"] or probe:
-                    sl = sub.forward(logits, params)[..., :min(sub.out_features, self.attached_model().config.vocab_size)].float()
+                    sl = sub.forward(logits, params)[..., :min(sub.out_features, vs)].float()
                     conf, ids = torch.max(sl, dim = -1)
                     pp = (1.0 / torch.exp(sl - conf.unsqueeze(-1)).sum(-1)).reshape(-1)    # max probability over the subset
                     if probe:
-                        fl = lm.forward(logits, params)[..., :self.attached_model().config.vocab_size].float()
+                        fl = lm.forward(logits, params)[..., :vs].float()
                         fconf, fids = torch.max(fl, dim = -1)
                         miss = float((fids != ids).any().item())
                         st["ema"] = 0.9 * st["ema"] + 0.1 * miss

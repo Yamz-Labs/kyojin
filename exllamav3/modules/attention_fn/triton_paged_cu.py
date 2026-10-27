@@ -375,6 +375,7 @@ def _paged_attn_decode_split_kernel(
     HAS_SINKS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KEY_LO: tl.constexpr = 0,   # KVWIN: the pool pass skips the sink positions < KEY_LO (the ring serves them)
 ):
     """Flash-decoding phase 1: one program per (batch, kv_head, row block, kv split). The rows of a
     kv head are its (query position, sibling q head) pairs packed densely (decode_row_layout), so a
@@ -486,6 +487,8 @@ def _paged_attn_decode_split_kernel(
             valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
         if WINDOW_RIGHT >= 0:
             valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
+        if KEY_LO > 0:
+            valid = valid & (offs_n[None, :] >= KEY_LO)
         scores = tl.where(valid, scores, -float("inf"))
 
         m_new = tl.maximum(m, tl.max(scores, axis=1))
@@ -696,6 +699,8 @@ def paged_attn_triton_decode_cu(
     num_warps: int | None = None,
     num_stages: int | None = None,
     split_batch: int | None = None,     # batch size the split count is derived from (default: bsz)
+    ring = None,                        # KVWIN: KVWinCtx; pool pass over [S, q-W], fp16 ring partial for the sinks + window
+    tq = None,                          # TurboQuant (cache.tq.TQState): CUDA qdec kernel only, NoFittingConfig for anything else
 ) -> torch.Tensor:
     """Flash-decoding paged attention for short queries: the kv sequence is split across
     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
@@ -750,7 +755,7 @@ def paged_attn_triton_decode_cu(
 
     if qc is not None:
         k_scales, v_scales, qck, qcv = qc
-        h32 = _get_h32(q.device)
+        h32 = tq.eye32 if tq is not None else _get_h32(q.device)
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
@@ -783,10 +788,20 @@ def paged_attn_triton_decode_cu(
     programs_split = programs if split_batch is None else programs // bsz * split_batch
     req_splits = num_splits
 
+    # KVWIN: the pool pass attends [S, q-W] (causal bound shifted by W, KEY_LO cuts the sinks) and the fp16 ring pass is one
+    # more partial after the pool splits, so the combine needs no change but its split count
+    pool_seqlens, key_lo = cache_seqlens, 0
+    if ring is not None:
+        if qc is None or not causal or softcap or window_left >= 0 or window_right >= 0 or k is not None:
+            raise ValueError("KVWIN ring: quantized, causal, pre-appended, unwindowed decode only")
+        pool_seqlens, key_lo = cache_seqlens - ring.cfg.W, ring.cfg.S
+
     if qc is not None and qck > 0 and qcv > 0:
         from . import qdec_cuda
         qcfg = qdec_cuda.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, page_size, causal, softmax_scale,
-                                  block_rows, window_left, window_right, softcap, kv_append_len)
+                                  block_rows, window_left, window_right, softcap, kv_append_len, key_lo, tq is not None)
+        if tq is not None and (qcfg is None or h_blocks != 1):
+            raise NoFittingConfig("TurboQuant: qdec.cu shapes only")
         if qcfg is not None and (h_blocks == 1 or qcfg.get("rows_kernel")):
             if qcfg.get("rows_kernel"):
                 # many-row kernel (cu/qdec_rows.cu): all of a kv head's (query, head) rows in one program
@@ -797,19 +812,24 @@ def paged_attn_triton_decode_cu(
             qsplits = req_splits if req_splits is not None else \
                 max(1, min(qdec_cuda.split_cap(qcfg, q.device, programs_split), triton.cdiv(max_k_len, 16), 128))
             qsplit_len = triton.cdiv(triton.cdiv(max_k_len, qsplits), 16) * 16
-            partial_o = torch.empty(programs * qsplits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
-            partial_ml = torch.empty(programs * qsplits * block_rows * 2, dtype = torch.float32, device = q.device)
+            ns_total = qsplits + (1 if ring is not None else 0)
+            partial_o = torch.empty(programs * ns_total * block_rows * hd_pad, dtype = torch.float32, device = q.device)
+            partial_ml = torch.empty(programs * ns_total * block_rows * 2, dtype = torch.float32, device = q.device)
             with torch.cuda.device(q.device):
                 qdec_cuda.get_kernel(qcfg).launch(
                     (programs, qsplits),
-                    [q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), block_table.data_ptr(), cache_seqlens.data_ptr(),
+                    [q.data_ptr(), k_cache.data_ptr(), v_cache.data_ptr(), block_table.data_ptr(), pool_seqlens.data_ptr(),
                      out.data_ptr(), partial_o.data_ptr(), partial_ml.data_ptr(), k_scales.data_ptr(), v_scales.data_ptr(),
                      h32.data_ptr()],
-                    [qsplit_len, num_pages_per_seq, qsplits])
+                    [qsplit_len, num_pages_per_seq, ns_total], tq)
+                if ring is not None:
+                    from .kvwin_triton import ring_split
+                    ring_split(ring, q, cache_seqlens, h32, partial_o, partial_ml, ns_total, programs,
+                               q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, tq is None, 0, 1, 1, block_rows)
                 rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
                 _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                     partial_o, partial_ml, out, h32,
-                    qsplits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
+                    ns_total, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
                     block_rows, rows_sub, d_sub,
                     num_warps=4, num_stages=1,
                 )
@@ -827,20 +847,22 @@ def paged_attn_triton_decode_cu(
         if splits is None:
             splits = max(1, min(target // programs_split, triton.cdiv(max_k_len, 1 * block_n), 128))
         split_len = triton.cdiv(triton.cdiv(max_k_len, splits), block_n) * block_n
-        if splits > 1:
-            partial_o = torch.empty(programs * splits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
-            partial_ml = torch.empty(programs * splits * block_rows * 2, dtype = torch.float32, device = q.device)
+        # KVWIN: one more partial after the pool splits holds the ring pass (see paged_attn_triton_decode)
+        ns_total = splits + (1 if ring is not None else 0)
+        if ns_total > 1:
+            partial_o = torch.empty(programs * ns_total * block_rows * hd_pad, dtype = torch.float32, device = q.device)
+            partial_ml = torch.empty(programs * ns_total * block_rows * 2, dtype = torch.float32, device = q.device)
         else:
             partial_o = q   # unused
             partial_ml = q  # unused
         args = (
-            q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml,
+            q, k_cache, v_cache, block_table, pool_seqlens, out, partial_o, partial_ml,
             k_scales, v_scales, h32,
-            split_len, num_pages_per_seq, splits, sinks,
+            split_len, num_pages_per_seq, ns_total, sinks,
             qck, qcv, q_len, kv_append_len, n_q_heads, n_kv_heads,
             page_size, head_dim, hd_pad, float(softmax_scale),
             bool(causal), int(window_left), int(window_right), float(softcap or 0.0),
-            splits == 1, has_sinks, block_rows, block_n,
+            ns_total == 1, has_sinks, block_rows, block_n, key_lo,
         )
         return args, splits, partial_o, partial_ml
 
@@ -870,11 +892,19 @@ def paged_attn_triton_decode_cu(
             *args, num_warps = num_warps, num_stages = num_stages,
         )
 
-        if num_splits > 1:
+        ns_total = num_splits
+        if ring is not None:
+            from .kvwin_triton import ring_split
+            ns_total = num_splits + 1
+            ring_split(ring, q, cache_seqlens, h32, partial_o, partial_ml, ns_total, programs,
+                       q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, softmax_scale, qcv > 0, 0,
+                       1, 1, block_rows)
+
+        if ns_total > 1:
             rows_sub, d_sub = combine_subtiles(block_rows, hd_pad)
             _paged_attn_decode_combine_kernel[(programs, (block_rows // rows_sub) * (hd_pad // d_sub))](
                 partial_o, partial_ml, out, h32,
-                num_splits, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
+                ns_total, sinks, qcv, has_sinks, q_len, n_q_heads, n_kv_heads, head_dim, hd_pad, head_dim,
                 block_rows, rows_sub, d_sub,
                 num_warps=4, num_stages=1,
             )

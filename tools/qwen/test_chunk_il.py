@@ -65,7 +65,8 @@ class FakeJob:
             if seq.kv_position == self.n - 1:
                 self.t_prefill_done = self.sim.clk.t; return
         rem = self.n - 1 - seq.kv_position
-        end = self.n - 1 if rem <= CHUNK + MERGE else (seq.kv_position + CHUNK) // PAGE * PAGE   # Job.prefill's chunk rule (shape)
+        chunk = self.sim.g.max_chunk_size                          # lowered at run time under decode priority
+        end = self.n - 1 if rem <= chunk + MERGE else (seq.kv_position + chunk) // PAGE * PAGE   # Job.prefill's chunk rule (shape)
         self.ranges.append((seq.kv_position, end))
         self.sim.clk.t += (end - seq.kv_position) * ROW_S
         seq.kv_position = end
@@ -78,7 +79,7 @@ class Sim:
     def __init__(self, flag, **planner_kw):
         self.clk = Clock()
         self.flag = flag
-        g = types.SimpleNamespace(active_jobs=[], max_chunk_size=CHUNK)
+        g = types.SimpleNamespace(active_jobs=[], max_chunk_size=CHUNK, base_chunk_size=CHUNK)
         for k, f in load_glue().items():
             setattr(g, k, types.MethodType(f, g))
         g._cil = chunk_il.ChunkPlanner(clock=self.clk, **planner_kw) if flag else None
@@ -152,6 +153,78 @@ def first_tokens(s, prefix):
 def solo_big_ttft(n=45000):
     s = Sim(False); a = s.add("A", n, 1); s.run(1e9)
     return a.t_prefill_done
+
+
+class DecodePriorityTests(unittest.TestCase):
+    """EXL3_CIL_DECODE_PRIO=1: a running stream waits one short chunk, not the whole big prefill (3 users on one 3090)."""
+
+    def tearDown(self):
+        os.environ.pop("EXL3_SCHED_CHUNK_IL", None)
+
+    def run_case(self, flag, **kw):
+        s = Sim(flag, **kw)
+        s.add("u1", 900, out=4000); s.add("u2", 900, out=4000)
+        big = []
+
+        def refill(sim):
+            if not big and sim.clk.t >= 3.0:
+                big.append(sim.add("A", 100000, 1))
+            if big and big[0].t_prefill_done is not None and sim.clk.t > big[0].t_prefill_done + 5:
+                sim.g.active_jobs.clear()
+        s.run(600, refill=refill)
+        a = big[0]
+        ends = [t1 for (t0, t1, pre, dec) in s.log if "u1" in dec and a.t_arrive <= t0 <= a.t_prefill_done]
+        gaps = [b - a_ for a_, b in zip(ends, ends[1:])]
+        toks = sum(1 for (t0, t1, pre, dec) in s.log if "u1" in dec and a.t_arrive <= t0 <= a.t_prefill_done)
+        return max(gaps), a.t_prefill_done - a.t_arrive, toks / (a.t_prefill_done - a.t_arrive), s
+
+    def test_stream_gap_bounded_and_big_prefill_not_starved(self):
+        solo = solo_big_ttft(100000)
+        gap0, t0_, _, _ = self.run_case(True)                       # decode priority off: leader chunks are exclusive
+        self.assertGreater(gap0, 3.0)
+        os.environ["EXL3_CIL_DECODE_PRIO"] = "1"
+        try:
+            gap1, t1_, rate1, s = self.run_case(True, slice_s=0.35)
+        finally:
+            os.environ.pop("EXL3_CIL_DECODE_PRIO", None)
+        self.assertLess(gap1, 1.5)                                  # one 768-row chunk (the last one merges the tail, 1792 rows), never a 4096-row chunk
+        self.assertLess(t1_, 1.7 * solo)                            # the big prefill keeps about 60 % of the GPU
+        self.assertGreater(rate1, 10)                               # rounds per second of a stream during the big prefill (full speed 29: about 40 %)
+
+    def test_short_prefill_beside_a_stream_takes_short_chunks(self):
+        def gap(prio):
+            if prio:
+                os.environ["EXL3_CIL_DECODE_PRIO"] = "1"
+            try:
+                s = Sim(True)
+                s.add("u1", 900, out=2000)
+                arrived = []
+
+                def refill(sim):
+                    if not arrived and sim.clk.t >= 3.0:
+                        arrived.append(sim.add("u2", 3500, out=30))   # a tool result of 3.5K rows: a short prefill (below the 4096 big threshold)
+                    if arrived and arrived[0].time_first_token is not None:
+                        sim.g.active_jobs.clear()
+                s.run(60, refill=refill)
+                ends = [t1 for (t0, t1, pre, dec) in s.log if "u1" in dec and 2.5 <= t0 <= arrived[0].t_prefill_done]
+                return max(b - a for a, b in zip(ends, ends[1:]))
+            finally:
+                os.environ.pop("EXL3_CIL_DECODE_PRIO", None)
+        self.assertGreater(gap(False), 2.0)    # one 3.5K-row chunk (4096 cap) stops the stream
+        self.assertLess(gap(True), 1.1)        # 768-row chunks with a decode round between them (the last chunk merges the tail: <= 1792 rows)
+
+    def test_chunk_size_restored_when_nobody_decodes(self):
+        os.environ["EXL3_CIL_DECODE_PRIO"] = "1"
+        try:
+            s = Sim(True)
+            s.add("A", 30000, out=1)
+            s.add("u1", 900, out=3)
+            s.run(60)
+            s.add("B", 5000, out=1)       # alone: the first step of a lone job restores the generator's chunk size before its prefill
+            s.step()
+            self.assertEqual(s.g.max_chunk_size, CHUNK)
+        finally:
+            os.environ.pop("EXL3_CIL_DECODE_PRIO", None)
 
 
 class InterleaveTests(unittest.TestCase):

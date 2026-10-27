@@ -56,8 +56,8 @@ def geometry(hd, nqh, nkv, qlen, nw, dw):
 
 
 def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, causal, sm_scale,
-             window_left, window_right, softcap, kv_append_len, has_sinks):
-    """Kernel config for a call, or None when the Triton kernels must run it"""
+             window_left, window_right, softcap, kv_append_len, has_sinks, key_lo = 0, tq = False):
+    """Kernel config for a call, or None when the Triton kernels must run it. key_lo: KVWIN, positions below it are not attended"""
     if (not ENABLED or window_left >= 0 or window_right >= 0 or softcap or kv_append_len != q_len
             or not (2 <= k_bits <= 8) or not (2 <= v_bits <= 8)):
         return None
@@ -72,13 +72,13 @@ def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, 
     if shared > 64 * 1024:
         return None
     return dict(hd=head_dim, kb=k_bits, vb=v_bits, nkv=n_kv_heads, nqh=n_q_heads, qlen=q_len, page=page_size, nw=nw, dw=dw,
-                causal=bool(causal), scale=float(sm_scale), sinks=bool(has_sinks))
+                causal=bool(causal), scale=float(sm_scale), sinks=bool(has_sinks), key_lo=int(key_lo), tq=bool(tq))
 
 
 def _compile(cfg, arch):
     from exllamav3.util import hip_compiler
     defs = dict(HD=cfg["hd"], KB=cfg["kb"], VB=cfg["vb"], NKV=cfg["nkv"], NQH=cfg["nqh"], QLEN=cfg["qlen"], PAGE=cfg["page"],
-                NW=cfg["nw"], DW=cfg["dw"], CAUSAL=int(cfg["causal"]), HAS_SINKS=int(cfg["sinks"]), SCALE=repr(float(cfg["scale"])) + "f")
+                NW=cfg["nw"], DW=cfg["dw"], CAUSAL=int(cfg["causal"]), HAS_SINKS=int(cfg["sinks"]), KEY_LO=cfg["key_lo"], TQ=int(cfg.get("tq", False)), SCALE=repr(float(cfg["scale"])) + "f")
     extra = [f"-D{k}={v}" for k, v in defs.items()] + os.environ.get("EXL3_QDEC_HIP_FLAGS", "").split()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"] + extra
     gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
@@ -148,26 +148,36 @@ def cu_count(device):
 def num_splits(cfg, device, programs, max_k_len):
     if os.environ.get("EXL3_QDEC_HIP_SPL"):
         return int(os.environ["EXL3_QDEC_HIP_SPL"])
-    waves = int(os.environ.get("EXL3_QDEC_HIP_WAVES", "0")) or cu_count(device) * 12
+    waves = int(os.environ.get("EXL3_QDEC_HIP_WAVES", "0")) or cu_count(device) * (16 if cfg.get("tq") and cfg["qlen"] * (cfg["nqh"] // cfg["nkv"]) <= 16 else 12)   # tq, one q tile: 4 waves per SIMD (its V loads stay in flight)
     return max(1, min(-(-waves // (programs * cfg["nw"])), -(-max_k_len // 16 // cfg["nw"]), 128))
 
 
-def decode(cfg, q, k_cache, v_cache, block_table, cache_seqlens, k_scales, v_scales, h32, sinks, out, max_k_len):
-    """q [bsz, q_len, n_q_heads, hd] fp16 -> out (same shape, fp16); caches are the packed int32 words"""
+def decode(cfg, q, k_cache, v_cache, block_table, cache_seqlens, k_scales, v_scales, h32, sinks, out, max_k_len, ring = None, tq = None):
+    """q [bsz, q_len, n_q_heads, hd] fp16 -> out (same shape, fp16); caches are the packed int32 words.
+    ring (KVWIN, cfg built with key_lo = S): the split kernel attends [S, q - W] (cache_seqlens shifted by W) and one more
+    partial, written by the fp16 ring kernel after the last split, carries the sinks and the window."""
     bsz = q.shape[0]
     kern = get_kernel(cfg, q.device)
     programs = bsz * cfg["nkv"]
     splits = num_splits(cfg, q.device, programs, max_k_len)
     split_len = -(-(-(-max_k_len // splits)) // 16) * 16
     rows = cfg["qlen"] * (cfg["nqh"] // cfg["nkv"])
-    po = _buf(q.device, "po", programs * splits * kern.rp * cfg["hd"])
-    pml = _buf(q.device, "pml", programs * splits * kern.rp * 2)
+    ns_total = splits + (1 if ring is not None else 0)
+    po = _buf(q.device, "po", programs * ns_total * kern.rp * cfg["hd"])
+    pml = _buf(q.device, "pml", programs * ns_total * kern.rp * 2)
+    pool_seqlens = cache_seqlens if ring is None else cache_seqlens - ring.cfg.W
     P, I = ctypes.c_void_p, ctypes.c_int
     kern._launch(kern.split, (programs, splits), 32 * cfg["nw"], kern.shared,
-                 [P(q.data_ptr()), P(k_cache.data_ptr()), P(v_cache.data_ptr()), P(block_table.data_ptr()), P(cache_seqlens.data_ptr()),
+                 [P(q.data_ptr()), P(k_cache.data_ptr()), P(v_cache.data_ptr()), P(block_table.data_ptr()), P(pool_seqlens.data_ptr()),
                   P(po.data_ptr()), P(pml.data_ptr()), P(k_scales.data_ptr()), P(v_scales.data_ptr()), P(h32.data_ptr()),
-                  I(split_len), I(block_table.shape[1]), I(splits)])
+                  I(split_len), I(block_table.shape[1]), I(ns_total),
+                  P(tq.cbk16.data_ptr() if tq is not None else None), P(tq.cbv16.data_ptr() if tq is not None else None)])
+    if ring is not None:
+        import triton
+        from .kvwin_triton import ring_split
+        ring_split(ring, q, cache_seqlens, h32, po, pml, ns_total, programs, cfg["qlen"], cfg["nqh"], cfg["nkv"], cfg["hd"],
+                   cfg["hd"], cfg["scale"], tq is None, 2, 1, 1, max(16, triton.next_power_of_2(kern.rp)), rpp = kern.rp)
     kern._launch(kern.combine, (programs, rows), cfg["hd"], 0,
                  [P(po.data_ptr()), P(pml.data_ptr()), P(out.data_ptr()), P(h32.data_ptr()),
-                  P(sinks.data_ptr() if cfg["sinks"] else None), I(splits)])
+                  P(sinks.data_ptr() if cfg["sinks"] else None), I(ns_total)])
     return out

@@ -977,6 +977,9 @@ class Job:
                 rw = self.recurrent_state.position - target
                 if rw <= self.recurrent_state.rollback_capacity():
                     self.recurrent_state.rewind(rw)
+                elif self.generator.ring_states:
+                    self.recurrent_state.free()
+                    self.recurrent_state = self._cold_ring_state(target)   # the K/V pool is complete: only the ring is rebuilt
                 else:
                     stashed = self.find_recurrent_stash(target)
                     self.recurrent_state.free()
@@ -1824,6 +1827,8 @@ class Job:
                         position = cached_pages * PAGE_SIZE,
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
+            elif self.generator.ring_states:
+                self.recurrent_state = self._cold_ring_state(cached_pages * PAGE_SIZE)
 
             # End of the pages found by hash past the recurrent checkpoint (K/V valid, state not), read by EXL3_BRANCH_CKPT. Taken
             # here, before any chunk runs: a chunk's page bookkeeping touches the page after its end, so a later chunk can't rescan
@@ -1903,7 +1908,7 @@ class Job:
         if ok is None:
             from ..modules.gated_delta_net import GatedDeltaNet
             from ..modules.ple import PLELayer   # Qwen 3.8: one PLE layer also holds a recurrent state (it saves its own mid-chunk state)
-            rl = g.model.get_recurrent_layers()
+            rl = g.model.get_checkpoint_layers()
             ok = bool(rl) and not g.model.loaded_tp and \
                 all(isinstance(m, PLELayer) or (isinstance(m, GatedDeltaNet) and not m.kda) for m in rl) and \
                 any(isinstance(m, GatedDeltaNet) for m in rl)
@@ -1924,7 +1929,7 @@ class Job:
         ok = getattr(g, "_big_tail_ok", None)
         if ok is None:
             from ..modules.gated_delta_net import GatedDeltaNet
-            rl = g.model.get_recurrent_layers()
+            rl = g.model.get_checkpoint_layers()
             ok = bool(rl) and not g.model.loaded_tp and \
                 all(isinstance(m, GatedDeltaNet) and m.kda for m in rl)
             g._big_tail_ok = ok
@@ -2193,13 +2198,19 @@ class Job:
         seq = self.sequences[0]
         rc = self.generator.recurrent_cache
         layers = self.generator.cache.get_all_recurrent_layers()
+        # KVWIN rings are not captured mid-chunk (the ring has already advanced to the chunk end): such a checkpoint restores
+        # with a cold ring that is rebuilt from the pool (quant-level window for the first W tokens)
+        ring_layers = {k for k, l in layers.items() if getattr(l, "kvwin", False)}
         n = 0
         for r, per_layer in sorted(saved.items()):
-            if set(per_layer) != set(layers):
+            if set(per_layer) != set(layers) - ring_layers:
                 continue
             pos = prefill_start + r
             stashed = {"position": pos, "checkpoint_size": self.recurrent_state.checkpoint_size}
             for k in layers:
+                if k in ring_layers:
+                    stashed[k] = None
+                    continue
                 s, c = per_layer[k][:2]
                 if len(per_layer[k]) == 3:
                     per_layer[k][2].synchronize()  # mode 2: pinned host copies, D2H event on the side stream
@@ -2242,6 +2253,14 @@ class Job:
             "page": seq.allocated_pages[p0], "draft_ok": not self.mtp_defer,
         })
         return 1
+
+
+    def _cold_ring_state(self, position: int):
+        """Ring-only job state at `position`; its rings are rebuilt from the quantized pool at the first attention."""
+        cache = self.generator.cache
+        if position == 0:
+            return cache.get_new_state()
+        return cache.new_from_stashed({"position": position}, position)
 
 
     def find_recurrent_stash(self, target_pos: int):

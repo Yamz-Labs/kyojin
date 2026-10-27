@@ -9,7 +9,8 @@ from ...util import profile_opt
 from .. import row_split as _row_split
 _row_split.install()
 
-MAX_BSZN_GEMV_R = 8  # must match MOE_R_MAX in exllamav3_ext/quant/exl3_dec.cu
+# rows of one exl3_dec_gemv_r call: GEMV_R_MAX_ROWS in exllamav3_ext/quant/exl3_dec.cu (ROCm: 9..32 rows run as grid.y row chunks); the 8-row MOE_R_MAX elsewhere
+MAX_BSZN_GEMV_R = min(32, max(1, int(os.environ.get("EXL3_GEMV_R_MAX_ROWS", "32" if torch.version.hip else "8"))))
 # K >= this runs R batch-1 launches instead of one gemv_r launch (A/B knob; 99 = never loop)
 DEC_GEMV_R_LOOP_MIN_K = int(os.environ.get("EXL3_DEC_GEMV_R_LOOP_MIN_K", "99"))
 # EXL3_VERIFY_FUSE=1 routes every R-row (1 < R <= 8) dense EXL3 linear of the MTP/DFlash
@@ -227,7 +228,7 @@ def _had_cache_put(inner, n_offset, n, w, clock):
 # are fp16 anyway so the only loss is rounding the product to fp16 before the fp32 consumer.
 # Decode (few rows) keeps the direct fp32 path, where the tile choice does not matter.
 _f32_via_f16 = os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
-_f32_via_f16_min_rows = int(os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "32"))
+_f32_via_f16_min_rows = int(os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "33"))
 _hip_gemv_support_cache: dict[int, bool] = {}
 
 # Batch-1 decode kernels (exl3_dec.cu, gfx11.5): one launch per GEMV with both Hadamard stages
@@ -236,7 +237,10 @@ EXL3_DEC = os.environ.get("EXL3_DEC", "1") != "0"
 _DEC_KB2 = (4, 5, 6, 8, 10, 12)
 # dense projections also decode K7 (attention, linear-attention and shared-expert projections of 5 bpw packs); the routed-MoE kernels stop at K6
 _DEC_KB2_DENSE = _DEC_KB2 + (14,)
-DEC_SCRATCH_FLOATS = 2 << 20
+# ROCm carries 9..32 rows per exl3_dec_gemv_r call: R * kbs * N partial sums of a wide dense projection (GDN qkvz at 28+ rows) outgrow 2M floats
+DEC_SCRATCH_FLOATS = (8 << 20) if torch.version.hip else (2 << 20)
+# arrival counters: the 8-row kernels fit 4096; a 32-row GEMV of a wide N (lm_head: 32 * ceil(N / 512)) needs up to ~16k
+DEC_COUNTERS = 16384
 _dec_workspaces: dict = {}
 
 
@@ -259,14 +263,14 @@ def dec_workspace(device: torch.device):
     ws = _dec_workspaces.get(key)
     if ws is None:
         ws = (torch.zeros(DEC_SCRATCH_FLOATS, dtype = torch.float, device = device),
-              torch.zeros(4096, dtype = torch.int, device = device))
+              torch.zeros(DEC_COUNTERS, dtype = torch.int, device = device))
         _dec_workspaces[key] = ws
     return ws
 
 
 # wide-N R-row GEMV (lm_head, N=248320: R*kbs*N partial sums > DEC_SCRATCH_FLOATS even at R=2) used to fall back to
 # R batch-1 launches, each re-reading the whole weight (R x 1.36 ms). A dedicated scratch lets one gemv_r launch carry all rows
-# (same kernel, same per-row reduction order, so bit-exact). Counters are shared (R * ceil(N/512) <= 3880 <= 4096 for R <= 8).
+# (same kernel, same per-row reduction order, so bit-exact). Counters are shared (R * ceil(N/512) <= 15520 <= DEC_COUNTERS for R <= 32).
 # Mutable at run time for one-load A/B: set WIDE_R["on"].
 WIDE_R = {"on": os.environ.get("EXL3_VERIFY_WIDE_R", "1") != "0"}
 WIDE_SCRATCH_FLOATS = 16 << 20
@@ -523,15 +527,15 @@ class LinearEXL3:
             except RuntimeError as e:
                 # The R-row partial sums of a very wide N (lm_head) can exceed the shared scratch; the
                 # size check runs before any launch, so fall back to the batch-1 loop (same order)
-                if "scratch too small" not in str(e): raise
+                if "scratch too small" not in str(e) and "counters too small" not in str(e): raise
                 loop = True
-                if WIDE_R["on"] and rows <= 8:
+                if WIDE_R["on"] and rows <= MAX_BSZN_GEMV_R and "scratch too small" in str(e):
                     try:
                         ext.exl3_dec_gemv_r(x.view(rows, self.in_features), self.trellis, self.suh, self.svh,
                                             y.view(rows, self.out_features), wide_scratch(x.device), counters, self.K)
                         loop = False
                     except RuntimeError as e2:
-                        if "scratch too small" not in str(e2): raise
+                        if "scratch too small" not in str(e2) and "counters too small" not in str(e2): raise
         if loop:
             # reference path: R batch-1 launches, bit-identical to gemv_r. gemv_r lost at K >= 5 only
             # while its 2-deep tile ring spilled; with ring 1 at RM > 1 it wins (GLM lm_head K 5,

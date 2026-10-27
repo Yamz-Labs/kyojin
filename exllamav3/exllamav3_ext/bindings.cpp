@@ -297,6 +297,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("g_get_cc", &g_get_cc, "g_get_cc");
     m.def("g_get_num_sms", &g_get_num_sms, "g_get_num_sms");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
+    m.def("exl3_gemv_int8_pair", &exl3_gemv_int8_pair_eager, "exl3_gemv_int8_pair");
     m.def("exl3_moe_cpu_make_layer", &exl3_moe_cpu_make_layer, "exl3_moe_cpu_make_layer");
     m.def("exl3_moe_cpu_free_layer", &exl3_moe_cpu_free_layer, "exl3_moe_cpu_free_layer");
     m.def("exl3_moe_cpu_forward", &exl3_moe_cpu_forward, "exl3_moe_cpu_forward",
@@ -455,6 +456,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_moe_fused_grid", &exl3_moe_fused_grid, "exl3_moe_fused_grid");
     m.def("exl3_moe_fused_tile_test", &exl3_moe_fused_tile_test, "exl3_moe_fused_tile_test");
     m.def("exl3_gemv_int8_max_k", &exl3_gemv_int8_max_k, "exl3_gemv_int8_max_k");
+    m.def("exl3_gemv_int8_pair", &exl3_gemv_int8_pair_eager, "exl3_gemv_int8_pair");
     m.def("exl3_moe_gfx12_k3", &exl3_moe_gfx12_k3, "exl3_moe_gfx12_k3");
     bind_exl3_dec(m);
     m.def("fused_gated_rms_norm", &fused_gated_rms_norm, "fused_gated_rms_norm");

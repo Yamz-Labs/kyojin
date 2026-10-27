@@ -324,14 +324,14 @@ class BCAttn:
         } | {n: "constexpr" for n in (
             "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
             "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
-            "SOFTCAP", "FINAL", "HAS_SINKS") + (() if ATTN16 else ("BLOCK_M", "BLOCK_H")) + ("BLOCK_ROWS", "BLOCK_N")}
+            "SOFTCAP", "FINAL", "HAS_SINKS") + (() if ATTN16 else ("BLOCK_M", "BLOCK_H")) + ("BLOCK_ROWS", "BLOCK_N", "KEY_LO")}
         consts = dict(
             QCK = self.k_bits, QCV = self.v_bits,
             q_len = q_len, kv_append_len = q_len, n_q_heads = qh, n_kv_heads = kvh,
             page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
-            BLOCK_ROWS = block_rows, BLOCK_N = block_n,
+            BLOCK_ROWS = block_rows, BLOCK_N = block_n, KEY_LO = 0,
         )
         if not ATTN16:
             consts |= dict(BLOCK_M = block_m, BLOCK_H = block_h)
@@ -753,6 +753,14 @@ def build_bc_attn(module, layer):
     from ...cache.qsa import QSAPlanes
 
     m = module
+    if getattr(layer, "kvwin", None) is not None:
+        # KVWIN: the graph writes the pool inside the captured block and would leave the fp16 ring stale
+        _trace_build(m, None, "attn")
+        return None
+    if getattr(layer, "tq", False):
+        # TurboQuant: rotation + codebook reads live in the Triton path
+        _trace_build(m, None, "attn")
+        return None
     qsa_idx = getattr(m, "qsa_indexer", None)
     if not (
         _module_eligible(m) and

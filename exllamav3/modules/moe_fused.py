@@ -15,6 +15,7 @@ import time
 import torch
 from ..ext import exllamav3_ext as ext
 from .hyperconnections import HyperConnection
+from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices
 
 MAX_ROWS = 4
 # EXL3_VERIFY_ROW_SPLIT=1: 5..8 rows of one sequence run as fused sub-calls of at most 4 rows (per-row arithmetic unchanged)
@@ -176,7 +177,12 @@ class FusedMoEHalf:
             return False
         if x.dtype != torch.float or not x.is_contiguous() or x.dim() != 4 or x.shape[2] != self.H or x.shape[3] != self.D:
             return False
-        return 1 <= x.shape[0] * x.shape[1] <= (8 if R8["on"] else SPLIT_MAX_ROWS)
+        rows = x.shape[0] * x.shape[1]
+        lim = 8 if R8["on"] else SPLIT_MAX_ROWS
+        if rows <= lim:
+            return rows >= 1
+        # ROCm: a verify step of 9..ROW_INV_MAX_ROWS rows (several jobs x draft depth) runs as job-aligned sub-calls of the 8-row path
+        return lim >= 8 and rows <= ROW_INV_MAX_ROWS and bool(params.get("dflash_verify"))
 
     def _wide_ok(self) -> bool:
         """The one-launch 5..8 row path exists for this block: mf9 at the default variant 0x160000 (six stage launches), native layout, no timing. The wide instantiations cover K2..K5 only (the K6 drafter layer takes the split path)."""
@@ -185,6 +191,13 @@ class FusedMoEHalf:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """x (b, s, H, D) fp32 residual stack, updated in place and returned."""
+        rows = x.shape[0] * x.shape[1]
+        if rows > 8:
+            # whole jobs per call, at most 8 rows each: every row keeps the arithmetic of an 8-row (or shorter) round
+            xf = x.view(1, rows, *x.shape[2:])
+            for lo, hi in job_slices(rows, x.shape[1], 8):
+                self(xf[:, lo:hi])
+            return x
         if x.shape[0] * x.shape[1] > MAX_ROWS and R8["on"] and self._wide_ok():
             gr = self.gr
             fq, fsc, uq, usc = gr.q8_set()

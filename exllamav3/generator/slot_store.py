@@ -242,9 +242,10 @@ class SlotStore:
         pt = g.pagetable
         ids = tail["ids"]
         L = ids.shape[-1]
-        for e in list(g.tail_ckpts):                    # same content already in memory: the restored copy replaces it
-            if e["prev_hash"] == ph and e["ids"].shape == ids.shape and torch.equal(e["ids"].cpu(), ids):
-                g.tail_ckpts.remove(e)
+        # same content already in memory: the restored copy replaces it. By identity: list.remove() compares the entries as
+        # dicts, and two entries with the same prev_hash but ids of other lengths raise "The size of tensor a must match"
+        g.tail_ckpts[:] = [e for e in g.tail_ckpts
+                           if not (e["prev_hash"] == ph and e["ids"].shape == ids.shape and torch.equal(e["ids"].cpu(), ids))]
         if order is None:
             order = pt.build_eviction_order(protected)
         while order[0].ref_count:

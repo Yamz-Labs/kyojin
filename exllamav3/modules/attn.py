@@ -43,6 +43,7 @@ def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
 
 from ..util.tensor import g_tensor_cache
 from .attention_fn import attn_dispatch
+from ..cache.kvwin import env_capable as _kvwin_capable, make_ctx as _kvwin_ctx, ensure_filled as _kvwin_fill, KVWinLayerState
 
 """
                    
@@ -147,6 +148,12 @@ def split_params_by_sequence(params: dict, bsz: int) -> list[dict]:
         p.pop("dev_cache", None)
         p["block_table"] = params["block_table"][b:b + 1]
         p["cache_seqlens"] = params["cache_seqlens"][b:b + 1]
+        # the sequence's own recurrent state (and slot): the KVWIN ring of the attention layer lives in it
+        rs = params.get("recurrent_states")
+        if rs and len(rs) == bsz:
+            p["recurrent_states"] = rs[b:b + 1]
+            if torch.is_tensor(params.get("recurrent_slots")):
+                p["recurrent_slots"] = params["recurrent_slots"][b:b + 1]
         if positions is not None:
             p["positions"] = p["cache_seqlens"] if positions is params["cache_seqlens"] else positions[b:b + 1]
         out.append(p)
@@ -440,6 +447,12 @@ class Attention(Module):
             "kv_cache": True
         })
 
+        # KVWIN (EXL3_KVWIN=sink:window): the fp16 sink + window ring of a quantized cache is a per-job recurrent layer state
+        self.recurrent_layers = []
+        if _kvwin_capable() and self.num_kv_heads > 0:
+            self.caps["recurrent_cache"] = True
+            self.layer_state_cls = KVWinLayerState
+
         self.cache_layers = []
         self.tp_cache_lookup = {}
         self.multi_kv = None
@@ -487,6 +500,8 @@ class Attention(Module):
         # Cache
         for cl in self.cache_layers:
             cl.alloc(device)
+        for rl in self.recurrent_layers:
+            rl.alloc(device)
 
         if self.rope_settings:
             self.rope = RoPE(
@@ -633,6 +648,8 @@ class Attention(Module):
 
         for cl in self.cache_layers:
             cl.free()
+        for rl in self.recurrent_layers:
+            rl.free()
 
         self.rope = None
         self.sinks = None
@@ -1264,6 +1281,18 @@ class Attention(Module):
         self.forward(x, p2)
 
 
+    def kvwin_ctx(self, cache, params: dict, bsz: int, block_table: torch.Tensor):
+        """KVWIN ring context of this attention call (None when off, inert or the call has no job states)."""
+        if not self.caps.get("recurrent_cache"):
+            return None
+        rl = getattr(cache, "recurrent_layers", None)
+        if not rl:
+            return None
+        ctx = _kvwin_ctx(rl.get((self.layer_idx, params.get("layer_instance") or 0)), params, self.device, bsz)
+        _kvwin_fill(ctx, params, block_table)
+        return ctx
+
+
     def decode_flash_attn(
         self,
         x: torch.Tensor,
@@ -1281,6 +1310,7 @@ class Attention(Module):
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
+        ov = self.kvwin_ctx(cache, params, bsz, block_table)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
         non_causal_spans = params.get("non_causal_spans")
@@ -1390,6 +1420,7 @@ class Attention(Module):
                     dispatch_cache = self.dispatch_cache,
                     max_kv_len = max_kv_len,
                     v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                    ov = ov,
                 ) for i in range(seqlen)], dim = 1)
             else:
                 o = attn_dispatch(
@@ -1410,6 +1441,7 @@ class Attention(Module):
                     dispatch_cache = self.dispatch_cache,
                     max_kv_len = max_kv_len,
                     v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                    ov = ov,
                 )
 
         if self.headwise_gate:
@@ -1457,6 +1489,7 @@ class Attention(Module):
         positions = get_for_device(params, "positions", self.device, None)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
+        ov_all = self.kvwin_ctx(cache, params, bsz, block_table)
         qsa_layer = qsa_cpu = None
         if self.qsa_indexer is not None:
             from ..cache import CacheLayer as _CL
@@ -1505,6 +1538,7 @@ class Attention(Module):
                         window_size = self.window_arg(), softcap = self.logit_softcapping, non_causal_spans = None,
                         sinks = self.sinks, dispatch_cache = self.dispatch_cache, max_kv_len = max_kv_len,
                         v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                        ov = ov_all._replace(slots = ov_all.slots[sl]) if ov_all is not None else None,
                     )
                 if rows is None:
                     outs.append(call(q[sl], k[sl], v[sl], cs_b))

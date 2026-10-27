@@ -7,7 +7,7 @@ def test_off_by_default_state_is_respected():
     old = PLAIN_ROWS["on"]
     try:
         PLAIN_ROWS["on"] = False
-        assert not any(plain_rows_verify(r, False) for r in range(0, 20))
+        assert not any(plain_rows_verify(r, False) for r in range(0, ROW_INV_MAX_ROWS + 4))
     finally:
         PLAIN_ROWS["on"] = old
 
@@ -17,7 +17,7 @@ def test_on_covers_rows_two_to_max_only():
     try:
         PLAIN_ROWS["on"] = True
         ROW_INV["on"] = True
-        got = [r for r in range(0, 20) if plain_rows_verify(r, False)]
+        got = [r for r in range(0, ROW_INV_MAX_ROWS + 4) if plain_rows_verify(r, False)]
         assert got == list(range(2, ROW_INV_MAX_ROWS + 1))
         assert not plain_rows_verify(4, True)            # a drafted step is already marked by its caller
         ROW_INV["on"] = False

@@ -23,6 +23,12 @@
 #define NTHREADS (NW * 32)
 #define LOG2E 1.4426950408889634f
 #define NSL (HD / 16)
+#ifndef TQ
+#define TQ 0           // TurboQuant cache (cache/tq.py): codebook LUT dequant, ONE fp16 scale per head vector, q / output rotated outside
+#endif
+#if TQ && !FASTDQ
+#error "TQ needs the FASTDQ unpack"
+#endif
 
 // dynamic smem layout: [Qs fp16 NT*8 x QSTR][ring: NW x ST x STAGE_B]   (epilogue reuses the ring for the cross-warp merge)
 
@@ -52,6 +58,13 @@ __device__ __forceinline__ u32 magic_mask(u32 x, u32 m) { return hsub2((x & m) |
 template<int B> __device__ __forceinline__ u32 negbias2() { return (u32)(0x8000 | ((15 + B - 1) << 10)) * 0x10001u; }
 __device__ __forceinline__ u32 bytesel(int b) { return (u32)b | ((u32)(4 + b) << 8); }
 
+// TurboQuant: packed raw pair (1024 + raw in each half) -> half2 (codebook[raw] * scale); the codebook sits in smem as fp16 bits
+template<int B> __device__ __forceinline__ u32 lut2(u32 x, u32 s2, const u32* cb)
+{
+    // pair table: index = raw(lo half) | raw(hi half) << B, one 32-bit smem load gives the half2
+    return cb[(x & ((1u << B) - 1)) | ((x >> (16 - B)) & (((1u << B) - 1) << B))];       // the per-vector scale is folded into the scores (K) / the probabilities (V)
+}
+
 struct DqK { u32 sel8, sh4, sh2, sel2[2], sh1, mu8, mu4, mu2; };
 template<int B> __device__ __forceinline__ DqK make_dqk(int t)
 {
@@ -63,13 +76,14 @@ template<int B> __device__ __forceinline__ DqK make_dqk(int t)
 // K pair register: dims (16U + 8S + t, 16U + 8S + t + 4) of one token row (kr = row words of this 32-dim group). The pair stays
 // inside the 8-dim half (slots 0-7 / 8-15) of the mma k range it belongs to: permuting k inside a half is bit-neutral on
 // the tensor core (tested), so the scores stay bit-identical to the plain dim order
-template<int B, int U, int S> __device__ __forceinline__ u32 kdq(const u32* kr, const DqK& c, u32 sc)
+template<int B, int U, int S> __device__ __forceinline__ u32 kdq(const u32* kr, const DqK& c, u32 sc, const u32* cb)
 {
-    u32 x = negbias2<B>();
+    u32 x = TQ ? 0x64006400u : negbias2<B>();     // TQ: 1024 + raw in both halves, the low 10 bits are the codebook index
     if constexpr (B & 1) { u32 y = (kr[B & ~1] >> (c.sh1 + 16 * U + 8 * S)) & 0x11u; x = hfma2(magic_mask(y * 0x1001u, 0x00010001u), 0x3C003C00u, x); }
     if constexpr (B & 2) { u32 w = kr[(B & ~3) + U] >> c.sh2; x = hfma2(magic_mask(prmt(w, w, c.sel2[S]), 0x00030003u), c.mu2, x); }
     if constexpr (B & 4) { x = hfma2(magic_mask(kr[(B & ~7) + 2 * U + S] >> c.sh4, 0x000F000Fu), c.mu4, x); }
     if constexpr (B & 8) { x = hfma2(magic_mask(prmt(kr[4 * U + 2 * S], kr[4 * U + 2 * S + 1], c.sel8), 0x00FF00FFu), c.mu8, x); }
+    if (TQ) return lut2<B>(x, sc, cb);
     return hfma2(x, sc, hmul2(sc, 0x38003800u));
 }
 
@@ -92,13 +106,14 @@ template<int B> __device__ __forceinline__ DqV make_dqv(int g)
     return c;
 }
 // V pair register: dim 16 il + g + 8 rh of two tokens (wA, wB = their row words of this 32-dim group)
-template<int B, int IL, int RH> __device__ __forceinline__ u32 vdq(const u32* wA, const u32* wB, const DqV& c, u32 sc)
+template<int B, int IL, int RH> __device__ __forceinline__ u32 vdq(const u32* wA, const u32* wB, const DqV& c, u32 sc, const u32* cb)
 {
-    u32 x = negbias2<B>();
+    u32 x = TQ ? 0x64006400u : negbias2<B>();
     if constexpr (B & 1) { const int o = B & ~1; x = hfma2(magic_mask(prmt(wA[o], wB[o], c.sel1[IL][RH]), c.m1), c.mu1, x); }
     if constexpr (B & 2) { const int o = (B & ~3) + IL; x = hfma2(magic_mask(prmt(wA[o], wB[o], c.sel2[RH]), c.m2), c.mu2, x); }
     if constexpr (B & 4) { const int o = (B & ~7) + 2 * IL + RH; x = hfma2(magic_mask(prmt(wA[o], wB[o], c.sel4), c.m4), c.mu4, x); }
     if constexpr (B & 8) { const int o = 4 * IL + 2 * RH; x = hfma2(magic_mask(prmt(wA[o + c.gq], wB[o + c.gq], c.sel8), c.m8), c.mu8, x); }
+    if (TQ) return lut2<B>(x, sc, cb);
     return hfma2(x, sc, hmul2(sc, 0x38003800u));
 }
 #endif
@@ -109,8 +124,10 @@ qdec_split(
     float* __restrict__ partial_o, float* __restrict__ partial_ml,
     const u16* __restrict__ k_scales, const u16* __restrict__ v_scales, const u16* __restrict__ h32,
     int split_len, int num_pages_per_seq, int num_splits, const float* sinks_unused,
-    void* s0, void* s1)
+    const u16* __restrict__ cbk, const u16* __restrict__ cbv)
 {
+    __shared__ __align__(16) u32 cbk_s[TQ ? (1 << (2 * KB)) : 1];
+    __shared__ __align__(16) u32 cbv_s[TQ ? (1 << (2 * VB)) : 1];
     extern __shared__ __align__(16) unsigned char smem[];
     u16* Qs = (u16*)smem;
     unsigned char* ring = smem + ((NT * 8 * QSTR * 2 + 15) / 16) * 16;
@@ -126,7 +143,17 @@ qdec_split(
     const int n_end = min(n_start + split_len, total_k);
 
     // ---- q rows -> rotated (h32) fp16 in smem
-    {
+    if (TQ) {                                            // q arrives already rotated: plain copy (K dim order permuted like below)
+        for (int i = tid; i < (1 << (2 * KB)); i += NTHREADS) cbk_s[i] = (u32)cbk[i & ((1 << KB) - 1)] | ((u32)cbk[i >> KB] << 16);
+        for (int i = tid; i < (1 << (2 * VB)); i += NTHREADS) cbv_s[i] = (u32)cbv[i & ((1 << VB) - 1)] | ((u32)cbv[i >> VB] << 16);
+        for (int idx = tid; idx < NT * 8 * HD; idx += NTHREADS) {
+            int r = idx / HD, d = idx % HD;
+            u16 x = 0;
+            if (r < ROWS) x = q[((size_t)((batch * QLEN + r % QLEN) * NQH + kvh * GROUP + r / QLEN)) * HD + d];
+            Qs[r * QSTR + ((d & ~15) | (d & 8) | ((d & 3) << 1) | ((d >> 2) & 1))] = x;
+        }
+        __syncthreads();
+    } else {
         float* hs = (float*)(ring);                      // 32x32 fp32 scratch, ring is idle until the loop
         for (int i = tid; i < 1024; i += NTHREADS) hs[i] = h2f(h32[i]);
         __syncthreads();
@@ -206,8 +233,14 @@ qdec_split(
                 cp16(vsm + tk * VSTRW + pt * 4, v_cache + (row0 + tk) * (GPT * VB) + kvh * VCHW + pt * 4, n0 + tk < n_end);
 #endif
             }
+#if TQ
+            // one fp16 per (token, kv head): fetch the 4-byte word holding it (NKV is even), the pair's parity picks the half
+            if (lane < 16) cp4h(ksc + lane * 2, k_scales + (row0 + lane) * NKV + (kvh & ~1), n0 + lane < n_end, pol_l);
+            else           cp4h(vsc + (lane - 16) * 2, v_scales + (row0 + lane - 16) * NKV + (kvh & ~1), n0 + lane - 16 < n_end, pol_l);
+#else
             if (lane < 16) cp_sc(ksc + lane * G, k_scales + (row0 + lane) * GPT + kvh * G, n0 + lane < n_end, pol_l);
             else           cp_sc(vsc + (lane - 16) * G, v_scales + (row0 + lane - 16) * GPT + kvh * G, n0 + lane - 16 < n_end, pol_l);
+#endif
         }
         asm volatile("cp.async.commit_group;");
     };
@@ -242,18 +275,18 @@ qdec_split(
 #if FASTDQ
         #pragma unroll
         for (int gi = 0; gi < G; gi++) {
-            u32 sc0 = scale2<KB>(ksc[g * G + gi], ksc[g * G + gi]);
-            u32 sc1 = scale2<KB>(ksc[(g + 8) * G + gi], ksc[(g + 8) * G + gi]);
+            u32 sc0 = TQ ? 0u : scale2<KB>(ksc[g * G + gi], ksc[g * G + gi]);
+            u32 sc1 = TQ ? 0u : scale2<KB>(ksc[(g + 8) * G + gi], ksc[(g + 8) * G + gi]);
             #pragma unroll
             for (int h = 0; h < 2; h++) {
                 int ks = gi * 2 + h;
                 u32 a0, a1, a2, a3;
                 if (h == 0) {
-                    a0 = kdq<KB, 0, 0>(kr0 + gi * KB, dk, sc0); a1 = kdq<KB, 0, 0>(kr1 + gi * KB, dk, sc1);
-                    a2 = kdq<KB, 0, 1>(kr0 + gi * KB, dk, sc0); a3 = kdq<KB, 0, 1>(kr1 + gi * KB, dk, sc1);
+                    a0 = kdq<KB, 0, 0>(kr0 + gi * KB, dk, sc0, cbk_s); a1 = kdq<KB, 0, 0>(kr1 + gi * KB, dk, sc1, cbk_s);
+                    a2 = kdq<KB, 0, 1>(kr0 + gi * KB, dk, sc0, cbk_s); a3 = kdq<KB, 0, 1>(kr1 + gi * KB, dk, sc1, cbk_s);
                 } else {
-                    a0 = kdq<KB, 1, 0>(kr0 + gi * KB, dk, sc0); a1 = kdq<KB, 1, 0>(kr1 + gi * KB, dk, sc1);
-                    a2 = kdq<KB, 1, 1>(kr0 + gi * KB, dk, sc0); a3 = kdq<KB, 1, 1>(kr1 + gi * KB, dk, sc1);
+                    a0 = kdq<KB, 1, 0>(kr0 + gi * KB, dk, sc0, cbk_s); a1 = kdq<KB, 1, 0>(kr1 + gi * KB, dk, sc1, cbk_s);
+                    a2 = kdq<KB, 1, 1>(kr0 + gi * KB, dk, sc0, cbk_s); a3 = kdq<KB, 1, 1>(kr1 + gi * KB, dk, sc1, cbk_s);
                 }
                 #pragma unroll
                 for (int j = 0; j < NT; j++) {
@@ -288,6 +321,10 @@ qdec_split(
 
         // ---- online softmax (log2 domain), rows 2t / 2t+1 of every n-tile
         u32 plo[NT], phi[NT];
+#if TQ
+        const float kf0 = h2f(ksc[g * 2 + (kvh & 1)]) * sl, kf1 = h2f(ksc[(g + 8) * 2 + (kvh & 1)]) * sl;
+        const float vf0 = h2f(vsc[g * 2 + (kvh & 1)]), vf1 = h2f(vsc[(g + 8) * 2 + (kvh & 1)]);
+#endif
         #pragma unroll
         for (int j = 0; j < NT; j++) {
             float s[4]; bool ok[4];
@@ -295,8 +332,12 @@ qdec_split(
             for (int e = 0; e < 4; e++) {
                 int tk = n0 + g + ((e >> 1) << 3);
                 int ri = e & 1;
-                ok[e] = rvalid[j][ri] && tk < n_end && (!CAUSAL || (float)tk <= qabs[j][ri]);
+                ok[e] = rvalid[j][ri] && tk < n_end && tk >= KEY_LO && (!CAUSAL || (float)tk <= qabs[j][ri]);
+#if TQ
+                s[e] = ok[e] ? S[j][e] * ((e >> 1) ? kf1 : kf0) : -INFINITY;
+#else
                 s[e] = ok[e] ? S[j][e] * sl : -INFINITY;
+#endif
             }
             float alpha[2];
             #pragma unroll
@@ -318,6 +359,9 @@ qdec_split(
             for (int i = 0; i < NSL; i++) {
                 O[i][j][0] *= alpha[0]; O[i][j][1] *= alpha[1]; O[i][j][2] *= alpha[0]; O[i][j][3] *= alpha[1];
             }
+#if TQ
+            s[0] *= vf0; s[1] *= vf0; s[2] *= vf1; s[3] *= vf1;       // V scale rides on P (token g / g+8 of this lane's rows)
+#endif
             plo[j] = movtrans(pack_h2(s[0], s[1]));
             phi[j] = movtrans(pack_h2(s[2], s[3]));
         }
@@ -331,16 +375,16 @@ qdec_split(
 #if FASTDQ
         #pragma unroll
         for (int gi = 0; gi < G; gi++) {
-            u32 sAB = scale2<VB>(vsc[(2 * t) * G + gi], vsc[(2 * t + 1) * G + gi]);
-            u32 sCD = scale2<VB>(vsc[(2 * t + 8) * G + gi], vsc[(2 * t + 9) * G + gi]);
+            u32 sAB = TQ ? ((u32)vsc[(2 * t) * 2 + (kvh & 1)] | ((u32)vsc[(2 * t + 1) * 2 + (kvh & 1)] << 16)) : scale2<VB>(vsc[(2 * t) * G + gi], vsc[(2 * t + 1) * G + gi]);
+            u32 sCD = TQ ? ((u32)vsc[(2 * t + 8) * 2 + (kvh & 1)] | ((u32)vsc[(2 * t + 9) * 2 + (kvh & 1)] << 16)) : scale2<VB>(vsc[(2 * t + 8) * G + gi], vsc[(2 * t + 9) * G + gi]);
             const u32 *pA = vA + gi * VB, *pB = vB + gi * VB, *pC = vC + gi * VB, *pD = vD + gi * VB;
             u32 a0, a1, a2, a3;
-            a0 = vdq<VB, 0, 0>(pA, pB, dv, sAB); a1 = vdq<VB, 0, 1>(pA, pB, dv, sAB);
-            a2 = vdq<VB, 0, 0>(pC, pD, dv, sCD); a3 = vdq<VB, 0, 1>(pC, pD, dv, sCD);
+            a0 = vdq<VB, 0, 0>(pA, pB, dv, sAB, cbv_s); a1 = vdq<VB, 0, 1>(pA, pB, dv, sAB, cbv_s);
+            a2 = vdq<VB, 0, 0>(pC, pD, dv, sCD, cbv_s); a3 = vdq<VB, 0, 1>(pC, pD, dv, sCD, cbv_s);
             #pragma unroll
             for (int j = 0; j < NT; j++) mma16816(O[gi * 2][j], a0, a1, a2, a3, plo[j], phi[j]);
-            a0 = vdq<VB, 1, 0>(pA, pB, dv, sAB); a1 = vdq<VB, 1, 1>(pA, pB, dv, sAB);
-            a2 = vdq<VB, 1, 0>(pC, pD, dv, sCD); a3 = vdq<VB, 1, 1>(pC, pD, dv, sCD);
+            a0 = vdq<VB, 1, 0>(pA, pB, dv, sAB, cbv_s); a1 = vdq<VB, 1, 1>(pA, pB, dv, sAB, cbv_s);
+            a2 = vdq<VB, 1, 0>(pC, pD, dv, sCD, cbv_s); a3 = vdq<VB, 1, 1>(pC, pD, dv, sCD, cbv_s);
             #pragma unroll
             for (int j = 0; j < NT; j++) mma16816(O[gi * 2 + 1][j], a0, a1, a2, a3, plo[j], phi[j]);
         }

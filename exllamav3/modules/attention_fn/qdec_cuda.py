@@ -74,9 +74,10 @@ def _compile(cfg):
     from cuda.bindings import nvrtc
     defs = dict(HD=cfg["hd"], KB=cfg["kb"], VB=cfg["vb"], NKV=cfg["nkv"], NQH=cfg["nqh"], QLEN=cfg["qlen"],
                 PAGE=cfg["page"], NW=cfg["nw"], ST=cfg["st"], CAUSAL=int(cfg["causal"]), BLOCK_ROWS=cfg["block_rows"],
-                HD_PAD=triton.next_power_of_2(cfg["hd"]), SCALE=repr(float(cfg["scale"])) + "f")
+                HD_PAD=triton.next_power_of_2(cfg["hd"]), SCALE=repr(float(cfg["scale"])) + "f", KEY_LO=cfg.get("key_lo", 0),
+                TQ=int(cfg.get("tq", False)))
     defs["L2HINT"] = int(os.environ.get("EXL3_QDEC_L2HINT", "1"))       # L2 evict_first on K/V, evict_last on the scales
-    defs["FASTDQ"] = int(os.environ.get("EXL3_QDEC_FASTDQ", "1"))        # permuted-order PRMT/LOP3 bit-plane unpack (qdec.cu)
+    defs["FASTDQ"] = 1 if cfg.get("tq") else int(os.environ.get("EXL3_QDEC_FASTDQ", "1"))        # permuted-order PRMT/LOP3 bit-plane unpack (qdec.cu)
     if os.environ.get("EXL3_QDEC_ABL"):
         defs["ABL"] = int(os.environ["EXL3_QDEC_ABL"])
     src = "#define INFINITY __int_as_float(0x7f800000)\n" + open(_COMMON).read() + "\n" + \
@@ -121,7 +122,7 @@ class _Kernel:
         assert r == driver.CUresult.CUDA_SUCCESS, r
         r, self.fn = driver.cuModuleGetFunction(self.mod, b"qdec_split_rows" if cfg.get("rows_kernel") else b"qdec_split")
         assert r == driver.CUresult.CUDA_SUCCESS, r
-        if self.shared > 48 * 1024:
+        if self.shared + static_smem(cfg) > 48 * 1024:       # the opt-in covers static + dynamic
             r, = driver.cuFuncSetAttribute(self.fn, driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, self.shared)
             assert r == driver.CUresult.CUDA_SUCCESS, r
 
@@ -134,11 +135,12 @@ class _Kernel:
             self._bps = max(1, n)
         return self._bps
 
-    def launch(self, grid, ptrs, ints):
-        """ptrs: 11 device pointer ints (q .. h32 incl. out), ints: split_len, num_pages_per_seq, num_splits"""
+    def launch(self, grid, ptrs, ints, tq = None):
+        """ptrs: 11 device pointer ints (q .. h32 incl. out), ints: split_len, num_pages_per_seq, num_splits;
+        tq: the cache's TQState (codebook pointers)"""
         import ctypes
         from cuda.bindings import driver
-        vals = list(ptrs) + list(ints) + [0, 0, 0]       # + sinks, 2 scratch slots (unused)
+        vals = list(ptrs) + list(ints) + ([0, tq.cbk16.data_ptr(), tq.cbv16.data_ptr()] if tq is not None else [0, 0, 0])   # + sinks (unused), codebooks
         types = [ctypes.c_void_p] * len(ptrs) + [ctypes.c_int] * len(ints) + [ctypes.c_void_p] * 3
         stream = torch.cuda.current_stream().cuda_stream
         r, = driver.cuLaunchKernel(self.fn, grid[0], grid[1], 1, 32 * self.cfg["nw"], 1, 1, self.shared, stream, (tuple(vals), tuple(types)), 0)
@@ -158,6 +160,11 @@ def rows_nw(hd):
     return int(os.environ.get("EXL3_QDEC_RNW", "0")) or (4 if (hd // 32) % 4 == 0 else 2)
 
 
+def static_smem(cfg) -> int:
+    """static shared memory of qdec.cu: the TurboQuant pair tables (codebook entry pairs as 32-bit words, K and V)"""
+    return 4 * ((1 << 2 * cfg["kb"]) + (1 << 2 * cfg["vb"])) if cfg.get("tq") and not cfg.get("rows_kernel") else 0
+
+
 def pick_nw_st(cfg):
     """(warps per CTA, ring depth), measured on a 3090 at 128K context (K/V bits 4/4, 6/6, 8/8): 8 x 2 for hd128 with
     narrow codes, 4 x 2 otherwise; shrinks until the shared memory fits the opt-in limit"""
@@ -172,7 +179,7 @@ def pick_nw_st(cfg):
     narrow = cfg["hd"] == 128 and cfg["kb"] + cfg["vb"] <= 8
     for nw, st in (((8, 2), (4, 2), (4, 1), (2, 2), (2, 1)) if narrow else ((4, 2), (4, 1), (2, 2), (2, 1))):
         c.update(nw=nw, st=st)
-        if geometry(c)["shared"] <= 99 * 1024:
+        if geometry(c)["shared"] <= 99 * 1024 - static_smem(cfg):
             return nw, st
     raise QdecUnsupported("no ring configuration fits")
 
@@ -184,13 +191,27 @@ _sm = {}
 
 
 def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, causal, sm_scale, block_rows,
-             window_left, window_right, softcap, kv_append_len):
-    """Kernel config for a call, or None when the Triton kernels must run it"""
+             window_left, window_right, softcap, kv_append_len, key_lo = 0, tq = False):
+    """Kernel config for a call, or None when the Triton kernels must run it. key_lo: KVWIN, positions below it are not attended"""
     if (not ENABLED or window_left >= 0 or window_right >= 0 or softcap or kv_append_len != q_len
             or k_bits == 0 or v_bits == 0):
         return None
     cfg = dict(hd=head_dim, kb=k_bits, vb=v_bits, nkv=n_kv_heads, nqh=n_q_heads, qlen=q_len, page=page_size,
                nw=4, st=2, causal=bool(causal), scale=float(sm_scale), block_rows=block_rows)
+    if key_lo:
+        cfg["key_lo"] = int(key_lo)
+    if tq:
+        # TurboQuant: qdec.cu only (no many-row kernel); the per-head scale is fetched as a 4-byte word, so the kv head count is even
+        if n_kv_heads % 2 or cfg["hd"] % 64 != 0:
+            return None
+        cfg["tq"] = True
+        if not (supported(cfg) and geometry(cfg)["nt"] * 8 <= block_rows):
+            return None
+        try:
+            cfg["nw"], cfg["st"] = pick_nw_st(cfg)
+        except QdecUnsupported:
+            return None
+        return cfg
     old_ok = supported(cfg) and geometry(cfg)["nt"] * 8 <= block_rows
     # the many-row kernel also serves 2-row hd256 steps (qdec.cu needs 74 KB there: one CTA per SM)
     if ROWS_MODE == "2" or (ROWS_MODE == "1" and (not old_ok or (cfg["hd"] >= 256 and cfg["qlen"] == 2))):

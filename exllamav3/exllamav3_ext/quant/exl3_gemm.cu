@@ -69,7 +69,8 @@ uint64_t gemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) (size_m <= 16 ? roundup_pow2(size_m) : MIN(CEIL_DIVIDE(size_m, 16) * 16, 64)));
+    // 17..24 rows have their own class (the 24-row tile only competes there); the other classes keep their keys and candidates
+    mix((uint64_t) (size_m <= 16 ? roundup_pow2(size_m) : size_m <= 24 ? 24 : MIN(CEIL_DIVIDE(size_m, 16) * 16, 64)));
     mix((uint64_t) size_k);
     mix((uint64_t) size_n);
     mix((uint64_t) K);

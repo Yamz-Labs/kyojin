@@ -68,6 +68,9 @@ __device__ __forceinline__ void cp4(void* dst, const void* src, bool pred)
 // L2 cache hints: the K/V stream is read once per decode step (evict_first) while the per-token scale sectors are shared
 // by the kv-head CTAs of a split, which run unsynchronized (evict_last keeps them resident for the siblings). Without
 // the hints the 8-byte scale pieces were refetched from HBM by every head: 794 -> 860 GB/s on a load-only kernel.
+#ifndef KEY_LO
+#define KEY_LO 0       // KVWIN: tokens below KEY_LO are not attended (the fp16 ring serves the sinks)
+#endif
 #ifndef L2HINT
 #define L2HINT 1
 #endif

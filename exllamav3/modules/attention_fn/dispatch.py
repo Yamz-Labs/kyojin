@@ -3,6 +3,8 @@ import os
 import torch
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
+from ...cache.kvwin import MAX_DRAFT
+from .kvwin_triton import ov_write
 from .bighead_scalar import fn_bighead_scalar_attn
 from .torch import fn_torch_sdpa_fallback_cache, fn_torch_sdpa_fallback_nocache
 from .xformers import fn_xformers_cutlass_fallback_cache, fn_xformers_cutlass_fallback_nocache
@@ -100,6 +102,7 @@ def attn_dispatch(
     dispatch_cache: dict | None = None,
     max_kv_len: int | None = None,
     v_dim: int | None = None,
+    ov = None,
 ):
     """
     Select and run the first compatible attention implementation for the supplied tensors.
@@ -115,6 +118,8 @@ def attn_dispatch(
     # kernels when possible: new K/V are quantized into the cache up front and never
     # materialized as full fp16 cache-sized temporaries
     q_cache = None
+    ov_attend = False
+    tq = None
     if cache is not None:
         assert block_table is not None
         assert cache_seqlens is not None
@@ -127,9 +132,24 @@ def attn_dispatch(
             dim <= 512 and dim % 32 == 0 and   # packed groups of 32; non-pow2 dims run zero-padded
             cu_seqlens is None
         ):
+            tq = layer.get_tq() if getattr(layer, "tq", False) else None
+            if tq is not None:
+                # TurboQuant: the pool, the ring and the kernels live in the rotated domain (see cache/tq.py)
+                q, k, v = tq.rotate(q, k, v)
             layer.update_kv_direct(cache_seqlens, block_table, k, v, q_len)
             q_cache = layer.get_qkv()
             k_cache, v_cache = None, None
+            # KVWIN: decode / verify rows enter the ring before attending (the ring pass includes the row's own key);
+            # a prefill chunk attends the ring as it was before the chunk (window patch of the staged scratch) and
+            # enters it afterwards
+            # (every quant-direct call writes the ring, even one that cannot attend it, so no row is ever stale)
+            ov_attend = ov is not None and causal and not non_causal_spans and not softcap and \
+                window_size in (None, -1, (-1, -1))
+            if ov is not None:
+                if q_len <= MAX_DRAFT:
+                    ov_write(ov, k, v, cache_seqlens, q_len)
+                else:
+                    ov = ov._replace(chunk_k = k, chunk_v = v)
         else:
             # Only the left bound governs how much of the paged cache has to be fetched
             _wl = window_size[0] if isinstance(window_size, tuple) else window_size
@@ -158,6 +178,8 @@ def attn_dispatch(
         sinks,
         max_kv_len = max_kv_len,
         v_dim = v_dim,
+        ov = ov if q_cache is not None and ov_attend else None,
+        tq = tq,
     )
     # Quant-direct calls select among the qc-aware backends only; a separate hint slot keeps a function that
     # won a cache-less or fp16-cache call from being retried on quant-direct arguments (it cannot see q_cache
@@ -181,6 +203,11 @@ def attn_dispatch(
             raise ValueError("No matching attention function")
         if dispatch_cache is not None:
             dispatch_cache[hint_key] = fn
+
+    if ov is not None and q_cache is not None and q_len > MAX_DRAFT:
+        ov_write(ov, k, v, cache_seqlens, q_len)
+    if tq is not None:
+        o = tq.unrotate(o)
 
     # Update cache (quant-direct mode already wrote the new K/V before the attention call)
     if cache is not None and q_cache is None:

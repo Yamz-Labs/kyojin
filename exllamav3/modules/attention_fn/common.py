@@ -29,6 +29,8 @@ class AttnArgs(NamedTuple):
                                     # block-table span; e.g. QSA's dense regime)
 
     v_dim: int | None = None        # V lanes in use when V is zero-padded to dim (MiMo 128 of 192)
+    ov: object | None = None        # KVWIN: KVWinCtx of a quant-direct call (fp16 sink + window ring next to the pool)
+    tq: object | None = None        # TurboQuant cache (cache.tq.TQState): q / k / v / ring are already rotated, codes read through a codebook
 
     def sanity_check(self):
         # Cache must be paged
