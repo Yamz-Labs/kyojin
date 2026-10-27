@@ -36,7 +36,7 @@ Quick test:
 | `--model-id` | `Qwen3.8-Flash-Yamz` | id in `/v1/models`; requests that name another model get 400 |
 | `--host`, `--port` | `127.0.0.1`, 8000 | listen address |
 | `-c`, `--ctx` | 65536 | KV cache size in tokens (prompt + answer must fit) |
-| `--cache-bits` | 0 | `0` = fp16 K/V cache pages (default); `8` = packed int8 pages: 2.6 GiB less at 256K (peak 83.6 vs 86.2 GiB), but output is not row-invariant when several rows decode together |
+| `--cache-bits` | 0 | `0` = fp16 K/V cache pages (default); `8` = packed int8 pages: 2.6 GiB less at 256K (peak 83.6 vs 86.2 GiB), but greedy output differs from the 16-bit cache; with `EXL3_ROW_INV_GROUPS=1` four parallel sessions matched solo runs, 16 of 16 (see Concurrent sessions) |
 | `--ndt` | 7 | max draft tokens per speculative round (the rule drafts up to 3 on most rounds, deeper only on confident chains) |
 | `--draft-policy` | `mix` | `mix` shipped rule, `mtp` fixed MTP chain, `off` plain decode (no drafter loaded) |
 | `--no-vision` | off | do not load the vision tower (less memory, image input answers 400) |
@@ -76,6 +76,12 @@ The pack is tied to one set of weights: download it from the same model repo.
   Give thinking room: with a small `max_tokens` the budget can end inside the thought, so `content` is empty and
   `finish_reason` is `length`.
 - `finish_reason`: `stop`, `length` (cut by `max_tokens`), `tool_calls`.
+  The loop guard can end an answer that degenerated into a loop. That turn reports `finish_reason` `length`,
+  `choices[0].stop_reason` `loop_guard` (chat and completions, stream and JSON) and the detail in `timings.loop_guard`
+  (`phase`, `kind`, `at`, `cut`). A natural end never carries `stop_reason`. Valid repetitive output (dense code, tables,
+  JSON records) is not cut: in an answer the guard needs most of the tail to replay itself, or a tail that compresses to
+  almost nothing. Repetitive data (a grid of zeros, identical JSON lines, a zero-padded hex dump) is cut only after 16384 tokens of
+  repetition. `loop_guard: false` in the request body turns the guard off.
 - Tool calls: the model writes `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`.
   They come back as OpenAI `tool_calls`; argument types follow the tool's JSON schema. In a stream, tool calls arrive
   as one delta after the text. Text after a closed call (or between two calls) is returned as `content`.
@@ -152,8 +158,13 @@ new text. `timings.prompt_n` shows how many tokens were prefilled. By default re
 ## Concurrent sessions
 
 `--sessions N` decodes up to N requests together (one recurrent slot each); more requests wait in order. A request
-reserves the pages for its prompt plus `max_tokens` when it starts, so one that does not fit next to the running ones
-waits. With N > 1, a request with `speculative: false` or `cache_prompt: false` answers 400 (both rebuild the Generator), and slot
+reserves the pages for its prompt plus its reply budget when it starts, so one that does not fit next to the running ones
+waits. A client that sends no `max_tokens` (Hermes, most chat UIs) asks for a reply as long as the context: with N > 1 such a
+request holds only its share of the context (`-c` / N, at least 2048 tokens of reply) and the generator requeues it when the
+reply goes on: the pages are released, the request re-enters the queue at the front and continues as soon as pages are free
+(the full pages are found by hash, only the tail is prefilled again). The other sessions are not blocked, and a request
+running alone still reaches the end of the context. A reply that fits its share is untouched; `--sessions 1` is unchanged.
+`--default-max-tokens` still caps the reply when you want a hard limit. With N > 1, a request with `speculative: false` or `cache_prompt: false` answers 400 (both rebuild the Generator), and slot
 save/restore/erase wait until the running requests finish.
 
 Measured with `--ndt 3`, `-c 262144`, temperature 0, two short prompts sent together (four for `--sessions 4`):
@@ -166,12 +177,23 @@ Measured with `--ndt 3`, `-c 262144`, temperature 0, two short prompts sent toge
 | 4 | 8 | no (2 of 4 differ) | 2.19 s | 51.4 |
 | 4 | 0 | no (2 of 4 differ) | not measured | 54.4 (reported, another machine) |
 
-With N > 1, greedy output is not guaranteed equal to a solo run, for either cache width: the decode attention kernel
-chooses how it splits the cache from the batch it runs with, so the last bits of the sums, and now and then a near-tie
-token, can change. What was measured: the 16-bit cache (`--cache-bits 0`) stayed equal on two short prompts at 2 sessions and differed on 2 of 4 at 4 sessions (reported by @felladrin on 1.3);
-the 8-bit cache did not (rows above). Two short prompts show nothing more than that.
+By default the answers of parallel requests can differ from solo runs (rows above). `EXL3_ROW_INV_GROUPS=1` (opt-in) makes the
+decode step row-exact: the jobs of one step are packed into forwards of at most 8 token rows, and the attention layers of a
+forward with several sequences run one sequence at a time, so each row gets the bits of the same row decoded alone. With
+`--ndt 7`, four cold 8K prompts sent together at `--sessions 4` gave greedy answers equal to the same prompts sent one at a
+time, 16 of 16, with the 16-bit cache and with `--cache-bits 8` (without it: 5 to 7 of 16). A step with one job runs as before, so
+`--sessions 1` is unchanged. Cost: about 3 % more wall time on that four-prompt load, and 8 to 10 % less aggregate decode
+throughput on short prompts (four parallel sessions then decode no faster than one).
 
-The server prints this warning at start-up whenever N > 1, and a second one past 8 verify rows (`N x (ndt + 1)`).
+Where the opt-in is not exact:
+- A request whose context grows past about 2051 tokens while it shares a step with other requests can hit one different token:
+  the step where a sequence crosses the sparse-attention threshold, if the draft width of the group differs from the width the
+  request would have drafted alone (measured: 7 of 8 equal on 2030-token prompts). The 8K gate prompts start past the threshold
+  and never cross it. Fixing it needs a per-job draft width at the crossing step.
+- While a request with images in its prompt is active, every step it shares runs as one forward (no groups), so the other
+  requests lose the guarantee. Vision was off in every measurement above.
+
+The server prints a warning at start-up with N > 1 unless `EXL3_ROW_INV_GROUPS=1`.
 
 ## Tests
 

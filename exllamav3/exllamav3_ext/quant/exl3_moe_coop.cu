@@ -6,6 +6,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <map>
+#include <tuple>
+#include <utility>
 #include <cmath>
 
 #include "../util.h"
@@ -59,6 +61,58 @@ static int moe_coop_pick_ksplit(int max_split)
     return forced > 0 ? std::min(forced, max_split) : 1;
 }
 
+// Stream-K for the gate/up stage (exl3_moe_coop_kernel.cuh, SkGeom), grid = resident blocks x SMs:
+// EXL3_MOE_COOP_SK = 0 off, 1 hybrid (whole units on SMs blocks, the remainder shared; CUDA default),
+// 2 pure stream-K. The down stage's short units gain nothing from it. Not measured on
+// ROCm: off there unless set
+static int moe_coop_sk_mode()
+{
+    static int mode = -2;
+    if (mode == -2)
+    {
+        const char* env = std::getenv("EXL3_MOE_COOP_SK");
+#ifdef USE_ROCM
+        mode = env ? atoi(env) : 0;
+#else
+        mode = env ? atoi(env) : 1;
+#endif
+    }
+    return mode;
+}
+
+// Gate/up k-split for batches whose units already fit one per SM (decode: 48 units for 82 SMs on Flint): every
+// unit's k-slice loop is a latency chain of one block, so with EXL3_MOE_COOP_KSPLIT_A = n it is shared by up to n
+// blocks (as long as the grid stays resident), the last arrival summing the fp32 partial rows (d_out scratch) in
+// fixed order. The sum is not rounded to fp16 before the output rotation as the unsplit unit's output is, so results
+// differ from it by that rounding. Off by default (unset, 0 or 1): the unsplit unit, bit-identical to the previous kernel
+static int moe_coop_ksplit_a_mode()
+{
+    static int mode = -2;
+    if (mode == -2)
+    {
+        const char* env = std::getenv("EXL3_MOE_COOP_KSPLIT_A");
+        mode = env ? atoi(env) : 1;
+    }
+    return mode;
+}
+
+// Grid (resident blocks x SMs) and SM count, per (kernel, smem, device), queried once
+static int moe_coop_sk_grid(const MoeCoopKernel& k, int device, int& sms)
+{
+    static std::map<std::tuple<void*, int, int>, std::pair<int, int>> grid;
+    const auto key = std::make_tuple(k.kernel, k.smem, device);
+    auto it = grid.find(key);
+    if (it == grid.end())
+    {
+        int per_sm = 0, n = 0;
+        cuda_check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, k.kernel, MOE_COOP_THREADS, k.smem));
+        cuda_check(cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, device));
+        it = grid.emplace(key, std::make_pair(std::max(1, per_sm) * n, n)).first;
+    }
+    sms = it->second.second;
+    return it->second.first;
+}
+
 // Tile geometry per stage: the wide (128-column, 4-way k-split) tile for long k, the narrow one
 // otherwise. EXL3_MOE_COOP_WIDE = 0 / 1 forces one geometry for every stage (testing)
 static int moe_coop_wide_mode()
@@ -98,6 +152,9 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     const int slots = p.bsz * p.topk;
     const int nproj = p.gated ? 2 : 1;
     p.a_global = p.bsz > 1;
+    // A scratch built for more rows must not change the launch geometry of the rows it always served
+    if (p.rows_ref > 0 && slots <= p.rows_ref * p.topk)
+        p.slots_max = std::min(p.slots_max, p.rows_ref * p.topk);
 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
     const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);
@@ -111,8 +168,34 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     const int max_split = std::max(1, p.slots_max / slots);
     p.ksplit_a = moe_coop_pick_ksplit(max_split);
     p.ksplit_b = moe_coop_pick_ksplit(max_split);
-    const int grid_a = base_a * p.ksplit_a;
+    int grid_a = base_a * p.ksplit_a;
     const int grid_b = base_b * p.ksplit_b;
+    // Stream-K gate/up stage (wide tile; bsz <= 2 at MAX_BSZN 8, i.e. max_split >= 4: slower at 4
+    // rows; room for >= 2 fp32 partial rows per projection in d_out): ksplit = -(whole-unit blocks + 1).
+    // The hybrid needs a second resident block per SM for the shared remainder, else pure stream-K
+    const int sk = moe_coop_sk_mode();
+    if (sk > 0 && wide_a && max_split >= 4 && exl3_moe_coop_ns::sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) >= 2)
+    {
+        int sms;
+        const int grid_sk = moe_coop_sk_grid(ka, device, sms);
+        if (sk == 2 || base_a > sms || DevCtx::instance().get_cc(device) != CC_AMPERE)
+        {
+            grid_a = grid_sk;
+            p.ksplit_a = -((sk == 2 || grid_a <= sms ? 0 : sms) + 1);
+        }
+        else if (p.ksplit_a == 1 && p.Hi / 16 >= 96)
+        {
+            // Units fit one per SM, so the hybrid would run whole units anyway (and launch a grid of resident
+            // blocks that mostly exit at once): per-unit grid, k-split while the grid stays resident
+            const int ks = std::min({ moe_coop_ksplit_a_mode(), max_split, grid_sk / std::max(base_a, 1),
+                                     exl3_moe_coop_ns::sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) });
+            if (ks > 1)
+            {
+                p.ksplit_a = ks;
+                grid_a = base_a * ks;
+            }
+        }
+    }
 
     void* args[] = { (void*) &p };
     if (p.a_global)

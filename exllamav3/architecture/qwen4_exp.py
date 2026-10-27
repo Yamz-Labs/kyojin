@@ -309,6 +309,7 @@ class Qwen4ExpModel(Model):
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
             "linear_attn": True,
+            "row_inv_groups": True,
         })
         self.recurrent_state_cls = GDNState
 

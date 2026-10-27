@@ -1,9 +1,12 @@
 #include "exl3_gemv_int8_instances.cuh"
 #include "../exl3_gemv_int8_kernel.cuh"
 
-void* exl3_gemv_int8_sq_sel_k2(int M, bool c_fp32, bool residual)
+void* exl3_gemv_int8_sq_sel_k2(int M, bool c_fp32, bool residual, bool dual)
 {
     #define SELM_(M_) \
+        if (dual)    return residual ? nullptr \
+                                     : c_fp32 ? (void*) exl3_gemv_int8_sq_kernel<2, M_, true, false, true> \
+                                              : (void*) exl3_gemv_int8_sq_kernel<2, M_, false, false, true>; \
         if (c_fp32)  return residual ? (void*) exl3_gemv_int8_sq_kernel<2, M_, true, true> \
                                      : (void*) exl3_gemv_int8_sq_kernel<2, M_, true, false>; \
         else         return residual ? (void*) exl3_gemv_int8_sq_kernel<2, M_, false, true> \

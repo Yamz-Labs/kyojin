@@ -9,7 +9,8 @@ from ...util import profile_opt
 from .. import row_split as _row_split
 _row_split.install()
 
-MAX_BSZN_GEMV_R = 8  # must match MOE_R_MAX in exllamav3_ext/quant/exl3_dec.cu
+# rows of one exl3_dec_gemv_r call: GEMV_R_MAX_ROWS in exllamav3_ext/quant/exl3_dec.cu (ROCm: 9..32 rows run as grid.y row chunks); the 8-row MOE_R_MAX elsewhere
+MAX_BSZN_GEMV_R = min(32, max(1, int(os.environ.get("EXL3_GEMV_R_MAX_ROWS", "32" if torch.version.hip else "8"))))
 # K >= this runs R batch-1 launches instead of one gemv_r launch (A/B knob; 99 = never loop)
 DEC_GEMV_R_LOOP_MIN_K = int(os.environ.get("EXL3_DEC_GEMV_R_LOOP_MIN_K", "99"))
 # EXL3_VERIFY_FUSE=1 routes every R-row (1 < R <= 8) dense EXL3 linear of the MTP/DFlash
@@ -18,7 +19,10 @@ DEC_GEMV_R_LOOP_MIN_K = int(os.environ.get("EXL3_DEC_GEMV_R_LOOP_MIN_K", "99"))
 # (mlp.py). Rows stay bit-exact vs R batch-1 dec_gemv calls (the R=1 plain-decode math). R=1 untouched.
 # Mutable at run time for one-load A/B: set VERIFY_FUSE["on"] (the harness also calls block_graph.purge()).
 VERIFY_FUSE = {"on": os.environ.get("EXL3_VERIFY_FUSE", "0") != "0"}
-AUTO_RECONSTRUCT_THRESHOLD = 144
+# With the 32-row GEMM tile (EXL3_GEMM_SHAPE_5) the GEMM path beats reconstruct + hgemm up to ~192-256
+# rows on Ampere (Qwen3.8-27B TTFT 160 / 192 tokens 278 -> 238 / 320 -> 279 ms; at 256 reconstruct wins 344 vs 362 ms).
+# Without that patch 144 is right (16-row passes: threshold 512 is slower at every T > 144).
+AUTO_RECONSTRUCT_THRESHOLD = 192 if not torch.version.hip else 144
 MAX_RECONSTRUCT_SLICE_N = 32768
 RECONSTRUCT_SLICE_GRANULARITY_N = 128
 
@@ -224,7 +228,7 @@ def _had_cache_put(inner, n_offset, n, w, clock):
 # are fp16 anyway so the only loss is rounding the product to fp16 before the fp32 consumer.
 # Decode (few rows) keeps the direct fp32 path, where the tile choice does not matter.
 _f32_via_f16 = os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
-_f32_via_f16_min_rows = int(os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "32"))
+_f32_via_f16_min_rows = int(os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "33"))
 _hip_gemv_support_cache: dict[int, bool] = {}
 
 # Batch-1 decode kernels (exl3_dec.cu, gfx11.5): one launch per GEMV with both Hadamard stages
@@ -241,25 +245,40 @@ _DEC_KB2_DENSE = _DEC_KB2 + (14,)
 # run of tools/qwen/check_dense_k8.py.
 _DENSE_K8_SHAPES = {(2560, 512), (2560, 6144), (2560, 10240),
                     (2560, 12288), (6144, 2560)}
-DEC_SCRATCH_FLOATS = 2 << 20
+# ROCm carries 9..32 rows per exl3_dec_gemv_r call: R * kbs * N partial sums of a wide dense projection (GDN qkvz at 28+ rows) outgrow 2M floats
+DEC_SCRATCH_FLOATS = (8 << 20) if torch.version.hip else (2 << 20)
+# arrival counters: the 8-row kernels fit 4096; a 32-row GEMV of a wide N (lm_head: 32 * ceil(N / 512)) needs up to ~16k
+DEC_COUNTERS = 16384
 _dec_workspaces: dict = {}
+
+
+_dec_side = [False]
+
+
+class dec_side_workspace:
+    """Context: dec_workspace() hands out a second scratch/counter pair, for GEMVs that run on a side stream concurrently with
+    launches that use the main pair (the pair is shared only among stream-ordered launches)."""
+    def __enter__(self):
+        _dec_side[0] = True
+    def __exit__(self, *a):
+        _dec_side[0] = False
 
 
 def dec_workspace(device: torch.device):
     """fp32 scratch (cross-block partial sums) + int32 arrival counters, one pair per device. The
     kernels leave the counters zeroed; all launches share them because they are stream-ordered."""
-    key = str(device)
+    key = str(device) + ("#side" if _dec_side[0] else "")
     ws = _dec_workspaces.get(key)
     if ws is None:
         ws = (torch.zeros(DEC_SCRATCH_FLOATS, dtype = torch.float, device = device),
-              torch.zeros(4096, dtype = torch.int, device = device))
+              torch.zeros(DEC_COUNTERS, dtype = torch.int, device = device))
         _dec_workspaces[key] = ws
     return ws
 
 
 # wide-N R-row GEMV (lm_head, N=248320: R*kbs*N partial sums > DEC_SCRATCH_FLOATS even at R=2) used to fall back to
 # R batch-1 launches, each re-reading the whole weight (R x 1.36 ms). A dedicated scratch lets one gemv_r launch carry all rows
-# (same kernel, same per-row reduction order, so bit-exact). Counters are shared (R * ceil(N/512) <= 3880 <= 4096 for R <= 8).
+# (same kernel, same per-row reduction order, so bit-exact). Counters are shared (R * ceil(N/512) <= 15520 <= DEC_COUNTERS for R <= 32).
 # Mutable at run time for one-load A/B: set WIDE_R["on"].
 WIDE_R = {"on": os.environ.get("EXL3_VERIFY_WIDE_R", "1") != "0"}
 WIDE_SCRATCH_FLOATS = 16 << 20
@@ -367,7 +386,10 @@ class LinearEXL3:
         self.suh = suh if suh is not None else self.unpack_bf(su)
         self.svh = svh if svh is not None else self.unpack_bf(sv)
         self.trellis = trellis
-        self.K = trellis.shape[-1] / 16
+        # Integral K stays an int (the CUDA BC objects and kernels take int K); half-integer K stays a float.
+        # Same rule as upstream exllamav3 1.6.0 (MIT, modules/quant/exl3.py:68).
+        K = trellis.shape[-1] / 16
+        self.K = int(K) if float(K).is_integer() else K
         self.in_features = in_features
         self.out_features = out_features
         self.bias = bias
@@ -384,6 +406,7 @@ class LinearEXL3:
         self.dec_ok = dec_supported(self)
         self.dec_ok_moe = dec_moe_supported(self)
         self.bsz1_xh_args = (self.trellis.device, (1, self.in_features), self.out_dtype)
+        # The CUDA BC object takes an integer K; half-integer K tensors keep the Python path
         self.bc = ext.BC_LinearEXL3(
             self.trellis,
             self.suh,
@@ -393,7 +416,7 @@ class LinearEXL3:
             self.mcg,
             self.mul1,
             g_tensor_cache.get(*self.bsz1_xh_args)
-        )
+        ) if isinstance(self.K, int) else None
 
 
     def unload(self):
@@ -516,15 +539,15 @@ class LinearEXL3:
             except RuntimeError as e:
                 # The R-row partial sums of a very wide N (lm_head) can exceed the shared scratch; the
                 # size check runs before any launch, so fall back to the batch-1 loop (same order)
-                if "scratch too small" not in str(e): raise
+                if "scratch too small" not in str(e) and "counters too small" not in str(e): raise
                 loop = True
-                if WIDE_R["on"] and rows <= 8:
+                if WIDE_R["on"] and rows <= MAX_BSZN_GEMV_R and "scratch too small" in str(e):
                     try:
                         ext.exl3_dec_gemv_r(x.view(rows, self.in_features), self.trellis, self.suh, self.svh,
                                             y.view(rows, self.out_features), wide_scratch(x.device), counters, self.K)
                         loop = False
                     except RuntimeError as e2:
-                        if "scratch too small" not in str(e2): raise
+                        if "scratch too small" not in str(e2) and "counters too small" not in str(e2): raise
         if loop:
             # reference path: R batch-1 launches, bit-identical to gemv_r. gemv_r lost at K >= 5 only
             # while its 2-deep tile ring spilled; with ring 1 at RM > 1 it wins (GLM lm_head K 5,

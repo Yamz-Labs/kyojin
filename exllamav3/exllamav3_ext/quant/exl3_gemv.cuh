@@ -14,7 +14,7 @@ int exl3_gemv_wmma_family(int device);
 
 #if defined(USE_ROCM)
 // Grouped MoE decode/verification path (routed experts, one launch per projection over every
-// (token, expert) assignment). Supports 1..16 token rows and top-k 8 (MiMo-V2) or 10 (Qwen3.8);
+// (token, expert) assignment). Supports 1..16 token rows and top-k 6 (DeepSeek-V4.1), 8 (MiMo-V2) or 10 (Qwen3.8);
 // routing IDs and weights remain device-resident and duplicate assignment slots are preserved
 // independently per token. K is the experts' trellis bitrate and must be uniform
 // across gate/up/down (2, 2.5, 3 or 4). dedup sorts the assignments by expert so an expert
@@ -39,7 +39,8 @@ void exl3_moe_gfx12_k3
     at::Tensor& down_had,
     at::Tensor& down_out,
     double K,
-    bool dedup
+    bool dedup,
+    double act_limit        // DeepSeek swiglu_limit (0 = off): silu(min(g, L)) * clamp(u, -L, L)
 );
 
 // gfx12 throughput counterpart for sorted prefill assignments. Each expert is evaluated in
@@ -104,4 +105,7 @@ void exl3_gemv
     bool mul1
 );
 
+// Test hook: the grouped-MoE activation, out = silu(min(gate, L)) * clamp(up, -L, L) in fp16 (L = limit > 0; limit 0 = unclamped).
+// gate, up, out: contiguous fp16 of the same numel (out may alias gate or up).
+void exl3_moe_silu_mul_limit(const at::Tensor& gate, const at::Tensor& up, at::Tensor& out, double limit);
 void exl3_moe_valu_override(int64_t v);   // test hook: force EXL3_MOE_VALU on (1) / off (0) / back to env (-1) in this process

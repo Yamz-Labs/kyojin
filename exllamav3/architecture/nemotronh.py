@@ -18,6 +18,28 @@ from ..modules.attn import prepare_for_attn
 from ..cache.recurrent_util import prepare_for_recurrence
 from .nemotronh_mtp import NemotronHMTPModel
 
+# Bolt as-shipped port (feat/bolt1): BOLT_FOREIGN=1 builds the U8 checkpoint
+# tensors (ggml Q8_0 / IQ2_XXS, ModelOpt NVFP4) as ForeignLinear instead of
+# native Linear. Off by default; other Nemotron-H checkpoints are unaffected.
+try:
+    from ..modules.foreign_linear import ForeignLinear as _ForeignLinear
+    _FOREIGN_OK = True
+except ImportError:  # pragma: no cover
+    _FOREIGN_OK = False
+
+
+def _norm_time_step_limit(ts):
+    """time_step_limit may carry JSON-encoded infinities
+    ({'__float__': 'Infinity'}) from the checkpoint config; the dt kernels
+    need real floats."""
+    out = []
+    for v in ts:
+        if isinstance(v, dict) and set(v) == {"__float__"}:
+            out.append(float(v["__float__"]))
+        else:
+            out.append(float(v))
+    return tuple(out)
+
 class NemotronHConfig(Config):
     arch_string = "NemotronHForCausalLM"
 
@@ -99,16 +121,32 @@ def nemotronh_block(
     layer_idx: int,
     block_type: str,
     qbits_key: str = "bits",
+    foreign: bool = False,
 ) -> TransformerBlock:
     """One block of the hybrid pattern: M = Mamba2, * = attention, - = MLP, E = MoE. Shared by the
-    trunk (backbone.layers.N) and the MTP head (mtp.layers.N, mtp_bits)"""
+    trunk (backbone.layers.N) and the MTP head (mtp.layers.N, mtp_bits)
+
+    foreign=True substitutes ForeignLinear for the U8 checkpoint tensors of
+    the Bolt QAT checkpoint (NVFP4 mamba in/out_proj, Q8_0 attention q/k/v/o);
+    every other tensor loads natively. Requires BOLT_FOREIGN wiring upstream.
+    """
+    if foreign and not _FOREIGN_OK:
+        raise ValueError("foreign=True needs exllamav3.modules.foreign_linear")
     norm = RMSNorm(
         config = config,
         key = f"{key}.norm",
         rms_norm_eps = config.layer_norm_epsilon,
     )
+    if foreign:
+        _fl = lambda k, i, o, fmt, out_dtype = None: _ForeignLinear(
+            config, f"{key}.mixer.{k}", i, o, fmt, out_dtype = out_dtype)
+    else:
+        _fl = None
     match block_type:
         case "M":
+            m_v_dim = config.mamba_num_heads * config.mamba_head_dim
+            m_k_dim = config.n_groups * config.ssm_state_size
+            m_proj_dim = m_v_dim + (m_v_dim + 2 * m_k_dim) + config.mamba_num_heads
             return TransformerBlock(
                 config = config,
                 key = key,
@@ -125,13 +163,19 @@ def nemotronh_block(
                     state_size = config.ssm_state_size,
                     rms_norm_eps = config.layer_norm_epsilon,
                     conv_kernel_size = config.conv_kernel,
-                    dt_limit = tuple(config.time_step_limit),
+                    dt_limit = _norm_time_step_limit(config.time_step_limit),
                     qmap = "block.attn",
                     out_dtype = torch.float,
                     select_hq_bits = 2,
+                    in_proj = _fl("in_proj", config.hidden_size, m_proj_dim, "nvfp4",
+                                     out_dtype = torch.float) if foreign else None,
+                    o_proj = _fl("out_proj", m_v_dim, config.hidden_size, "nvfp4",
+                                     out_dtype = torch.float) if foreign else None,
                 ),
             )
         case "*":
+            q_out = config.num_q_heads * config.head_dim
+            kv_out = config.num_kv_heads * config.head_dim
             return TransformerBlock(
                 config = config,
                 key = key,
@@ -147,10 +191,14 @@ def nemotronh_block(
                     num_kv_heads = config.num_kv_heads,
                     rope_settings = None,
                     sm_scale = None,
-                    key_q = "q_proj",
-                    key_k = "k_proj",
-                    key_v = "v_proj",
-                    key_o = "o_proj",
+                    key_q = None if foreign else "q_proj",
+                    key_k = None if foreign else "k_proj",
+                    key_v = None if foreign else "v_proj",
+                    key_o = None if foreign else "o_proj",
+                    q_proj = _fl("q_proj", config.hidden_size, q_out, "q8_0") if foreign else None,
+                    k_proj = _fl("k_proj", config.hidden_size, kv_out, "q8_0") if foreign else None,
+                    v_proj = _fl("v_proj", config.hidden_size, kv_out, "q8_0") if foreign else None,
+                    o_proj = _fl("o_proj", q_out, config.hidden_size, "q8_0") if foreign else None,
                     qmap = "block.attn",
                     out_dtype = torch.float,
                     select_hq_bits = 2,

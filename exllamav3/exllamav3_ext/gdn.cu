@@ -1767,11 +1767,12 @@ void gdn_ba_gemv_gr
     const at::Tensor& w_t,          // [n, k] half
     const c10::optional<at::Tensor>& bias,  // [n] half
     at::Tensor& y,                  // [rows, n] float
-    Graph* graph
+    Graph* graph,
+    cudaStream_t stream_ovr         // non-null: launch on this stream (forked branch of an outer graph capture)
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
-    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = stream_ovr ? stream_ovr : graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(w_t, kHalf);

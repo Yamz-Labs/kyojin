@@ -7,6 +7,68 @@ Boolean-ish variables treat `0` as off and any other value as on unless noted. C
 variables are read once (on first use) and cached; Python-side variables are read at import
 time. Either way, set them before loading a model.
 
+## Persistent prompt cache (GLM, Qwen, DS4.1 servers)
+
+Prompt-cache pages are written to the NVMe in the background, so a restarted server (or a session resumed the next day)
+only prefills the new tokens. Off unless a directory is set.
+
+### `EXL3_PREFIX_DISK_DIR` (default: empty = off)
+Root directory of the cache. One namespace per model and build; a page is reused only when its token hash and the
+model fingerprint match.
+
+### `EXL3_PREFIX_DISK_GB` (default: `30`)
+LRU byte cap for the whole root, all models together. The checkpoints of the first 8K tokens of each prompt are kept.
+
+### `EXL3_PREFIX_DISK_FLOOR_GB` (default: `60`)
+Free space that must remain on the volume after a write; writes are skipped below it.
+
+### `EXL3_PREFIX_DISK_MB_MIN` (default: `8000`)
+Write budget per minute, so long agent sessions do not hit the sustained-write slowdown of QLC drives.
+
+## Prefill scheduling (GLM and Qwen servers, `--sessions` 2 or more)
+
+A prompt is prefilled in chunks of `EXL3_PREFILL_CHUNK` rows, one chunk per scheduler step. By default every active request
+runs its chunk in every step, so a 45K-token prompt holds back every short request that arrives next to it, and four 8K prompts
+sent together all finish together. The interleave only changes when a chunk runs, never the chunks: each request's chunk
+boundaries, and so its prefill math, are the ones of the default path. A single running request is not touched.
+
+### `EXL3_SCHED_CHUNK_IL` (default: `0`)
+`1` turns the interleave on. A prompt with more than `EXL3_CIL_SHORT_TOK` rows left to prefill (counted after the prompt-cache and
+tail-checkpoint restore) is a big prefill; the oldest one is the leader and the other big prefills wait for it, in arrival order.
+Between two leader chunks the short requests get a slice: their prefill, then one single-sequence decode step per scheduler
+step, for up to `EXL3_CIL_SLICE_S`. A leader chunk never shares its step with other work. The time the leader spends waiting is
+capped per leader (below), after which only its chunks run until it is done. A planner error turns the feature off for the
+process with one warning. Needs `--sessions` 2 or more; the server prints one line at start-up when it is on.
+
+### `EXL3_CIL_DEFER_FRAC` (default: `0.18`), `EXL3_CIL_MAX_DEFER_S` (default: `8`)
+Most the leader may be delayed by others: `min(EXL3_CIL_MAX_DEFER_S, EXL3_CIL_DEFER_FRAC x its estimated prefill time)`. A
+45K-row prefill of 36 s is delayed by at most 6.5 s, an 8K one of 6.5 s by at most 1.2 s. `EXL3_CIL_DEFER_FRAC=0` uses the
+seconds cap alone. The step that crosses the limit is the only overshoot: a slice step is only taken when its estimated cost
+(rows x measured seconds per row of the leader, plus `EXL3_CIL_DECODE_S` per decode step) still fits.
+
+### `EXL3_CIL_SHORT_TOK` (default: `4096`), `EXL3_CIL_SLICE_S` (default: `0.6`)
+Rows at or below which a prefill counts as short; length of one slice in seconds.
+
+### `EXL3_CIL_SINGLE_DECODE` (default: `1`)
+In a slice only one decode-ready request decodes per step (least recently served first), alone, as it would without the big
+prefill. `0` lets all of them decode in one batch: the slice is cheaper for the leader, but a batched decode is not
+guaranteed to give the tokens of a solo run.
+
+### `EXL3_CIL_ROW_S` (default: `0.0007`), `EXL3_CIL_DECODE_S` (default: `0.05`)
+Starting estimates in seconds of one prefill row and of one decode step; the row estimate is replaced by the measured leader
+chunk times after the first chunk.
+
+## Prompt encoding (GLM and Qwen servers)
+
+### `KYO_TOKCACHE` (default: `8`)
+Number of recent prompts whose token ids the server keeps. A client that re-sends the whole conversation, or the same long
+document with another question, then encodes only the part after the last shared turn marker or line break; the ids equal a
+full encode (a self-test at start-up turns the cache off where they would not). Encoding a re-sent prompt of about 90K tokens:
+118 ms to 4 ms. `0` turns it off.
+
+### `KYO_TOKCACHE_CHECK` (default: unset)
+`1` also runs the full encode for every request and compares the ids. For debugging.
+
 ## Attention
 
 ### `EXL3_BC_ATTN` (default: `1`)
@@ -94,6 +156,20 @@ Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, t
 {1, 2} is measured once per (shape family, device) at first use; a nonzero value pins it,
 skipping the measurement. Only relevant where the direct path still runs (`EXL3_QC_STAGING=0`,
 or short chunks below the threshold above).
+
+### `EXL3_KVWIN` (default: unset = `4:128` when k or v bits <= 5 on ROCm, off on CUDA and at 6 bits and above)
+
+`sink:window`, e.g. `4:128`; `0` / `off` disables it, an explicit value forces it at any bit width and on any backend (the unset-switch default is ROCm-only until the CUDA served A/B clears it: `DEFAULT_ON_CUDA` in `cache/kvwin.py`). Keeps the first `sink` positions and the last `window` positions of every job in fp16
+next to a quantized K/V cache (`--k-bits/--v-bits`): attention reads the quantized pool for everything in between
+and a small fp16 ring (`sink + window + 16` rows per layer and job) for the rest, merged exactly by the flash-decoding
+combine. Costs about 10 MiB of VRAM per job slot at `4:128` on a 16-layer, 4-kv-head, head-dim-256 model. Applies to
+quantized-cache attention layers of models with recurrent state slots (Qwen3.5/3.8 hybrids); the ring is part of the
+job's recurrent state, so prefix/tail checkpoints, the CPU stash and the prefix disk carry it and restores stay
+bit-exact (a checkpoint written without the switch rebuilds the ring from the pool, with quantized precision for the
+first `window` tokens). While it is on, the graph-captured decode attention (`EXL3_BC_ATTN`) and the whole-forward
+graph (`EXL3_CUDA_GRAPH`) decline, and tensor-parallel loading is not supported. Prefill chunks attend the exact
+sinks, the exact window before the chunk and all of the chunk's own rows (a superset of the per-row decode window).
+With the window off (`0`, or unset at >= 6 bits) every code path is bit-identical to a build without it.
 
 ### `EXL3_MLA_PREFILL` (default: `mha`)
 
@@ -370,6 +446,18 @@ Split-k factor of the fused decode MoE kernels: `n` runs every column chunk as `
 disjoint k ranges whose partial sums the last-arriving block adds. Measured as neutral to harmful
 on every GPU here, so the default is no split. Testing knob only.
 
+### `EXL3_MOE_COOP_KSPLIT_A` (default: unset, no split; Ampere only)
+
+Gate/up stage of the fused decode MoE kernels at batch sizes whose (token, expert, projection,
+128-column) units fit one per SM (Flint at batch 1: 48 units on 82 SMs): every unit's k loop
+is one block's serial chain. `n` >= 2 (`3` is the measured choice) shares it over up to `n`
+blocks (while the grid stays resident); the last-arriving block of a chunk adds the fp32 partial
+rows in fixed order. The pre-activation is then no longer rounded to fp16 before the output
+rotation, so results differ from the unsplit unit in that rounding (teacher-forced NLL on Flint
+is lower at 4K, 32K and 64K; greedy text flips at near-ties). Unset, `0` or `1` keep the unsplit
+unit, which is bit-identical to the previous kernel. Other architectures and larger batches are
+not affected.
+
 ### `EXL3_MOE_COOP_WIDE` (default: unset)
 
 Tile geometry of the fused decode MoE kernels (the bsz <= 8 path of `BlockSparseMLP`): `0` forces
@@ -550,7 +638,7 @@ into tens of thousands of segments with large reserved-but-unallocated overhead.
 module frees its blocks; at most one boundary block shared with a neighboring module stays
 pinned. Set to `0` to fall back to per-tensor allocations.
 
-### `EXL3_NGRAM_STREAM` (default: `1`)
+### `EXL3_NGRAM_STREAM` (default: unset = stream from disk)
 
 Default for `Config.infer_params.ngram_stream_from_disk`: stream an n-gram embedding table
 (PLE models, e.g. Qwen3.8-Flash-Next) from disk with per-forward row gathers (run-coalesced
@@ -559,8 +647,26 @@ queue depth on Windows) instead of loading the whole table into system RAM. The 
 is tens of GB, and streaming costs little on SSD-class storage (decode is latency-tolerant at
 ~30 rows/token; prefill gathers are batched). Set to `0` to hold the table in RAM — worthwhile
 only when the table lives on high-latency storage (e.g. HDD, where per-row seeks make streaming
-unusable). Also settable per load via `config.infer_params.ngram_stream_from_disk` or
+unusable). There is no automatic RAM choice: unset always streams from disk, because host memory sampled mid-load
+does not predict what the rest of the load (weights, KV cache, towers) will still take. The load log prints the
+placement, the reason, the table size and MemAvailable. Also settable per load via `config.infer_params.ngram_stream_from_disk` or
 `--ngram_ram` in `model_init`-based scripts.
+
+### `EXL3_NGRAM_IO_THREADS` (default: `128`)
+
+Upper bound on the reader threads of the n-gram table's disk gather (`EXL3_NGRAM_STREAM` on; read
+once, when the first gather starts). A cold gather is bound by the queue depth the disk sees, one
+blocking read per thread: 32 threads keep a consumer NVMe at about 45k random reads/s, 128 at about
+85k. The pool is also capped at 8 threads per CPU thread (at least 4). Lower the value on storage
+that saturates early or when the gather competes with CPU-bound work. Minimum 1.
+
+### `EXL3_NGRAM_WARM_TOKENS` (default: `8192`)
+
+How many prompt positions of the later part of a prompt the engine reads ahead from the n-gram
+table, on the prefetch worker, behind the chunk being issued. The rows land in the page cache, so
+the gather of the next chunks costs a few milliseconds instead of about 0.4 s of cold reads per
+4096-token chunk. It changes no result. `0` turns the look-ahead off. It matters only for models
+with an n-gram embedding table read from disk.
 
 ### `EXL3_AUTOSPLIT_WORSTCASE` (default: `1`)
 
@@ -781,6 +887,29 @@ ignored under tensor parallel; both lane launchers set it.
 released, because on unified memory the page cache and the weights are the same physical pool and
 keeping it leaves the box carrying a large pack twice.
 
+#### `EXL3_KERNEL_SEED` (default: `1`)
+
+`0` does not unpack the pre-compiled Triton kernels shipped in `exllamav3/kernel_seed/` into the
+Triton cache. With the seed a start with an empty cache compiles no kernel (GLM saved about 55 s,
+spread over start-up and the first requests). A seed is tied to one Triton version and GPU
+architecture; another build simply does not use it (nor does a GPU of another architecture).
+The seed hits from any install prefix: Triton hashes the absolute path of its bundled device
+libraries into the cache key, and the engine replaces that prefix by a placeholder in the key
+(HIP only, and only when a seed matches). `build` uses the same keys but installs nothing: it is
+the mode in which a seed is built from an empty cache. Rebuild with `tools/kernel_seed/` (sweep,
+then build).
+
+#### `EXL3_LOG_JIT` (default: `0`)
+
+`1` prints one `[jit]` line per Triton kernel the server compiles or loads, with its time. Use it to
+check that nothing compiles after READY.
+
+#### `EXL3_WARM_TUNE_BUDGET_S` (default: `90`)
+
+Seconds the start-up warm-up may spend screening dense GEMM solutions. After that the remaining
+shapes run untuned (bit-exact) and are tuned on first use. `0` never defers. The shipped tune
+seed makes a start on the pinned rocBLAS spend about 1 s here.
+
 #### `EXL3_DENSE_GEMM_TUNE_FILE` (default: `$HOME/.cache/exllamav3/dense_gemm_tune.txt`)
 
 The file that holds the tuned dense GEMM solution per shape class. Point it at a seeded file to
@@ -834,9 +963,45 @@ While on, a verify forward of up to 8 rows takes the per-row exact path in the M
 the MoE router, so each row is bit-equal to the same row decoded alone, which is two GLM jobs at
 draft depth 2. Only those two modules and only up to 8 rows: `0` drops the limit to 4, lets the
 faster batched paths take over, and a near-tied token can then change. Even with it on, more than
-one session does not guarantee greedy output equal to a solo run: the decode attention kernel picks
-how to split the cache from the batch it runs with, so a near-tie can change (see
-[tools/qwen/SERVE.md](../tools/qwen/SERVE.md)).
+one session does not guarantee greedy output equal to a solo run: the decode attention kernel
+picks how to split the cache from the batch it runs with, so a near-tie can change.
+`EXL3_ROW_INV_GROUPS` closes that gap on Qwen.
+
+#### `EXL3_ROW_INV_GROUPS` (default: `0`, off)
+
+Qwen with `--sessions` above 1, and `EXL3_ROW_INV` on. `1` packs the jobs of a decode step, in order, into
+forwards of at most 8 token rows (jobs times `1 + drafted tokens`), and inside a forward with several
+sequences each attention layer runs one sequence at a time, with that sequence's own block table and cache
+length. Every row then gets the bits of the same row decoded alone, and a step with one job runs as it always
+did. Four cold 8K prompts at `--sessions 4`, `--ndt 7`, greedy: answers equal to the serial ones, 16 of 16
+(16-bit and 8-bit cache; the same load gave 5 to 7 of 16 without it). It costs about 3 % wall time on that load
+and 8 to 10 % of the aggregate decode throughput on short prompts. Not covered: a step where a sequence crosses
+the sparse-attention threshold (2051 cached tokens) while the draft width of the group differs from the width the
+same request would have drafted alone (any request that grows past that length while it shares a step), and
+every step shared with a request that carries images (it keeps the plain one-forward path).
+
+#### `EXL3_ROW_INV_GROUP_ROWS` (default: `8`)
+
+With `EXL3_ROW_INV_GROUPS=1`: the most token rows one forward of a decode step may carry. `1` runs one forward per
+job, which is the slowest plan and exact by construction. Values above 8 leave the range where the row-exact
+kernels apply.
+
+#### `EXL3_PLAIN_ROWS_VERIFY` (default: `0`, off; the GLM server sets `1` with `--sessions` above 1)
+
+A decode step without drafted tokens that carries 2 to 8 rows (several sessions decoding together) is run like a verify
+forward: the union MoE on the device table, the R-row GEMV, the batched router and the per-sequence attention loops
+that `EXL3_ROW_INV` enables for verify forwards. Without it such a step fell to per-expert eager loops, thousands of
+host launches. Needs `EXL3_ROW_INV` on. One-row steps are untouched, so a single request decodes as before. GLM-5.3-Flash
+on the box (v1.7.2), 4 sessions, 4 greedy prompts: 26.1 to 40.7 tok/s aggregate. Qwen already has these paths, so it does
+not change there. The text of 4 concurrent plain streams still differs from the solo run at a near-tie word (the solo step
+uses the one-row kernels), as it did before the flag.
+
+#### `QWSPEC_LOAD_ROWS` (default: `EXL3_ROW_INV_GROUP_ROWS` (`8`) with `--sessions` above 1 in the Qwen server on ROCm; on NVIDIA `16` for a dense model and `0` for a model with MoE layers; `0` elsewhere)
+
+Qwen speculative decoding: with N requests decoding together the draft depth is capped at `R // N - 1`, so the verify rows
+of the step, `N * (depth + 1)`, stay within `R` rows (no draft when that is below 1). `0` turns the cap off.
+`QWSPEC_LOAD_CAPS="N:D,..."` sets the cap for chosen N. Qwen3.8-Flash-Next on the box (v1.7.2 with an equivalent cap), 4 sessions,
+4 greedy prompts: 54.9 tok/s aggregate without the cap, 71.2 with it.
 
 #### `EXL3_MTP_EH_FP16` (default: unset, off)
 
@@ -851,6 +1016,14 @@ Two-stage draft head for the MTP drafters: it finds the draft argmax in two step
 vocabulary. Every draft is still verified, so the output does not change. The GLM and Qwen servers pick up
 `draft2s.st` from the model folder when its header (vocabulary size, hidden width) matches `config.json`. A path in the
 variable wins; `0`, `off` or an empty value uses the full head. Sampled jobs always use the full head.
+
+#### `EXL3_DRAFT_VOCAB` (default: unset; the Qwen server sets `98304` on NVIDIA)
+
+Qwen3.5 MTP drafter, 1-row greedy draft steps: read only the first N rows (a multiple of 128) of the shared 248K-row head
+instead of all of it. On the RTX 3090 the K5 head is 0.93 ms of a ~1.5 ms draft step; N = 98304 makes it ~0.4 ms and
+costs nothing on English and code (99.3 % of tokens have an id below 98304). Every 8th step runs both heads; a language whose tokens sit
+above N (French, CJK) turns the subset off by itself (misses EMA >= 0.12) and back on when the probes agree (< 0.04). Every draft is
+verified, so the text is the one without the flag. `0` or unset uses the full head; sampled jobs always use the full head.
 
 #### `EXL3_MIMO_LOSSLESS` (default: `1`)
 
@@ -897,6 +1070,44 @@ tuning and the matching `/health` stage. Read only with `EXL3_DENSE_GEMM_TUNE=1`
 
 `1` prints a memory line after the GLM warm-up.
 
+#### `EXL3_TAIL_DENSE` (default: `0` in the engine; the Qwen server sets `7`, the GLM server `0`)
+
+Dense prompt-tail checkpoints. Besides the checkpoint on the last page of a prompt, the recurrent
+state is written at each of the `N` page boundaries below it, so a follow-up prompt that shares the
+cached prefix up to anywhere in its last `N` pages (the same document with another question)
+resumes within one page of the divergence instead of at the previous chunk start. Costs a few
+hundred MiB of host memory. The kernel side-writes at most 8 rows per chunk: the last page and the
+branch row come first, the dense rows fill the free slots, deepest first. On the KDA (GLM) layers
+the rows are added only with `EXL3_MIDCHUNK_CKPT=2`; the other mode splits the layer at every row
+and would drop all mid-chunk checkpoints. A resume replays a different number of rows than a cold
+prefill and the dense GEMM path depends on the row count, so the output of a resumed turn is not
+yet bit-identical to a cold prefill (a fix is in progress). `0` is off.
+
+#### `EXL3_TAIL_SUB` (default: `0`)
+
+Sub-page prompt-tail checkpoints: how many of the last multiples of 64 rows of the chunk that holds
+the prompt end get a checkpoint, so a prompt that diverges in its final tokens replays at most
+about 64 rows instead of up to a page. Entries that do not fall on a page boundary are kept in host
+memory (about 142 MiB each, at most `EXL3_TAIL_SUB_MAX`). Same numerics caveat as
+`EXL3_TAIL_DENSE`. `0` is off.
+
+#### `EXL3_TAIL_SUB_MAX` (default: `8`)
+
+Cap on the sub-page checkpoint entries the generator keeps (oldest dropped first). `0` keeps none
+and requests no kernel slot for them. Read only with `EXL3_TAIL_SUB`.
+
+#### `EXL3_LOOP_GUARD` (default: `1`)
+
+The answer-phase loop guard of the Qwen and GLM servers (`tools/loopguard.py`). `0` turns it off for
+every request. It ends a reply that has fallen into a loop: a repeated token period, or a tail that
+replays itself. The finish reason is `length` and the choice carries `stop_reason: "loop_guard"`
+(with the detail in `timings.loop_guard`), so a client can tell a guard stop from a natural end.
+A request can switch the guard off for itself with `"loop_guard": false` (a boolean; `true` or
+absent follows this variable). The Qwen server also watches the thinking block and restarts it
+from the kept thinking; the GLM server leaves a thinking block alone and watches the answer after
+`</think>`. Repetitive data that is valid (a grid of zeros, identical JSON lines, a zero-padded
+hex dump) is not cut before 16384 tokens of repetition.
+
 ### Speed defaults the servers set
 
 Each server applies a measured configuration before the engine loads, so a bare `serve.py` runs
@@ -913,7 +1124,7 @@ latch the value at import.
 | `EXL3_HOST_LEAN` | `1` | Host-side decode trims: batched verify readback and reused staging buffers. Launches, draw order and numerics are unchanged. |
 | `EXL3_HOST_CUTS` | `1` | The rest of the host trims: cached staging buffers and early-outs on no-op work. Only active together with `EXL3_HOST_LEAN=1`. |
 | `EXL3_MOE_FUSED` | `1` | The fused MoE kernel. Ignored on a non-ROCm build. |
-| `EXL3_MOE_VALU` | `1` | Folds the gate-and-up GEMV into the grouped-MoE decode kernel. |
+| `EXL3_MOE_VALU` | `1` | The FDOT2 VALU decode matvec for K2/K4 experts instead of the WMMA body (bitwise-identical outputs). K=2 also defaults on without it; `0` forces the WMMA body everywhere. |
 | `EXL3_VERIFY_ATTN_LOOP` | `1` | Runs an R-row verify attention as the exact R single-row loop, which is what keeps a verify forward bit-identical. |
 | `EXL3_VERIFY_GEMV_R` | `1` | Runs the decode projections of an R-row verify as one multi-row GEMV instead of R single-row calls. |
 | `EXL3_GEMV_R_DEC1` | `1` | Decodes each weight pair once per verify forward and shares it across rows, instead of decoding it again per row. Bit-identical, and it needs `EXL3_GEMV_R_RM6`. |
@@ -927,6 +1138,11 @@ latch the value at import.
 | `EXL3_PF_DEFER` | `0` | `1` runs the draft prefill after the first token instead of chunk by chunk with the target prefill. Needs a single session and no spec gate. |
 | `EXL3_PF_NO_TAIL` | `1` | Lets the last prefill chunk run to the end of the prompt instead of stopping at the last page, which saves a second pass over every expert. |
 | `EXL3_PF_TAIL_MERGE` | `1024` | How many rows past the chunk size a merged last chunk may take, so a short tail is merged rather than re-read. |
+| `EXL3_PF_SPLIT` | empty (off) | Comma list of offsets, in rows before the end of the prompt, at which the last prefill chunk is cut into extra passes, for example `256` or `1280,256`. Each cut lands on a page-aligned row and is stored as an exact recurrent checkpoint, so a later request that shares the prefix up to a cut resumes with the same pass shapes as a cold prefill and gets bit-identical logits. The extra passes cost a little prefill time. |
+| `EXL3_PF_SPLIT_MIN` | `4096` | The shortest prompt, in tokens, that `EXL3_PF_SPLIT` applies to. |
+| `EXL3_PF_SPLIT_HEAD` | `1024` | The fewest rows the first pass of a split last chunk must keep. A cut that would leave less is dropped. |
+| `EXL3_PF_SPLIT_STEP` | `512` | The least spacing, in rows, between two cuts of a split last chunk. |
+| `EXL3_PF_SPLIT_Q` | `256` | The grid, in rows, that split cuts are rounded down to. Rounded down to a multiple of the page size. |
 | `EXL3_VERIFY_QSA_PROJ` | `0` | `1` runs the indexer q and k projection per row instead of batched. |
 | `EXL3_VERIFY_QSA_ATTN` | `0` | `1` or `all` runs sparse selection and attention per row, `sel` selection only, `att` attention only. |
 | `EXL3_QSA_ROWINV` | `1` | Computes the sparse-attention split plan as if the batch were a single row, so a batched verify reduces in the same order as plain decode. `0` restores the batch-dependent plan. |
@@ -1022,3 +1238,79 @@ progress and report `eta_s`: `startup-qwen.json`, `startup-glm.json` and `startu
 it to share one cache between several checkouts. The GLM server keeps two files there, one for
 starts with the dense GEMM tuning already cached and one without, so a cached start is not timed
 with the slow first one.
+
+## NVIDIA (CUDA, sm_80+)
+
+Switches of the CUDA path. Defaults are the shipped behaviour on NVIDIA; none of them changes ROCm builds. Several
+are not bit-identical to the Triton / eager path on greedy output (first divergences sit on near-ties, KL within the
+noise of the quantization), which is why each has an off switch for A/B work.
+
+#### `EXL3_CUDA_GRAPH` (default `0`; `tools/qwen/serve.py` and `tools/flint/serve.py` set it to `1` on NVIDIA)
+
+Whole-forward CUDA graph for decode steps (Qwen GDN, Flint sliding-window ring, MTP verify). `EXL3_CUDA_GRAPH_MULTI=1`
+(default off; `tools/flint/serve.py --max-batch N` and `tools/qwen/serve.py --sessions N` set it to `1` on NVIDIA when N > 1) lets several jobs share one graph (B in 1..4, B*Q <= 32). `EXL3_CUDA_GRAPH_MAX` bounds the graph cache (16 with MULTI, 32 from the Qwen server with `--sessions` > 1).
+
+#### `EXL3_QDEC` (default `1`), `EXL3_QDEC_GRAPH` (default `1`), `EXL3_QDEC_ROWS` (default `1`)
+
+Decode attention for quantized KV caches (K/V bits 2..8): a tensor-core split kernel compiled at run time (NVRTC, no
+build step) that reads the packed pages directly. `EXL3_QDEC=0` falls back to the Triton kernels, `EXL3_QDEC_GRAPH=0`
+disables its CUDA-graph capture path, `EXL3_QDEC_ROWS` selects the many-row kernel for verify steps (q_len 2..8 at
+head dim 256): `0` off, `1` only where the single-row kernel cannot serve, `2` always.
+
+#### `EXL3_QWRITE_TRITON` (default `1`; ROCm)
+
+Native Triton writer for the quantized paged cache (K/V bits 2..8, `attention_fn/qwrite_triton.py`): one launch appends the new
+rows of K and V with the same arithmetic and packed plane layout as the PyTorch fallback (bit-identical words and scales,
+`tests/test_qwrite.py`). The fallback needs ~70 launches per layer (decode append 402 us, 4096-row prefill chunk 5.2 ms at
+K/V 6,6 per layer; native 17 us / 89 us). `0` restores the fallback.
+
+#### `EXL3_QDEC_HIP` (default `1`; ROCm gfx11.5)
+
+HIP counterpart of `EXL3_QDEC` for AMD (Strix Halo): a wave32 WMMA kernel (`attention_fn/qdec.hip`, compiled with hipcc at first
+use and cached under `~/.cache/exllamav3`) that dequantizes the packed K/V pages straight into the WMMA operands, plus a small
+combine kernel. Used for quantized-KV decode (K/V bits 2..8, head dim 128 or 256, q_len up to 6 at head dim 128 / 3 at 256) with
+full attention, no softcap; windowed layers, 1-bit planes and bigger shapes keep the Triton kernels. `0` keeps the Triton kernels.
+Tuning knobs for A/B work: `EXL3_QDEC_HIP_NW` (waves per CTA, default 4), `EXL3_QDEC_HIP_DW` (waves splitting the head dim),
+`EXL3_QDEC_HIP_WAVES` (target resident waves for the split count), `EXL3_QDEC_HIP_SPL` (fixed split count),
+`EXL3_QDEC_HIP_MAXO` (accumulator budget per lane, default 96).
+
+#### `EXL3_SHARED_SIDE` (default `0`; ROCm)
+
+Batch-1 MoE decode with a shared expert that is not folded into the routed launch (Flint: shared expert K=6, I=1024; the fold needs
+K=4 and the routed shape): the shared expert's GEMVs, which do not depend on the routed experts, run on a side stream with their
+own GEMV scratch/counters while the routed kernels run on the main one, and are joined at the shared add. Bit-identical results
+(same kernels, tests/gate_kv.py KL 0), Flint 4K / 32K decode +4..5 % (tests/ab_decode.py, alternating windows in one process).
+`EXL3_DEC_MIN_BLOCKS` (default 32; read per call) at 512 adds about 1.5 % on Flint (more blocks for its small GEMVs).
+
+#### `EXL3_PREFILL_WIDE` (default `1`)
+
+Models with sliding-window attention only and a fused MoE (Flint): prompts that fit are prefilled in one pass, in
+8192-row chunks while the cache holds less than 64K tokens, 4096 beyond. `0` restores the plain 4096-row plan.
+
+#### `EXL3_MOE_GROUPED` (default `1`), `EXL3_MOE_GROUPED_LO` (default `33`), `EXL3_MOE_GROUPED_ROWS`
+
+Grouped MoE prefill tier: one CTA per (expert, 64-row tile, 128-column tile) with fp32 accumulation and the output
+Hadamard fused with the top-k combine, for experts that receive at least `EXL3_MOE_GROUPED_LO` rows. `0` restores the
+persistent expert-group kernel.
+
+#### `EXL3_GEMV_POLICY` (default `1`), `EXL3_GEMV_ROWS`
+
+Slice height of the int8 decode GEMV on 4/5-bit weights: taller k-slices, about two work units per SM. `0` restores the
+former rule, `EXL3_GEMV_ROWS=<n>` forces a slice height.
+
+#### `EXL3_QC_PF_MAXNREG` (default `255` for 8-bit K+V and above, else `0`)
+
+Register cap of the quantized-KV prefill attention kernel (`0` = compiler default). Uncapped registers free 1.3 GiB of
+driver local memory and let Flint run `--kv 8,8` at 256K.
+
+#### `EXL3_TAIL_PIN` (default `1` on NVIDIA), `EXL3_TAIL_RING` (default `0`)
+
+`EXL3_TAIL_PIN=0` makes the prompt-end recurrent checkpoint a synchronous `.cpu()` copy instead of an asynchronous copy
+into pinned host memory. `EXL3_TAIL_RING=1` allows a tail restore into a partial page when the draft cache is a ring
+smaller than the target cache (a DFlash2 drafter).
+
+#### `QWSPEC_DEPTHRULE` (default unset)
+
+`N:thf,thv,maxd,thfd,thvd`: above N context tokens the MTP draft tier rule switches to these thresholds and draft depth
+(`QWSPEC_THF/THV/THFD/THVD` set the base tiers). Needed only with `EXL3_QDEC=0` or `EXL3_QDEC_ROWS=0`, where the
+Triton verify makes deep drafts expensive: `96000:0.45,0.2,4,0.8,0.6`.

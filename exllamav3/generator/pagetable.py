@@ -273,6 +273,7 @@ class Sequence:
         pagetable: PageTable,
         recurrent_cache: None | RecurrentCache,
         protected_hashes: set | None = None,
+        exact_gate = None,
     ):
         if self.max_cached_pages is None:
             page_hashes = self.page_hashes
@@ -287,10 +288,14 @@ class Sequence:
             recurrent_pages = []
             for pi, ph in enumerate(page_hashes):
                 rs = recurrent_cache.get(ph)
-                if rs:
+                if rs and (exact_gate is None or exact_gate(rs, ph, pi)):
                     recurrent_pages.append(pi)
             # CPU-tier restores past the last checkpoint can't advance the resume point; replay prefill
             # rewrites those pages anyway
+            if exact_gate is not None and getattr(exact_gate, "tagged", None):
+                # an exact checkpoint (EXL3_PF_SPLIT) is usable: resume there, not at a deeper checkpoint that would make the
+                # replay a chunk the cold prefill never computed (every page below it must be cached to reach a deeper one anyway)
+                recurrent_pages = [p for p in recurrent_pages if p <= max(exact_gate.tagged)]
             restore_limit = (max(recurrent_pages) + 1) if recurrent_pages else 0
 
         # Allocate pages in KV cache, limit prefix caching to available recurrent states

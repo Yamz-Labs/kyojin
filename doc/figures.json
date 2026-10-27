@@ -4,6 +4,10 @@
  "method": "new-user install, published packs, default environment, card prompts, greedy, server-reported prefill",
  "date": "2026-10-17",
  "commit": "db6103b",
+ "version": "1.5.10",
+ "readme_extra_rows": [
+  "<tr><td>DeepSeek-V4.1-Flash <sub>(experimental, SSD tier)</sub></td><td align=\"right\">185 GB</td><td align=\"right\">187 to 257 at 8K</td><td align=\"right\">5 to 11 <sub>(plain)</sub></td></tr>"
+ ],
  "models": [
   {
    "id": "qwen",

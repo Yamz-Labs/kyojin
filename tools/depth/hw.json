@@ -1,0 +1,7 @@
+{
+ "bw_gbs": 237.3,
+ "gemm_tflops": 34.7,
+ "gemm_tflops_4096rows": 36.3,
+ "device": "Radeon 8060S Graphics",
+ "measured": "2026-10-18"
+}

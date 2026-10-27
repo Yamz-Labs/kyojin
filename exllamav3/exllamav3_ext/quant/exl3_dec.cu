@@ -12,7 +12,7 @@
 //   - mul1 codebook: v = fp16(0x6400 + bytesum(w * 0x83DCD12D)) * fp16(0x1eee) + fp16(0xc931)
 //   - W = diag(suh) H128 W_hat H128 diag(svh), H128 the normalised Sylvester Hadamard per 128 block
 
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || defined(EXL3_PORT_DEC)
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -30,6 +30,7 @@
 #include <ATen/ops/empty.h>
 #include "exl3_dec.cuh"
 #include "../util.cuh"
+#include "../port.cuh"
 
 // QWG_ABLATE=1 compiles runtime ablation arms into the dense gemv (env EXL3_QWG_DABL; timing only, garbage results by design):
 // bit 1 = no trellis decode (loads kept alive by an xor), bit 2 = no DRAM stream (every k-tile read is k-row 0..ktw-1), bit 4 = no epilogue
@@ -39,8 +40,13 @@
 
 namespace exl3dec {
 
+#if defined(USE_ROCM)
 typedef _Float16 f16x2 __attribute__((ext_vector_type(2)));
 typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+#else
+typedef __half2 f16x2;
+typedef uint4 u32x4;
+#endif
 
 constexpr int WPB = 8;              // waves per block
 constexpr int THREADS = WPB * 32;
@@ -96,11 +102,11 @@ __device__ __forceinline__ uint32_t window(const uint32_t* w)
     constexpr int o = s & 31;
     constexpr int W = Fmt<KB2>::WORDS;
     if constexpr (o <= 16)
-        return __builtin_amdgcn_ubfe(w[i], 16 - o, 16);
+        return PORT_UBFE16(w[i], 16 - o);
     else if constexpr (MASK)
-        return __builtin_amdgcn_alignbit(w[i], w[(i + 1) % W], 48 - o) & 0xffffu;
+        return PORT_ALIGNBIT(w[i], w[(i + 1) % W], 48 - o) & 0xffffu;
     else
-        return __builtin_amdgcn_alignbit(w[i], w[(i + 1) % W], 48 - o);
+        return PORT_ALIGNBIT(w[i], w[(i + 1) % W], 48 - o);
 }
 
 // Product variants for p = (x & 0xffff) * 0x83DCD12D mod 2^32:
@@ -121,8 +127,10 @@ constexpr bool PROD_MASK = EXL3_DEC_PROD != 2;
 // carrying a 32-bit literal (the fully unrolled tile decode is instruction-cache bound on gfx1151,
 // bytes matter). The mcg codebook's decode yields the final fp16 weight directly, so its affine
 // fold (kinv2/kbias2, applied in pair_dot/block_reduce) is the identity.
-#if !defined(EXL3_DEC_SCONST)
+#if !defined(EXL3_DEC_SCONST) && defined(USE_ROCM)
 #define EXL3_DEC_SCONST 1
+#elif !defined(EXL3_DEC_SCONST)
+#define EXL3_DEC_SCONST 0   // CUDA: the s_mov asm is AMDGPU only
 #endif
 struct DecConst
 {
@@ -196,8 +204,8 @@ __device__ __forceinline__ uint32_t mul1_pair(uint32_t w0, uint32_t w1, const De
 #else
     const uint32_t p0 = mul1_prod(w0, c);
     const uint32_t p1 = mul1_prod(w1, c);
-    const uint32_t s0 = __builtin_amdgcn_sad_u8(p0, 0u, c.sadacc);
-    return __builtin_amdgcn_sad_hi_u8(p1, 0u, s0);
+    const uint32_t s0 = PORT_SAD_U8(p0, c.sadacc);
+    return PORT_SAD_HI_U8(p1, s0);
 #endif
 }
 
@@ -243,6 +251,20 @@ __device__ __forceinline__ uint32_t pair_decode(uint32_t w0, uint32_t w1, const 
 // at the noise floor (-0.015 +- 0.068 %, 8 x 1024 tok @4K). EXL3_DEC_MOE_FOLD=0 restores the exact path.
 template <int CB> constexpr bool dec_exact() { return CB == 3 ? false : (bool) EXL3_DEC_EXACT; }
 
+// Which (K, codebook) pairs get the fully unrolled decode. ROCm: all. CUDA: cicc needs minutes and GBs per pair, so an
+// EXL3_PORT_DEC build compiles the masks below (bit kb2 / bit cb; default K3 and K4, mul1) and traps on the others
+#if defined(USE_ROCM)
+template <int KB2, int CB> constexpr bool dec_built() { return true; }
+#else
+#if !defined(EXL3_PORT_DEC_KB2_MASK)
+#define EXL3_PORT_DEC_KB2_MASK ((1 << 6) | (1 << 8))
+#endif
+#if !defined(EXL3_PORT_DEC_CB_MASK)
+#define EXL3_PORT_DEC_CB_MASK (1 << 2)
+#endif
+template <int KB2, int CB> constexpr bool dec_built() { return ((EXL3_PORT_DEC_KB2_MASK >> KB2) & 1) && ((EXL3_PORT_DEC_CB_MASK >> CB) & 1); }
+#endif
+
 template <int KB2, int M, int CB = 2>
 __device__ __forceinline__ void pair_dot(const uint32_t* w, const f16x2* xp, float* acc, const DecConst& c)
 {
@@ -253,17 +275,17 @@ __device__ __forceinline__ void pair_dot(const uint32_t* w, const f16x2* xp, flo
     // multiplies the full 32-bit window, so it always needs the masked form.
     constexpr bool MASK = (CB >= 2) ? PROD_MASK : true;
     const uint32_t h2 = pair_decode<CB>(window<KB2, 2 * M, MASK>(w), window<KB2, 2 * M + 1, MASK>(w), c);
-    f16x2 h = __builtin_bit_cast(f16x2, h2);
+    f16x2 h = PORT_AS_F16X2(h2);
     if constexpr (dec_exact<CB>())
-        h = __builtin_elementwise_fma(h, __builtin_bit_cast(f16x2, c.kinv2), __builtin_bit_cast(f16x2, c.kbias2));
+        h = PORT_HFMA2(h, PORT_AS_F16X2(c.kinv2), PORT_AS_F16X2(c.kbias2));
     constexpr int t = M >> 2;
     constexpr int jj = M & 3;
     constexpr int q = (t & 3) + ((jj & 1) ? 4 : 0);
     constexpr int col = (t >> 2) + ((jj & 2) ? 8 : 0);
-    acc[col] = __builtin_amdgcn_fdot2(h, xp[q], acc[col], false);
+    acc[col] = PORT_FDOT2_F32(h, xp[q], acc[col]);
     // Scheduling fence every SB pairs: left free, the scheduler hoists the window/product work of a
     // whole tile ahead of the dot products and spills (hundreds of VGPRs)
-    if constexpr ((M % EXL3_DEC_SB) == EXL3_DEC_SB - 1) __builtin_amdgcn_sched_barrier(0);
+    if constexpr ((M % EXL3_DEC_SB) == EXL3_DEC_SB - 1) PORT_SCHED_BARRIER();
     if constexpr (M + 1 < 128) pair_dot<KB2, M + 1, CB>(w, xp, acc, c);
 }
 
@@ -282,7 +304,8 @@ __device__ __forceinline__ void tile_dot(const uint32_t* w, const f16x2* xp, flo
     for (int i = 0; i < Fmt<KB2>::WORDS; ++i) t ^= w[i];
     acc[0] += (float) (t & 0xff) * (float) xp[0][0];
 #else
-    pair_dot<KB2, 0, CB>(w, xp, acc, c);
+    if constexpr (dec_built<KB2, CB>()) pair_dot<KB2, 0, CB>(w, xp, acc, c);
+    else PORT_TRAP();
 #endif
 }
 
@@ -296,23 +319,23 @@ __device__ __forceinline__ void pair_dot_r(const uint32_t* w, const f16x2 (*xp)[
 {
     constexpr bool MASK = (CB >= 2) ? PROD_MASK : true;
     const uint32_t h2 = pair_decode<CB>(window<KB2, 2 * M, MASK>(w), window<KB2, 2 * M + 1, MASK>(w), c);
-    f16x2 h = __builtin_bit_cast(f16x2, h2);
+    f16x2 h = PORT_AS_F16X2(h2);
     if constexpr (dec_exact<CB>())
-        h = __builtin_elementwise_fma(h, __builtin_bit_cast(f16x2, c.kinv2), __builtin_bit_cast(f16x2, c.kbias2));
+        h = PORT_HFMA2(h, PORT_AS_F16X2(c.kinv2), PORT_AS_F16X2(c.kbias2));
     constexpr int t = M >> 2;
     constexpr int jj = M & 3;
     constexpr int q = (t & 3) + ((jj & 1) ? 4 : 0);
     constexpr int col = (t >> 2) + ((jj & 2) ? 8 : 0);
     #pragma unroll
     for (int j = 0; j < RM; ++j)
-        acc[j][col] = __builtin_amdgcn_fdot2(h, xp[j][q], acc[j][col], false);
-    if constexpr ((M % EXL3_DEC_SB) == EXL3_DEC_SB - 1) __builtin_amdgcn_sched_barrier(0);
+        acc[j][col] = PORT_FDOT2_F32(h, xp[j][q], acc[j][col]);
+    if constexpr ((M % EXL3_DEC_SB) == EXL3_DEC_SB - 1) PORT_SCHED_BARRIER();
     if constexpr (M + 1 < 128) pair_dot_r<KB2, M + 1, CB, RM>(w, xp, acc, c);
 }
 
 // fp16 codebook constants (codebook.cuh decode_3inst<2>)
-__device__ __forceinline__ float cb_kinv() { return (float) __builtin_bit_cast(_Float16, (unsigned short) 0x1eee); }
-__device__ __forceinline__ float cb_kbias() { return (float) __builtin_bit_cast(_Float16, (unsigned short) 0xc931); }
+__device__ __forceinline__ float cb_kinv() { return PORT_F16_BITS_TO_F32(0x1eee); }
+__device__ __forceinline__ float cb_kbias() { return PORT_F16_BITS_TO_F32(0xc931); }
 
 // The mcg decode is its own affine map (identity), so EXL3_DEC_EXACT 0 (affine folded into the
 // block sums) and 1 (folded per value) coincide there.
@@ -327,10 +350,10 @@ __device__ __forceinline__ void load_tile(const u32x4* p, u32x4* r)
     const int ln = threadIdx.x & 31;
     const u32x4* base = p - ln * Fmt<KB2>::VEC;
     #pragma unroll
-    for (int v = 0; v < Fmt<KB2>::VEC; ++v) r[v] = __builtin_nontemporal_load(base + v * 32 + ln);
+    for (int v = 0; v < Fmt<KB2>::VEC; ++v) r[v] = PORT_LD_STREAM(base + v * 32 + ln);
 #else
     #pragma unroll
-    for (int v = 0; v < Fmt<KB2>::VEC; ++v) r[v] = __builtin_nontemporal_load(p + v);
+    for (int v = 0; v < Fmt<KB2>::VEC; ++v) r[v] = PORT_LD_STREAM(p + v);
 #endif
 }
 
@@ -375,7 +398,7 @@ __device__ __forceinline__ void lane_gemv(const u32x4* tiles, size_t tstride, co
             #pragma unroll
             for (int q = 0; q < 8; ++q) xp[q] = xq[q];
             tile_dot<KB2, CB>(reinterpret_cast<const uint32_t*>(cur), xp, acc, dc);
-            __builtin_amdgcn_sched_barrier(0);
+            PORT_SCHED_BARRIER();
         }
         return;
     }
@@ -397,7 +420,7 @@ __device__ __forceinline__ void lane_gemv(const u32x4* tiles, size_t tstride, co
             if constexpr (NODEC) { uint32_t xx = 0; for (int v = 0; v < VEC; ++v) xx ^= buf[r][v].x ^ buf[r][v].y ^ buf[r][v].z ^ buf[r][v].w; acc[0] += __uint_as_float(xx & 0x3fffffff); }
             else tile_dot<KB2, CB>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
             if (i + RING < n) load_tile<KB2>(tiles + (i + RING) * tstride, buf[r]);
-            __builtin_amdgcn_sched_barrier(0);   // keep the scheduler from interleaving tiles (VGPR blowup)
+            PORT_SCHED_BARRIER();   // keep the scheduler from interleaving tiles (VGPR blowup)
         }
     }
 }
@@ -440,7 +463,7 @@ __device__ __forceinline__ void lane_gemv_r(const u32x4* tiles, size_t tstride, 
                 tile_dot<KB2, CB>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc[j], dc);
             }
             if (i + RING < n) load_tile<KB2>(tiles + (i + RING) * tstride, buf[r]);
-            __builtin_amdgcn_sched_barrier(0);
+            PORT_SCHED_BARRIER();
         }
     }
 }
@@ -470,9 +493,46 @@ __device__ __forceinline__ void lane_gemv_r1(const u32x4* tiles, size_t tstride,
                 #pragma unroll
                 for (int q = 0; q < 8; ++q) xp[j][q] = xq[q];
             }
-            pair_dot_r<KB2, 0, CB, RM>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
+            if constexpr (dec_built<KB2, CB>()) pair_dot_r<KB2, 0, CB, RM>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
+            else PORT_TRAP();
             if (i + RING < n) load_tile<KB2>(tiles + (i + RING) * tstride, buf[r]);
-            __builtin_amdgcn_sched_barrier(0);
+            PORT_SCHED_BARRIER();
+        }
+    }
+}
+
+// lane_gemv_r1 with the x words held in SGPRs (EXL3_GEMV_R_WIDE8, the 7..8 row single-pass form). The tile's x words are the same for every
+// lane of a wave (xs_rows[j] + i * 16 is wave-uniform), so they are read from LDS once per tile and moved to scalar registers with
+// readfirstlane: RM x 8 words stay out of the VGPR file, which RM 8 needs (128 accumulators + tile words + RM x 8 x words spilled to
+// scratch as VGPRs). Same fdot2 operands, same accumulation order as lane_gemv_r1, so the output is bit-identical.
+template <int KB2, int CB, int RM, int RING_ = 0>
+__device__ __forceinline__ void lane_gemv_r2(const u32x4* tiles, size_t tstride, const half* const* xs_rows, int n, float acc[][16])
+{
+    constexpr int VEC = Fmt<KB2>::VEC;
+    constexpr int RING = RING_ > 0 ? RING_ : ring_of<KB2>();
+    u32x4 buf[RING][VEC];
+    const DecConst dc = dec_const<CB>();
+    #pragma unroll
+    for (int r = 0; r < RING; ++r) if (r < n) load_tile<KB2>(tiles + r * tstride, buf[r]);
+    for (int i0 = 0; i0 < n; i0 += RING)
+    {
+        #pragma unroll
+        for (int r = 0; r < RING; ++r)
+        {
+            const int i = i0 + r;
+            if (i >= n) break;
+            f16x2 xp[RM][8];
+            #pragma unroll
+            for (int j = 0; j < RM; ++j)
+            {
+                const uint32_t* xq = reinterpret_cast<const uint32_t*>(xs_rows[j] + i * 16);
+                #pragma unroll
+                for (int q = 0; q < 8; ++q) xp[j][q] = PORT_AS_F16X2(PORT_READFIRSTLANE(xq[q]));
+            }
+            if constexpr (dec_built<KB2, CB>()) pair_dot_r<KB2, 0, CB, RM>(reinterpret_cast<const uint32_t*>(buf[r]), xp, acc, dc);
+            else PORT_TRAP();
+            if (i + RING < n) load_tile<KB2>(tiles + (i + RING) * tstride, buf[r]);
+            PORT_SCHED_BARRIER();
         }
     }
 }
@@ -489,7 +549,7 @@ __device__ __forceinline__ void fwht128(float* v, int lane)
         #pragma unroll
         for (int i = 0; i < 4; ++i)
         {
-            const float o = __shfl_xor(v[i], m);
+            const float o = PORT_SHFL_XOR(v[i], m);
             v[i] = (lane & m) ? (o - v[i]) : (v[i] + o);
         }
     }
@@ -503,7 +563,7 @@ __device__ __forceinline__ half sat_half(float f)
 __device__ __forceinline__ float wave_sum(float v)
 {
     #pragma unroll
-    for (int m = 1; m < 32; m <<= 1) v += __shfl_xor(v, m);
+    for (int m = 1; m < 32; m <<= 1) v += PORT_SHFL_XOR(v, m);
     return v;
 }
 
@@ -512,41 +572,60 @@ __device__ __forceinline__ float wave_sum(float v)
 // of the stored fp16 values of chunk c.
 // x_gstride > 0: input chunk g (inputs 128g .. 128g + 127) sits at x + g * x_gstride (e.g. the
 // first 128 of every 192-wide head), otherwise x is contiguous.
+// One 128-element chunk of the rotated input (wave-wide: lane owns 4 elements): suh sign, 128-point Hadamard, fp16 store at dst, chunk sum into *xsum_slot.
+__device__ __forceinline__ void prologue_chunk(const half* x, const half* suh, int k, int kx, half* dst, float* xsum_slot, int lane)
+{
+    const uint2 xr = *reinterpret_cast<const uint2*>(x + kx);
+    const half* xh = reinterpret_cast<const half*>(&xr);
+    half o[4];
+#if defined(EXL3_DEC_DEBUG)
+    if (false)
+#else
+    if (suh)
+#endif
+    {
+        const uint2 sr = *reinterpret_cast<const uint2*>(suh + k);
+        const half* sh = reinterpret_cast<const half*>(&sr);
+        float v[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = __half2float(xh[i]) * __half2float(sh[i]);
+        fwht128(v, lane);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) o[i] = sat_half(v[i] * HAD_SCALE);
+    }
+    else
+    {
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) o[i] = xh[i];
+    }
+    *reinterpret_cast<uint2*>(dst + lane * 4) = *reinterpret_cast<uint2*>(o);
+    float t = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) t += __half2float(o[i]);
+    t = wave_sum(t);
+    if (lane == 0) *xsum_slot = t;
+}
+
 __device__ __forceinline__ void prologue_x(const half* x, const half* suh, int k0, int n, half* xs, float* xsum, int wave, int lane, int x_gstride = 0)
 {
     for (int c = wave; c < n / 128; c += WPB)
     {
         const int k = k0 + c * 128 + lane * 4;
         const int kx = x_gstride ? (k0 / 128 + c) * x_gstride + lane * 4 : k;
-        const uint2 xr = *reinterpret_cast<const uint2*>(x + kx);
-        const half* xh = reinterpret_cast<const half*>(&xr);
-        half o[4];
-#if defined(EXL3_DEC_DEBUG)
-        if (false)
-#else
-        if (suh)
-#endif
-        {
-            const uint2 sr = *reinterpret_cast<const uint2*>(suh + k);
-            const half* sh = reinterpret_cast<const half*>(&sr);
-            float v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) v[i] = __half2float(xh[i]) * __half2float(sh[i]);
-            fwht128(v, lane);
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) o[i] = sat_half(v[i] * HAD_SCALE);
-        }
-        else
-        {
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) o[i] = xh[i];
-        }
-        *reinterpret_cast<uint2*>(xs + c * 128 + lane * 4) = *reinterpret_cast<uint2*>(o);
-        float t = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) t += __half2float(o[i]);
-        t = wave_sum(t);
-        if (lane == 0) xsum[c] = t;
+        prologue_chunk(x, suh, k, kx, xs + c * 128, xsum + c, lane);
+    }
+}
+
+// Phase `ph` of a block whose waves each own ktw / 8 chunks of the rotated input (ktw a multiple of 16): stages 2 chunks per wave
+// (16 tiles of every wave) into xs, chunk c = 2 * wave + m, so a row needs 16 x 128 halves of LDS whatever ktw is. xsum keeps the
+// block-wide chunk index, so the sum over the block's ktw chunks is the one prologue_x produces.
+__device__ __forceinline__ void prologue_x_phase(const half* x, const half* suh, int k0, int ktw, int ph, half* xs, float* xsum, int wave, int lane)
+{
+    for (int c = wave; c < 16; c += WPB)
+    {
+        const int cg = (c >> 1) * (ktw >> 3) + ph * 2 + (c & 1);
+        const int k = k0 + cg * 128 + lane * 4;
+        prologue_chunk(x, suh, k, k, xs + c * 128, xsum + cg, lane);
     }
 }
 
@@ -620,7 +699,47 @@ __device__ __forceinline__ void k_split(int G, int kb, int kbs, int& k0, int& kt
 
 __device__ __forceinline__ float ld_coherent(const float* p)
 {
-    return __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    return PORT_LD_COHERENT(p);
+}
+
+// sum_b p[b * stride], b = 0..n-1, added in index order (bitwise the plain `for b: s += ld_coherent(..)` loop), with the loads of 8 partials
+// in flight at once: the plain loop waits for each load before issuing the next, so the last block of a split-K launch paid n L2 round trips
+__device__ __forceinline__ float sum_coherent(const float* p, size_t stride, int n)
+{
+    float s = 0.0f;
+    int b = 0;
+    for (; b + 8 <= n; b += 8)
+    {
+        float v[8];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) v[j] = ld_coherent(p + (size_t) (b + j) * stride);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) s += v[j];
+    }
+    for (; b < n; ++b) s += ld_coherent(p + (size_t) b * stride);
+    return s;
+}
+// the same for 4 adjacent columns (4 independent sums, each in index order)
+__device__ __forceinline__ void sum_coherent4(const float* p, size_t stride, int n, float (&t)[4])
+{
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) t[i] = 0.0f;
+    int b = 0;
+    for (; b + 4 <= n; b += 4)
+    {
+        float v[4][4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) v[j][i] = ld_coherent(p + (size_t) (b + j) * stride + i);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) t[i] += v[j][i];
+    }
+    for (; b < n; ++b)
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) t[i] += ld_coherent(p + (size_t) b * stride + i);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -638,11 +757,14 @@ struct Job
     int block_base; // first block of this job
     int part_base;  // float offset into scratch
     int ctr_base;   // int offset into counters
+    int x_off;      // half offset of this job's input inside x (0: all jobs share x[0..K))
 };
+
+constexpr int MAXJ = 8;   // matrices per dense GEMV launch
 
 struct Jobs
 {
-    Job j[4];
+    Job j[MAXJ];
     int count;
     int K;
     int kbs;        // k blocks
@@ -669,7 +791,7 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
 
     int ji = 0;
     #pragma unroll
-    for (int i = 1; i < 4; ++i) if (i < jobs.count && (int) blockIdx.x >= jobs.j[i].block_base) ji = i;
+    for (int i = 1; i < MAXJ; ++i) if (i < jobs.count && (int) blockIdx.x >= jobs.j[i].block_base) ji = i;
     const Job& job = jobs.j[ji];
     const int local = blockIdx.x - job.block_base;
     const int strip = local / jobs.kbs;
@@ -679,7 +801,7 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
     k_split(jobs.K / 128, kb, jobs.kbs, k0, ktw);
 
     // Input rotation for this block's ktw * 128 input values
-    prologue_x(x, job.suh, k0, ktw * 128, xs, s_xsum, wave, lane, jobs.x_gstride);
+    prologue_x(x + job.x_off, job.suh, k0, ktw * 128, xs, s_xsum, wave, lane, jobs.x_gstride);
     __syncthreads();
     float xsum = 0.0f;
     for (int c = 0; c < ktw; ++c) xsum += s_xsum[c];
@@ -714,9 +836,7 @@ void gemv_kernel(const half* __restrict__ x, Jobs jobs, float* scratch, int* cou
         if (!arrive(z, part, ncols, counters + job.ctr_base + strip, jobs.kbs, tid)) return;
         for (int col = tid; col < ncols; col += THREADS)
         {
-            float s = 0.0f;
-            for (int b = 0; b < jobs.kbs; ++b) s += ld_coherent(scratch + job.part_base + (size_t) b * job.N + col0 + col);
-            z[col] = s;
+            z[col] = sum_coherent(scratch + job.part_base + col0 + col, job.N, jobs.kbs);
         }
         __syncthreads();
     }
@@ -863,7 +983,7 @@ void moe_gu_kernel(const half* __restrict__ x, MoeArgs a, int kbs)
         const int p = col / STRIP;
         const int c = col % STRIP;
         float s = 0.0f;
-        for (int b = 0; b < kbs; ++b) s += ld_coherent(part_base + ((size_t) (slot * 2 + p) * kbs + b) * a.I + col0 + c);
+        s = sum_coherent(part_base + (size_t) (slot * 2 + p) * kbs * a.I + col0 + c, a.I, kbs);
         z[col] = s;
     }
     __syncthreads();
@@ -988,13 +1108,7 @@ void moe_down_kernel(MoeArgs a, int kbs)
             const int64_t es = a.sel[s];
             if (es < 0 || es >= a.experts) continue;
             float v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                float t = 0.0f;
-                for (int b = 0; b < kbs; ++b) t += ld_coherent(part_base + ((size_t) s * kbs + b) * a.H + col + i);
-                v[i] = t;
-            }
+            sum_coherent4(part_base + (size_t) s * kbs * a.H + col, a.H, kbs, v);
             fwht128(v, lane);
             const half* sv = reinterpret_cast<const half*>(a.dv[es]) + col;
             const float w = __half2float(a.wts[s]);
@@ -1004,13 +1118,7 @@ void moe_down_kernel(MoeArgs a, int kbs)
         if constexpr (KB2S > 0)
         {
             float v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                float t = 0.0f;
-                for (int b = 0; b < kbs; ++b) t += ld_coherent(part_base + ((size_t) a.topk * kbs + b) * a.H + col + i);
-                v[i] = t;
-            }
+            sum_coherent4(part_base + (size_t) a.topk * kbs * a.H + col, a.H, kbs, v);
             fwht128(v, lane);
             const half* sv = a.shv[2] + col;
             #pragma unroll
@@ -1171,7 +1279,7 @@ void moe_gu_kernel_r(MoeArgsR a, int kbs)
             const int p = col / STRIP;
             const int c = col % STRIP;
             float s = 0.0f;
-            for (int b = 0; b < kbs; ++b) s += ld_coherent(part_base + ((size_t) (slot * 2 + p) * kbs + b) * a.I + col0 + c);
+            s = sum_coherent(part_base + (size_t) (slot * 2 + p) * kbs * a.I + col0 + c, a.I, kbs);
             z[col] = s;
         }
         __syncthreads();
@@ -1294,13 +1402,7 @@ void moe_down_kernel_r(MoeArgsR a, int kbs, int ctr_b_off)
         {
             const int col = col0 + wave * 128 + lane * 4;
             float v[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                float t = 0.0f;
-                for (int b = 0; b < kbs; ++b) t += ld_coherent(part_base + (size_t) slot * kbs * a.H + (size_t) b * a.H + col + i);
-                v[i] = t;
-            }
+            sum_coherent4(part_base + (size_t) slot * kbs * a.H + col, a.H, kbs, v);
             fwht128(v, lane);
             const half* sv = reinterpret_cast<const half*>(a.dv[e]) + col;
             float o[4];
@@ -1389,7 +1491,7 @@ __global__ void moe_combine_kernel_r(MoeArgsR a)
 
 constexpr int ROUTER_KCHUNK = 64;
 constexpr int CTR_ROUTER = 4000;          // one arrival counter per row: CTR_ROUTER + row
-constexpr int ROUTER_NORM_MAX_ROWS = 8;
+constexpr int ROUTER_NORM_MAX_ROWS = 32;   // grid.y = row, one arrival counter per row (CTR_ROUTER + row); rows never share state
 
 // Fused pre-norm (NORM): the block also computes the MLP pre-norm of r + xa (rms_norm_res_in
 // semantics, the same arithmetic as rms_norm_kernel mode 2), writes its 64 normalized fp16 inputs to
@@ -1557,8 +1659,7 @@ void router_kernel(const half* __restrict__ x, RouterNorm rn, const half* __rest
         ch[i] = -INFINITY;
         if (e < E)
         {
-            float l = 0.0f;
-            for (int b = 0; b < nkb; ++b) l += ld_coherent(scratch + (size_t) b * E + e);
+            float l = sum_coherent(scratch + e, E, nkb);
             l = __half2float(__float2half_rn(l));
             const float sc = 1.0f / (1.0f + __expf(-l));
             score[e] = sc;
@@ -1586,8 +1687,8 @@ void router_kernel(const half* __restrict__ x, RouterNorm rn, const half* __rest
         #pragma unroll
         for (int m = 16; m >= 1; m >>= 1)
         {
-            const float ov = __shfl_xor(bv, m);
-            const int oi = __shfl_xor(bi, m);
+            const float ov = PORT_SHFL_XOR(bv, m);
+            const int oi = PORT_SHFL_XOR(bi, m);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
         const int pb = j & 1;
@@ -1716,14 +1817,13 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
     // Tail: every thread reduces the cross-block partials of all rows (same b order per element),
     // then 64-thread groups (2 waves) run the rows' top-k concurrently, group g = row g. The pick
     // (max choice, lowest index on ties) and the weight sum order equal router_kernel's.
-    __shared__ float score[4][320];
-    __shared__ float chs[4][320];
+    __shared__ float score[NR][320];
+    __shared__ float chs[NR][320];
     for (int i = tid; i < NR * E; i += 256)
     {
         const int r = i / E, e = i - r * E;
         const float* sc_r = scratch + (size_t) r * nkb * E;
-        float l = 0.0f;
-        for (int b = 0; b < nkb; ++b) l += ld_coherent(sc_r + (size_t) b * E + e);
+        float l = sum_coherent(sc_r + e, E, nkb);
         l = __half2float(__float2half_rn(l));
         const float sc = 1.0f / (1.0f + __expf(-l));
         score[r][e] = sc;
@@ -1732,17 +1832,20 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
     __syncthreads();
     __shared__ float s_val[2][8];
     __shared__ int s_idx[2][8];
-    __shared__ int s_sel[4][64];
+    __shared__ int s_sel[NR][64];
     const int lane = tid & 31;
     const int wave = tid >> 5;
-    const int g = tid >> 6;
-    const int gl = tid & 63;
+    // up to 4 rows: a row per 64-thread group (two waves, winners combined through LDS); 5..8 rows: a row per wave, no barrier in the rounds
+    constexpr int GT = NR <= 4 ? 64 : 32;
+    constexpr int CH = 320 / GT;
+    const int g = tid / GT;
+    const int gl = tid % GT;
     const bool act = g < NR;
-    float ch[5];
+    float ch[CH];
     #pragma unroll
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < CH; ++i)
     {
-        const int e = gl + 64 * i;
+        const int e = gl + GT * i;
         ch[i] = (act && e < E) ? chs[g][e] : -INFINITY;
     }
     for (int j = 0; j < topk; ++j)
@@ -1750,29 +1853,34 @@ void router_rows_kernel(const half* __restrict__ x, const half* __restrict__ G, 
         float bv = -INFINITY;
         int bi = 0x7fffffff;
         #pragma unroll
-        for (int i = 0; i < 5; ++i)
+        for (int i = 0; i < CH; ++i)
         {
-            const int e = gl + 64 * i;
+            const int e = gl + GT * i;
             if (e < E && (ch[i] > bv || (ch[i] == bv && e < bi))) { bv = ch[i]; bi = e; }
         }
         #pragma unroll
         for (int m = 16; m >= 1; m >>= 1)
         {
-            const float ov = __shfl_xor(bv, m);
-            const int oi = __shfl_xor(bi, m);
+            const float ov = PORT_SHFL_XOR(bv, m);
+            const int oi = PORT_SHFL_XOR(bi, m);
             if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
         }
-        const int pb = j & 1;
-        if (lane == 0) { s_val[pb][wave] = bv; s_idx[pb][wave] = bi; }
-        __syncthreads();
-        float v = s_val[pb][2 * g]; int w0 = s_idx[pb][2 * g];
+        int w0;
+        if constexpr (GT == 64)
         {
-            const float v1 = s_val[pb][2 * g + 1]; const int w1 = s_idx[pb][2 * g + 1];
-            if (v1 > v || (v1 == v && w1 < w0)) { v = v1; w0 = w1; }
+            const int pb = j & 1;
+            if (lane == 0) { s_val[pb][wave] = bv; s_idx[pb][wave] = bi; }
+            __syncthreads();
+            float v = s_val[pb][2 * g]; w0 = s_idx[pb][2 * g];
+            {
+                const float v1 = s_val[pb][2 * g + 1]; const int w1 = s_idx[pb][2 * g + 1];
+                if (v1 > v || (v1 == v && w1 < w0)) { v = v1; w0 = w1; }
+            }
         }
+        else w0 = bi;   // the butterfly leaves the wave winner in every lane
         if (act && gl == 0) s_sel[g][j] = w0;
         #pragma unroll
-        for (int i = 0; i < 5; ++i) if (gl + 64 * i == w0) ch[i] = -INFINITY;
+        for (int i = 0; i < CH; ++i) if (gl + GT * i == w0) ch[i] = -INFINITY;
     }
     __syncthreads();
     if (act && gl == 0)
@@ -1942,6 +2050,9 @@ inline int kb2_of(double K)
 {
     const int kb2 = (int) (K * 2.0 + 0.5);
     TORCH_CHECK(kb2 >= 4 && kb2 <= 14 && (double) kb2 == K * 2.0, "exl3_dec: unsupported K ", K);
+#if !defined(USE_ROCM)
+    TORCH_CHECK((EXL3_PORT_DEC_KB2_MASK >> kb2) & 1, "exl3_dec: K ", K, " not in this build's EXL3_PORT_DEC_KB2_MASK");
+#endif
     return kb2;
 }
 
@@ -2147,23 +2258,31 @@ static void dec_gemv_impl
     const std::vector<double>& K,
     int64_t Kdim_strided,
     int64_t x_gstride,
-    bool mcg
+    bool mcg,
+    int64_t x_job_stride = 0,   // > 0: job i reads its own input x[i * x_job_stride ..), K = x_job_stride (x is [n, K])
+    int64_t strips_hint = 0     // > 0: pick ktw as if the launch had this many strips (the strips of ONE equivalent single call)
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
     const int n = trellis.size();
-    TORCH_CHECK(n >= 1 && n <= 4, "exl3_dec_gemv: 1..4 matrices");
+    TORCH_CHECK(n >= 1 && n <= MAXJ, "exl3_dec_gemv: 1..", MAXJ, " matrices");
+    TORCH_CHECK(n <= 4 || x_job_stride > 0 || strips_hint > 0, "exl3_dec_gemv: more than 4 matrices need x_job_stride or strips_hint");
     TORCH_CHECK(x.dtype() == at::kHalf && x.is_contiguous(), "exl3_dec_gemv: x must be contiguous fp16");
-    const int Kdim = x_gstride ? (int) Kdim_strided : (int) x.size(-1);
-    TORCH_CHECK(x_gstride ? (x_gstride >= 128 && x.numel() >= (int64_t) (Kdim / 128 - 1) * x_gstride + 128)
-                          : x.numel() == x.size(-1), "exl3_dec_gemv: x must be fp16 [1, K] (or cover the strided groups)");
+    const int Kdim = x_job_stride ? (int) x_job_stride : x_gstride ? (int) Kdim_strided : (int) x.size(-1);
+    if (x_job_stride) {
+        TORCH_CHECK(!x_gstride && x.numel() == (int64_t) n * x_job_stride, "exl3_dec_gemv: x must be fp16 [n, K] for per-job inputs");
+    } else {
+        TORCH_CHECK(x_gstride ? (x_gstride >= 128 && x.numel() >= (int64_t) (Kdim / 128 - 1) * x_gstride + 128)
+                              : x.numel() == x.size(-1), "exl3_dec_gemv: x must be fp16 [1, K] (or cover the strided groups)");
+    }
     TORCH_CHECK(Kdim % 512 == 0, "exl3_dec_gemv: K must be a multiple of 512");
     const int kb2 = dense_kb2_of(K[0], mcg);
     int strips_total = 0;
     for (int i = 0; i < n; ++i) strips_total += (out[i].size(-1) + STRIP - 1) / STRIP;
     const int min_blocks = env_int("EXL3_DEC_MIN_BLOCKS", 32);
     const int forced = env_int("EXL3_DEC_KTW", 0);
+    if (strips_hint > 0) strips_total = (int) strips_hint;
     const int ktw = pick_ktw(Kdim / 16, strips_total, ring_of_kb2(kb2), min_blocks, forced);
     Jobs jobs;
     jobs.count = n;
@@ -2192,6 +2311,7 @@ static void dec_gemv_impl
         j.block_base = blocks;
         j.part_base = part;
         j.ctr_base = ctr;
+        j.x_off = x_job_stride ? (int) (i * x_job_stride) : 0;
         blocks += j.strips * jobs.kbs;
         part += jobs.kbs * N;
         ctr += j.strips;
@@ -2219,6 +2339,24 @@ void exl3_dec_gemv_multi
 )
 {
     dec_gemv_impl(x, trellis, suh, svh, out, scratch, counters, K, 0, 0, mcg);
+}
+
+void exl3_dec_gemv_x
+(
+    const at::Tensor& x,
+    const std::vector<at::Tensor>& trellis,
+    const std::vector<at::Tensor>& suh,
+    const std::vector<at::Tensor>& svh,
+    const std::vector<at::Tensor>& out,
+    at::Tensor& scratch,
+    at::Tensor& counters,
+    const std::vector<double>& K,
+    bool mcg,
+    int64_t x_job_stride,
+    int64_t strips_hint
+)
+{
+    dec_gemv_impl(x, trellis, suh, svh, out, scratch, counters, K, 0, 0, mcg, x_job_stride, strips_hint);
 }
 
 void exl3_dec_gemv
@@ -2297,6 +2435,10 @@ struct JobsR
 };
 
 constexpr int GEMV_R_ROW_BUDGET = MOE_R_MAX * MOE_R_KTW_MAX;   // 128: max rpb * ktw
+// Rows per exl3_dec_gemv_r call. One block still holds at most MOE_R_MAX rows (LDS staging, accumulators); rows beyond that run as
+// further grid.y row chunks of the same launch. Every row keeps batch-1's ktw / kbs / reduction order, so the bits of a row do not
+// depend on how many rows the call carries (checked by tools/decode/gemv_r_probe.py and gemv_r_rows_bench.py).
+constexpr int GEMV_R_MAX_ROWS = 32;
 // Tile ring depth for gemv_kernel_r. 0 (default) = batch-1's ring at RM 1, else 1: the 2-deep ring of
 // the > 4 bpw formats (80 VGPRs of tile words) plus RM x 16 accumulators spilled 125 VGPRs at
 // KB2 10 RM 2 (GLM lm_head, R 2 ran 5.0 ms vs 3.6 ms for two batch-1 launches). Result-neutral.
@@ -2337,13 +2479,19 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
     int k0, ktw;
     k_split(jobs.K / 128, kb, jobs.kbs, k0, ktw);
 
-    for (int j = 0; j < nrows; ++j)
+    // MODE 2: ktw > 16 stages the input in phases of 16 tiles per wave (the 8-row LDS budget), the wave's tile order is unchanged
+    const int ktp = (MODE == 2 && ktw > 16) ? 16 : ktw;
+    const int nph = ktw / ktp;
+    if (nph == 1)
     {
-        const int row = row0 + j;
-        prologue_x(x + (size_t) row * jobs.x_row_pitch, job.suh, k0, ktw * 128,
-                   xs + j * (ktw * 128), s_xsum[j], wave, lane);
+        for (int j = 0; j < nrows; ++j)
+        {
+            const int row = row0 + j;
+            prologue_x(x + (size_t) row * jobs.x_row_pitch, job.suh, k0, ktw * 128,
+                       xs + j * (ktw * 128), s_xsum[j], wave, lane);
+        }
+        __syncthreads();
     }
-    __syncthreads();
 
     float acc[RM][16];
     #pragma unroll
@@ -2352,14 +2500,36 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
         for (int c = 0; c < 16; ++c) acc[j][c] = 0.0f;
 
     const int nt = strip * 32 + lane;
-    if (nt < NT)
+    if constexpr (MODE == 2)
+    {
+        if (nph > 1)
+        {
+            const int kt0 = k0 / 16 + wave * ktw;
+            const u32x4* tiles = job.trellis + ((size_t) kt0 * NT + nt) * VEC;
+            const half* xs_rows[RM];
+            #pragma unroll
+            for (int j = 0; j < RM; ++j) xs_rows[j] = xs + min(j, nrows - 1) * (16 * 128) + wave * 16 * 16;
+            for (int ph = 0; ph < nph; ++ph)
+            {
+                if (ph > 0) __syncthreads();      // every wave is done with the previous phase's x
+                for (int j = 0; j < nrows; ++j)
+                    prologue_x_phase(x + (size_t) (row0 + j) * jobs.x_row_pitch, job.suh, k0, ktw, ph, xs + j * (16 * 128), s_xsum[j], wave, lane);
+                __syncthreads();
+                if (nt < NT)
+                    lane_gemv_r2<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles + (size_t) ph * 16 * NT * VEC, (size_t) NT * VEC, xs_rows, 16, acc);
+            }
+        }
+    }
+    if (nph == 1 && nt < NT)
     {
         const int kt0 = k0 / 16 + wave * ktw;
         const u32x4* tiles = job.trellis + ((size_t) kt0 * NT + nt) * VEC;
         const half* xs_rows[RM];
         #pragma unroll
         for (int j = 0; j < RM; ++j) xs_rows[j] = xs + (MODE ? min(j, nrows - 1) : j) * (ktw * 128) + wave * ktw * 16;
-        if constexpr (MODE == 1 && RM > 1)
+        if constexpr (MODE == 2 && RM > 1)
+            lane_gemv_r2<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles, (size_t) NT * VEC, xs_rows, ktw, acc);
+        else if constexpr (MODE == 1 && RM > 1)
             lane_gemv_r1<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles, (size_t) NT * VEC, xs_rows, ktw, acc);
         else
             lane_gemv_r<KB2, CB, RM, gemv_r_ring<KB2, RM>()>(tiles, (size_t) NT * VEC, xs_rows, nrows, ktw, acc);
@@ -2385,10 +2555,7 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
             if (!last) continue;
             for (int col = tid; col < ncols; col += THREADS)
             {
-                float s = 0.0f;
-                for (int b = 0; b < jobs.kbs; ++b)
-                    s += ld_coherent(scratch + job.part_base + (size_t) row * jobs.kbs * job.N + (size_t) b * job.N + col0 + col);
-                z[col] = s;
+                z[col] = sum_coherent(scratch + job.part_base + (size_t) row * jobs.kbs * job.N + col0 + col, job.N, jobs.kbs);
             }
             __syncthreads();
         }
@@ -2442,7 +2609,7 @@ static void dec_gemv_r_impl
     TORCH_CHECK(x.dtype() == at::kHalf && x.is_contiguous() && x.dim() == 2, "exl3_dec_gemv_r: x must be [R, K] fp16");
     const int R = (int) x.size(0);
     const int Kdim = (int) x.size(1);
-    TORCH_CHECK(R >= 1 && R <= MOE_R_MAX, "exl3_dec_gemv_r: R must be 1..MOE_R_MAX");
+    TORCH_CHECK(R >= 1 && R <= GEMV_R_MAX_ROWS, "exl3_dec_gemv_r: R must be 1..GEMV_R_MAX_ROWS");
     TORCH_CHECK(Kdim % 512 == 0, "exl3_dec_gemv_r: K must be a multiple of 512");
     const int kb2 = dense_kb2_of(K[0], mcg);
     int strips_total = 0;
@@ -2456,12 +2623,14 @@ static void dec_gemv_r_impl
     // EXL3_GEMV_R_RPB caps rows per block (grid.y = ceil(R / rpb) row chunks, each re-reading the
     // weights). Null result (glm-mtp step 4): RM 4 spills a little at KB2 >= 8 but a cap of 1 or 2
     // always lost (lm_head R 4: 1.81 ms default vs 3.53 ms cap 2; R 3 verify 80.4 vs 94.5 ms).
-    int rpb = std::max(1, std::min(R, GEMV_R_ROW_BUDGET / ktw));
+    int rpb = std::max(1, std::min(std::min(R, GEMV_R_ROW_BUDGET / ktw), MOE_R_MAX));
     const int rpb_cap = env_int("EXL3_GEMV_R_RPB", 0);
     if (rpb_cap > 0) rpb = std::min(rpb, rpb_cap);
     // (MiMo, R 5..8 verify, bitwise independent of rpb): the 8-row kernel variant wins at R 5-6
     // but loses at R 7-8 (131 vs 123 ms per verify forward, spills); from R 7 on run two 4-row chunks (grid.y = 2).
     else if (R >= 7 && rpb > 4 && env_int("EXL3_GEMV_R_RPB78", 4) > 0) rpb = env_int("EXL3_GEMV_R_RPB78", 4);
+    // 9..32 rows: row chunks of EXL3_GEMV_R_RPB9 rows (default 4: the 4-row instantiation does not spill), grid.y = ceil(R / rpb)
+    if (R > MOE_R_MAX && !(rpb_cap > 0) && rpb > 1) rpb = std::min(rpb, std::max(1, env_int("EXL3_GEMV_R_RPB9", 4)));
 
     // EXL3_GEMV_R_RM6=1 (needs EXL3_GEMV_R_DEC1=1): 5 or 6 rows run in ONE launch of the 6-row instantiation (one decode pass,
     // no VGPR spill at K*2 = 8 / 10) instead of a 4-row chunk plus a 1..2 row chunk. Same per-row arithmetic (rows are independent
@@ -2470,13 +2639,24 @@ static void dec_gemv_r_impl
                      env_int("EXL3_GEMV_R_DEC1", 0) == 1 && GEMV_R_ROW_BUDGET / ktw >= R;
     if (rm6) rpb = R;
 
+    // EXL3_GEMV_R_WIDE8=1 (needs EXL3_GEMV_R_DEC1=1): 7..8 rows run in ONE launch of the 8-row instantiation with the x words in SGPRs
+    // (lane_gemv_r2) instead of two 4-row chunks that each decode every tile (ktw > 16: the input is staged in 16-tile phases). Grids under
+    // EXL3_GEMV_R_WIDE8_MINBLK (32) blocks keep the two chunks. Same per-row arithmetic, bit-identical output.
+    const bool wide8 = R >= 7 && R <= MOE_R_MAX && env_int("EXL3_GEMV_R_WIDE8", 0) != 0 &&
+                       env_int("EXL3_GEMV_R_DEC1", 0) == 1 &&
+                       (GEMV_R_ROW_BUDGET / ktw >= R || (ktw % 16 == 0 && ktw <= 64)) &&      // ktw 32 / 48 / 64: staged in 16-tile phases
+                       strips_total * kbs >= env_int("EXL3_GEMV_R_WIDE8_MINBLK", 32);          // one pass runs half the blocks of the two 4-row chunks: it loses when the grid gets sparse
+    if (wide8) rpb = R;
+
     JobsR jobs;
     jobs.count = n;
     jobs.K = Kdim;
     jobs.kbs = kbs;
     jobs.R = R;
     jobs.rpb = rpb;
-    jobs.swap = env_int("EXL3_GEMV_R_CHUNK_FAST", 0) != 0 && R > 4 && R > rpb;   // 5..8 rows only: the <= 4 row launches keep their grid
+    // 5..8 rows only (the <= 4 row launches keep their grid); 9..32 rows swap by default (EXL3_GEMV_R_SWAP9=0 restores the plain grid):
+    // the chunks of one weight block then run side by side and share its reads through L2 instead of re-streaming the weights per chunk
+    jobs.swap = (env_int("EXL3_GEMV_R_CHUNK_FAST", 0) != 0 || (R > MOE_R_MAX && env_int("EXL3_GEMV_R_SWAP9", 1) != 0)) && R > 4 && R > rpb;
     jobs.x_row_pitch = Kdim;
     int blocks = 0, part = 0, ctr = 0;
     for (int i = 0; i < n; ++i)
@@ -2508,6 +2688,7 @@ static void dec_gemv_r_impl
     float* sp = scratch.data_ptr<float>();
     int* cp = counters.data_ptr<int>();
     const int nch = (R + rpb - 1) / rpb;
+    if (jobs.swap && blocks > 65535 && R > MOE_R_MAX) jobs.swap = 0;       // the default-swapped 9+ row launch falls back to the plain grid
     TORCH_CHECK(!jobs.swap || blocks <= 65535, "exl3_dec_gemv_r: too many blocks for the swapped grid");
     const dim3 grid = jobs.swap ? dim3(nch, blocks) : dim3(blocks, nch);
     if (rm6)
@@ -2535,7 +2716,9 @@ static void dec_gemv_r_impl
     EXL3_DEC_DISPATCH_CB(mcg ? 1 : 2, EXL3_DEC_DISPATCH_RM(rpb, EXL3_DEC_DISPATCH_KB2(kb2,
         {
             // EXL3_GEMV_R_DEC1=1 decodes each tile once for all rows (bit-identical)
-            if (RM > 1 && env_int("EXL3_GEMV_R_DEC1", 0) == 1)
+            if (wide8 && RM == 8)
+            { auto kfn = gemv_kernel_r<KB2, CB, RM, 2>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
+            else if (RM > 1 && env_int("EXL3_GEMV_R_DEC1", 0) == 1)
             { auto kfn = gemv_kernel_r<KB2, CB, RM, 1>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
             else
             { auto kfn = gemv_kernel_r<KB2, CB, RM>; kfn<<<grid, THREADS, 0, stream>>>(xp, jobs, sp, cp); }
@@ -3003,7 +3186,7 @@ void exl3_dec_router
     cuda_check(cudaPeekAtLastError());
 }
 
-// NR = 2..4 verify rows, one launch (router_rows_kernel); bitwise = NR exl3_dec_router calls.
+// NR = 2..8 verify rows, one launch (router_rows_kernel); bitwise = NR exl3_dec_router calls.
 void exl3_dec_router_rows
 (
     const at::Tensor& x,
@@ -3025,7 +3208,7 @@ void exl3_dec_router_rows
     const int E = gate.size(1);
     TORCH_CHECK(selected.dim() == 2 && selected.size(0) == NR && selected.is_contiguous(), "exl3_dec_router_rows: selected [NR, topk]");
     const int topk = selected.size(1);
-    TORCH_CHECK(NR >= 2 && NR <= 4, "exl3_dec_router_rows: NR in 2..4");
+    TORCH_CHECK(NR >= 2 && NR <= 8, "exl3_dec_router_rows: NR in 2..8");
     TORCH_CHECK(H % ROUTER_KCHUNK == 0 && E <= 320 && E % 8 == 0 && topk <= 64 && topk <= E, "exl3_dec_router_rows: unsupported shape");
     TORCH_CHECK(selected.dtype() == at::kLong && weights.dtype() == at::kHalf && weights.is_contiguous() && weights.numel() == NR * topk, "exl3_dec_router_rows: outputs");
     TORCH_CHECK(scratch.numel() >= (int64_t) NR * (H / ROUTER_KCHUNK) * E && counters.numel() > CTR_ROUTER, "exl3_dec_router_rows: workspace");
@@ -3040,7 +3223,11 @@ void exl3_dec_router_rows
         scratch.data_ptr<float>(), counters.data_ptr<int>(), H, E, topk, (float) scale
     if (NR == 2) { router_rows_kernel<2><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
     else if (NR == 3) { router_rows_kernel<3><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
-    else { router_rows_kernel<4><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else if (NR == 4) { router_rows_kernel<4><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else if (NR == 5) { router_rows_kernel<5><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else if (NR == 6) { router_rows_kernel<6><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else if (NR == 7) { router_rows_kernel<7><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
+    else { router_rows_kernel<8><<<H / ROUTER_KCHUNK, 256, 0, stream>>>(ROUTER_ROWS_ARGS); }
     #undef ROUTER_ROWS_ARGS
     cuda_check(cudaPeekAtLastError());
 }
@@ -3071,7 +3258,7 @@ void exl3_dec_router_norm
     const int E = gate.size(1);
     TORCH_CHECK(H > 0 && xa.numel() % H == 0, "exl3_dec_router_norm: xa size");
     const int NR = xa.numel() / H;
-    TORCH_CHECK(NR >= 1 && NR <= ROUTER_NORM_MAX_ROWS, "exl3_dec_router_norm: rows 1..8");
+    TORCH_CHECK(NR >= 1 && NR <= ROUTER_NORM_MAX_ROWS, "exl3_dec_router_norm: rows 1..ROUTER_NORM_MAX_ROWS");
     TORCH_CHECK((xa.dtype() == at::kHalf || xa.dtype() == at::kFloat) && xa.is_contiguous() && xa.numel() == (int64_t) NR * H,
                 "exl3_dec_router_norm: xa fp16/fp32 [NR, H]");
     TORCH_CHECK(r.dtype() == at::kFloat && r.is_contiguous() && r.numel() == (int64_t) NR * H, "exl3_dec_router_norm: r fp32 [NR, H]");

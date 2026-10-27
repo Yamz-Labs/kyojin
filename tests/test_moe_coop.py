@@ -134,8 +134,8 @@ def run_case(seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = False, lim
     gu_u = torch.empty((smax, 1, I), dtype = gu_dt, device = DEV)
     act_out = torch.empty((smax, 1, I), dtype = torch.half, device = DEV)
     d_out = torch.empty((smax, 1, Ho), dtype = torch.float, device = DEV)
-    out = torch.full((8, H_out), float("nan"), dtype = torch.float, device = DEV)
-    ctr = torch.zeros((smax * (I // 128) + 8 * (Ho // 128) + 2 * smax + 3,), dtype = torch.int, device = DEV)
+    out = torch.full((max(8, bsz), H_out), float("nan"), dtype = torch.float, device = DEV)
+    ctr = torch.zeros((smax * (I // 128) + max(8, bsz) * (Ho // 128) + 2 * smax + 3,), dtype = torch.int, device = DEV)
     had_g = torch.empty((slots, Hi), dtype = torch.half, device = DEV); had_u = torch.empty_like(had_g)
     gtabs = gate.tabs if gated else up.tabs
     gK = gate.K if gated else up.K
@@ -238,7 +238,36 @@ def test_batch_extremes():
     run_case(15, 2, 2, 2, 2, bsz = 8, topk = 32, E = 40, H = 512, Hi = 512, I = 384, Ho = 512, H_out = 512)
 
 
+def test_many_rows():
+    # 9..32 rows (verify batches of several requests): duplicates grouped into runs of ROWS, runs spanning the run table,
+    # shared expert, expert-range masking, K widths on both register-dequant and staged paths
+    run_case(30, 3, 3, 3, 2, bsz = 9, topk = 6, E = 24, H = 512, Hi = 512, I = 256, Ho = 512, H_out = 512, shared = "gated")
+    run_case(31, 4, 4, 4, 1, bsz = 16, topk = 6, E = 20, H = 512, Hi = 512, I = 256, Ho = 512, H_out = 512)
+    run_case(32, 2, 2, 5, 2, bsz = 32, topk = 8, E = 64, H = 256, Hi = 256, I = 256, Ho = 256, H_out = 256, shared = "plain")
+    run_case(33, 4, 4, 4, 1, bsz = 32, topk = 8, E = 10, H = 256, Hi = 256, I = 256, Ho = 256, H_out = 256, min_e = 2, max_e = 8)
+    run_case(34, 6, 6, 6, 0, bsz = 24, topk = 4, E = 5, H = 256, Hi = 256, I = 256, Ho = 256, H_out = 256, bias = True)
+
+
 def test_odd_shapes():
     # k-slices not divisible by the 16-warp split, several column groups
     run_case(16, 4, 4, 4, 1, H = 640, Hi = 640, I = 896, Ho = 640, H_out = 640)
     run_case(17, 6, 6, 6, 2, H = 384, Hi = 384, I = 1152, Ho = 384, H_out = 384)
+
+
+def test_decode_k_split():
+    # Flint-like batch 1: 48 gate/up units fit one per SM. Default: unsplit unit (per-unit grid); with
+    # EXL3_MOE_COOP_KSPLIT_A=3 (see test_decode_k_split_opt_in) the gate/up stage shares each unit's k loop over
+    # blocks (fp32 partial rows) on Ampere; shared-expert merge and mixed widths on top
+    run_case(28, 3, 3, 3, 2, H = 2048, Hi = 2048, I = 512, Ho = 2048, H_out = 2048, E = 8, topk = 6, bsz = 1)
+    run_case(29, 4, 4, 5, 2, H = 2048, Hi = 2048, I = 512, Ho = 2048, H_out = 2048, E = 8, topk = 6, bsz = 1, shared = "gated")
+
+
+def test_decode_k_split_opt_in():
+    # The mode is read once per process: rerun the shape test with the k-split enabled
+    if os.environ.get("EXL3_MOE_COOP_KSPLIT_A") == "3":
+        pytest.skip("already running with the k-split")
+    import subprocess, sys
+    env = dict(os.environ, EXL3_MOE_COOP_KSPLIT_A = "3")
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", f"{__file__}::test_decode_k_split"],
+                       env = env, capture_output = True, text = True)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]

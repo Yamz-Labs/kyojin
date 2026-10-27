@@ -64,6 +64,9 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
     int rows, int qkv_width, int key_heads, int value_heads, float query_scale, int output_bf16
 #ifdef KYO_RAW
     , float* __restrict__ ck0, int ck_row0, float* __restrict__ ck1, int ck_row1   // state entering row ck_row* (multiple of 16), or row -1
+    , float* __restrict__ ck2, int ck_row2, float* __restrict__ ck3, int ck_row3
+    , float* __restrict__ ck4, int ck_row4, float* __restrict__ ck5, int ck_row5
+    , float* __restrict__ ck6, int ck_row6, float* __restrict__ ck7, int ck_row7   // 8 slots: dense prompt-tail checkpoints
 #endif
 #ifdef NPU_TRUNK_ARENA
     , int z_pitch, int z_col0
@@ -273,8 +276,10 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
         }
         GC_BARRIER();  // chunk inputs consumed; out_s complete
 #ifdef KYO_RAW
-        if (t0 + 16 == ck_row0 || t0 + 16 == ck_row1) {   // prefix-cache checkpoint: S after this chunk = state entering row t0 + 16
-            float* ck = t0 + 16 == ck_row0 ? ck0 : ck1;
+        const int tn = t0 + 16;
+        float* ck = tn == ck_row0 ? ck0 : tn == ck_row1 ? ck1 : tn == ck_row2 ? ck2 : tn == ck_row3 ? ck3 :
+                    tn == ck_row4 ? ck4 : tn == ck_row5 ? ck5 : tn == ck_row6 ? ck6 : tn == ck_row7 ? ck7 : nullptr;
+        if (ck != nullptr) {   // prefix-cache checkpoint: S after this chunk = state entering row t0 + 16
 #pragma unroll
             for (int t = 0; t < 8; ++t)
 #pragma unroll

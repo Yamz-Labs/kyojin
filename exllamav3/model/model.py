@@ -8,7 +8,8 @@ from ..util.memory import free_mem
 from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
-from ..cache.recurrent_util import advance_recurrent_states
+from ..cache.recurrent_util import advance_recurrent_states, prepare_for_recurrence
+from . import cuda_graph as _cuda_graph
 import os
 
 class Model(Model_TPMixin, Model_LSMixin):
@@ -29,7 +30,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.active_devices = []
         self.output_device = None
         self.cache_weakrefs = {}
-        self.recurrent_state_cls = None
+        self._recurrent_state_cls = None
         self.draft_verifier_params = {}
 
         # Index of last layer that affects KV cache, used during prefill
@@ -66,12 +67,39 @@ class Model(Model_TPMixin, Model_LSMixin):
         return self._get_cache_layers
 
 
+    @property
+    def recurrent_state_cls(self):
+        """The job state class. A model with no recurrent state of its own (plain attention) whose attention modules declare
+        a KVWIN ring gets KVWinState: a job state that only carries the rings."""
+        c = self._recurrent_state_cls
+        if c is None and self.kvwin_ring_only():
+            from ..cache.kvwin import KVWinState
+            return KVWinState
+        return c
+
+    @recurrent_state_cls.setter
+    def recurrent_state_cls(self, value):
+        self._recurrent_state_cls = value
+
+    def kvwin_ring_only(self) -> bool:
+        """True when the only recurrent layers are KVWIN rings (no GDN / SWA / conv state)."""
+        return self._recurrent_state_cls is None and bool(self._get_recurrent_layers)
+
     @cached_property
     def _get_recurrent_layers(self):
         return [m for m in self if m.caps.get("recurrent_cache")]
 
     def get_recurrent_layers(self):
         return self._get_recurrent_layers
+
+    @cached_property
+    def _get_checkpoint_layers(self):
+        return [m for m in self._get_recurrent_layers if not getattr(getattr(m, "layer_state_cls", None), "kvwin", False)]
+    def get_checkpoint_layers(self):
+        """Recurrent layers whose state shapes the checkpoint cadence (GDN / KDA / SWA / conv): the recurrent layers without the
+        KVWIN rings, which ride the job state but are not a state kind. Path eligibility checks (GDN no-tail, big tail, wide
+        prefill chunks) must see the same layers with the ring declared as without it."""
+        return self._get_checkpoint_layers
 
     @cached_property
     def _get_prefetch_layers(self):
@@ -200,6 +228,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         if params is None:
             params = {}
         x = self.prepare_inputs(input_ids, params)
+        if params.get("recurrent_states") is not None and "recurrent_slots" not in params:
+            prepare_for_recurrence(input_ids, params, self)   # ring-only models: their prepare_inputs does not
         if self.loaded_tp:
             y = self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
             advance_recurrent_states(input_ids, params, self)
@@ -225,11 +255,19 @@ class Model(Model_TPMixin, Model_LSMixin):
         if params is None:
             params = {}
         x = self.prepare_inputs(input_ids, params)
+        if params.get("recurrent_states") is not None and "recurrent_slots" not in params:
+            prepare_for_recurrence(input_ids, params, self)   # ring-only models: their prepare_inputs does not
         if self.loaded_tp:
             y = self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
             advance_recurrent_states(input_ids, params, self)
             return y
         else:
+            if _cuda_graph.CUDA_GRAPH_ENABLED:
+                # opt-in whole-forward CUDA graph (decode only); None = declined, run eager below
+                y = _cuda_graph.maybe_forward(self, x, params)
+                if y is not None:
+                    advance_recurrent_states(input_ids, params, self)
+                    return y
             for m in self._get_prefetch_layers:
                 m.prefetch(x, params)
             y = self.forward_ls(x, params)
@@ -238,6 +276,7 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     def unload(self):
+        _cuda_graph.purge(self)
         for module in self.modules:
             module.unload()
         # The loader's open slab blocks must not outlive the tensors sliced from them
@@ -492,6 +531,12 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         # Release all global shared tensors (refs still held by modules until model is unloaded)
         g_tensor_cache.drop_all()
+
+        # Tiered experts (EXL3_EXPERT_BUDGET_GIB): the layers only registered their experts while loading; allocate
+        # the slot pools now, after the cache and every other allocation of the load
+        _st = getattr(self.config, "_expert_store", None)
+        if _st is not None:
+            _st.finalize()
 
         # Mark every attached cache usable.
         for ref in self.cache_weakrefs.values():

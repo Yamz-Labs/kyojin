@@ -39,6 +39,9 @@ class RecurrentCache(OrderedDict):
         # EXL3_NC2_ASYNC_STASH: stashes whose D2H is still in flight (see settle)
         self._pending = []
         self._pin_pool = {}  # (shape, dtype) -> pinned host tensors free for reuse
+        # page hash -> exactness tag of the checkpoint stashed under it (Job._stash_exact); outside the stash dict, whose
+        # asynchronous finisher thread is still writing to it
+        self.exact_meta = OrderedDict()
         self._worker = None
         self.metrics = {
             "stash_evictions": 0,           # checkpoints dropped by LRU pressure
@@ -149,17 +152,20 @@ class RecurrentCache(OrderedDict):
                             self.metrics["stash_evictions_live_kv"] += 1
 
                 self.metrics["stash_evictions"] += 1
+                self.exact_meta.pop(popped_key, None)
                 note_freed(popped["checkpoint_size"])
                 if self.model.loaded_tp:
                     self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))
 
             self[key] = stashed_state
+            self.exact_meta.pop(key, None)    # a tag belongs to the stash it was made for (Job._stash_exact sets it after put)
             self.update_total_size()
 
 
     def drop(self, key) -> None:
         """Remove one checkpoint (rolling-checkpoint cleanup)."""
         popped = self.pop(key, None)
+        self.exact_meta.pop(key, None)
         if popped is None:
             return
         note_freed(popped["checkpoint_size"])
@@ -180,6 +186,7 @@ class RecurrentCache(OrderedDict):
         stranded = [k for k in self if not self.pagetable.is_resumable(k)]
         for k in stranded:
             popped = self.pop(k)
+            self.exact_meta.pop(k, None)
             self.metrics["stash_pruned"] += 1
             note_freed(popped["checkpoint_size"])
             if self.model.loaded_tp:

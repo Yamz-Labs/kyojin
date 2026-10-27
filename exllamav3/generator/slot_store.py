@@ -79,12 +79,12 @@ class SlotStore:
             tensors += c.get_all_tensors()
         return tensors
 
-    def _resident_chain(self) -> tuple[list, list]:
-        """Hashes and live pages of the full pages of the last prompt still resident in the PageTable."""
+    def _resident_chain(self, ids=None) -> tuple[list, list]:
+        """Hashes and live pages of the full pages of the last prompt (or `ids`) still resident in the PageTable."""
         pt = self.generator.pagetable
         from .pagetable import tensor_hash_checksum
         hashes, pages, prev = [], [], None
-        ids = self.ids.view(1, -1)
+        ids = (self.ids if ids is None else ids).view(1, -1)
         for pi in range(ids.shape[1] // PAGE_SIZE):
             h = tensor_hash_checksum(ids[:, pi * PAGE_SIZE:(pi + 1) * PAGE_SIZE], prev)
             page = pt.referenced_pages.get(h) or pt.unreferenced_pages.get(h)
@@ -95,10 +95,10 @@ class SlotStore:
             prev = h
         return hashes, pages
 
-    def _find_tail(self, hashes: list):
-        """Newest prompt-end checkpoint of the slot prompt whose partial page still holds its K/V: (page number, entry)."""
+    def _find_tail(self, hashes: list, ids=None):
+        """Newest prompt-end checkpoint of the slot prompt (or `ids`) whose partial page still holds its K/V: (page number, entry)."""
         g = self.generator
-        ids = self.ids.view(1, -1)
+        ids = (self.ids if ids is None else ids).view(1, -1)
         for e in reversed(getattr(g, "tail_ckpts", [])):
             ph = e["prev_hash"]
             if ph is None:
@@ -242,9 +242,10 @@ class SlotStore:
         pt = g.pagetable
         ids = tail["ids"]
         L = ids.shape[-1]
-        for e in list(g.tail_ckpts):                    # same content already in memory: the restored copy replaces it
-            if e["prev_hash"] == ph and e["ids"].shape == ids.shape and torch.equal(e["ids"].cpu(), ids):
-                g.tail_ckpts.remove(e)
+        # same content already in memory: the restored copy replaces it. By identity: list.remove() compares the entries as
+        # dicts, and two entries with the same prev_hash but ids of other lengths raise "The size of tensor a must match"
+        g.tail_ckpts[:] = [e for e in g.tail_ckpts
+                           if not (e["prev_hash"] == ph and e["ids"].shape == ids.shape and torch.equal(e["ids"].cpu(), ids))]
         if order is None:
             order = pt.build_eviction_order(protected)
         while order[0].ref_count:

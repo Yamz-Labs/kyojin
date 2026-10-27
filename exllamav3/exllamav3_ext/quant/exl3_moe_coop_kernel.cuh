@@ -20,6 +20,7 @@
 //
 // The grid is sized for the no-duplicates case (slots x groups x projections); blocks past the
 // actual run count exit at once.
+// Stream-K (gate/up stage, ksplit < 0, SkGeom below): a fixed grid shares the (unit, k-slice) work evenly.
 
 #include <cuda_fp16.h>
 #include "../util.h"
@@ -33,7 +34,13 @@ namespace exl3_moe_coop_ns {
 
 constexpr int WK = 16;                          // k-split (warps per block)
 constexpr int WNT = MOE_COOP_WNT;               // adjacent n-tiles per warp
-constexpr int PF = 4;                           // prefetch ring depth
+// Prefetch ring depth. On Ampere (64 registers per thread at 2 blocks per SM) a deeper ring spills and measured slower at every
+// width (RTX 3090); other architectures keep the original depth
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 890
+constexpr int PF = 1;
+#else
+constexpr int PF = 4;
+#endif
 constexpr int FOLD = 4;                         // fp16 -> fp32 fold cadence
 constexpr int THREADS = WK * 32;
 constexpr int COLS = WNT * 16;                  // columns per warp
@@ -494,7 +501,7 @@ __device__ __forceinline__ void gemv_tile
                 exl3_gemv_ns::mma_ab_h(a01, a23, f1, ch[t][1]);
             }
 
-            if ((d + 1) % FOLD == 0 || i + 1 == myn)
+            if ((i + 1) % FOLD == 0 || i + 1 == myn)
             {
                 #pragma unroll
                 for (int t = 0; t < WNT; ++t)
@@ -542,19 +549,106 @@ __device__ __forceinline__ void gemv_tile
     __syncthreads();
 }
 
-// Completion counter: every thread fences its own stores, then one thread arrives. Returns true
-// (block-uniform) for the last arriving block, which may then read the other blocks' results
-// through L2 (load_*_cg)
-__device__ __forceinline__ bool arrive_last(int* counter, int expected, int* sh_flag)
+// Completion counter: every thread fences its own stores, then one thread arrives (adding a
+// positive weight). Returns true (block-uniform) for the last arriving block, which may then read
+// the other blocks' results through L2 (load_*_cg)
+__device__ __forceinline__ bool arrive_last(int* counter, int expected, int* sh_flag, int add = 1)
 {
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0)
-        *sh_flag = (atomicAdd(counter, 1) == expected - 1);
+        *sh_flag = (atomicAdd(counter, add) == expected - add);
     __syncthreads();
     bool last = *sh_flag;
     if (last) __threadfence();
     return last;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Stream-K hybrid, kernel A (launcher ksplit_a = -(S + 1), grid = resident blocks x SMs): the per-unit grid
+// leaves most SMs with half the work of the busiest at bsz 1 (96..128 units on 82 SMs, 2 resident).
+// Blocks [0, S) (S = SMs) take whole units b, b + S, ... below D = U - U % S, one segment each;
+// blocks [S, grid) share the k-slices of the R = U - D remaining units in equal contiguous shares.
+// U <= S: whole units only. S = 0: every unit shared (pure stream-K). A shared unit's k-range spans
+// n_seg blocks; segment q (= block - the unit's first block) writes an fp32 partial row (sk_rows) and
+// the last arrival sums them in q order (a whole unit writes its gu row as on the per-unit grid). Arrivals are weighted (segment 0 adds SK_C - n_seg + 1, the
+// others 1) so the expected count is SK_C per unit whatever the split. WIDE geometry only
+
+constexpr int SK_C = 1 << 16;
+
+struct SkGeom
+{
+    int G;                              // blocks sharing the remainder (0: per-unit grid)
+    int KS;                             // k-slices per unit
+    long long T;                        // R * KS
+    int S;                              // whole-unit blocks = first sharing block
+    int D;                              // first shared unit
+    // Sharing block (relative) owning slice s: the largest b with floor(b * T / G) <= s
+    __device__ __forceinline__ int owner(long long s) const { return (int) (((s + 1) * G - 1) / T); }
+    __device__ __forceinline__ int first(int u) const { return owner((long long) u * KS); }
+    __device__ __forceinline__ int nseg(int u) const { return owner((long long) (u + 1) * KS - 1) - first(u) + 1; }
+    __device__ __forceinline__ long long start(int b) const { return (long long) b * T / G; }
+    // Segments of unit u (absolute)
+    __device__ __forceinline__ int nseg_u(int u) const { return u < D ? 1 : nseg(u - D); }
+};
+
+// Partial rows per projection for the shared units: their k-segment partials are kept in fp32 in
+// the down stage's d_out scratch (idle until kernel B runs), laid out [projection][q][slot][I]
+__host__ __device__ inline int sk_rows(int slots_max, int slots, int nproj, int I, int Ho)
+{
+    return (int) (((long long) slots_max * Ho) / ((long long) nproj * slots * I));
+}
+
+// Shares of at least pmin slices keep n_seg <= sk_rows (launched only with sk_rows >= 2), and >= 4
+// slices per share (one per k-warp)
+__device__ __forceinline__ SkGeom sk_geom(const MoeCoopParams& p, int S, int grid, int U, int KS)
+{
+    SkGeom g;
+    g.S = S;
+    g.D = S == 0 ? 0 : (U <= S ? U : U - U % S);
+    g.KS = KS;
+    g.T = (long long) (U - g.D) * KS;
+    const int nq = sk_rows(p.slots_max, p.bsz * p.topk, p.gated ? 2 : 1, p.I, p.Ho);
+    const int pmin = max(4, CEIL_DIVIDE(KS, nq - 1));
+    g.G = (int) max(1LL, min((long long) (grid - S), g.T / pmin));
+    return g;
+}
+
+// The block's current unit segment, written by thread 0 of the driver into shared memory and read
+// by every thread; read again after the GEMV so that none of it stays live across the main loop
+enum
+{
+    SEG_RUN, SEG_GROUP, SEG_PROJ, SEG_K0, SEG_K1, SEG_Q,  // unit, k-slice range (K0 < 0: done), partial row
+    SEG_ADD, SEG_EXP, SEG_NPG, SEG_NPU,                     // arrival weight / expected sum, partial rows to sum
+    SEG_NEXT,                                               // stream-K: next unit / slice of the block (-1: first)
+    SEG_N
+};
+
+// Stream-K: the block's next unit and k-range [k0, k1), its partial row q and segment count;
+// false when the block is done. prev: SEG_NEXT (-1 first, else the unit / slice after the last)
+__device__ __forceinline__ bool sk_next(const SkGeom& g, int prev, int& u, int& k0, int& k1, int& q, int& ns, int& next)
+{
+    if ((int) blockIdx.x < g.S)
+    {
+        u = prev < 0 ? (int) blockIdx.x : prev;
+        if (u >= g.D) return false;
+        k0 = 0; k1 = g.KS; q = 0; ns = 1;
+        next = u + g.S;
+        return true;
+    }
+    const int b = blockIdx.x - g.S;
+    const long long end = b < g.G ? g.start(b + 1) : 0;
+    const long long x = prev < 0 ? g.start(min(b, g.G)) : prev;
+    if (x >= end) return false;
+    const int ur = (int) (x / g.KS);
+    const long long u_end = (long long) (ur + 1) * g.KS;
+    u = g.D + ur;
+    k0 = (int) (x - (long long) ur * g.KS);
+    k1 = (int) (min(u_end, end) - (long long) ur * g.KS);
+    q = b - g.first(ur);
+    ns = g.nseg(ur);
+    next = (int) u_end;
+    return true;
 }
 
 // Number of active slots of a token
@@ -672,90 +766,137 @@ __global__ void exl3_moe_coop_rot_kernel(const MoeCoopParams p);
 // Kernel A: gate/up GEMV per (expert run, group, projection) with the chunk epilogue (rotation,
 // bias, activation, down-input rotation) by the last arrival per (slot, chunk)
 
-template <int bits, int cb, bool WIDE>
-__global__ __launch_bounds__(THREADS)
-void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+// Thread 0: the block's next segment into seg[] (one per block on the per-unit grid; the shares of
+// stream-K, unit u = (run * ng + group) * nproj + projection)
+template <bool WIDE>
+__device__ __forceinline__ void a_next_seg(const MoeCoopParams& p, int* seg)
 {
-    constexpr int TCOLS = tile_cols<WIDE>();
+    const int nproj = p.gated ? 2 : 1;
+    const int ng = p.I / tile_cols<WIDE>();
+    const int KS = p.Hi / 16;
+    const int prev = seg[SEG_NEXT];
+    if (p.ksplit_a > 0)
+    {
+        if (prev >= 0) { seg[SEG_K0] = -1; return; }
+        const int item = blockIdx.x;
+        const int rem = item / nproj;
+        const int ks = rem % p.ksplit_a;                 // split-k index: partial output rows
+        const int rem2 = rem / p.ksplit_a;
+        seg[SEG_RUN] = rem2 / ng;
+        seg[SEG_GROUP] = rem2 % ng;
+        seg[SEG_PROJ] = item % nproj;
+        seg[SEG_K0] = KS * ks / p.ksplit_a;
+        seg[SEG_K1] = KS * (ks + 1) / p.ksplit_a;
+        seg[SEG_Q] = ks;
+        seg[SEG_ADD] = 1;
+        seg[SEG_EXP] = tile_gpc<WIDE>() * nproj * p.ksplit_a;
+        seg[SEG_NPG] = p.ksplit_a;
+        seg[SEG_NPU] = p.ksplit_a;
+        seg[SEG_NEXT] = 0;
+        return;
+    }
+    const int n_runs = p.a_global ? p.runs[0] : p.bsz * p.topk;
+    const SkGeom g = sk_geom(p, -p.ksplit_a - 1, gridDim.x, n_runs * ng * nproj, KS);
+    int u, k0, k1, q, ns, next;
+    if (!sk_next(g, prev, u, k0, k1, q, ns, next)) { seg[SEG_K0] = -1; return; }
+    const int proj = u % nproj;
+    seg[SEG_RUN] = u / nproj / ng;
+    seg[SEG_GROUP] = (u / nproj) % ng;
+    seg[SEG_PROJ] = proj;
+    seg[SEG_K0] = k0;
+    seg[SEG_K1] = k1;
+    seg[SEG_Q] = q;
+    seg[SEG_ADD] = q == 0 ? SK_C - (ns - 1) : 1;
+    seg[SEG_EXP] = nproj * SK_C;
+    seg[SEG_NPG] = p.gated ? g.nseg_u(u - proj) : 0;
+    seg[SEG_NPU] = g.nseg_u(u - proj + nproj - 1);
+    seg[SEG_NEXT] = next;
+}
+
+// One segment: a unit's k-range into partial rows q, arrivals, chunk epilogue of the last arrival
+template <int bits, int cb, bool WIDE>
+__device__ __forceinline__ void a_unit
+(
+    const MoeCoopParams& p, const int* seg,
+    half* sh_A, float* sh_red, uint32_t* sh_stage, int* sh_flag, int* sh_res, int* sh_rows
+)
+{
     constexpr int GPC = tile_gpc<WIDE>();
     constexpr int CPB = tile_cpb<WIDE>();
-    extern __shared__ uint32_t smem_dyn[];
-    half* sh_A = (half*) smem_dyn;
-    float* sh_red = (float*) (smem_dyn + p.Hi / 2);
-    uint32_t* sh_stage = smem_dyn + p.Hi / 2 + WK * ROWS * COLS;
-    __shared__ int sh_flag;
-    __shared__ int sh_res[4];
-    __shared__ int sh_rows[ROWS];
-
     const int warp = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
-    const int nproj = p.gated ? 2 : 1;
-    const int ng = p.I / TCOLS;
+    const int ng = p.I / tile_cols<WIDE>();
 
-    // Reset the down stage's counters for this call (its previous use finished in stream order)
-    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
-        p.ctr_b[i] = 0;
-
-    const int item = blockIdx.x;
-    const bool is_gate = p.gated && (item % nproj) == 0;
-    const int rem = item / nproj;
-    const int ks = rem % p.ksplit_a;                 // split-k index: partial output rows
-    const int rem2 = rem / p.ksplit_a;
-    const int run_idx = rem2 / ng;
-    const int group = rem2 % ng;
+    const bool is_gate = p.gated && seg[SEG_PROJ] == 0;
+    const int run_idx = seg[SEG_RUN];
     int nrows = 0;
     if (!read_run(p, run_idx, sh_rows, nrows, sh_res))
     {
         // bsz 1: an inactive slot's blocks (up projection, split 0) write the output chunks of an
         // empty token row, one warp per chunk, strided by the number of gate/up groups
-        if (!p.a_global && run_idx < p.bsz * p.topk && !is_gate && ks == 0 && run_idx % p.topk == 0)
+        if (!p.a_global && run_idx < p.bsz * p.topk && !is_gate && seg[SEG_Q] == 0 && run_idx % p.topk == 0)
         {
             const int row = run_idx / p.topk;
             if (token_active_slots(p, row) == 0)
-                for (int oc = group + warp * ng; oc < p.Ho / 128; oc += ng * WK)
+                for (int oc = seg[SEG_GROUP] + warp * ng; oc < p.Ho / 128; oc += ng * WK)
                     write_empty_row_chunk(p, row, oc, lane);
         }
         return;
     }
-    const int local = slot_info(p, sh_rows[0]).local;
-    const int kslices_all = p.Hi / 16;
-    const int k_begin = kslices_all * ks / p.ksplit_a;
-    const int k_end = kslices_all * (ks + 1) / p.ksplit_a;
-
-    const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[local];
-    const half2* A2;
-    size_t a_stride2;
-    if (p.a_global)
-    {
-        A2 = (const half2*) (is_gate ? p.had_g : p.had_u);
-        a_stride2 = (size_t) p.Hi / 2;
-    }
-    else
-    {
-        // bsz 1: every run is a single slot; rotate its input into shared memory here. A zero
-        // row stride makes the tile read it whatever the slot index (which still selects the C row)
-        const SlotInfo si = slot_info(p, sh_rows[0]);
-        for (int c = warp; c < p.Hi / 128; c += WK)
-            rotate_chunk(p, si.row, suh, c, sh_A, lane);
-        __syncthreads();
-        A2 = (const half2*) sh_A;
-        a_stride2 = 0;
-    }
 
     {
+        const int local = slot_info(p, sh_rows[0]).local;
+        const int k_begin = seg[SEG_K0];
+        const int k_end = seg[SEG_K1];
+        const half* suh = (const half*) (is_gate ? p.g_suh : p.u_suh)[local];
+        const half2* A2;
+        size_t a_stride2;
+        if (p.a_global)
+        {
+            A2 = (const half2*) (is_gate ? p.had_g : p.had_u);
+            a_stride2 = (size_t) p.Hi / 2;
+        }
+        else
+        {
+            // bsz 1: every run is a single slot; rotate the input chunks of the k-range into shared
+            // memory here. A zero row stride makes the tile read it whatever the slot index (which
+            // still selects the C row)
+            const SlotInfo si = slot_info(p, sh_rows[0]);
+            for (int c = k_begin / 8 + warp; c < CEIL_DIVIDE(k_end, 8); c += WK)
+                rotate_chunk(p, si.row, suh, c, sh_A, lane);
+            __syncthreads();
+            A2 = (const half2*) sh_A;
+            a_stride2 = 0;
+        }
+
         const uint32_t* B32 = (const uint32_t*) (is_gate ? p.g_trellis : p.u_trellis)[local];
-        // Partial output rows of split ks live at slot + ks * slots (ksplit * slots <= slots_max)
-        const size_t part = (size_t) ks * (p.bsz * p.topk) * p.I * (p.gu_f32 ? 4 : 2);
-        void* C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
-        gemv_tile<bits, cb, WIDE>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, p.gu_f32, k_begin, k_end, p.I / 16, group, sh_red, sh_stage);
+        const int slots = p.bsz * p.topk;
+        void* C;
+        bool c_f32 = p.gu_f32;
+        if ((p.ksplit_a < 0 && seg[is_gate ? SEG_NPG : SEG_NPU] > 1) || p.ksplit_a > 1)
+        {
+            // Stream-K segment of a shared unit, or a split-k block: fp32 partial row in the d_out scratch
+            const int nproj = p.gated ? 2 : 1;
+            const int pi = is_gate ? 0 : nproj - 1;
+            C = (void*) (p.d_out + (size_t) (pi * sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) + seg[SEG_Q]) * slots * p.I);
+            c_f32 = true;
+        }
+        else
+        {
+            // Partial output rows of split q live at slot + q * slots (splits * slots <= slots_max)
+            const size_t part = (size_t) seg[SEG_Q] * slots * p.I * (p.gu_f32 ? 4 : 2);
+            C = (void*) (((char*) (is_gate ? p.gu_g : p.gu_u)) + part);
+        }
+        gemv_tile<bits, cb, WIDE>(B32, A2, a_stride2, sh_rows, nrows, C, p.I, c_f32, k_begin, k_end, p.I / 16, seg[SEG_GROUP], sh_red, sh_stage);
     }
 
+    const int local = slot_info(p, sh_rows[0]).local;
     for (int r = 0; r < nrows; ++r)
     for (int j = 0; j < CPB; ++j)
     {
         const int s = sh_rows[r];
-        const int chunk = (group * CPB + j) / GPC;
-        if (!arrive_last(p.ctr_a + (size_t) s * (p.I / 128) + chunk, GPC * nproj * p.ksplit_a, &sh_flag)) continue;
+        const int chunk = (seg[SEG_GROUP] * CPB + j) / GPC;
+        if (!arrive_last(p.ctr_a + (size_t) s * (p.I / 128) + chunk, seg[SEG_EXP], sh_flag, seg[SEG_ADD])) continue;
         if (p.dbg & 1) continue;
         if (warp == 0)
         {
@@ -763,20 +904,33 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
             const size_t off = (size_t) s * p.I + col;
             const size_t pstride = (size_t) (p.bsz * p.topk) * p.I;
 
-            // Sum of the split-k partials (fixed order)
-            auto load_sum = [&] (const void* buf, float& v0, float& v1, float& v2, float& v3)
+            // Sum of the split-k partials (fixed order); stream-K shared units: fp32 rows in d_out
+            auto load_sum = [&] (const void* buf, int np, int pi, float& v0, float& v1, float& v2, float& v3)
             {
                 v0 = v1 = v2 = v3 = 0.0f;
-                for (int q = 0; q < p.ksplit_a; ++q)
+                if ((p.ksplit_a < 0 || p.ksplit_a > 1) && np > 1)
+                {
+                    const int nproj = p.gated ? 2 : 1;
+                    const int slots = p.bsz * p.topk;
+                    const float* part = p.d_out + (size_t) pi * sk_rows(p.slots_max, slots, nproj, p.I, p.Ho) * pstride + off;
+                    for (int qq = 0; qq < np; ++qq)
+                    {
+                        float t0, t1, t2, t3;
+                        load_f4_cg(part + qq * pstride, t0, t1, t2, t3);
+                        v0 += t0; v1 += t1; v2 += t2; v3 += t3;
+                    }
+                    return;
+                }
+                for (int qq = 0; qq < np; ++qq)
                 {
                     float t0, t1, t2, t3;
-                    if (p.gu_f32) load_f4_cg(((const float*) buf) + q * pstride + off, t0, t1, t2, t3);
-                    else          load_h4_cg(((const half*) buf) + q * pstride + off, t0, t1, t2, t3);
+                    if (p.gu_f32) load_f4_cg(((const float*) buf) + qq * pstride + off, t0, t1, t2, t3);
+                    else          load_h4_cg(((const half*) buf) + qq * pstride + off, t0, t1, t2, t3);
                     v0 += t0; v1 += t1; v2 += t2; v3 += t3;
                 }
             };
             float u0, u1, u2, u3;
-            load_sum(p.gu_u, u0, u1, u2, u3);
+            load_sum(p.gu_u, seg[SEG_NPU], p.gated ? 1 : 0, u0, u1, u2, u3);
             had128(u0, u1, u2, u3, lane);
             scale_h4(((const half*) p.u_svh[local]) + col, u0, u1, u2, u3);
             if (p.u_bias) add_h4(((const half*) p.u_bias[local]) + col, u0, u1, u2, u3);
@@ -784,7 +938,7 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
             float g0 = u0, g1 = u1, g2 = u2, g3 = u3;
             if (p.gated)
             {
-                load_sum(p.gu_g, g0, g1, g2, g3);
+                load_sum(p.gu_g, seg[SEG_NPG], 0, g0, g1, g2, g3);
                 had128(g0, g1, g2, g3, lane);
                 scale_h4(((const half*) p.g_svh[local]) + col, g0, g1, g2, g3);
                 if (p.g_bias) add_h4(((const half*) p.g_bias[local]) + col, g0, g1, g2, g3);
@@ -799,6 +953,34 @@ void exl3_moe_coop_a_kernel(const MoeCoopParams p)
             had128(a0, a1, a2, a3, lane);
             store_h4(p.act_out + off, a0, a1, a2, a3);
         }
+        __syncthreads();
+    }
+}
+
+template <int bits, int cb, bool WIDE>
+__global__ __launch_bounds__(THREADS, 2)     // 2 resident blocks per SM (<= 64 registers)
+void exl3_moe_coop_a_kernel(const MoeCoopParams p)
+{
+    extern __shared__ uint32_t smem_dyn[];
+    half* sh_A = (half*) smem_dyn;
+    float* sh_red = (float*) (smem_dyn + p.Hi / 2);
+    uint32_t* sh_stage = smem_dyn + p.Hi / 2 + WK * ROWS * COLS;
+    __shared__ int sh_flag;
+    __shared__ int sh_res[4];
+    __shared__ int sh_rows[ROWS];
+    __shared__ int sh_seg[SEG_N];
+
+    // Reset the down stage's counters for this call (its previous use finished in stream order)
+    for (int i = blockIdx.x * THREADS + threadIdx.x; i < p.ctr_b_len; i += gridDim.x * THREADS)
+        p.ctr_b[i] = 0;
+
+    if (threadIdx.x == 0) sh_seg[SEG_NEXT] = -1;
+    for (;;)
+    {
+        if (threadIdx.x == 0) a_next_seg<WIDE>(p, sh_seg);
+        __syncthreads();
+        if (sh_seg[SEG_K0] < 0) break;
+        a_unit<bits, cb, WIDE>(p, sh_seg, sh_A, sh_red, sh_stage, &sh_flag, sh_res, sh_rows);
         __syncthreads();
     }
 }

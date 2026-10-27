@@ -50,7 +50,7 @@ def test_dense_decode_dispatch_covers_k7():
 
 def test_python_gates():
     b = open(os.path.join(ROOT, "exllamav3", "modules", "block_sparse_mlp.py")).read()
-    assert b.count("multi.K in (2, 2.5, 3, 4, 5, 6)") == 2
+    assert b.count("multi.K in (1, 2, 2.5, 3, 4, 5, 6)") == 2
     e = open(os.path.join(ROOT, "exllamav3", "modules", "quant", "exl3.py")).read()
     assert "_DEC_KB2_DENSE = _DEC_KB2 + (14,)" in e
     assert re.search(r"def dec_supported.*?_DEC_KB2_DENSE", e, re.S)
