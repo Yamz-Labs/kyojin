@@ -10,14 +10,14 @@ ROCm torch and `rocm-sdk-devel` from AMD's gfx1151 nightly index, the Kyojin tre
 
 ## Prebuilt images
 
-Nothing to build: the images of Kyojin 1.5 are on the GitHub registry (about 3 GB to download, 11 GB on disk).
+Nothing to build: the images of Kyojin 1.7 are on the GitHub registry (about 3 GB to download, 11 GB on disk).
 
 ```bash
-docker pull ghcr.io/yamz-labs/kyojin-qwen:1.5     # or podman pull
-docker pull ghcr.io/yamz-labs/kyojin-glm:1.5
+docker pull ghcr.io/yamz-labs/kyojin-qwen:1.7     # or podman pull
+docker pull ghcr.io/yamz-labs/kyojin-glm:1.7
 ```
 
-Then use `ghcr.io/yamz-labs/kyojin-qwen:1.5` in place of `kyojin-qwen` (or `localhost/kyojin-qwen`) in the run lines below. The MiMo image is not published: build it with the line below.
+Then use `ghcr.io/yamz-labs/kyojin-qwen:1.7` in place of `kyojin-qwen` (or `localhost/kyojin-qwen`) in the run lines below. The MiMo image is not published: build it with the line below.
 
 ## Build (tested)
 
@@ -44,20 +44,22 @@ docker run --rm --name kyojin-qwen \
 
 The image has no `video` or `render` group by name, so docker needs the numeric ids of the host. With no `-e` at all the server starts with 131072 tokens of context, the sampling of the model card and the port 8731. The port opens when the model is loaded and warmed up; then `curl http://localhost:8731/v1/models` and `python tools/bench.py --base http://localhost:8731/v1` work from the host.
 
-Measured (Qwen pack, 89 GB, 131072 context, docker 29, nothing else on the GPU):
+Time to ready, measured on a Strix Halo machine with nothing else on the GPU, 147456 tokens of context, Qwen without vision:
 
-| Start | Time to ready |
-|---|---|
-| First start, empty cache volume | 566 s (kernels are compiled, the dense GEMM table is tuned, both are cached) |
-| Second start, same cache volume | 82 s |
-| GLM pack, first start | 813 s |
-| MiMo pack, first start | 130 s |
+| Start | 1.6 | 1.7 |
+|---|---|---|
+| Qwen pack, first start, empty cache | 493 s (kernels compiled, dense GEMM table tuned, both cached) | 67 s |
+| Qwen pack, second start, same cache | 84 s | 68 s |
+| GLM pack, first start, empty cache | 77 s, plus 28 s of kernel compiles inside the first request | 69 s, first requests without compiles (1.7.1; 1.7.0 still compiled about 5 s) |
+| GLM pack, second start, same cache | 70 s | 67 s |
+
+The Triton kernels and the dense GEMM tune table now ship with the code (see `EXL3_KERNEL_SEED`), so an empty cache no longer costs a compile or a tuning run. A restart with warm caches still reads the whole pack from the disk, so it is bound by the disk speed (about 2 GB/s: 45 to 65 s for a 72 to 89 GB pack). The MiMo image is not part of these figures: first start 130 s (1.5).
 
 A chat completion and a tool call (`tools` in the request, the answer carries `tool_calls`) worked on Qwen and on GLM; MiMo was loaded and answered one completion. `docker stop` returns in 1 s (Qwen), 10 s (GLM), 2 s (MiMo); the exit code is 143 (SIGTERM) for Qwen and 0 for GLM and MiMo.
 
 ### Keep the cache
 
-The cache holds compiled HIP/Triton kernels and, for GLM, the dense GEMM tuning table. It must outlive the container, or every start pays the full first-start time again, and Qwen's 10 minutes may exceed a supervisor timeout. In order: a volume on `/root/.cache` (as above); else a hidden folder `.kyojin-cache` inside `/models` if it is mounted writable; `KYOJIN_CACHE_DIR=/some/folder` forces a folder. Warm the cache once by hand before you put the model behind a supervisor.
+The cache holds compiled HIP kernels and the dense GEMM tuning table; the Triton kernels ship with the image and are unpacked into it at start. Keep it across restarts so that kernels and tune results found at run time are not recomputed. In order: a volume on `/root/.cache` (as above); else a hidden folder `.kyojin-cache` inside `/models` if it is mounted writable; `KYOJIN_CACHE_DIR=/some/folder` forces a folder.
 
 ### No pack yet
 

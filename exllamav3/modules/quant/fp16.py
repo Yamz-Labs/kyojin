@@ -4,12 +4,22 @@ from torch import nn
 from ...ext import exllamav3_ext as ext
 import os as _os
 _f32_via_f16 = _os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
-_f32_via_f16_min_rows = int(_os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "32"))
+# 33, not 32: a 32-row multi-user verify step must stay on the exact row paths (a 32-row call widens an fp16 GEMM instead)
+_f32_via_f16_min_rows = int(_os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "33"))
 # gfx1151 decode: fp16-out torch.matmul at M <= 8 lands on a single-workgroup hipBLAS tile (GLM-5.3
 # indexer wk/weights_proj: 108-154 us for 1 MB); ext.hgemm takes the multi-CU skinny
 # split-K GEMV first (M <= 8, N <= 128) and falls back to the same GEMM otherwise
 _hip = bool(torch.version.hip)
 _f16_small_m_hgemm = _os.environ.get("EXL3_HIP_F16_SMALL_M_HGEMM", "1") != "0" and bool(torch.version.hip)
+# Multi-user verify (rows = users x (depth + 1)) reaches 9..32 rows: the skinny kernel runs padded 12/16/24/32-row
+# instantiations whose per-row reduction is identical to the <= 8-row ones, so these rows stay bit-identical to a
+# solo decode instead of falling to hipBLASLt. N > 128 keeps the GEMM (skinny does not cover it).
+_f16_small_m_rows = max(8, int(_os.environ.get("EXL3_HIP_F16_SMALL_M_ROWS", "32"))) if _f16_small_m_hgemm else 8
+_f16_small_m_max_n = 128
+
+
+def _skinny_rows_ok(rows: int, n: int) -> bool:
+    return rows <= 8 or (rows <= _f16_small_m_rows and n <= _f16_small_m_max_n)
 from ...util.tensor import to2
 from ...util import first_not_none
 
@@ -107,10 +117,11 @@ class LinearFP16:
             # multiple of 4 KiB (hidden 4096 = 8192 B); one padded copy of x runs the same product bit-exactly 3-4x faster
             from .exl3 import pad_copy_in
             ext.hgemm(pad_copy_in(x, x.shape[1]), weight, y)
-        elif dtype == x.dtype and not (_f16_small_m_hgemm and x.dtype == torch.half and x.shape[0] <= 8):
+        elif dtype == x.dtype and not (_f16_small_m_hgemm and x.dtype == torch.half and _skinny_rows_ok(x.shape[0], self.out_features)):
             torch.matmul(x, weight, out = y)
         elif (_f32_via_f16 and dtype == torch.float and x.dtype == torch.half
-              and x.shape[0] >= _f32_via_f16_min_rows):
+              and x.shape[0] >= _f32_via_f16_min_rows
+              and not (_f16_small_m_hgemm and _skinny_rows_ok(x.shape[0], self.out_features))):
             # gfx1151: hipblaslt's fp16-in/fp32-out kernels run at ~6 TFLOP/s vs ~34 for
             # fp16-out. Compute narrow, widen after. See exl3.py for the measurement.
             yh = torch.empty(y.shape, dtype = torch.half, device = y.device)

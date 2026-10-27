@@ -34,16 +34,17 @@ static int moe_tile_n_override()
 
 fp_exl3_moe_kernel exl3_moe_kernel_instances[] =
 {
-    // [K][cb - 1][N_off]: K = 0 switches Kg/Ku/Kd at runtime, K > 0 = compile-time Kg = Ku = Kd
-    exl3_moe_kernel_k0_n128_cb1(), exl3_moe_kernel_k0_n256_cb1(), exl3_moe_kernel_k0_n128_cb2(), exl3_moe_kernel_k0_n256_cb2(),
-    exl3_moe_kernel_k1_n128_cb1(), exl3_moe_kernel_k1_n256_cb1(), exl3_moe_kernel_k1_n128_cb2(), exl3_moe_kernel_k1_n256_cb2(),
-    exl3_moe_kernel_k2_n128_cb1(), exl3_moe_kernel_k2_n256_cb1(), exl3_moe_kernel_k2_n128_cb2(), exl3_moe_kernel_k2_n256_cb2(),
-    exl3_moe_kernel_k3_n128_cb1(), exl3_moe_kernel_k3_n256_cb1(), exl3_moe_kernel_k3_n128_cb2(), exl3_moe_kernel_k3_n256_cb2(),
-    exl3_moe_kernel_k4_n128_cb1(), exl3_moe_kernel_k4_n256_cb1(), exl3_moe_kernel_k4_n128_cb2(), exl3_moe_kernel_k4_n256_cb2(),
-    exl3_moe_kernel_k5_n128_cb1(), exl3_moe_kernel_k5_n256_cb1(), exl3_moe_kernel_k5_n128_cb2(), exl3_moe_kernel_k5_n256_cb2(),
-    exl3_moe_kernel_k6_n128_cb1(), exl3_moe_kernel_k6_n256_cb1(), exl3_moe_kernel_k6_n128_cb2(), exl3_moe_kernel_k6_n256_cb2(),
-    exl3_moe_kernel_k7_n128_cb1(), exl3_moe_kernel_k7_n256_cb1(), exl3_moe_kernel_k7_n128_cb2(), exl3_moe_kernel_k7_n256_cb2(),
-    exl3_moe_kernel_k8_n128_cb1(), exl3_moe_kernel_k8_n256_cb1(), exl3_moe_kernel_k8_n128_cb2(), exl3_moe_kernel_k8_n256_cb2()
+    // [K][cb][N_off]: K = 0 switches Kg/Ku/Kd at runtime, K > 0 = compile-time Kg = Ku = Kd;
+    // cb 0 = 3INST, 1 = mcg, 2 = mul1 (the codebook template argument of exl3_gemm_kernel_inner)
+    exl3_moe_kernel_k0_n128_cb0(), exl3_moe_kernel_k0_n256_cb0(), exl3_moe_kernel_k0_n128_cb1(), exl3_moe_kernel_k0_n256_cb1(), exl3_moe_kernel_k0_n128_cb2(), exl3_moe_kernel_k0_n256_cb2(),
+    exl3_moe_kernel_k1_n128_cb0(), exl3_moe_kernel_k1_n256_cb0(), exl3_moe_kernel_k1_n128_cb1(), exl3_moe_kernel_k1_n256_cb1(), exl3_moe_kernel_k1_n128_cb2(), exl3_moe_kernel_k1_n256_cb2(),
+    exl3_moe_kernel_k2_n128_cb0(), exl3_moe_kernel_k2_n256_cb0(), exl3_moe_kernel_k2_n128_cb1(), exl3_moe_kernel_k2_n256_cb1(), exl3_moe_kernel_k2_n128_cb2(), exl3_moe_kernel_k2_n256_cb2(),
+    exl3_moe_kernel_k3_n128_cb0(), exl3_moe_kernel_k3_n256_cb0(), exl3_moe_kernel_k3_n128_cb1(), exl3_moe_kernel_k3_n256_cb1(), exl3_moe_kernel_k3_n128_cb2(), exl3_moe_kernel_k3_n256_cb2(),
+    exl3_moe_kernel_k4_n128_cb0(), exl3_moe_kernel_k4_n256_cb0(), exl3_moe_kernel_k4_n128_cb1(), exl3_moe_kernel_k4_n256_cb1(), exl3_moe_kernel_k4_n128_cb2(), exl3_moe_kernel_k4_n256_cb2(),
+    exl3_moe_kernel_k5_n128_cb0(), exl3_moe_kernel_k5_n256_cb0(), exl3_moe_kernel_k5_n128_cb1(), exl3_moe_kernel_k5_n256_cb1(), exl3_moe_kernel_k5_n128_cb2(), exl3_moe_kernel_k5_n256_cb2(),
+    exl3_moe_kernel_k6_n128_cb0(), exl3_moe_kernel_k6_n256_cb0(), exl3_moe_kernel_k6_n128_cb1(), exl3_moe_kernel_k6_n256_cb1(), exl3_moe_kernel_k6_n128_cb2(), exl3_moe_kernel_k6_n256_cb2(),
+    exl3_moe_kernel_k7_n128_cb0(), exl3_moe_kernel_k7_n256_cb0(), exl3_moe_kernel_k7_n128_cb1(), exl3_moe_kernel_k7_n256_cb1(), exl3_moe_kernel_k7_n128_cb2(), exl3_moe_kernel_k7_n256_cb2(),
+    exl3_moe_kernel_k8_n128_cb0(), exl3_moe_kernel_k8_n256_cb0(), exl3_moe_kernel_k8_n128_cb1(), exl3_moe_kernel_k8_n256_cb1(), exl3_moe_kernel_k8_n128_cb2(), exl3_moe_kernel_k8_n256_cb2()
 };
 
 // 32-row tile instances, [K], N = 128 shape, mul1 codebook only
@@ -235,8 +236,8 @@ void exl3_moe
     // TORCH_CHECK(!(down_mcg && down_mul1), "Specified both mcg and mul1 (down)");
     TORCH_CHECK(gate_mcg == up_mcg && up_mcg == down_mcg && gate_mul1 == up_mul1 && up_mul1 == down_mul1,
                 "MoE kernel: gate/up/down must share the same codebook");
-    TORCH_CHECK(gate_mcg != gate_mul1, "MoE kernel: Only mcg and mul1 codebooks are supported");
-    const int cb_idx = gate_mul1 ? 1 : 0;
+    TORCH_CHECK(!(gate_mcg && gate_mul1), "MoE kernel: Specified both mcg and mul1");
+    const int cb_idx = gate_mul1 ? 2 : (gate_mcg ? 1 : 0);
 
     // TORCH_CHECK(act_function == MOE_ACT_SILU, "MoE kernel: Only SiLU is currently supported");
 
@@ -280,7 +281,7 @@ void exl3_moe
     fp_exl3_moe_kernel kernel;
     if (m_tile <= 16)
     {
-        kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];
+        kernel = exl3_moe_kernel_instances[6 * K + 2 * cb_idx + N_off];
     }
     else
     {
@@ -288,7 +289,7 @@ void exl3_moe
         // multiples of 128: for dims that are multiples of 256 they still beat the N = 256
         // 16-row tiling by ~20% at 24+ rows per expert (the N = 256 instance stays the faster
         // one for the <= 16-row launch, which the caller issues with m_tile 16)
-        TORCH_CHECK(cb_idx == 1, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
+        TORCH_CHECK(cb_idx == 2, "exl3_moe: row tiles above 16 are instantiated for the mul1 codebook only");
         TORCH_CHECK(max_tokens_per_expert >= (size_t) m_tile, "exl3_moe: temp buffers hold fewer rows than the tile");
         kernel = m_tile >= 64 ? exl3_moe_kernel_instances_m64[K] : exl3_moe_kernel_instances_m32[K];
     }

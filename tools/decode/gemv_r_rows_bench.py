@@ -29,8 +29,13 @@ ARMS = {
  "D1c4f": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RPB": "4", "EXL3_GEMV_R_CHUNK_FAST": "1"},
  "D1rm6": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RPB": "4", "EXL3_GEMV_R_CHUNK_FAST": "1", "EXL3_GEMV_R_RM6": "1"},
  "D0": {},
+ # rows 9..32 (ROCm): block rows RPB9 (default 4), swap = row chunks on the fast grid axis (SWAP9 default 1)
+ "D9": {"EXL3_GEMV_R_DEC1": "1"},
+ "D9r2": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RPB9": "2"},
+ "D9r8": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RPB9": "8"},
+ "D9ns": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_SWAP9": "0"},
 }
-KEYS = ["EXL3_GEMV_R_DEC1", "EXL3_GEMV_R_RPB", "EXL3_GEMV_R_CHUNK_FAST", "EXL3_GEMV_R_RPB78", "EXL3_GEMV_R_RM6"]
+KEYS = ["EXL3_GEMV_R_DEC1", "EXL3_GEMV_R_RPB", "EXL3_GEMV_R_CHUNK_FAST", "EXL3_GEMV_R_RPB78", "EXL3_GEMV_R_RM6", "EXL3_GEMV_R_RPB9", "EXL3_GEMV_R_SWAP9"]
 def setarm(name):
     for k in KEYS: os.environ.pop(k, None)
     os.environ.update(ARMS[name])
@@ -41,7 +46,7 @@ for name in a.shapes.split(","):
     for R in [int(v) for v in a.rows.split(",")]:
         x = (torch.randn(R, K, device=dev, generator=g) * 0.5).half().contiguous()
         outs = [torch.empty(R, N, dtype=torch.half, device=dev) for N in Ns]
-        scr = torch.zeros(R * 8 * sum(Ns) * 2, dtype=torch.float, device=dev); ctr = torch.zeros(8192, dtype=torch.int32, device=dev)
+        scr = torch.zeros(R * 8 * sum(Ns) * 2, dtype=torch.float, device=dev); ctr = torch.zeros(16384, dtype=torch.int32, device=dev)
         def call():
             if len(Ns) == 1: ext.exl3_dec_gemv_r(x, tr[0], suh[0], svh[0], outs[0], scr, ctr, KB, False)
             else: ext.exl3_dec_gemv_r_multi(x, tr, suh, svh, outs, scr, ctr, Ks, False)

@@ -69,7 +69,10 @@ template <class S7, bool TM, int OCC, int INL, int ABL = 0> void launch7(const a
         mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 2><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
         mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 3><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
         mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 4><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
-        mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 5><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
+        // EXL3_MOE_COMBINE_SPLIT=0: the combine stage runs as the G-block stage-5 kernel again (A/B)
+        static const bool cmb_own = [] { const char* e = getenv("EXL3_MOE_COMBINE_SPLIT"); return !e || atoi(e) != 0; }();
+        if (cmb_own) { mf9::moe_combine9s_kernel<S7><<<DM::CMB_BLOCKS * R, 384, 0, stream>>>(p); }
+        else { mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 5><<<p.G, mf::THREADS, 0, stream>>>(p, vmask); }
     }
     else
     {

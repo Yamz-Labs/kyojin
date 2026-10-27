@@ -4,3 +4,4 @@ from .quant import CacheLayer_quant
 from .mla import CacheLayer_MLA_fp16, CacheLayer_MLA_quant
 from .dsa import CacheLayer_dsa
 from .recurrent import RecurrentCache
+from .tq import CacheLayer_tq

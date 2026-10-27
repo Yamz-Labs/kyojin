@@ -13,12 +13,47 @@
 // faster at bsz 1 on RTX 3090 together with the codebook.cuh IMUL change (see benchmarks/exl3_m1_bench).
 // Max observed error vs fp32 accumulation is ~1% of output RMS at k=4096, well below quantization noise.
 // Only enabled for sm_86 for now; unvalidated on other archs where fp32-acc HMMA is also half rate.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860)
+// EXL3_GEMM_NO_H_ACC (per translation unit): keep fp32 accumulation, e.g. for the fused 3INST MoE instances
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 860) && !defined(EXL3_GEMM_NO_H_ACC)
     #define EXL3_GEMM_H_ACC 1
 #else
     #define EXL3_GEMM_H_ACC 0
 #endif
 
+// ldmatrix of two / four 8x8 b16 matrices straight into B-operand fragments (swapped-operand tile, rows in the n8 dimension)
+#if !defined(USE_ROCM)
+__device__ __forceinline__ void ldsm4_xb(FragB& x0, FragB& x1, const void* smem_ptr)
+{
+    uint32_t* a = reinterpret_cast<uint32_t*>(&x0);
+    uint32_t* b = reinterpret_cast<uint32_t*>(&x1);
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile
+    (
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(a[0]), "=r"(a[1]), "=r"(b[0]), "=r"(b[1]) : "r"(smem)
+    );
+}
+
+__device__ __forceinline__ void ldsm2_xb(FragB& x, const void* smem_ptr)
+{
+    uint32_t* a = reinterpret_cast<uint32_t*>(&x);
+    uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile
+    (
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+        : "=r"(a[0]), "=r"(a[1]) : "r"(smem)
+    );
+}
+#else
+// Never reached: the swapped tile has no ROCm instance
+__device__ __forceinline__ void ldsm4_xb(FragB&, FragB&, const void*) {}
+__device__ __forceinline__ void ldsm2_xb(FragB&, const void*) {}
+#endif
+
+// TILESIZE_M == 24 is the swapped-operand tile for 17..24 rows (CUDA): the decoded weight fragments are the A operand
+// (m16 = 16 output columns) and the activation rows the B operand (n8), so 24 rows cost three MMAs per 16 columns and k16
+// where the 32-row tile pays four. Same warp-private k16 pipeline as the 16-row tile; each output element still
+// accumulates the same products in k order (the C fragment is the transpose of the row-major tile).
 // TILESIZE_M == 16 is the dense / decode shape: one m16 row fragment, A fragments double-buffered
 // across the fragment stages (codegen unchanged by the multi-row support below). TILESIZE_M > 16
 // is the fused-MoE prefill shape (32 / 64 rows per tile): TILEBLOCKS_M row fragments share each
@@ -39,6 +74,8 @@ void exl3_gemm_kernel_inner
     int size_n_stride = 0     // full width of B and C when computing a column slice (0: = size_n)
 )
 {
+    constexpr bool SWAP = TILESIZE_M == 24;
+    constexpr int SW_RB = 3;                                // row blocks of 8 in the swapped tile
     const int TILEBLOCKS_M = TILESIZE_M / 16;
     if (size_n_stride == 0) size_n_stride = size_n;
     // Column blocks of the full-width B row: slices index B relative to their own column offset,
@@ -49,7 +86,23 @@ void exl3_gemm_kernel_inner
     // const int FRAGS_M = TILEBLOCKS_M;
     const int FRAGS_N_PER_WARP = 2 * TILEBLOCKS_N / (EXL3_GEMM_BASE_THREADS / 32);
 
-    const int sh_a_stage_size = TILESIZE_M * TILESIZE_K;                         // in halfs
+    // Warp-private pipeline (CUDA, 16x16 tiles). Each warp only ever decodes its own FRAGS_N_PER_WARP / 2 B blocks,
+    // contiguous in smem and in global, so it copies exactly those (lane-indexed) plus its own copy of the A tile, and waits for
+    // its stage with cp.async.wait_group + __syncwarp: no block-wide barrier in the main loop. Same data, same smem slots for B,
+    // same arithmetic and order (bitwise). The column-end reduce keeps its barriers
+#if !defined(USE_ROCM) && !defined(EXL3_GEMM_NO_PW)
+    constexpr bool PW = (TILESIZE_M == 16 || SWAP) && TILESIZE_K == 16;
+#else
+    constexpr bool PW = false;
+#endif
+    constexpr int PW_WARPS = PW ? EXL3_GEMM_BASE_THREADS / 32 : 1;
+#if defined(USE_ROCM)
+    static_assert(!SWAP, "The swapped-operand tile is CUDA only");
+#endif
+    static_assert(!SWAP || (PW && TILESIZE_K == 16), "The swapped-operand tile needs the warp-private k16 pipeline");
+    constexpr int PW_B_INT4 = FRAGS_N_PER_WARP / 2 * 256 / 16 * bits / 8;        // B int4 chunks per warp per stage
+
+    const int sh_a_stage_size = TILESIZE_M * TILESIZE_K * PW_WARPS;              // in halfs
     const int sh_b_stage_size = TILEBLOCKS_K * TILEBLOCKS_N * 256 / 16 * bits;   // in uint16s
     const int sh_c_size = MAX  // in floats
     (
@@ -65,7 +118,7 @@ void exl3_gemm_kernel_inner
 
     // Sanity checks
     static_assert(EXL3_GEMM_BASE_THREADS == 256);
-    static_assert(TILESIZE_M >= 16 && TILESIZE_M % 16 == 0, "Invalid kernel params");
+    static_assert(TILESIZE_M >= 16 && (TILESIZE_M % 16 == 0 || SWAP), "Invalid kernel params");
     static_assert(TILESIZE_K % 16 == 0, "Invalid kernel params");
     static_assert(TILESIZE_N % 128 == 0, "Invalid kernel params");
     static_assert
@@ -121,16 +174,19 @@ void exl3_gemm_kernel_inner
     const half* gl_a_ptr = A + slice_m * gl_a_stride_m + slice0_k * gl_a_stride_k;
     half* sh0_a_ptr = sh_a + (slice0_iters % SH_STAGES) * sh_a_stage_size;
 
-    const int load_a_iters = CEIL_DIVIDE(sh0_a_stride_m / 8, EXL3_GEMM_BASE_THREADS);
+    // PW: the 32 lanes of each warp copy the whole 16x16 A tile (32 int4) into the warp's own A slot
+    const int a_ld_stride = PW ? 32 : EXL3_GEMM_BASE_THREADS;
+    const int load_a_iters = CEIL_DIVIDE(sh0_a_stride_m / 8, a_ld_stride);
+    const int a_t = PW ? lane_id : t;
     bool pred_a_gl[load_a_iters];
     int load_a_gl[load_a_iters];
     int load_a_sh[load_a_iters];
     for (int i = 0; i < load_a_iters; ++i)
     {
-        int k = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_a_stride_k / 8);
-        int m = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_a_stride_k / 8);
+        int k = (i * a_ld_stride + a_t) % (gl_a_stride_k / 8);
+        int m = (i * a_ld_stride + a_t) / (gl_a_stride_k / 8);
         load_a_gl[i] = m * size_k / 8 + k;
-        load_a_sh[i] = m * A_COLS + (k ^ ((m >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK));
+        load_a_sh[i] = m * A_COLS + (k ^ ((m >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK)) + (PW ? warp_id * (TILESIZE_M * TILESIZE_K / 8) : 0);
         pred_a_gl[i] = m < size_m;
     }
 
@@ -140,37 +196,66 @@ void exl3_gemm_kernel_inner
     const uint16_t* gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
     uint16_t* sh0_b_ptr = sh_b + (slice0_iters % SH_STAGES) * sh_b_stage_size;
 
-    const int load_b_iters = CEIL_DIVIDE(sh0_b_stride_k / 8, EXL3_GEMM_BASE_THREADS);
+    // PW: chunk c of the stage row is copied by warp c / PW_B_INT4 (the warp that decodes it), lane (c % PW_B_INT4) % 32
+    const int load_b_iters = PW ? CEIL_DIVIDE(PW_B_INT4, 32) : CEIL_DIVIDE(sh0_b_stride_k / 8, EXL3_GEMM_BASE_THREADS);
     bool pred_b_gl[load_b_iters];
     int load_b_gl[load_b_iters];
+    int load_b_c[load_b_iters];
     for (int i = 0; i < load_b_iters; ++i)
     {
-        int n = (i * EXL3_GEMM_BASE_THREADS + t) % (gl_b_stride_n / 8);
-        int k = (i * EXL3_GEMM_BASE_THREADS + t) / (gl_b_stride_n / 8);
+        int c = PW ? warp_id * PW_B_INT4 + i * 32 + lane_id : i * EXL3_GEMM_BASE_THREADS + t;
+        int n = c % (gl_b_stride_n / 8);
+        int k = c / (gl_b_stride_n / 8);
+        load_b_c[i] = c;
         load_b_gl[i] = k * (blocks_n_full * 256 / 16 * bits / 8) + n;
-        pred_b_gl[i] = i * EXL3_GEMM_BASE_THREADS + t < sh0_b_stride_k / 8;
+        pred_b_gl[i] = PW ? i * 32 + lane_id < PW_B_INT4 : c < sh0_b_stride_k / 8;
     }
+
+    // Per-thread copy addresses are loop-carried (advanced by a step, or by a precomputed wrap delta at the
+    // end of a k column) so ptxas keeps them in registers instead of rematerializing the row / column / swizzle split
+    // from t on every iteration. Same addresses as gl_a_ptr / gl_b_ptr / sh0_*_ptr + the per-thread offsets above
+    const int4* a_src[load_a_iters];
+    int4* a_dst[load_a_iters];
+    for (int i = 0; i < load_a_iters; ++i)
+    {
+        a_src[i] = (const int4*) gl_a_ptr + load_a_gl[i];
+        a_dst[i] = (int4*) sh0_a_ptr + load_a_sh[i];
+    }
+    const int4* b_src[load_b_iters];
+    int4* b_dst[load_b_iters];
+    for (int i = 0; i < load_b_iters; ++i)
+    {
+        b_src[i] = (const int4*) gl_b_ptr + load_b_gl[i];
+        b_dst[i] = (int4*) sh0_b_ptr + load_b_c[i];
+    }
+    const int a_step = gl_a_stride_k / 8;                                         // int4 units
+    const int a_wrap = -(tiles_k - 1) * (gl_a_stride_k / 8);                      // back to k = 0 (slice_m fixed)
+    const int b_step = gl_b_stride_k / 8;
+    const int b_wrap = (gl_b_stride_n - (tiles_k - 1) * gl_b_stride_k) / 8;       // k = 0 of the next column
+    const int sh_a_back = -sh_a_stage_size / 8, sh_a_wrap = (SH_STAGES - 1) * sh_a_stage_size / 8;
+    const int sh_b_back = -sh_b_stage_size / 8, sh_b_wrap = (SH_STAGES - 1) * sh_b_stage_size / 8;
 
     auto advance0 = [&] ()
     {
         slice0_k++;
         slice0_iters--;
 
-        int stage = slice0_iters % SH_STAGES;
-        sh0_a_ptr = sh_a + stage * sh_a_stage_size;
-        sh0_b_ptr = sh_b + stage * sh_b_stage_size;
+        // stage = slice0_iters % SH_STAGES steps down by one and wraps from 0 to SH_STAGES - 1
+        const bool sw = (unsigned) slice0_iters % SH_STAGES == SH_STAGES - 1;
+        const bool kw = slice0_k >= tiles_k;
+        if (kw) { slice0_k = 0; slice0_n++; }
 
-        if (slice0_k >= tiles_k)
+        #pragma unroll
+        for (int i = 0; i < load_a_iters; ++i)
         {
-            slice0_k = 0;
-            slice0_n++;
-            gl_a_ptr = A + slice_m * gl_a_stride_m + slice0_k * gl_a_stride_k;
-            gl_b_ptr = B + slice0_k * gl_b_stride_k + slice0_n * gl_b_stride_n;
+            a_src[i] += kw ? a_wrap : a_step;
+            a_dst[i] += sw ? sh_a_wrap : sh_a_back;
         }
-        else
+        #pragma unroll
+        for (int i = 0; i < load_b_iters; ++i)
         {
-            gl_a_ptr += gl_a_stride_k;
-            gl_b_ptr += gl_b_stride_k;
+            b_src[i] += kw ? b_wrap : b_step;
+            b_dst[i] += sw ? sh_b_wrap : sh_b_back;
         }
     };
 
@@ -182,14 +267,42 @@ void exl3_gemm_kernel_inner
     half* sh1_a_ptr = sh_a + (slice1_iters % SH_STAGES) * sh_a_stage_size;
     uint16_t* sh1_b_ptr = sh_b + (slice1_iters % SH_STAGES) * sh_b_stage_size;
 
+    // Fragment read addresses, loop-carried like the copy addresses
+    constexpr int A_PTRS = SWAP ? 2 : TILEBLOCKS_M;
+    const int4* a_frag[A_PTRS];
+    if constexpr (SWAP)
+    {
+        // x4: rows 0..15 as (rows 0-7 k lo, rows 0-7 k hi, rows 8-15 k lo, rows 8-15 k hi); x2: rows 16..23 (k lo, k hi)
+        int base_c = (lane_id / 8) % 2;
+        int R0 = (lane_id % 8) + 8 * (lane_id / 16);
+        int R1 = 16 + (lane_id % 8);
+        a_frag[0] = (const int4*) sh1_a_ptr + R0 * A_COLS + (base_c ^ ((R0 >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK)) + warp_id * (TILESIZE_M * TILESIZE_K / 8);
+        a_frag[1] = (const int4*) sh1_a_ptr + R1 * A_COLS + (base_c ^ ((R1 >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK)) + warp_id * (TILESIZE_M * TILESIZE_K / 8);
+    }
+    else
+    {
+        int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
+        int base_c = lane_id / 16 + sub_k * 2;
+        for (int m = 0; m < TILEBLOCKS_M; ++m)
+        {
+            int R = r + m * 16;
+            int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
+            a_frag[m] = (const int4*) sh1_a_ptr + R * A_COLS + c_swizzled + (PW ? warp_id * (TILESIZE_M * TILESIZE_K / 8) : 0);
+        }
+    }
+    const uint32_t* b_frag = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + warp_id * FRAGS_N_PER_WARP / 2) * 256 / 16 * bits);
+    const int shf_b_back = -sh_b_stage_size / 2, shf_b_wrap = (SH_STAGES - 1) * sh_b_stage_size / 2;   // uint32 units
+
     auto advance1 = [&] ()
     {
         slice1_k++;
         slice1_iters--;
 
-        int stage = slice1_iters % SH_STAGES;
-        sh1_a_ptr = sh_a + stage * sh_a_stage_size;
-        sh1_b_ptr = sh_b + stage * sh_b_stage_size;
+        const bool sw = (unsigned) slice1_iters % SH_STAGES == SH_STAGES - 1;
+        #pragma unroll
+        for (int m = 0; m < A_PTRS; ++m)
+            a_frag[m] += sw ? sh_a_wrap : sh_a_back;
+        b_frag += sw ? shf_b_wrap : shf_b_back;
 
         if (slice1_k >= tiles_k)
         {
@@ -219,6 +332,13 @@ void exl3_gemm_kernel_inner
     #if EXL3_GEMM_H_ACC
         register FragC_h frag_c_h[TILEBLOCKS_M][FRAGS_N_PER_WARP];
     #endif
+    // Swapped tile: activation fragments per fragment stage, accumulators per (row block, 16 output columns)
+    constexpr int SW_PAIRS = SWAP ? FRAGS_N_PER_WARP / 2 : 1;
+    register FragB frag_x[SWAP ? FRAG_STAGES : 1][SW_RB];
+    register FragC frag_cs[SWAP ? SW_RB : 1][SW_PAIRS];
+    #if EXL3_GEMM_H_ACC
+        register FragC_h frag_cs_h[SWAP ? SW_RB : 1][SW_PAIRS];
+    #endif
 
     auto advance2 = [&] ()
     {
@@ -240,7 +360,7 @@ void exl3_gemm_kernel_inner
     // Schedule load of the next A, B tiles to shared memory and advance the pipeline
     auto async_load_gl = [&] ()
     {
-        if (sub_k)
+        if (TILESIZE_K > 16 && sub_k)   // sub_k is 0 for 16-wide k tiles (256 threads)
         {
             cp_async_fence();
             return;
@@ -249,26 +369,17 @@ void exl3_gemm_kernel_inner
         if (slice0_iters)
         {
             // Copy tile from row-major A matrix (XOR-swizzled for bank-conflict-free ldmatrix)
+            #pragma unroll
+            for (int i = 0; i < load_a_iters; ++i)
             {
-                const int4* gl = (const int4*) gl_a_ptr;
-                int4* sh = (int4*) sh0_a_ptr;
-                #pragma unroll
-                for (int i = 0; i < load_a_iters; ++i)
-                {
-                    if (pred_a_gl[i]) cp_async(sh + load_a_sh[i], gl + load_a_gl[i]);
-                }
+                if (pred_a_gl[i]) cp_async(a_dst[i], a_src[i]);
             }
 
             // Copy tile of 256-element blocks from quantized B matrix
+            #pragma unroll
+            for (int i = 0; i < load_b_iters; ++i)
             {
-                const int4* gl = (const int4*) gl_b_ptr;
-                int4* sh = (int4*) sh0_b_ptr;
-                #pragma unroll
-                for (int i = 0; i < load_b_iters; ++i)
-                {
-                    // cp_async_pred(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i], pred_b_gl[i]);
-                    if (pred_b_gl[i]) cp_async(sh + EXL3_GEMM_BASE_THREADS * i + t, gl + load_b_gl[i]);
-                }
+                if (pred_b_gl[i]) cp_async(b_dst[i], b_src[i]);
             }
             advance0();
         }
@@ -285,36 +396,55 @@ void exl3_gemm_kernel_inner
         if (!slice1_iters) return;
 
         // A fragments (XOR-swizzled shared memory layout)
+        if constexpr (SWAP)
         {
-            int r = (lane_id % 8) + 8 * ((lane_id / 8) % 2);
-            int base_c = lane_id / 16 + sub_k * 2;
+            ldsm4_xb(frag_x[buf][0], frag_x[buf][1], (int4*) a_frag[0]);
+            ldsm2_xb(frag_x[buf][2], (int4*) a_frag[1]);
+        }
+        else
+        {
             #pragma unroll
             for (int m = 0; m < TILEBLOCKS_M; ++m)
-            {
-                int R = r + m * 16;
-                int c_swizzled = base_c ^ ((R >> A_SWIZZLE_SHIFT) & A_SWIZZLE_MASK);
-                ldsm4(frag_a[TILEBLOCKS_M == 1 ? buf : m], (int4*) sh1_a_ptr + R * A_COLS + c_swizzled);
-            }
+                ldsm4(frag_a[TILEBLOCKS_M == 1 ? buf : m], (int4*) a_frag[m]);
         }
 
         // B fragments
         #pragma unroll
         for (int n2 = 0; n2 < FRAGS_N_PER_WARP; n2 += 2)
         {
-            int sub_n2 = warp_id * FRAGS_N_PER_WARP / 2 + n2 / 2;
-            const uint32_t* shb = (const uint32_t*) (sh1_b_ptr + (sub_k * TILEBLOCKS_N + sub_n2) * 256 / 16 * bits);
+            const uint32_t* shb = b_frag + (n2 / 2) * ((256 / 16 * bits / 2));
 
             dq_dispatch<bits, cb>(shb, lane_id << 3, frag_b[buf][n2], frag_b[buf][n2 + 1]);
         }
 
+        // Redundant for SH_STAGES >= 3 (wait_stage() orders these reads before the next cp.async overwrite).
+        // CUDA sm_86, 16-wide k tiles: +4..12 % K3 / ~+1 % K4 per call, bitwise identical;
+        // kept for other tiles (-1 % without it) and on ROCm (unmeasured)
+#if defined(USE_ROCM)
         __syncthreads();
+#else
+        if constexpr (TILESIZE_K != 16 || SH_STAGES < 3) __syncthreads();
+#endif
         advance1();
     };
 
     // Clear C fragments
     auto clear_frag_c = [&] ()
     {
-        if constexpr (TILEBLOCKS_M == 1)
+        if constexpr (SWAP)
+        {
+            #pragma unroll
+            for (int rb = 0; rb < SW_RB; ++rb)
+                #pragma unroll
+                for (int j = 0; j < SW_PAIRS; ++j)
+                {
+                    frag_cs[rb][j] = {};
+                    #if EXL3_GEMM_H_ACC
+                        frag_cs_h[rb][j] = {};
+                    #endif
+                }
+        }
+        else if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
@@ -526,11 +656,34 @@ void exl3_gemm_kernel_inner
         }
     };
 
+    // Swapped tile: visit every accumulator element as (row, column in the tile, value). The C fragment of the
+    // transposed product holds rows 2t, 2t+1 of the row block at output columns g and g + 8 of each 16-column pair
+    auto sw_visit = [&] (auto&& f)
+    {
+        const int g = lane_id / 4, tq = lane_id % 4;
+        #pragma unroll
+        for (int rb = 0; rb < SW_RB; ++rb)
+            #pragma unroll
+            for (int j = 0; j < SW_PAIRS; ++j)
+            {
+                const int col = warp_id * FRAGS_N_PER_WARP * 8 + 16 * j + g;
+                const int row = 8 * rb + 2 * tq;
+                f(row,     col,     frag_cs[rb][j][0]);
+                f(row + 1, col,     frag_cs[rb][j][1]);
+                f(row,     col + 8, frag_cs[rb][j][2]);
+                f(row + 1, col + 8, frag_cs[rb][j][3]);
+            }
+    };
+
     // Pre-hadamard: Write final output tile to shmem
     auto write_sum_tile_sh = [&]()
     {
         const int n0 = warp_id * FRAGS_N_PER_WARP;
-        if constexpr (TILEBLOCKS_M == 1)
+        if constexpr (SWAP)
+        {
+            sw_visit([&] (int row, int col, float& v) { if (row < size_m) ((float*) sh_c)[row * TILESIZE_N + col] = v; });
+        }
+        else if constexpr (TILEBLOCKS_M == 1)
         {
             const int r0 = lane_id / 4;
             const int r1 = r0 + 8;
@@ -620,7 +773,16 @@ void exl3_gemm_kernel_inner
     auto read_sum_gl = [&]()
     {
         int n0 = warp_id * FRAGS_N_PER_WARP;
-        if constexpr (TILEBLOCKS_M == 1)
+        if constexpr (SWAP)
+        {
+            sw_visit([&] (int row, int col, float& v)
+            {
+                if (row >= size_m) return;
+                if constexpr (c_fp32) v += gl_c_ptr_32[row * size_n_stride + col];
+                else v += __half2float(gl_c_ptr_16[row * size_n_stride + col]);
+            });
+        }
+        else if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
@@ -711,7 +873,16 @@ void exl3_gemm_kernel_inner
     auto write_sum_gl = [&]()
     {
         int n0 = warp_id * FRAGS_N_PER_WARP;
-        if constexpr (TILEBLOCKS_M == 1)
+        if constexpr (SWAP)
+        {
+            sw_visit([&] (int row, int col, float& v)
+            {
+                if (row >= size_m) return;
+                if constexpr (c_fp32) gl_c_ptr_32[row * size_n_stride + col] = v;
+                else gl_c_ptr_16[row * size_n_stride + col] = __float2half_rn(v);
+            });
+        }
+        else if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
@@ -800,7 +971,20 @@ void exl3_gemm_kernel_inner
     {
         #if EXL3_GEMM_H_ACC
             // Fold the fp16 MMA accumulators into the fp32 accumulators once per k-slice
-            if constexpr (TILEBLOCKS_M == 1)
+            if constexpr (SWAP)
+            {
+                #pragma unroll
+                for (int rb = 0; rb < SW_RB; ++rb)
+                    #pragma unroll
+                    for (int j = 0; j < SW_PAIRS; ++j)
+                    {
+                        float2 f0 = __half22float2(frag_cs_h[rb][j][0]);
+                        float2 f1 = __half22float2(frag_cs_h[rb][j][1]);
+                        frag_cs[rb][j][0] += f0.x; frag_cs[rb][j][1] += f0.y;
+                        frag_cs[rb][j][2] += f1.x; frag_cs[rb][j][3] += f1.y;
+                    }
+            }
+            else if constexpr (TILEBLOCKS_M == 1)
             {
                 #pragma unroll
                 for (int n = 0; n < FRAGS_N_PER_WARP; ++n)
@@ -877,13 +1061,40 @@ void exl3_gemm_kernel_inner
     auto wait_stage = [&] ()
     {
         cp_async_wait<SH_STAGES - 2>();
+#if defined(USE_ROCM)
         __syncthreads();
+#else
+        if constexpr (PW) __syncwarp();
+        else __syncthreads();
+#endif
     };
 
     // Perform tensor core matmul on current tile
     auto matmul = [&] (int buf)
     {
-        if constexpr (TILEBLOCKS_M == 1)
+        if constexpr (SWAP)
+        {
+            #pragma unroll
+            for (int j = 0; j < SW_PAIRS; ++j)
+            {
+                // The two decoded n8 fragments of a 16-column block are the rows 0-7 / 8-15 halves of the A operand
+                FragA w;
+                w.elems[0] = frag_b[buf][2 * j].elems[0];
+                w.elems[1] = frag_b[buf][2 * j + 1].elems[0];
+                w.elems[2] = frag_b[buf][2 * j].elems[1];
+                w.elems[3] = frag_b[buf][2 * j + 1].elems[1];
+                #pragma unroll
+                for (int rb = 0; rb < SW_RB; ++rb)
+                {
+                    #if EXL3_GEMM_H_ACC
+                        ptx_mma_m16n8k16(w, frag_x[buf][rb], frag_cs_h[rb][j]);
+                    #else
+                        ptx_mma_m16n8k16(w, frag_x[buf][rb], frag_cs[rb][j]);
+                    #endif
+                }
+            }
+        }
+        else if constexpr (TILEBLOCKS_M == 1)
         {
             #pragma unroll
             for (int n = 0; n < FRAGS_N_PER_WARP; ++n)

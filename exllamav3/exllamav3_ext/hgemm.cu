@@ -363,7 +363,8 @@ namespace skinny
 constexpr int COLS = 32;         // output columns per block (one lane each)
 constexpr int WARPS = 8;         // warps per block, each a k-sub-slice of the block's k-chunk
 constexpr int THREADS = WARPS * 32;
-constexpr int MAX_M = 8;
+constexpr int EXACT_M = 8;       // rows served by one exact-M instantiation (and by skinny_cat)
+constexpr int MAX_M = 32;        // 9..32 rows run padded instantiations (12/16/24/32), same per-row reduction
 constexpr int MAX_N = 128;       // above this, let hipblaslt have it
 constexpr int K_CHUNK = 128;     // k rows per block -> 16 k's per warp, 20 blocks on k=2560
 constexpr int MAX_KSPLIT = 64;   // k <= 8192
@@ -419,9 +420,14 @@ void skinny_partials_kernel
     const int lda,
     int* __restrict__ cnt,        // ONEPASS: [MAX_N / COLS] tickets
     C_T* __restrict__ c,          // ONEPASS: output [M, ldc]
-    const int ldc
+    const int ldc,
+    const int m_rt                // rows really used: M for the exact instantiations (<= 8), <= M for the padded ones
 )
 {
+    // M > EXACT_M: padded instantiation, rows >= m_rt are skipped. A row's accumulation and reduction order do not
+    // depend on M or m_rt, so rows 9..32 are bit-identical to the same rows in an exact <= 8-row launch.
+    constexpr bool PAD = M > EXACT_M;
+    const int mr = PAD ? m_rt : M;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int col = blockIdx.x * COLS + lane;
@@ -450,7 +456,8 @@ void skinny_partials_kernel
             {
                 #pragma unroll
                 for (int i = 0; i < M; ++i)
-                    acc[i] = fmaf(__half2float(a[(size_t) i * lda + kk]), bv[j], acc[i]);
+                    if (!PAD || i < mr)
+                        acc[i] = fmaf(__half2float(a[(size_t) i * lda + kk]), bv[j], acc[i]);
             }
         }
     }
@@ -462,10 +469,11 @@ void skinny_partials_kernel
 
     if (warp == 0 && active)
     {
-        float* out = part + ((size_t) blockIdx.y * M) * MAX_N;
+        float* out = part + ((size_t) blockIdx.y * mr) * MAX_N;
         #pragma unroll
         for (int i = 0; i < M; ++i)
         {
+            if (PAD && i >= mr) continue;
             float s = 0.0f;
             #pragma unroll
             for (int w = 0; w < WARPS; ++w) s += red[w][i][lane];
@@ -487,14 +495,14 @@ void skinny_partials_kernel
         if (!last_s) return;
         __threadfence();
         const int ksplit = gridDim.y;
-        for (int idx = threadIdx.x; idx < M * COLS; idx += THREADS)
+        for (int idx = threadIdx.x; idx < mr * COLS; idx += THREADS)
         {
             const int i = idx / COLS;
             const int cc = blockIdx.x * COLS + idx % COLS;
             if (cc >= n) continue;
             float s = 0.0f;
             for (int y = 0; y < ksplit; ++y)
-                s += __builtin_nontemporal_load(&part[((size_t) y * M + i) * MAX_N + cc]);
+                s += __builtin_nontemporal_load(&part[((size_t) y * mr + i) * MAX_N + cc]);
             if constexpr (std::is_same_v<C_T, float>)
                 c[(size_t) i * ldc + cc] = s;
             else
@@ -532,12 +540,16 @@ template <bool ONEPASS, typename C_T>
 static void launch_partials(int m, const half* a, const half* b, float* part, int k, int n, int lda,
                             dim3 grid, cudaStream_t stream, int* cnt = nullptr, C_T* c = nullptr, int ldc = 0)
 {
-    #define SK_CASE(MM) case MM: skinny_partials_kernel<MM, ONEPASS, C_T><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc); break;
+    #define SK_CASE(MM) case MM: skinny_partials_kernel<MM, ONEPASS, C_T><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); break;
+    #define SK_PAD(MM, LO, HI) if (m >= LO && m <= HI) { skinny_partials_kernel<MM, ONEPASS, C_T><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); return; }
     switch (m)
     {
         SK_CASE(1) SK_CASE(2) SK_CASE(3) SK_CASE(4) SK_CASE(5) SK_CASE(6) SK_CASE(7) SK_CASE(8)
-        default: break;
+        default:
+            SK_PAD(12, 9, 12) SK_PAD(16, 13, 16) SK_PAD(24, 17, 24) SK_PAD(32, 25, 32)
+            break;
     }
+    #undef SK_PAD
     #undef SK_CASE
 }
 
@@ -565,6 +577,19 @@ static bool enabled()
     return cached == 1;
 }
 
+// Rows above this are left to the caller's GEMM (EXL3_HIP_SKINNY_MAX_M, default MAX_M; 8 = the old behaviour).
+static int max_rows()
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char* e = getenv("EXL3_HIP_SKINNY_MAX_M");
+        int v = e && *e ? atoi(e) : MAX_M;
+        cached = v < 1 ? 1 : (v > MAX_M ? MAX_M : v);
+    }
+    return cached;
+}
+
 // true if handled
 static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, cudaStream_t stream)
 {
@@ -575,7 +600,7 @@ static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, 
     const int k = a.size(-1);
     const int m = a.numel() / k;
     const int n = b.size(-1);
-    if (m < 1 || m > MAX_M || n < 1 || n > MAX_N || k < 1) return false;
+    if (m < 1 || m > max_rows() || n < 1 || n > MAX_N || k < 1) return false;
     const int ksplit = (k + K_CHUNK - 1) / K_CHUNK;
     if (ksplit > MAX_KSPLIT) return false;
     if (a.stride(-1) != 1 || c.stride(-1) != 1) return false;
@@ -790,14 +815,14 @@ static void skinny_cat_impl(at::Tensor a, const at::Tensor* b, const std::vector
             seg.ldw[s] = n;
         }
     }
-    TORCH_CHECK(m >= 1 && m <= MAX_M && n >= 1 && n <= CAT_MAX_N, "skinny_cat: shape out of range");
+    TORCH_CHECK(m >= 1 && m <= EXACT_M && n >= 1 && n <= CAT_MAX_N, "skinny_cat: shape out of range");
     const int ksplit = (k + K_CHUNK - 1) / K_CHUNK;
     TORCH_CHECK(ksplit <= MAX_KSPLIT, "skinny_cat: k too large");
 
     const int dev = a.device().index();
     TORCH_CHECK(dev >= 0 && dev < NUM_DEV, "skinny_cat: device");
     if (!g_cat_partials[dev])
-        cuda_check(cudaMalloc((void**) &g_cat_partials[dev], (size_t) MAX_KSPLIT * MAX_M * CAT_MAX_N * sizeof(float)));
+        cuda_check(cudaMalloc((void**) &g_cat_partials[dev], (size_t) MAX_KSPLIT * EXACT_M * CAT_MAX_N * sizeof(float)));
     if (!g_cat_counters[dev])
     {
         cuda_check(cudaMalloc((void**) &g_cat_counters[dev], (CAT_MAX_N / COLS) * sizeof(int)));

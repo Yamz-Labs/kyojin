@@ -2,7 +2,7 @@
 # ROCm SDK hipcc on first use (cached by source hash) and launches it through torch's own libamdhip64 via
 # hipModuleLaunchKernel on the current torch stream: no extension rebuild, no second HIP runtime.
 
-import ctypes, hashlib, os, shutil, subprocess
+import ctypes, hashlib, os, shutil, subprocess, threading
 import torch
 from exllamav3.util import hip_compiler
 from exllamav3.util.hip_lib import load_hip_runtime
@@ -26,17 +26,40 @@ def _compile(defs, arch):
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"kda_fused_h_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
         os.makedirs(os.path.dirname(cache), exist_ok=True)
-        tmp = cache + f".{os.getpid()}.tmp"
+        tmp = cache + f".{os.getpid()}.{threading.get_ident()}.tmp"
         subprocess.run([_hipcc(), *flags, "-o", tmp, _SRC], check=True, capture_output=True)
         os.replace(tmp, cache)
     return cache
+
+
+_CK = ("CK4=1", "CK8=1")
+
+
+def _siblings(defs):
+    """The builds that differ from `defs` only in the checkpoint-slot count (2 slots: none, 4: CK4, 8: CK8)."""
+    base = " ".join(t for t in defs.split() if t not in _CK)
+    return [d for d in [base] + [f"{base} {t}".strip() for t in _CK] if d.split() != defs.split()]
+
+
+def _precompile_siblings(defs, arch):
+    # The number of checkpoint rows of a request picks the build. A prefill chunk and a short prompt tail use different
+    # ones, so the first re-sent prompt would run hipcc (about 2.5 s) inside its own time to first token. Build the
+    # others now, off the request path; a failure is not an error (the build then happens on first use as before).
+    def run():
+        for d in _siblings(defs):
+            try:
+                _compile(d, arch)
+            except Exception:  # noqa: BLE001
+                return
+    threading.Thread(target=run, name="kda-fused-h-precompile", daemon=True).start()
 
 
 def _load(defs=""):
     # defs: extra -D defines (timing experiments only, e.g. "ABL=4"); one module per defines string
     if defs in _state:
         return _state[defs]
-    cache = _compile(defs, torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    cache = _compile(defs, arch)
     lib = load_hip_runtime()
     torch.cuda.init()
     mod, fn = ctypes.c_void_p(), ctypes.c_void_p()
@@ -48,6 +71,10 @@ def _load(defs=""):
     _state["lib"] = lib
     _state[defs] = fn
     _state["mod", defs] = mod
+    base = " ".join(t for t in defs.split() if t not in _CK)
+    if ("pre", base) not in _state:
+        _state["pre", base] = True
+        _precompile_siblings(defs, arch)
     return fn
 
 
@@ -75,13 +102,15 @@ def chunk_kda_fwd_h_fused_hip(q, k, v, gk, beta, Akk, Aqk, scale, initial_state=
         # default off. Name kept per brief; the 2-WG split (lever a) was ruled NO-GO by
         # construction (w/tril/vn couple all halves).
         defs = "BRL=1 UNI=1"
-    # ckpt: one dict or a list of up to 2 (EXL3_PF_NO_TAIL adds the prompt's last full page); up to 4 with the CK4 build
+    # ckpt: one dict or a list of up to 2 (EXL3_PF_NO_TAIL adds the prompt's last full page); up to 4 with the CK4 build, up to 8 with the CK8 build
     # (EXL3_NC2_CKPT4: an 8192-row chunk carries 3 interior checkpoints + the last full page)
     cks = [] if ckpt is None else (list(ckpt) if isinstance(ckpt, (list, tuple)) else [ckpt])
-    nslot = 4 if len(cks) > 2 else 2
+    nslot = 8 if len(cks) > 4 else 4 if len(cks) > 2 else 2
     assert len(cks) <= nslot
     if nslot == 4:
         defs = (defs + " CK4=1").strip()
+    elif nslot == 8:
+        defs = (defs + " CK8=1").strip()
     fn = _load(defs)
     if o is None:
         o = torch.empty_like(v)

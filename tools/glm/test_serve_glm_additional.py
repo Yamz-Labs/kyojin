@@ -743,7 +743,7 @@ class SSEKeepAliveTests(unittest.TestCase):
 
         body = run(check())
         self.assertTrue([line for line in body.split(b"\n") if line.startswith(b":")], body[:400])
-        self.assertLess(body.index(b": waiting"), body.index(b"hello"))   # before the first token
+        self.assertLess(body.index(b": waiting"), body.index(b'"content":"hel'))   # before the first token
         self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))          # the stream still ends the OpenAI way
 
     def test_a_ping_covers_a_tool_call_the_server_holds_back(self):
@@ -1044,7 +1044,7 @@ class SSEKeepAliveTests(unittest.TestCase):
 
         body = run(check())
         self.assertEqual([line for line in body.split(b"\n") if line.startswith(b":")], [])
-        self.assertIn(b"hello", body)
+        self.assertIn(b'"content":"hel', body)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,11 @@ else:
         "-Xcudafe", "--diag_suppress=177",
         "-Xcudafe", "--diag_suppress=20012",
     ]
+    # EXL3_PORT_DEC=1 at build time compiles the HIP decode kernels (quant/exl3_dec.cu) for CUDA too
+    # (see port.cuh); they are bound only when EXL3_PORT_DEC=1 at import as well.
+    if os.environ.get("EXL3_PORT_DEC", "0") == "1":
+        extra_cuda_cflags += ["-DEXL3_PORT_DEC"]
+        extra_cflags += ["-DEXL3_PORT_DEC"]
 
 if windows:
     # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every

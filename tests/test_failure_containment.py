@@ -71,6 +71,8 @@ def make_generator(pending, active=(), max_batch_size=16):
     generator.pagetable = StubPagetable()
     generator.pending_jobs = list(pending)
     generator.active_jobs = list(active)
+    generator.deferred_jobs = []     # read by flush_deferred() (EXL3_REPLY_FIRST) at the start of iterate()
+    generator.model = None           # read by the fused-MoE barrier check at the end of iterate()
     generator.max_batch_size = max_batch_size
     return generator
 

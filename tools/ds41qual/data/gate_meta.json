@@ -1,0 +1,26 @@
+{
+ "names": [
+  "agentic:agentic_code_01:2048",
+  "agentic:agentic_curl_05:2048",
+  "agentic:agentic_code_10:2048",
+  "agentic:agentic_code_20:4096",
+  "agentic:agentic_curl_10:4096",
+  "agentic_long:curl_16+code_29:8192",
+  "code:ds41_serving_sources:2048",
+  "french:ds41ref_row10:2048"
+ ],
+ "lengths": [
+  2048,
+  2048,
+  2048,
+  4096,
+  4096,
+  8192,
+  2048,
+  2048
+ ],
+ "bos_id": 0,
+ "start": 64,
+ "sha256": "c6f862584608b81f27c14ecb7ed1055eef1f2b041b5c7991e9b664b9feb81a85",
+ "total_tokens": 26624
+}

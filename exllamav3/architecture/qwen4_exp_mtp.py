@@ -190,7 +190,10 @@ class Qwen4ExpMTPModel(Model):
             return ids.clone().view(bsz, seq)
         logits = lm.forward(logits, params)
         if params.get("export_draft_logits"):
-            params["draft_logits"] = logits   # spec_sample: the drafter's law for sampled jobs
+            params["draft_logits"] = logits   # spec_sample: the drafter's law for sampled jobs (it zeroes the padding itself)
+        lim = getattr(self, "vocab_limit", None)   # set by the Generator: the tokenizer's piece count when the head is padded
+        if lim is not None:
+            logits = logits[..., :lim]   # the padding columns have no piece: a draft there is rejected for sure
         if params.get("export_draft_conf"):
             logits = logits[..., :self.attached_model().config.vocab_size]
             conf, ids = torch.max(logits, dim = -1)

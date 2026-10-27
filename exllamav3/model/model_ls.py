@@ -107,7 +107,7 @@ class Model_LSMixin(ABC):
                     "batch_shape": (1, max_chunk_size),
                 })
                 prepare_for_attn(torch.zeros((1, max_chunk_size), dtype = torch.long), params)
-                rl = [m for m in self if m.caps.get("recurrent_cache")]
+                rl = self.get_recurrent_layers()   # not the raw caps: a KVWIN ring declared by a model without recurrent state slots does not count
                 if rl:
                     prepare_for_recurrence(None, params, self)
 
@@ -298,6 +298,15 @@ class Model_LSMixin(ABC):
             yield
 
 
+    def _name_embedding_target(self, x: torch.Tensor, params: dict):
+        """A long chunk of token ids headed for a CPU-resident embedding: tell it the device of the module that consumes its output
+        (Embedding.forward then uploads the rows pinned and asynchronously, see EXL3_PF_EMB_UPLOAD)."""
+        if x.device.type == "cpu" and x.numel() >= 1024 and len(self.fwd_modules) > 1:
+            dev = self.fwd_modules[1][0].device
+            if dev is not None and torch.device(dev).type == "cuda":
+                params["emb_next_device"] = dev
+
+
     def prefill_ls(
         self,
         x: torch.Tensor,
@@ -305,6 +314,7 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
+        self._name_embedding_target(x, params)
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance
             pf = (idx, instance) == self.last_kv_module_idx_instance
@@ -328,6 +338,7 @@ class Model_LSMixin(ABC):
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
+        self._name_embedding_target(x, params)
         span = _FWD_SPAN and x.dim() >= 3 and x.shape[1] <= 8   # (batch, rows, ..): decode/verify only, not prefill chunks
         for module, instance, idx in self.fwd_modules:
             params["layer_instance"] = instance

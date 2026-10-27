@@ -400,7 +400,7 @@ def routing_ds3(bsz, cfg, y, params):
 
 
 DEC_ROUTER_ROWS_MAX = 4  # loop ~23 us/row vs torch fallback ~120 us flat: loses past R~5
-ROUTER_ROWS_KERNEL_MAX = 4  # exl3_dec_router_rows takes NR in 2..4 (exl3_dec.cu)
+ROUTER_ROWS_KERNEL_MAX = 8  # exl3_dec_router_rows takes NR in 2..8 (exl3_dec.cu)
 
 
 def _router_row_chunks(bsz: int) -> list:
@@ -466,8 +466,7 @@ def _dec_router_rows(cfg, y, bsz):
     # bitwise to the per-row loop below
     if (os.environ.get("EXL3_DEC_ROUTER_ROWS", "1") == "2" and hasattr(ext, "exl3_dec_router_rows") and
             cfg.num_experts <= 320):
-        # The kernel takes 2..4 rows: more rows go as balanced chunks of 2..4 (5 -> 3+2, 8 -> 4+4),
-        # every row is still the batch-1 arithmetic
+        # The kernel takes 2..8 rows: more rows go as balanced chunks of 2..8, every row is still the batch-1 arithmetic
         r0 = 0
         for k in _router_row_chunks(bsz):
             ext.exl3_dec_router_rows(y2[r0:r0 + k], cfg.gate_tensor, bias, selected_experts[r0:r0 + k],
@@ -606,13 +605,42 @@ def _routing_sqrtsp_vl(cfg, y, vl, hash_sel):
     return sel.long(), w.half()
 
 
+def _ds41_router_ok(bsz, cfg, y, params):
+    return (
+        bool(torch.version.hip) and os.environ.get("EXL3_DS41_ROUTER", "0") == "1" and y.dtype == torch.half and
+        y.dim() == 2 and y.shape[1] == 5120 and cfg.num_experts % 8 == 0 and cfg.num_experts <= 512 and
+        cfg.num_experts_per_tok <= 16 and cfg.e_score_correction_bias is not None and
+        cfg.gate_tensor.dtype in (torch.float, torch.half, torch.bfloat16) and
+        _vl_rows(cfg, params, bsz, y.device) is None
+    )
+
+
+def _ds41_router(bsz, cfg, y):
+    from .dsv41_fn import dsv41_hip
+    if cfg.gate_tensor_t is None:
+        cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()                      # [E, H], the kernel's row-major gate
+    if getattr(cfg, "ds41_bias32", None) is None:
+        cfg.ds41_bias32 = cfg.e_score_correction_bias.float().contiguous()
+    _, sel, wts = _routing_buffers(cfg, bsz, y.device)
+    scores = g_tensor_cache.get_bucketed(y.device, bsz * cfg.num_experts, torch.float, "ds41_route_scores")
+    dsv41_hip.router(y.contiguous(), cfg.gate_tensor_t, cfg.ds41_bias32, sel, wts, scores.view(bsz, cfg.num_experts),
+                     cfg.num_experts_per_tok, cfg.routed_scaling_factor, 1.0, True)
+    return sel, wts
+
+
 def routing_sqrtsp(bsz, cfg, y, params):
     """DeepSeek-V4 router: sqrt(softplus(logits)) affinity, noaux_tc bias for selection only,
     weights normalized over the selected set, times routed_scaling_factor. The nogroup top-k
     kernel serves every batch size (one block per row); bsz 1 reuses the cached output
     buffers, larger batches allocate per call. activate_all_experts (conversion) stays
     torch-composed."""
-    if params.get("activate_all_experts") or not hasattr(ext, "routing_ds3_nogroup"):
+    if params.get("activate_all_experts"):
+        return _routing_nogroup_torch(cfg, y, params, _sqrtsp_scores(cfg, y))
+    if not hasattr(ext, "routing_ds3_nogroup"):
+        # ROCm builds exclude routing.cu. DS4.1-shaped gates (hidden 5120) take the fused HIP router (2 launches: GEMV + sqrtsoftplus,
+        # top-k, normalise; fp32 bias and scores) instead of ~10 torch launches. Opt-in until validated on the device.
+        if _ds41_router_ok(bsz, cfg, y, params):
+            return _ds41_router(bsz, cfg, y)
         return _routing_nogroup_torch(cfg, y, params, _sqrtsp_scores(cfg, y))
     vl = _vl_rows(cfg, params, bsz, y.device)
     if vl is not None:

@@ -15,6 +15,7 @@ import time
 import torch
 from ..ext import exllamav3_ext as ext
 from .hyperconnections import HyperConnection
+from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices
 
 MAX_ROWS = 4
 # EXL3_VERIFY_ROW_SPLIT=1: 5..8 rows of one sequence run as fused sub-calls of at most 4 rows (per-row arithmetic unchanged)
@@ -78,6 +79,17 @@ K6S8_WIDE_SHAPES = ((2560, 4, 320, 512, 10, 640, 6, 8),
                     (256, 4, 32, 64, 4, 128, 6, 8))
 
 
+def _route_trace(fh, rows: int) -> None:
+    """EXL3_ROUTE_TRACE (diagnostic, see block_sparse_mlp._RouteTrace): record the experts the fused half-layer selected this launch,
+    read back from the kernel's own selection record (seldbg), so the trace is what the kernel really ran."""
+    from . import block_sparse_mlp as bsm
+    rt = bsm._ROUTE_TRACE
+    if rt is None:
+        return
+    k = fh.TOPK
+    rt.record(fh._tkey, rows, fh.ws_view("seldbg", rows)[: rows * k].view(rows, k))
+
+
 class FusedMoEHalf:
     """Static plan + workspace of one qwen4_exp-style MoE half-layer (HC sites, BlockSparseMLP + shared expert)."""
 
@@ -88,6 +100,8 @@ class FusedMoEHalf:
         if not hasattr(ext, "exl3_moe_fused_half"):
             return "extension has no exl3_moe_fused_half"
         gr, mlp = block.mlp_hc, block.mlp
+        if getattr(mlp, "tier", None) is not None:
+            return "tiered experts (expert store): the half-layer kernel bakes the expert pointers"
         if gr is None or mlp is None or block.mlp_norm is not None:
             return "needs mlp_hc, mlp and no mlp_norm"
         if not getattr(gr, "use_q8", False) or gr.hc_mult != 4:
@@ -198,7 +212,12 @@ class FusedMoEHalf:
             return False
         if x.dtype != torch.float or not x.is_contiguous() or x.dim() != 4 or x.shape[2] != self.H or x.shape[3] != self.D:
             return False
-        return 1 <= x.shape[0] * x.shape[1] <= (8 if R8["on"] else SPLIT_MAX_ROWS)
+        rows = x.shape[0] * x.shape[1]
+        lim = 8 if R8["on"] else SPLIT_MAX_ROWS
+        if rows <= lim:
+            return rows >= 1
+        # ROCm: a verify step of 9..ROW_INV_MAX_ROWS rows (several jobs x draft depth) runs as job-aligned sub-calls of the 8-row path
+        return lim >= 8 and rows <= ROW_INV_MAX_ROWS and bool(params.get("dflash_verify"))
 
     def _wide_ok(self) -> bool:
         """Native wide launches; K6/K8 requires its own experimental opt-in."""
@@ -212,12 +231,20 @@ class FusedMoEHalf:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """x (b, s, H, D) fp32 residual stack, updated in place and returned."""
+        rows = x.shape[0] * x.shape[1]
+        if rows > 8:
+            # whole jobs per call, at most 8 rows each: every row keeps the arithmetic of an 8-row (or shorter) round
+            xf = x.view(1, rows, *x.shape[2:])
+            for lo, hi in job_slices(rows, x.shape[1], 8):
+                self(xf[:, lo:hi])
+            return x
         if x.shape[0] * x.shape[1] > MAX_ROWS and R8["on"] and self._wide_ok():
             gr = self.gr
             fq, fsc, uq, usc = gr.q8_set()
             R8["calls"] += 1
             torch.ops.mf9.half(x, fq, fsc, uq, usc, gr.w_h, self.router, self.sgate,
                                self.wt, self.svt, self.ws, gr.rms_eps, 1, 0, MF9["variant"] | (0x1000 if MF9["tk2"] else 0), *self.shape)
+            _route_trace(self, x.shape[0] * x.shape[1])
             return x
         if x.shape[0] * x.shape[1] > MAX_ROWS:
             # several jobs (b > 1, e.g. the MTP drafter at 5+ sessions) split over their rows like one job: rows are independent
@@ -231,9 +258,11 @@ class FusedMoEHalf:
             # core9 kernel (forced-inline phases, two blocks per WGP), byte-identical to the kernel below; same workspace layout
             torch.ops.mf9.half(x, fq, fsc, uq, usc, gr.w_h, self.router, self.sgate,
                                self.wt, self.svt, self.ws, gr.rms_eps, 1, MF9["timing"], MF9["variant"] | (0x1000 if MF9["tk2"] else 0), *self.shape)
+            _route_trace(self, x.shape[0] * x.shape[1])
             return x
         ext.exl3_moe_fused_half(x, fq, fsc, uq, usc, gr.w_h, self.router, self.sgate,
                                 self.wt, self.svt, self.ws, gr.rms_eps, int(self.native), *self.shape)
+        _route_trace(self, x.shape[0] * x.shape[1])
         return x
 
 
@@ -308,6 +337,7 @@ def maybe_apply(block, x: torch.Tensor, params: dict, hc_pending):
         if FusedMoEHalf.why_not(block) is not None:
             return None
         fh = FusedMoEHalf(block)
+        fh._tkey = block.mlp.key
         block._moe_fused = fh
     if not fh.applicable(x, params):
         return None

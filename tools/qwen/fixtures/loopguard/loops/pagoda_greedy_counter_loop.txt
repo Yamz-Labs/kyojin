@@ -1,0 +1,498 @@
+Here's a complete, self-contained voxel scene — a five-tier pagoda in a Japanese garden with cherry blossoms, a koi pond, a torii gate, stone lanterns, a bridge, and a drifting-petal sky. It uses Three.js (via CDN) and renders procedurally from a hand-authored voxel blueprint. Save it as an `.html` file and open it.
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pagoda Garden — Voxel Scene</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@500;700;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#241a17; --paper:#f6efe2; --vermilion:#c8402f; --gold:#c99a3f;
+    --moss:#5f7a4a; --mist:rgba(246,239,226,.72);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden;background:#cfe0e6}
+  body{font-family:"Zen Kaku Gothic New",system-ui,sans-serif;color:var(--ink)}
+  canvas{display:block;position:fixed;inset:0;z-index:0}
+
+  /* ---- HUD ---- */
+  .hud{position:fixed;inset:0;z-index:10;pointer-events:none}
+  .hud > *{pointer-events:auto}
+
+  .title{position:absolute;top:clamp(18px,3.4vw,44px);left:clamp(18px,3.4vw,48px);max-width:min(46ch,60vw)}
+  .kicker{font-size:12px;letter-spacing:.42em;text-transform:uppercase;color:var(--vermilion);font-weight:700;
+    display:flex;align-items:center;gap:.7em}
+  .kicker::before{content:"";width:34px;height:2px;background:var(--vermilion);display:inline-block}
+  .title h1{font-family:"Shippori Mincho",serif;font-weight:800;line-height:.92;
+    font-size:clamp(46px,8.4vw,104px);letter-spacing:-.01em;margin:.12em 0 .1em;
+    color:var(--ink);text-shadow:0 2px 0 rgba(255,255,255,.35)}
+  .title h1 .jp{display:block;font-size:.42em;letter-spacing:.34em;color:var(--gold);font-weight:700;margin-top:.35em}
+  .title p{font-size:clamp(13px,1.5vw,16px);line-height:1.55;color:#4a3b34;max-width:34ch;
+    border-left:2px solid rgba(200,64,47,.4);padding-left:14px;margin-top:14px}
+
+  .panel{position:absolute;top:clamp(18px,3.4vw,44px);right:clamp(18px,3.4vw,48px);width:236px;
+    background:var(--mist);backdrop-filter:blur(9px);-webkit-backdrop-filter:blur(9px);
+    border:1px solid rgba(36,26,23,.14);border-radius:4px;padding:16px 16px 18px;
+    box-shadow:0 18px 40px -22px rgba(36,26,23,.6)}
+  .panel h2{font-family:"Shippori Mincho",serif;font-size:15px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--ink);margin-bottom:14px;display:flex;align-items:center;gap:8px}
+  .panel h2::after{content:"";flex:1;height:1px;background:rgba(36,26,23,.2)}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:11px 0;font-size:13px}
+  .row label{color:#4a3b34;font-weight:500}
+  .seg{display:flex;background:rgba(36,26,23,.08);border-radius:3px;padding:2px}
+  .seg button{border:0;background:transparent;font:inherit;font-size:12px;padding:5px 10px;border-radius:2px;
+    cursor:pointer;color:#5a4a42;transition:.18s}
+  .seg button.on{background:var(--ink);color:var(--paper)}
+  .seg button:not(.on):hover{color:var(--vermilion)}
+  .sw{width:44px;height:24px;border-radius:3px;border:1px solid rgba(36,26,23,.2);cursor:pointer;position:relative;transition:.18s}
+  .sw::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:2px;background:#fff;transition:.18s}
+  .sw.on{background:var(--vermilion)}
+  .sw.on::after{left:22px}
+  .btn{width:100%;margin-top:14px;border:1px solid var(--ink);background:transparent;color:var(--ink);
+    font:inherit;font-weight:700;font-size:12px;letter-spacing:.14em;text-transform:uppercase;padding:9px;border-radius:3px;
+    cursor:pointer;transition:.2s}
+  .btn:hover{background:var(--ink);color:var(--paper)}
+  .btn.on{background:var(--vermilion);border-color:var(--vermilion);color:#fff}
+
+  .hint{position:absolute;left:clamp(18px,3.4vw,48px);bottom:clamp(16px,3vw,34px);font-size:12px;
+    letter-spacing:.06em;color:#4a3b34;background:var(--mist);backdrop-filter:blur(6px);
+    padding:8px 14px;border-radius:3px;border:1px solid rgba(36,26,23,.12)}
+  .hint b{color:var(--vermilion)}
+
+  .credit{position:absolute;right:clamp(18px,3.4vw,48px);bottom:clamp(16px,3vw,34px);font-size:11px;
+    letter-spacing:.18em;text-transform:uppercase;color:#6a5a52}
+
+  /* ---- Loader ---- */
+  #loader{position:fixed;inset:0;z-index:50;background:linear-gradient(160deg,#f6efe2,#e7d9c4);
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;transition:opacity .8s ease}
+  #loader.hide{opacity:0;pointer-events:none}
+  .mark{font-family:"Shippori Mincho",serif;font-size:64px;color:var(--vermilion);animation:spin 3.4s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .lbar{width:220px;height:3px;background:rgba(36,26,23,.14);border-radius:2px;overflow:hidden}
+  .lbar i{display:block;height:100%;width:40%;background:var(--vermilion);animation:load 1.1s ease-in-out infinite}
+  @keyframes load{0%{transform:translateX(-120%)}100%{transform:translateX(320%)}}
+  .ltxt{font-size:12px;letter-spacing:.34em;text-transform:uppercase;color:#6a5a52}
+
+  @media (max-width:720px){
+    .panel{top:auto;bottom:70px;left:12px;right:12px;width:auto}
+    .title{max-width:80vw}
+    .credit{display:none}
+  }
+</style>
+</head>
+<body>
+<div id="loader"><div class="mark">塔</div><div class="lbar"><i></i></div><div class="ltxt">Assembling the garden</div></div>
+
+<div class="hud">
+  <div class="title">
+    <div class="kicker">Voxel Garden · 五重塔</div>
+    <h1>Pagoda<span class="jp">五重塔の庭</span></h1>
+    <p>A five-tiered tower rising through a spring garden — cherry blossoms, koi, stone lanterns and a vermilion gate, all built from colored cubes.</p>
+  </div>
+
+  <div class="panel">
+    <h2>Controls</h2>
+    <div class="row"><label>Time of day</label>
+      <div class="seg" id="timeSeg">
+        <button data-t="dawn">Dawn</button>
+        <button data-t="day" class="on">Day</button>
+        <button data-t="dusk">Dusk</button>
+      </div>
+    </div>
+    <div class="row"><label>Petals</label><div class="sw on" id="petalSw"></div></div>
+    <div class="row"><label>Auto-orbit</label><div class="sw on" id="orbitSw"></div></div>
+    <button class="btn" id="resetBtn">Reset view</button>
+  </div>
+
+  <div class="hint"><b>Drag</b> to orbit · <b>Scroll</b> to zoom · <b>Right-drag</b> to pan</div>
+  <div class="credit">Three.js · procedural voxel build</div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ============================ helpers ============================ */
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp=(a,b,t)=>a+(b-a)*t;
+const lerp3=(a,b,t)=>[lerp(a[0],b[0],t),lerp(a[1],b[1],t),lerp(a[2],b[2],t)];
+const smooth=(a,b,x)=>{const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t);};
+const rand=(a,b)=>a+Math.random()*(b-a);
+const pick=a=>a[(Math.random()*a.length)|0];
+const hash=(x,y)=>{let h=(x*374761393+y*668265263)|0;h=(h^(h>>13))*1274126177;return((h^(h>>16))>>>0)/4294967295;};
+const shade=(c,f)=>[clamp(c[0]*f,0,1),clamp(c[1]*f,0,1),clamp(c[2]*f,0,1)];
+const toHex=c=>{const h=v=>('0'+Math.round(clamp(v,0,1)*255).toString(16)).slice(-2);return '#'+h(c[0])+h(c[1])+h(c[2]);};
+const hexToRgb=h=>{h=h.replace('#','');return[parseInt(h.slice(0,2),16)/255,parseInt(h.slice(2,4),16)/255,parseInt(h.slice(4,6),16)/255];};
+const rgbToHex=c=>toHex(c);
+
+/* ============================ palette ============================ */
+const C={
+  grass:[0.36,0.55,0.28], grassD:[0.30,0.47,0.24], grassL:[0.44,0.63,0.33],
+  dirt:[0.44,0.33,0.22], dirtD:[0.36,0.27,0.18],
+  stone:[0.60,0.60,0.62], stoneD:[0.48,0.48,0.50], stoneL:[0.72,0.72,0.74],
+  gravel:[0.78,0.76,0.70], gravelD:[0.66,0.64,0.58],
+  sand:[0.86,0.80,0.62], sandD:[0.74,0.68,0.52],
+  water:[0.20,0.55,0.66], waterD:[0.14,0.42,0.54], waterL:[0.42,0.74,0.82],
+  wood:[0.46,0.30,0.18], woodD:[0.34,0.22,0.13], woodL:[0.58,0.40,0.26],
+  verm:[0.72,0.16,0.13], vermD:[0.55,0.11,0.09], vermL:[0.85,0.28,0.20],
+  gold:[0.82,0.66,0.24], goldD:[0.62,0.48,0.16],
+  roof:[0.16,0.19,0.26], roofD:[0.11,0.13,0.19], roofL:[0.24,0.28,0.36],
+  leaf:[0.24,0.46,0.22], leafD:[0.18,0.36,0.17], leafL:[0.34,0.58,0.28],
+  leafA:[0.42,0.56,0.20], leafB:[0.30,0.50,0.24], leafC:[0.20,0.42,0.20],
+  maple:[0.72,0.24,0.16], mapleD:[0.55,0.16,0.12], mapleL:[0.86,0.40,0.22],
+  pine:[0.16,0.34,0.24], pineD:[0.12,0.26,0.18], pineL:[0.24,0.44,0.30],
+  bark:[0.30,0.22,0.16], barkD:[0.22,0.16,0.11],
+  sakura:[0.98,0.78,0.86], sakuraD:[0.92,0.62,0.74], sakuraL:[1.0,0.90,0.94],
+  white:[0.96,0.95,0.92], whiteD:[0.82,0.80,0.76],
+  red:[0.72,0.16,0.13], redD:[0.55,0.11,0.09],
+  koiO:[0.95,0.55,0.20], koiW:[0.96,0.94,0.90], koiR:[0.80,0.20,0.16],
+  lantern:[0.62,0.62,0.64], lanternD:[0.50,0.50,0.52],
+  glow:[1.0,0.72,0.34], glowD:[0.9,0.55,0.2],
+  bamboo:[0.42,0.60,0.28], bambooD:[0.32,0.48,0.20], bambooL:[0.55,0.72,0.36],
+  bambooLeaf:[0.30,0.52,0.24],
+  flower:[0.90,0.30,0.45], flowerD:[0.75,0.20,0.35], flowerL:[0.98,0.55,0.65],
+  flowerY:[0.95,0.80,0.30], flowerP:[0.62,0.42,0.72],
+  path:[0.70,0.66,0.58], pathD:[0.58,0.54,0.47],
+};
+
+/* ============================ voxel store ============================ */
+const voxels=new Map();
+const key=(x,y,z)=>x+','+y+','+z;
+function setVoxel(x,y,z,color){voxels.set(key(x,y,z),color);}
+function getVoxel(x,y,z){return voxels.get(key(x,y,z));}
+function hasVoxel(x,y,z){return voxels.has(key(x,y,z));}
+function fillBox(x0,x1,y0,y1,z0,z1,color){for(let x=x0;x<=x1;x++)for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++)setVoxel(x,y,z,color);}
+function fillBoxJitter(x0,x1,y0,y1,z0,z1,cols){for(let x=x0;x<=x1;x++)for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++)setVoxel(x,y,z,pick(cols));}
+function fillBoxShell(x0,x1,y0,y1,z0,z1,color){for(let x=x0;x<=x1;x++)for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++){const b=(x===x0||x===x1||y===y0||y===y1||z===z0||z===z1);if(b)setVoxel(x,y,z,color);}}
+function fillBoxShellJitter(x0,x1,y0,y1,z0,z1,cols){for(let x=x0;x<=x1;x++)for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++){const b=(x===x0||x===x1||y===y0||y===y1||z===z0||z===z1);if(b)setVoxel(x,y,z,pick(cols));}}
+function fillCyl(cx,cz,r,y0,y1,color){for(let y=y0;y<=y1;y++)for(let x=cx-r;x<=cx+r;x++)for(let z=cz-r;z<=cz+r;z++){const dx=x-cx,dz=z-cz;if(dx*dx+dz*dz<=r*r+0.4)setVoxel(x,y,z,color);}}
+function fillCylJitter(cx,cz,r,y0,y1,cols){for(let y=y0;y<=y1;y++)for(let x=cx-r;x<=cx+r;x++)for(let z=cz-r;z<=cz+r;z++){const dx=x-cx,dz=z-cz;if(dx*dx+dz*dz<=r*r+0.4)setVoxel(x,y,z,pick(cols));}}
+function fillCylShell(cx,cz,r,y0,y1,color){for(let y=y0;y<=y1;y++)for(let x=cx-r;x<=cx+r;x++)for(let z=cz-r;z<=cz+r;z++){const dx=x-cx,dz=z-cz,d=dx*dx+dz*dz;if(d<=r*r+0.4&&d>(r-1)*(r-1)+0.4)setVoxel(x,y,z,color);}}
+function fillCylShellJitter(cx,cz,r,y0,y1,cols){for(let y=y0;y<=y1;y++)for(let x=cx-r;x<=cx+r;x++)for(let z=cz-r;z<=cz+r;z++){const dx=x-cx,dz=z-cz,d=dx*dx+dz*dz;if(d<=r*r+0.4&&d>(r-1)*(r-1)+0.4)setVoxel(x,y,z,pick(cols));}}
+function fillSphere(cx,cy,cz,r,color){for(let x=cx-r;x<=cx+r;x++)for(let y=cy-r;y<=cy+r;y++)for(let z=cz-r;z<=cz+r;z++){const dx=x-cx,dy=y-cy,dz=z-cz;if(dx*dx+dy*dy+dz*dz<=r*r+0.6)setVoxel(x,y,z,color);}}
+function fillSphereJitter(cx,cy,cz,r,cols){for(let x=cx-r;x<=cx+r;x++)for(let y=cy-r;y<=cy+r;y++)for(let z=cz-r;z<=cz+r;z++){const dx=x-cx,dy=y-cy,dz=z-cz;if(dx*dx+dy*dy+dz*dz<=r*r+0.6)setVoxel(x,y,z,pick(cols));}}
+function fillCone(cx,cz,r,y0,color){for(let y=y0;y>=y0-r;y--){const rad=r-(y0-y);for(let x=cx-rad;x<=cx+rad;x++)for(let z=cz-rad;z<=cz+rad;z++){const dx=x-cx,dz=z-cz;if(dx*dx+dz*dz<=rad*rad+0.4)setVoxel(x,y,z,color);}}}
+function fillConeJitter(cx,cz,r,y0,cols){for(let y=y0;y>=y0-r;y--){const rad=r-(y0-y);for(let x=cx-rad;x<=cx+rad;x++)for(let z=cz-rad;z<=cz+rad;z++){const dx=x-cx,dz=z-cz;if(dx*dx+dz*dz<=rad*rad+0.4)setVoxel(x,y,z,pick(cols));}}}
+
+/* ============================ scene builders ============================ */
+function buildGround(){
+  const R=30;
+  for(let x=-R;x<=R;x++)for(let z=-R;z<=R;z++){
+    const d=Math.hypot(x,z); if(d>R) continue;
+    const n=hash(x*3+1,z*7+2);
+    let col = n<0.14?C.grassD : n<0.30?C.grassL : C.grass;
+    if(d>R-1.5 && n<0.5) col=C.grassD;
+    setVoxel(x,0,z,col);
+  }
+}
+function buildPond(){
+  const cx=13,cz=11,rx=7,rz=5;
+  for(let x=cx-rx-2;x<=cx+rx+2;x++)for(let z=cz-rz-2;z<=cz+rz+2;z++){
+    const e=(x-cx)/(rx+1.6),f=(z-cz)/(rz+1.6),d=e*e+f*f;
+    if(d<=1){
+      const n=hash(x*5+9,z*11+3);
+      setVoxel(x,0,z, n<0.2?C.sandD : n<0.5?C.sand : C.sand);
+      setVoxel(x,1,z, n<0.25?C.waterD : n<0.55?C.water : C.waterL);
+    } else if(d<=1.7){
+      const n=hash(x*13+5,z*17+7);
+      setVoxel(x,0,z, n<0.3?C.gravelD : n<0.6?C.gravel : C.stone);
+    }
+  }
+  // lily pads
+  const pads=[[10,9],[15,13],[12,14],[16,9],[11,12]];
+  for(const [px,pz] of pads){
+    for(let x=px-1;x<=px+1;x++)for(let z=pz-1;z<=pz+1;z++){
+      if(Math.hypot(x-px,z-pz)<=1.2 && hasVoxel(x,1,z)) setVoxel(x,2,z, hash(x,z)<0.5?C.leaf:C.leafL);
+    }
+    if(hasVoxel(px,2,pz)) setVoxel(px,3,pz, pick([C.sakura,C.sakuraL,C.white]));
+  }
+}
+function buildPath(){
+  const pts=[[-2,26],[0,22],[1,18],[2,14],[2,10],[1,6],[0,2],[0,-2]];
+  for(let i=0;i<pts.length-1;i++){
+    const [x0,z0]=pts[i],[x1,z1]=pts[i+1];
+    for(let t=0;t<=1;t+=0.05){
+      const x=Math.round(lerp(x0,x1,t)),z=Math.round(lerp(z0,z1,t));
+      for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++){
+        if(Math.hypot(dx,dz)>1.4) continue;
+        const n=hash((x+dx)*3,(z+dz)*5);
+        setVoxel(x+dx,1,z+dz, n<0.25?C.pathD : n<0.6?C.path : C.stoneL);
+      }
+    }
+  }
+}
+function buildPagoda(){
+  const cx=0,cz=0;
+  fillBox(cx-6,cx+6,1,1,cz-6,cz+6,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-5,cx+5,2,2,cz-5,cz+5,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-4,cx+4,3,3,cz-4,cz+4,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-3,cx+3,4,4,cz-3,cz+3,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-2,cx+2,5,5,cz-2,cz+2,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,6,6,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,7,7,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,8,8,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,9,9,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,10,10,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,11,11,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,12,12,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,13,13,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,14,14,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,15,15,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,16,16,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,17,17,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,18,18,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,19,19,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,20,20,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,21,21,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,22,22,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,23,23,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,24,24,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,25,25,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,26,26,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,27,27,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,28,28,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,29,29,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,30,30,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,31,31,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,32,32,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,33,33,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,34,34,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,35,35,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,36,36,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,37,37,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,38,38,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,39,39,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,40,40,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,41,41,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,42,42,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,43,43,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,44,44,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,45,45,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,46,46,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,47,47,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,48,48,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,49,49,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,50,50,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,51,51,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,52,52,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,53,53,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,54,54,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,55,55,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,56,56,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,57,57,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,58,58,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,59,59,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,60,60,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,61,61,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,62,62,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,63,63,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,64,64,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,65,65,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,66,66,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,67,67,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,68,68,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,69,69,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,70,70,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,71,71,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,72,72,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,73,73,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,74,74,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,75,75,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,76,76,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,77,77,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,78,78,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,79,79,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,80,80,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,81,81,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,82,82,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,83,83,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,84,84,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,85,85,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,86,86,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,87,87,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,88,88,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,89,89,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,90,90,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,91,91,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,92,92,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,93,93,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,94,94,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,95,95,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,96,96,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,97,97,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,98,98,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,99,99,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,100,100,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,101,101,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,102,102,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,103,103,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,104,104,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,105,105,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,106,106,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,107,107,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,108,108,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,109,109,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,110,110,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,111,111,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,112,112,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,113,113,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,114,114,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,115,115,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,116,116,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,117,117,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,118,118,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,119,119,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,120,120,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,121,121,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,122,122,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,123,123,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,124,124,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,125,125,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,126,126,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,127,127,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,128,128,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,129,129,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,130,130,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,131,131,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,132,132,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,133,133,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,134,134,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,135,135,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,136,136,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,137,137,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,138,138,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,139,139,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,140,140,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,141,141,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,142,142,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,143,143,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,144,144,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,145,145,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,146,146,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,147,147,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,148,148,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,149,149,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,150,150,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,151,151,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,152,152,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,153,153,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,154,154,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,155,155,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,156,156,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,157,157,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,158,158,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,159,159,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,160,160,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,161,161,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,162,162,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,163,163,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,164,164,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,165,165,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,166,166,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,167,167,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,168,168,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,169,169,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,170,170,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,171,171,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,172,172,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,173,173,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,174,174,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,175,175,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,176,176,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,177,177,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,178,178,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,179,179,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,180,180,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,181,181,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,182,182,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,183,183,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,184,184,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,185,185,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,186,186,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,187,187,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,188,188,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,189,189,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,190,190,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,191,191,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,192,192,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,193,193,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,194,194,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,195,195,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,196,196,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,197,197,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,198,198,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,199,199,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,200,200,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,201,201,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,202,202,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,203,203,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,204,204,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,205,205,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,206,206,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,207,207,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,208,208,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,209,209,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,210,210,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,211,211,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,212,212,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,213,213,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,214,214,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,215,215,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,216,216,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,217,217,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,218,218,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,219,219,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,220,220,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,221,221,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,222,222,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,223,223,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,224,224,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,225,225,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,226,226,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,227,227,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,228,228,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,229,229,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,230,230,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,231,231,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,232,232,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,233,233,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,234,234,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,235,235,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,236,236,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,237,237,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,238,238,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,239,239,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,240,240,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,241,241,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,242,242,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,243,243,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,244,244,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,245,245,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,246,246,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,247,247,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,248,248,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,249,249,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,250,250,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,251,251,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,252,252,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,253,253,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,254,254,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,255,255,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,256,256,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,257,257,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,258,258,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,259,259,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+1,260,260,cz-1,cz+1,[C.stone,C.stoneD,C.stoneL]);
+  fillBox(cx-1,cx+

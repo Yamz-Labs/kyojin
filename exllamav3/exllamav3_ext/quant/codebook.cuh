@@ -86,7 +86,14 @@ __device__ inline half2 decode_mul1_product_2_sad(uint32_t x0, uint32_t x1)
 // Keep this expression portable instead of relying on inline PTX.
 __device__ __forceinline__ uint32_t lop3_0x6a(uint32_t a, uint32_t b, uint32_t c)
 {
+#if !defined(USE_ROCM) && defined(__CUDA_ARCH__)
+    // CUDA: one explicit lop3, as upstream exllamav3 1.6.0 issues it (EXL3_CB_LOP3, MIT); A/B against the C form
+    uint32_t r;
+    asm ("lop3.b32 %0, %1, %2, %3, 0x6a;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+#else
     return c ^ (a & b);
+#endif
 }
 
 // Ditto mcg (cb 1)

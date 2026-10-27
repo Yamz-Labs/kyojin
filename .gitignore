@@ -31,3 +31,6 @@ sse.out
 scratch/pfskip1/*.logits.pt
 scratch/pfskip1/pfb1_results.json
 .venv*
+tools/ds41/_ref/
+tools/ds41/_scratch/
+.check_logs/

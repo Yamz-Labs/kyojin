@@ -8,7 +8,7 @@ from . import Module, Linear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
-from .quant.exl3 import row_pad_pitch as _row_pad_pitch
+from .quant.exl3 import row_pad_pitch as _row_pad_pitch, MAX_BSZN_GEMV_R as _MAX_GEMV_R
 
 _MIDCKPT_STREAM = None  # EXL3_MIDCHUNK_CKPT=2 side stream for the checkpoint D2H
 from ..cache import Cache
@@ -103,6 +103,23 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     return jobs_by_device
 
 
+# Rewind batching across the jobs of one speculative round (Generator.iterate_gen): while a round collects, GDNState.rewind() parks its
+# job descriptors here instead of launching them, and rewind_batch_end() launches ONE batched conv rewind (and state rewind) for every
+# user. The jobs touch disjoint slots and nothing reads a slot between its rewind and the end of the round's sampling loop.
+_rw_defer = None
+def rewind_batch_begin():
+    global _rw_defer
+    _rw_defer = {}
+
+def rewind_batch_end():
+    global _rw_defer
+    d, _rw_defer = _rw_defer, None
+    if d: _dispatch_rewind_jobs(d)
+
+# Bumped whenever a layer state (re)allocates or frees its tensors: the memoized rewind job pointers below belong to one allocation
+_alloc_epoch = 0
+
+
 def _dispatch_rewind_jobs(jobs_by_device):
     for device_index, (conv_jobs, state_jobs) in jobs_by_device.items():
         if conv_jobs:
@@ -167,11 +184,41 @@ class GDNState:
         self.cache.release_state(self)
 
 
+    def _rewind_jobs(self, num_tokens: int):
+        """The jobs of rewind(num_tokens) for this slot. A cache of GDN layers only has pointer-only job descriptors that depend on
+        (slot, last_history, num_tokens, rebase) and the allocation, so they are built once per key and reused (48 layers x 2 tensor
+        views x every user and round otherwise); the shared state_base index is still set on every call. Other state classes in the
+        cache (and the first call of a key) go through _collect_rewind_jobs."""
+        layers = self.cache.get_all_recurrent_layers()
+        rebase = _state_rebase()
+        key = (self.slot, self.last_history, num_tokens, rebase)
+        memo = self.cache.__dict__.setdefault("_rewind_memo", {})
+        ent = memo.get(key)
+        if ent is not None and ent[0] == _alloc_epoch:
+            for l in ent[2]:
+                if rebase:
+                    l._set_base(self.slot, (self.last_history + 1 - num_tokens) if num_tokens > 0 else 0)
+                elif _base_value.get((l.cache_id, self.slot), 0) != 0:
+                    l._set_base(self.slot, 0)
+            return ent[1]
+        jobs = _collect_rewind_jobs(layers.values(), self.slot, self.last_history, num_tokens)
+        # KVWIN ring states rewind as a no-op, so they do not break the pointer-only memo
+        if all(isinstance(l, GDNLayerState) or getattr(l, "rewind_noop", False) for l in layers.values()):
+            reps = {}
+            for l in layers.values():
+                if isinstance(l, GDNLayerState): reps.setdefault(l.cache_id, l)
+            memo[key] = (_alloc_epoch, jobs, list(reps.values()))
+        return jobs
+
     def rewind(self, num_tokens: int):
         if not self.cache.model.loaded_tp:
-            _dispatch_rewind_jobs(_collect_rewind_jobs(
-                self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
-            ))
+            jobs = self._rewind_jobs(num_tokens)
+            if _rw_defer is None:
+                _dispatch_rewind_jobs(jobs)
+            else:
+                for dev, (cj, sj) in jobs.items():
+                    d = _rw_defer.setdefault(dev, ([], []))
+                    d[0].extend(cj); d[1].extend(sj)
         else:
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_rewind, (id(self.cache), self.slot, self.last_history, num_tokens))
         self.position -= num_tokens
@@ -184,7 +231,7 @@ class GDNState:
         return 0
 
 
-    def stash(self, async_: bool = False, pin_pool: dict = None):
+    def stash(self, async_: bool = False, pin_pool: dict = None, pinned: bool = False):
         """async_ (EXL3_NC2_ASYNC_STASH, via RecurrentCache.stash_async only): non-blocking D2H into pinned host tensors on the
         current stream plus one event in stashed["_ev"]; the cache syncs it and moves the copies to pageable memory
         (RecurrentCache._finish, worker thread) before any reader sees the entry."""
@@ -194,7 +241,24 @@ class GDNState:
         }
         if not self.cache.model.loaded_tp:
             layers = self.cache.get_all_recurrent_layers()
-            if async_ and all(isinstance(l, GDNLayerState) for l in layers.values()):
+            if async_ and all(isinstance(l, GDNLayerState) or getattr(l, "kvwin", False) for l in layers.values()):
+                if os.environ.get("EXL3_STASH_SIDE", "0") == "1" and torch.cuda.is_available():
+                    # Snapshot every layer's state on the device (one D2D copy each, 153 MB at 27B: ~0.4 ms) and run the D2H
+                    # on a side stream: the copies (40 ms over a x4 link) overlap the first decode steps instead of delaying
+                    # them, and the live state is free to advance because the copies read the snapshots.
+                    snaps = {k: l.snapshot(self.slot) for k, l in layers.items()}
+                    side = _stash_stream(self.cache)
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        for k, l in layers.items():
+                            stashed[k] = l.stash_from_snapshot(snaps[k], pin_pool)
+                        ev = torch.cuda.Event()
+                        ev.record(side)
+                    for sn in snaps.values():
+                        for t in sn:
+                            t.record_stream(side)
+                    stashed["_ev"] = ev
+                    return stashed
                 for k, l in layers.items():
                     stashed[k] = l.stash_async(self.slot, pin_pool)
                 ev = torch.cuda.Event()
@@ -202,7 +266,7 @@ class GDNState:
                 stashed["_ev"] = ev
                 return stashed
             for k, l in layers.items():
-                stashed[k] = l.stash(self.slot)
+                stashed[k] = l.stash(self.slot, pinned = pinned) if pinned else l.stash(self.slot)
         else:
             cp_handle = new_checkpoint_handle()
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_stash, (id(self.cache), cp_handle, self.slot))
@@ -214,7 +278,10 @@ class GDNState:
         assert self.position == stashed["position"]
         if not self.cache.model.loaded_tp:
             for k, l in self.cache.get_all_recurrent_layers().items():
-                l.unstash(self.slot, stashed[k])
+                if k in stashed or not hasattr(l, "unstash_missing"):
+                    l.unstash(self.slot, stashed[k])
+                else:
+                    l.unstash_missing(self.slot)   # KVWIN ring absent from a checkpoint written with the switch off
         else:
             cp_handle = stashed["tp_handle"]
             self.cache.model.tp_dispatch_all(mp_cache_recurrent_unstash, (id(self.cache), cp_handle, self.slot))
@@ -235,6 +302,17 @@ class GDNState:
 
     def reset(self):
         self.position = 0
+
+
+_stash_streams = {}
+
+
+def _stash_stream(cache):
+    dev = torch.cuda.current_device()
+    st = _stash_streams.get(dev)
+    if st is None:
+        st = _stash_streams[dev] = torch.cuda.Stream()
+    return st
 
 
 class GDNLayerState:
@@ -284,6 +362,8 @@ class GDNLayerState:
 
 
     def alloc(self, device):
+        global _alloc_epoch
+        _alloc_epoch += 1
         self.conv_state = torch.empty_like(self.conv_state, device = device)
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = device)
         self.state_base = _shared_base(self.cache_id, self.max_batch_size, device)
@@ -293,6 +373,8 @@ class GDNLayerState:
 
 
     def free(self):
+        global _alloc_epoch
+        _alloc_epoch += 1
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
         self.state_base = torch.empty_like(self.state_base, device = "meta")
@@ -365,13 +447,39 @@ class GDNLayerState:
         )
 
 
-    def stash(self, slot, position: int = 0):
+    def stash(self, slot, position: int = 0, pinned: bool = False):
         cdim = self.module.conv_kernel_size
         b = _base_value.get((self.cache_id, slot), 0)
+        if pinned:
+            # CUDA prompt-end tail checkpoint (job._tail_stash): async copy into page-locked buffers from torch's
+            # caching host allocator (reused across stashes, bounded by the tail LRU) instead of a synchronous .cpu()
+            # into fresh pageable memory; stream order keeps the copy ahead of the next write and of unstash
+            src = (self.recurrent_state[slot, b:b + 1], self.conv_state[slot, :, :cdim])
+            out = tuple(torch.empty(s.shape, dtype = s.dtype, pin_memory = True) for s in src)
+            for d, s in zip(out, src):
+                d.copy_(s, non_blocking = True)
+            return out
         return (
             self.recurrent_state[slot, b:b + 1].cpu(),
             self.conv_state[slot, :, :cdim].cpu()
         )
+
+
+    def snapshot(self, slot):
+        """Device copies of the committed recurrent state and the conv window (what stash() reads)."""
+        cdim = self.module.conv_kernel_size
+        b = _base_value.get((self.cache_id, slot), 0)
+        return (self.recurrent_state[slot, b:b + 1].clone(), self.conv_state[slot, :, :cdim].clone())
+
+
+    def stash_from_snapshot(self, snap, pin_pool: dict = None):
+        out = []
+        for src in snap:
+            free = None if pin_pool is None else pin_pool.get((tuple(src.shape), src.dtype))
+            dst = free.pop() if free else torch.empty(src.shape, dtype = src.dtype, pin_memory = True)
+            dst.copy_(src, non_blocking = True)
+            out.append(dst)
+        return tuple(out)
 
 
     def stash_async(self, slot, pin_pool: dict = None):
@@ -422,6 +530,12 @@ class GatedDeltaNet(Module):
         rms_norm_eps: float,
         conv_kernel_size: int,
         beta_scale: float = 1.0,
+        # Blocked GQA pairing (MiniCPM GGUF): the file stores v-heads even/odd
+        # grouped while q/k heads are sequential, and pairs v[j] with q[j % nk]
+        # (llama blocked style). Repeat pairing (v[2m]/v[2m+1] with q[m]) then
+        # mis-pairs 30/32 heads. When set, q/k are duplicated blocked AFTER
+        # the (depthwise, order-agnostic) conv and the rule runs plain 32/32.
+        blocked_gqa: bool = False,
         key_a_log: str | None = None,
         key_dt_bias: str | None = None,
         key_conv1d: str | None = None,
@@ -472,6 +586,7 @@ class GatedDeltaNet(Module):
         self.k_dim = self.k_head_dim * self.num_k_heads
         self.v_dim = self.v_head_dim * self.num_v_heads
         self.beta_scale = beta_scale
+        self.blocked_gqa = blocked_gqa or os.environ.get("EXL3_GDN_BLOCKED", "0") == "1"
 
         self.out_dtype = out_dtype
 
@@ -1006,7 +1121,7 @@ class GatedDeltaNet(Module):
         """Decode qkv + z in ONE exl3_dec launch (both Hadamard stages inside): batch 1, or the R-row verify
         launch (dflash_verify). Returns (qkv, z) with the Linears' shapes and dtype, or None to fall back."""
         rows = bsz * seqlen
-        if rows > 8 or x.dtype != torch.half or "capture" in params or "ovr" in params or not x.is_contiguous():
+        if rows > _MAX_GEMV_R or x.dtype != torch.half or "capture" in params or "ovr" in params or not x.is_contiguous():
             return None
         if rows > 1 and not (params.get("dflash_verify") and os.environ.get("EXL3_VERIFY_GEMV_R", "0") != "0"
                              and hasattr(ext, "exl3_dec_gemv_r_multi")):
@@ -1369,8 +1484,14 @@ class GatedDeltaNet(Module):
         max_rows = 2 if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 1
         if self.kda and os.environ.get("EXL3_NC2_CKPT4", "0") == "1":
             max_rows = 4  # CK4 kernel build (vendor/fla/hip/kda_fused_h_hip.py): 8192-row chunks
-        if len(rows) > max_rows or any(r % 64 or not cdim <= r < seqlen for r in rows):
+        if (not self.kda and os.environ.get("EXL3_GDN_HF", "0") == "1") or \
+                (self.kda and (int(os.environ.get("EXL3_TAIL_DENSE", "0")) > 0 or int(os.environ.get("EXL3_TAIL_SUB", "0")) > 0)):
+            max_rows = 8  # gdn_hf.hip / the CK8 kda_fused_h build side-write up to 8 rows (dense prompt-tail checkpoints, see Job.tail_ckpt_rows)
+        if any(r % 64 or not cdim <= r < seqlen for r in rows):
             return None
+        # more rows than the kernel has slots: the deepest ones are written (the model-wide stash needs every layer to
+        # hold a row, so a row some layer drops is simply not stashed, see Job.stash_midchunk)
+        rows = rows[-max_rows:]
         cks = [{
             "row": r,
             "chunk": r // 64,
@@ -1737,8 +1858,20 @@ class GatedDeltaNet(Module):
             )
 
             # Delta rule
+            _nk, _kd, _mq = self.num_k_heads, self.k_dim, mixed_qkv
+            if self.blocked_gqa and not self.kda:
+                # Blocked pairing for grouped-v files: duplicate q/k heads
+                # blocked ([q,q] not interleaved) AFTER the depthwise conv and
+                # run the rule plain (nk == nv, no repeat). Bitwise vs repeat
+                # on sequential weights; correct on grouped ones.
+                # mixed_qkv is [B, T, C] here (conv output transposed back).
+                _kd2 = 2 * self.k_dim
+                _q = _mq[..., :self.k_dim]
+                _k = _mq[..., self.k_dim:_kd2]
+                _mq = torch.cat([_q, _q, _k, _k, _mq[..., _kd2:]], dim=-1)
+                _nk, _kd = self.num_v_heads, self.v_dim
             core_attn_out = gated_delta_rule_fn(
-                mixed_qkv = mixed_qkv,
+                mixed_qkv = _mq,
                 beta = beta,
                 g = g,
                 recurrent_state = recurrent_state,
@@ -1746,9 +1879,9 @@ class GatedDeltaNet(Module):
                 recurrent_base = recurrent_base,
                 history = save_history,
                 save_state = save_state,
-                num_k_heads = self.num_k_heads,
+                num_k_heads = _nk,
                 num_v_heads = self.num_v_heads,
-                k_dim = self.k_dim,
+                k_dim = _kd,
                 v_dim = self.v_dim,
                 k_head_dim = self.k_head_dim,
                 v_head_dim = self.v_head_dim,
