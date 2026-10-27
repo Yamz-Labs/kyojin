@@ -6,6 +6,7 @@ marker in its canonical diff. Both spellings must retain exact stage ownership.
 """
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 from typing import Any
@@ -19,6 +20,7 @@ apply_patch = _namespace['apply_patch']
 BuildError = _namespace['BuildError']
 
 
+@unittest.skipUnless(shutil.which('git'), 'git required')
 class PatchPackagingTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='ck-patch-', dir=os.environ.get('TMPDIR'))
