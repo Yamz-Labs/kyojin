@@ -240,6 +240,9 @@ source tools/strix_halo/env.sh                  # runtime env (LD_PRELOAD Ubuntu
 python tools/strix_halo/bench_mtp.py -n 128 -ndt 2 -dds -g
 ```
 
+Optional prefill attention (CK `fmha_fwd`, hd128/hd256, +24-62 % kernel, ~-7 % TTFT at 108K): `CK_FETCH=1 tools/strix_halo/ck_fmha/build.sh`
+(~33 s, built into the Docker image; `EXL3_PF_CK=auto` uses it when `libckpf.so` exists, else Triton silently; `0` = off).
+
 Build and bench in **separate shells** — `env.sh build` exports `ROCM_PATH`/`HIP_PATH`/
 `PYTORCH_ROCM_ARCH` and a bench in the same shell fails model load with a spurious
 "Insufficient VRAM".
