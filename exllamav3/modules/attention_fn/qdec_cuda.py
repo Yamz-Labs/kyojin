@@ -10,12 +10,14 @@ import math
 import os
 
 import torch
+
+from ...util.knobs import knob, knob_int, knob_on, on_change
 import triton
 
 _SRC = os.path.join(os.path.dirname(__file__), "cu", "qdec.cu")
 _SRC_ROWS = os.path.join(os.path.dirname(__file__), "cu", "qdec_rows.cu")      # many-row kernel (verify steps), see qdec_rows.cu
 _COMMON = os.path.join(os.path.dirname(__file__), "cu", "qdec_common.cuh")
-ROWS_MODE = os.environ.get("EXL3_QDEC_ROWS", "1")          # 0: no many-row kernel, 1: only where qdec.cu cannot, 2: always
+ROWS_MODE = knob("EXL3_QDEC_ROWS", "1")          # 0: no many-row kernel, 1: only where qdec.cu cannot, 2: always
 _CACHE = os.path.expanduser(os.environ.get("EXL3_QDEC_CACHE", "~/.cache/exl3_qdec"))
 _kernels = {}
 
@@ -76,10 +78,10 @@ def _compile(cfg):
                 PAGE=cfg["page"], NW=cfg["nw"], ST=cfg["st"], CAUSAL=int(cfg["causal"]), BLOCK_ROWS=cfg["block_rows"],
                 HD_PAD=triton.next_power_of_2(cfg["hd"]), SCALE=repr(float(cfg["scale"])) + "f", KEY_LO=cfg.get("key_lo", 0),
                 TQ=int(cfg.get("tq", False)))
-    defs["L2HINT"] = int(os.environ.get("EXL3_QDEC_L2HINT", "1"))       # L2 evict_first on K/V, evict_last on the scales
-    defs["FASTDQ"] = 1 if cfg.get("tq") else int(os.environ.get("EXL3_QDEC_FASTDQ", "1"))        # permuted-order PRMT/LOP3 bit-plane unpack (qdec.cu)
-    if os.environ.get("EXL3_QDEC_ABL"):
-        defs["ABL"] = int(os.environ["EXL3_QDEC_ABL"])
+    defs["L2HINT"] = knob_int("EXL3_QDEC_L2HINT", 1)       # L2 evict_first on K/V, evict_last on the scales
+    defs["FASTDQ"] = 1 if cfg.get("tq") else knob_int("EXL3_QDEC_FASTDQ", 1)        # permuted-order PRMT/LOP3 bit-plane unpack (qdec.cu)
+    if knob("EXL3_QDEC_ABL"):
+        defs["ABL"] = int(knob("EXL3_QDEC_ABL"))
     src = "#define INFINITY __int_as_float(0x7f800000)\n" + open(_COMMON).read() + "\n" + \
         open(_SRC_ROWS if cfg.get("rows_kernel") else _SRC).read()
     major, minor = torch.cuda.get_device_capability()
@@ -147,8 +149,13 @@ class _Kernel:
         assert r == driver.CUresult.CUDA_SUCCESS, r
 
 
+def _compile_knobs():
+    """the switches _compile bakes into the cubin: part of the kernel cache key, so a run-time flip picks (or builds) the other kernel"""
+    return (knob("EXL3_QDEC_L2HINT", "1"), knob("EXL3_QDEC_FASTDQ", "1"), knob("EXL3_QDEC_ABL"))
+
+
 def get_kernel(cfg):
-    key = tuple(sorted(cfg.items()))
+    key = tuple(sorted(cfg.items())) + (_compile_knobs(),)
     k = _kernels.get(key)
     if k is None:
         k = _kernels[key] = _Kernel(cfg)
@@ -157,7 +164,7 @@ def get_kernel(cfg):
 
 def rows_nw(hd):
     """warps per CTA of the many-row kernel (each takes hd/32/nw 32-dim groups)"""
-    return int(os.environ.get("EXL3_QDEC_RNW", "0")) or (4 if (hd // 32) % 4 == 0 else 2)
+    return knob_int("EXL3_QDEC_RNW", 0) or (4 if (hd // 32) % 4 == 0 else 2)
 
 
 def static_smem(cfg) -> int:
@@ -171,7 +178,7 @@ def pick_nw_st(cfg):
     c = dict(cfg)
     if cfg.get("rows_kernel"):
         c.update(nw=rows_nw(cfg["hd"]))
-        for st in ((int(os.environ["EXL3_QDEC_RST"]),) if os.environ.get("EXL3_QDEC_RST") else (3, 2, 1)):
+        for st in ((int(knob("EXL3_QDEC_RST")),) if knob("EXL3_QDEC_RST") else (3, 2, 1)):
             c.update(st=st)
             if geometry(c)["shared"] <= 99 * 1024:
                 return c["nw"], st
@@ -184,9 +191,17 @@ def pick_nw_st(cfg):
     raise QdecUnsupported("no ring configuration fits")
 
 
-ENABLED = os.environ.get("EXL3_QDEC", "1") != "0" and not torch.version.hip
+ENABLED = knob_on("EXL3_QDEC") and not torch.version.hip
 # graph (BC) path switch (EXL3_QDEC_GRAPH=0 keeps the Triton split kernel in captured graphs)
-GRAPH_ENABLED = os.environ.get("EXL3_QDEC_GRAPH", "1") != "0"
+GRAPH_ENABLED = knob_on("EXL3_QDEC_GRAPH")
+
+
+@on_change
+def _refresh_knobs():
+    global ROWS_MODE, ENABLED, GRAPH_ENABLED
+    ROWS_MODE = knob("EXL3_QDEC_ROWS", "1")
+    ENABLED = knob_on("EXL3_QDEC") and not torch.version.hip
+    GRAPH_ENABLED = knob_on("EXL3_QDEC_GRAPH")
 _sm = {}
 
 
@@ -232,10 +247,10 @@ def split_cap(cfg, device, programs):
     """kv splits per program: one full wave of resident CTAs (the many-row kernel's CTAs are small and several fit an SM;
     qdec.cu keeps one CTA's share per SM)"""
     sm = sm_count(device)
-    if cfg.get("rows_kernel") and not os.environ.get("EXL3_QDEC_SPL"):
+    if cfg.get("rows_kernel") and not knob("EXL3_QDEC_SPL"):
         sm *= get_kernel(cfg).blocks_per_sm()
-    elif os.environ.get("EXL3_QDEC_SPL"):
-        return int(os.environ["EXL3_QDEC_SPL"])
+    elif knob("EXL3_QDEC_SPL"):
+        return int(knob("EXL3_QDEC_SPL"))
     return max(1, sm // programs)
 
 

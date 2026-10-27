@@ -1484,11 +1484,11 @@ def format_logprobs(entries: list, token_ids: list[int], token_str, chat: bool) 
 
 
 # Every route of create_app(), for the early /health listener (404 / 405 while loading); a test keeps it in step.
-ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",)}
+ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",), "/admin/knobs": ("GET", "POST")}
 
 
 def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, Any] | None = None,
-               default_max_tokens: int | None = None) -> web.Application:
+               default_max_tokens: int | None = None, admin_knobs: bool = False) -> web.Application:
     """HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     defaults = defaults or load_defaults("/nonexistent")
     queue: asyncio.Queue = asyncio.Queue()
@@ -2206,6 +2206,25 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         except (ValueError, FileNotFoundError, RuntimeError, json.JSONDecodeError) as exc:
             return err(400, f"{type(exc).__name__}: {exc}")
 
+    @contextlib.asynccontextmanager
+    async def exclusive():
+        """No request runs inside: every session permit is held (the slot-action drain)."""
+        async with lock:
+            held = 0
+            try:
+                for _ in range(sessions):
+                    await gate.acquire()
+                    held += 1
+                yield
+            finally:
+                for _ in range(held):
+                    gate.release()
+
+    if admin_knobs:
+        import admin_knobs as _admin
+        h = _admin.make_handler(engine, exclusive)
+        app.router.add_get("/admin/knobs", h)
+        app.router.add_post("/admin/knobs", h)
     app.router.add_get("/v1/models", models)
     app.router.add_get("/health", health)
     app.router.add_post("/v1/chat/completions", lifecycle.wrapped(completions))
@@ -2315,6 +2334,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model", default=DEFAULT_MODEL, help="pack directory")
+    parser.add_argument("--admin-knobs", action="store_true", help="opt in to POST /admin/knobs (loopback clients only): switch the A/B knobs of exllamav3.util.knobs without a reload")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="id shown by /v1/models and expected in requests")
     parser.add_argument("--ctx", "-c", type=int, default=65536, help="KV cache size in tokens (default 65536)")
     parser.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
@@ -2393,7 +2413,7 @@ def main() -> None:
     except BaseException as exc:                                  # noqa: BLE001
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
-    app = create_app(engine, args.model_id, template, defaults, args.default_max_tokens)
+    app = create_app(engine, args.model_id, template, defaults, args.default_max_tokens, admin_knobs=args.admin_knobs)
     print(f"qserve: {app['ping'].describe()}", flush=True)
     print(f"qserve: {app['reqlog'].describe()}", flush=True)
 

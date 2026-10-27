@@ -10,7 +10,7 @@ from .multilinear import MultiLinear, SlicedMultiLinear
 from .quant.exl3 import MAX_BSZN_GEMV_R, row_pad_pitch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
-from ..util import profile_opt
+from ..util import profile_opt, knobs
 import os
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
@@ -459,7 +459,9 @@ class Attention(Module):
         self.multi_qg = None
         self.tp_reduce = False
         self.dispatch_cache = {}
+        knobs.clear_on_change(self, "dispatch_cache")   # the kernel picked per call shape may depend on a knob
         self.bc_attn = {}
+        knobs.clear_on_change(self, "bc_attn")         # BCAttn objects bake knob values (EXL3_QDEC_GRAPH, EXL3_BC_KVWIN...)
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
@@ -645,6 +647,7 @@ class Attention(Module):
         super().unload()
 
         self.bc_attn = {}
+        knobs.clear_on_change(self, "bc_attn")         # BCAttn objects bake knob values (EXL3_QDEC_GRAPH, EXL3_BC_KVWIN...)
 
         for cl in self.cache_layers:
             cl.free()

@@ -1321,10 +1321,10 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
 
 
 # Every route of create_app(), for the early /health listener (404 / 405 while loading); a test keeps it in step.
-ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",)}
+ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",), "/admin/knobs": ("GET", "POST")}
 
 
-def create_app(engine: Any, model_id: str, template: str) -> web.Application:
+def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = False) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
@@ -2046,6 +2046,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     if getattr(engine, "slot_store", None) is not None:
         app.router.add_get("/slots", slots)
         app.router.add_post("/slots/{id}", slot_action)
+    if admin_knobs:
+        import admin_knobs as _admin
+        h = _admin.make_handler(engine, exclusive)
+        app.router.add_get("/admin/knobs", h)
+        app.router.add_post("/admin/knobs", h)
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models)
     app.router.add_get("/metrics", metrics_view)
@@ -2064,6 +2069,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower (saves memory; image requests get HTTP 400)")
     parser.add_argument("--no-uncensor", action="store_true", help="ignore a bundled uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
+    parser.add_argument("--admin-knobs", action="store_true", help="opt in to POST /admin/knobs (loopback clients only): switch the A/B knobs of exllamav3.util.knobs without a reload")
     parser.add_argument("--model-id", default="glm-5.3-exl3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2217,7 +2223,7 @@ def main() -> None:
     except BaseException as exc:                                  # noqa: BLE001
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
-    app = create_app(engine, args.model_id, template)
+    app = create_app(engine, args.model_id, template, admin_knobs=args.admin_knobs)
     # Which run this is, in the log itself: ctx, sessions and the image-cache budget are what a later
     # "why was this request slow" question turns on, and they are not visible in the client's request.
     reqlog = app["reqlog"]

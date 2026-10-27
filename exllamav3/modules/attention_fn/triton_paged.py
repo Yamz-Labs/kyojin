@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from .common import AttnArgs, get_non_causal_span_arglist
+from ...util.knobs import knob, knob_int, on_change
 
 
 def _is_power_of_2(x: int) -> bool:
@@ -723,7 +724,7 @@ _pf_fa2_rows = int(os.environ.get("EXL3_PF_FA2_ROWS", "1024"))
 _pf_row_slice = int(os.environ.get("EXL3_PF_ROW_SLICE", "256" if torch.version.hip else "0"))
 
 # ROCm waves_per_eu launch hint of the fp16 prefill kernel (hd <= 256); 0 = compiler default
-_pf_waves_per_eu = int(os.environ.get("EXL3_PF_WAVES_PER_EU", "2"))
+_pf_waves_per_eu = knob_int("EXL3_PF_WAVES_PER_EU", 2)
 
 def _prefill_fa2_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
     from torch.nn.attention import sdpa_kernel, SDPBackend
@@ -749,9 +750,19 @@ def _prefill_fa2_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
 # TTFT 270.6/271.4 -> 252.2/251.7 s (-7 %), 35K prompt -1.4 %. Needs the library built by tools/strix_halo/ck_fmha/build.sh (EXL3_PF_CK_SO
 # overrides the path). EXL3_PF_CK=auto (default): used when the library exists, silently Triton otherwise; 1 = required (warns if missing); 0 = off.
 # Any miss falls back to the Triton kernel
-_pf_ck_mode = os.environ.get("EXL3_PF_CK", "auto")
+_pf_ck_mode = knob("EXL3_PF_CK", "auto")
 _pf_ck = _pf_ck_mode != "0" and bool(torch.version.hip)
 _pf_ck_fn = None
+
+
+@on_change
+def _refresh_pf_knobs():
+    """EXL3_PF_CK / EXL3_PF_WAVES_PER_EU switched at run time (util.knobs.set_knobs): re-derive the module state. A library that
+    failed to load is retried (the next _pf_ck_load decides again)."""
+    global _pf_ck_mode, _pf_ck, _pf_waves_per_eu
+    _pf_ck_mode = knob("EXL3_PF_CK", "auto")
+    _pf_ck = _pf_ck_mode != "0" and bool(torch.version.hip)
+    _pf_waves_per_eu = knob_int("EXL3_PF_WAVES_PER_EU", 2)
 
 
 def _pf_ck_load():
@@ -1177,6 +1188,12 @@ _decode_sm_count = {}
 # ROCm: HIP tensor-core split kernel for quantized-KV decode (qdec.hip), EXL3_QDEC_HIP=0 keeps the Triton kernels
 from . import qdec_hip as _qh
 _QDEC_HIP = _qh.ENABLED
+
+
+@on_change
+def _refresh_qdec_hip():
+    global _QDEC_HIP
+    _QDEC_HIP = _qh.ENABLED      # also re-arms a kernel that was switched off after a launch failure
 
 
 _QDEC_HIP_DEBUG = os.environ.get("EXL3_QDEC_HIP_DEBUG") == "1"
