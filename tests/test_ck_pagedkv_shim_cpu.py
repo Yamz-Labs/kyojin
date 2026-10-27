@@ -203,7 +203,7 @@ class ShimBoundaryTests(unittest.TestCase):
         for optimization in ("-O0", "-O2"):
             binary = cls.directory / ("shim" + optimization)
             cls.run_command(compiler + [
-                "-std=c++17", "-Wall", "-Wextra", "-Werror", optimization, "-U_FORTIFY_SOURCE",
+                "-std=c++17", "-Wall", "-Wextra", "-Werror", optimization, "-Wno-cpp",
                 "-isystem", str(include), str(driver), "-o", str(binary),
             ])
             cls.binaries[optimization] = binary
