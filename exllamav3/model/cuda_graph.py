@@ -190,6 +190,7 @@ class CudaGraphRunner:
         self.has_conv = False
         self.has_mamba = False
         self.has_swa = False
+        self.has_ring = False
         self.swa_mods = []
         _registry.append(weakref.ref(self))
 
@@ -213,6 +214,7 @@ class CudaGraphRunner:
         self.has_conv = False
         self.has_mamba = False
         self.has_swa = False
+        self.has_ring = False
         self.swa_mods = []
         for mod, inst, _ in fm[1:]:
             t = type(mod)
@@ -285,6 +287,10 @@ class CudaGraphRunner:
             if mod.device is None:
                 return False
             devs.add(torch.device(mod.device))
+        # KVWIN ring-only models (plain attention + fp16 sink/window rings riding the recurrent state slots): the ring ids are
+        # static slot data exactly like a GDN model's, the ring writer/reader run inside the capture (bc_attn.py)
+        from ..cache import kvwin
+        self.has_ring = bool(kvwin.ANY_ACTIVE) and os.environ.get("EXL3_CUDA_GRAPH_RING", "1") != "0" and not (self.has_gdn or self.has_conv or self.has_mamba or self.has_swa)
         if len(devs) != 1 or (self.has_gdn and self.has_conv):
             return False   # GDN graphs pass device slot ids, ShortConv reads them on the host: no mixed model
         dev = devs.pop()
@@ -315,7 +321,7 @@ class CudaGraphRunner:
         if kvwin.ANY_ACTIVE and kvwin.any_cold(params):
             return "kvwin_cold"   # the cold ring fill is a host step: eager this step, graph again from the next one
         rs = params.get("recurrent_states")
-        if self.has_gdn or self.has_conv or self.has_mamba or self.has_swa:
+        if self.has_gdn or self.has_conv or self.has_mamba or self.has_swa or self.has_ring:
             slots = params.get("recurrent_slots")
             nb = ids.shape[0] if CUDA_GRAPH_MULTI else 1   # one recurrent state / slot per job
             if (not rs or len(rs) != nb or any(getattr(r, "exported", False) for r in rs[:nb])
@@ -441,7 +447,7 @@ class CudaGraphRunner:
             # per-job page counts feed only the MLA decode kernel's KV split (mla_attn.py); MLAttention models
             # never get here (_check_model), and with B jobs they would recapture whenever one job crosses 16 pages
             None if CUDA_GRAPH_MULTI else (tuple(pages) if pages is not None else None),
-            (self.has_gdn, self.has_mamba), tuple(sorted(exl)) if exl else None, tuple(sorted(exn)) if exn else None,
+            (self.has_gdn, self.has_mamba, self.has_ring), tuple(sorted(exl)) if exl else None, tuple(sorted(exn)) if exn else None,
             tuple(int(s) for s in params["recurrent_slots"].tolist()) if self.has_conv else None,   # every job's conv slot is baked in
             tuple(r.slot for r in params["recurrent_states"]) if self.has_swa else None,   # per-slot ring block table is baked in
         )
@@ -469,7 +475,7 @@ class CudaGraphRunner:
             if self.has_swa:
                 e.swa_cs = torch.zeros(x.shape[0], dtype = torch.int32, device = dev)
                 e.swa_host = torch.zeros(x.shape[0], dtype = torch.int32).pin_memory()
-            if self.has_gdn or self.has_mamba:
+            if self.has_gdn or self.has_mamba or self.has_ring:
                 # Fixed-address slot buffer refreshed only when the live slot
                 # tensor object changes (stable across steps for one job, so
                 # the capture never bakes a per-step upload address).
