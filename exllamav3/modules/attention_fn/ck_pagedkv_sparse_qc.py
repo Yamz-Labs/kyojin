@@ -12,12 +12,12 @@ MiMo has 24 32-value quantization groups per token. The existing generic kernel
 assumes a power-of-two group count, so this dequantizer pads the Triton program to
 32 groups while masking the eight unused groups.
 """
-import os
 import torch
 import triton
 import triton.language as tl
 
-from .ck_pagedkv import _supported_device, kernel_or_none
+from ...util.attention_mode import CK_SPARSE_RETAIN, CK_SPARSE_MIN_SK
+from .ck_pagedkv import _kernel, _supported_device
 from .qwrite_triton import _h32_stage
 
 _page = 256
@@ -79,21 +79,22 @@ def _dequant8_pages_pad(qk, sk, qv, sv, pages, out_k, out_v, G, G_PAD):
         G=G, G_PAD=G_PAD, TBc=4, num_warps=4)
 
 
-# Persistent, grow-only staging buffers, one pair per device. Capacity is in PAGES; the buffers
-# are never shrunk so the torch allocator sees a stable working set once warm.
+# Persistent scratch, one pair per device under the engine's single-stream contract.
+# Concurrent streams/external views across growth are unsupported. Capacity grows in
+# 32-page steps, bounded by the active packed cache; a layout/bound change retires it.
 _STAGE = {}
-_STAGE_STEP_PAGES = 128   # grow in steps of 128 pages (32K tokens, about 50 MiB per buffer): few reallocations, no fragmentation
 
 
-def _stage_capacity(n_pages, pool_pages):
-    """Pages to stage for a request needing n_pages: rounded up to a step, never beyond the cache pool."""
-    return min(pool_pages, -(-n_pages // _STAGE_STEP_PAGES) * _STAGE_STEP_PAGES)
-
-
-def _stage_buffers(dev, cap_pages, vals_per_token):
+def _stage_buffers(dev, cap_pages, vals_per_token, max_pages=None):
+    if max_pages is not None and cap_pages > max_pages:
+        raise ValueError(f"staging needs {cap_pages} pages but packed cache holds {max_pages}")
     st = _STAGE.get(dev)
-    if st is None or st["k"].shape[0] < cap_pages * 256:
-        new_cap = cap_pages  # Do not double a full-prefix pair beyond the request's need.
+    if (st is None or st["cap_pages"] < cap_pages
+            or st["vals_per_token"] != vals_per_token
+            or (max_pages is not None and st["cap_pages"] > max_pages)):
+        new_cap = ((cap_pages + 31) // 32) * 32
+        if max_pages is not None:
+            new_cap = min(new_cap, max_pages)
         # Scratch is fully overwritten on every accepted call. Retire the old pair
         # before allocating replacements; retaining it inflates the growth peak.
         _STAGE.pop(dev, None)
@@ -102,7 +103,10 @@ def _stage_buffers(dev, cap_pages, vals_per_token):
             k=torch.empty((new_cap * 256, vals_per_token), dtype=torch.half, device=dev),
             v=torch.empty((new_cap * 256, vals_per_token), dtype=torch.half, device=dev),
             ident=None,   # identity table, rebuilt when cap grows
+            cap_pages=new_cap,
+            vals_per_token=vals_per_token,
         )
+    st["used_pages"] = cap_pages
     return st
 
 
@@ -116,7 +120,10 @@ def _owned_qc(args):
         and args.cu_seqlens is None
         and args.softcap == 0.0
         and args.sinks is None
+        and getattr(args, "ov", None) is None
+        and getattr(args, "tq", None) is None
         and args.causal
+        and not getattr(args, "non_causal_spans", None)
         and args.dim == 192
         and args.num_q_heads == 64
         and args.num_kv_heads == 4
@@ -138,7 +145,9 @@ def fn_ck_paged_attn_sparse_qc(args):
     """
     from .ck_pagedkv_sparse import _stats as sparse_stats, _page, select_pages, fn_ck_paged_attn_sparse
 
-    if not _owned_qc(args) or kernel_or_none() is None:
+    if not _owned_qc(args):
+        return None
+    if _kernel() is None:
         return None
     qk, sk, qv, sv, k_bits, v_bits = args.q_cache
     if k_bits != 8 or v_bits != 8:
@@ -149,6 +158,8 @@ def fn_ck_paged_attn_sparse_qc(args):
     cs = args.cache_seqlens
     past = int(cs[0].item())
     q_len = q.shape[1]
+    if past + q_len < CK_SPARSE_MIN_SK:
+        return None
 
     sparse_stats["owned_calls"] = (sparse_stats.get("owned_calls") or 0) + 1
     _r = past % _page
@@ -173,8 +184,8 @@ def fn_ck_paged_attn_sparse_qc(args):
     vals = G * 32                       # fp16 values per staged token (768)
     dev = q.device
 
-    st = _stage_buffers(dev, _stage_capacity(n_pages_needed, max(P, n_pages_needed)), vals)
-    cap_pages = st["k"].shape[0] // 256
+    st = _stage_buffers(dev, n_pages_needed, vals, max_pages=P)
+    cap_pages = st["cap_pages"]
     if st["ident"] is None or st["ident"].shape[0] < cap_pages:
         st["ident"] = torch.arange(cap_pages, dtype=torch.int32, device=dev)
 
@@ -199,7 +210,7 @@ def fn_ck_paged_attn_sparse_qc(args):
     # 3) unchanged fp16 sparse machinery: select over staged K, compact, kernel
     keep, info = select_pages(
         k_full, bt2, past, q, q_len,
-        retain=float(os.environ.get("EXL3_CK_SPARSE_RETAIN", "0.5")),
+        retain=CK_SPARSE_RETAIN,
         n_sink=2,
         n_local=1,
         probe=512,

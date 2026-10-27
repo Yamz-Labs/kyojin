@@ -28,9 +28,12 @@ import time
 import torch
 
 from .pagetable import PAGE_SIZE, _randomhash
+from ..util.attention_mode import ATTENTION_CACHE_MODE
 
 FORMAT_VERSION = 1
 FORMAT_VERSION_TAIL = 2     # adds the prompt-end checkpoint; older readers reject it instead of misplacing the stash
+FORMAT_VERSION_SPARSE = 3           # sparse sessions also bump the format so a legacy normal reader rejects the file
+FORMAT_VERSION_SPARSE_TAIL = 4
 
 
 class SlotStore:
@@ -149,8 +152,11 @@ class SlotStore:
         n_tokens = len(pages) * PAGE_SIZE
         n_ids = n_tokens if tail is None else n_tokens + tail[1]["ids"].shape[-1]
         data = {
-            "version": FORMAT_VERSION if tail is None else FORMAT_VERSION_TAIL,
+            "version": ((FORMAT_VERSION if tail is None else FORMAT_VERSION_TAIL)
+                        if ATTENTION_CACHE_MODE is None
+                        else (FORMAT_VERSION_SPARSE if tail is None else FORMAT_VERSION_SPARSE_TAIL)),
             "model_id": self.model_id,
+            "attention_mode": ATTENTION_CACHE_MODE,
             "prompt": self.prompt,
             "ids": self.ids[:n_ids].clone(),
             "hashes": hashes,
@@ -183,9 +189,18 @@ class SlotStore:
     def restore(self, filename: str) -> dict:
         t0 = time.perf_counter()
         data = torch.load(self._path(filename), map_location="cpu", weights_only=False)
-        if data.get("version") not in (FORMAT_VERSION, FORMAT_VERSION_TAIL) or data.get("model_id") != self.model_id:
+        # Sparse mode reads only its own format (3/4); legacy v1/v2 files stay
+        # normal-only, and a legacy normal reader rejects the sparse versions
+        # before touching the payload.
+        accepted_versions = ((FORMAT_VERSION, FORMAT_VERSION_TAIL) if ATTENTION_CACHE_MODE is None
+                             else (FORMAT_VERSION_SPARSE, FORMAT_VERSION_SPARSE_TAIL))
+        if data.get("version") not in accepted_versions or data.get("model_id") != self.model_id:
             raise ValueError(f"slot file is for {data.get('model_id')!r} v{data.get('version')}, "
-                             f"not {self.model_id!r} v{FORMAT_VERSION_TAIL}")
+                             f"not {self.model_id!r} with versions {accepted_versions}")
+        # Missing marker is a legacy normal cache. Check before tensor access or
+        # any page/stash/tail injection, including tails with no full-page hash.
+        if data.get("attention_mode") != ATTENTION_CACHE_MODE:
+            raise ValueError("slot file attention mode does not match the loaded attention mode")
         tensors = self._tensors()
         if len(data["tensors"]) not in (0, len(tensors)) or any(
                 s.shape[1:] != t.shape[1:] or s.dtype != t.dtype for s, t in zip(data["tensors"], tensors)):

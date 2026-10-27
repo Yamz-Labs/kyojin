@@ -89,16 +89,6 @@ def _stage_function(allocator):
     return namespace["_stage_buffers"], namespace["_STAGE"]
 
 
-class StageCapacityTests(unittest.TestCase):
-    def test_capacity_steps_up_and_stops_at_the_pool(self):
-        path, function = _function("ck_pagedkv_sparse_qc.py", "_stage_capacity")
-        namespace = {"min": min, "_STAGE_STEP_PAGES": 128}
-        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
-        capacity = namespace["_stage_capacity"]
-        self.assertEqual([capacity(n, 512) for n in (1, 128, 129, 300, 512)], [128, 128, 256, 384, 512])
-        self.assertEqual(capacity(130, 140), 140)
-
-
 class _InertTensor:
     def __init__(self, shape):
         self.shape = shape
@@ -136,48 +126,111 @@ class StageBufferMemoryTests(unittest.TestCase):
         self.dev = "inert:0"
         self.vals = 768
 
+    def test_coarse_capacity_grows_in_steps_but_reuses_within_step(self):
+        capacities = []
+        for pages in (2, 3, 32, 33, 63, 64, 65):
+            current = self.stage_buffers(self.dev, pages, self.vals)
+            capacity = current["cap_pages"]
+            capacities.append(capacity)
+            self.assertEqual(current["used_pages"], pages)
+            self.assertEqual(current["vals_per_token"], self.vals)
+            self.assertEqual(current["k"].shape, (capacity * 256, self.vals))
+            self.assertEqual(current["v"].shape, (capacity * 256, self.vals))
+            del current
+        self.assertEqual(capacities, [32, 32, 32, 64, 64, 64, 96])
+        self.assertEqual([call["shape"] for call in self.allocator.calls],
+                         [(pages * 256, self.vals) for pages in (32, 64, 96)
+                          for _ in range(2)])
+
+    def test_real_qc_caller_passes_physical_bound_and_builds_capacity_identity(self):
+        path, function = _function("ck_pagedkv_sparse_qc.py", "fn_ck_paged_attn_sparse_qc")
+        start = next(i for i, node in enumerate(function.body)
+                     if isinstance(node, ast.Assign) and any(
+                         isinstance(target, ast.Name) and target.id == "st" for target in node.targets))
+        body = function.body[start:start + 3]
+        calls = []
+        stage = {"k": _InertTensor((40 * 256, self.vals)), "cap_pages": 40, "ident": None}
+
+        def buffers(*args, **kwargs):
+            calls.append((args, kwargs))
+            return stage
+
+        def arange(count, **kwargs):
+            return _InertTensor((count,))
+
+        namespace = dict(_stage_buffers=buffers, dev=self.dev, n_pages_needed=33,
+                         vals=self.vals, P=40,
+                         torch=SimpleNamespace(arange=arange, int32=object()))
+        exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), namespace)
+        self.assertEqual(calls, [((self.dev, 33, self.vals), {"max_pages": 40})])
+        self.assertEqual(stage["ident"].shape, (40,))
+
+    def test_physical_capacity_caps_final_step(self):
+        capacities = []
+        for pages in (2, 33, 40):
+            current = self.stage_buffers(self.dev, pages, self.vals, max_pages=40)
+            capacities.append(current["cap_pages"])
+        self.assertEqual(capacities, [32, 40, 40])
+        self.assertEqual(len(self.allocator.calls), 4)
+        with self.assertRaises(ValueError):
+            self.stage_buffers(self.dev, 41, self.vals, max_pages=40)
+        self.assertEqual(len(self.allocator.calls), 4)
+
+    def test_width_change_retires_incompatible_pair(self):
+        self.stage_buffers(self.dev, 2, self.vals)
+        self.allocator.watched_refs = tuple(weakref.ref(self.stages[self.dev][name])
+                                            for name in ("k", "v"))
+        current = self.stage_buffers(self.dev, 2, 512)
+        self.assertEqual(current["vals_per_token"], 512)
+        self.assertEqual(current["used_pages"], 2)
+        self.assertEqual(current["k"].shape, (32 * 256, 512))
+        self.assertEqual(current["v"].shape, (32 * 256, 512))
+        self.assertEqual(len(self.allocator.calls), 4)
+        for call in self.allocator.calls[2:]:
+            self.assertEqual(call["watched_alive"], (False, False))
+            self.assertFalse(call["published"])
+
+    def test_smaller_physical_cache_retires_oversized_scratch(self):
+        self.stage_buffers(self.dev, 65, self.vals, max_pages=80)
+        current = self.stage_buffers(self.dev, 2, self.vals, max_pages=8)
+        self.assertEqual(current["cap_pages"], 8)
+        self.assertEqual(current["k"].shape, (8 * 256, self.vals))
+        self.assertEqual(len(self.allocator.calls), 4)
+
     def test_initial_allocation_publishes_only_complete_pair(self):
         current = self.stage_buffers(self.dev, 2, self.vals)
         self.assertIs(self.stages[self.dev], current)
-        self.assertEqual(set(current), {"k", "v", "ident"})
+        self.assertEqual(set(current), {"k", "v", "ident", "cap_pages", "used_pages", "vals_per_token"})
         self.assertIsNone(current["ident"])
         self.assertEqual(len(self.allocator.calls), 2)
         for name in ("k", "v"):
-            self.assertEqual(current[name].shape, (2 * 256, self.vals))
+            self.assertEqual(current[name].shape, (32 * 256, self.vals))
         for call in self.allocator.calls:
-            self.assertEqual(call["shape"], (2 * 256, self.vals))
+            self.assertEqual(call["shape"], (32 * 256, self.vals))
             self.assertIs(call["dtype"], self.allocator.half)
             self.assertEqual(call["device"], self.dev)
             self.assertFalse(call["published"])
 
     def test_equal_and_smaller_requests_reuse_pair_and_identity(self):
         current = self.stage_buffers(self.dev, 3, self.vals)
-        current["ident"] = _InertTensor((3,))
+        current["ident"] = _InertTensor((32,))
         identity = current["ident"]
         for pages in (3, 2, 0):
             self.assertIs(self.stage_buffers(self.dev, pages, self.vals), current)
             self.assertIs(current["ident"], identity)
         self.assertEqual(len(self.allocator.calls), 2)
 
-    def test_growth_allocates_exact_requested_capacity(self):
-        for pages in (2, 3, 5):
-            current = self.stage_buffers(self.dev, pages, self.vals)
-            for name in ("k", "v"):
-                self.assertEqual(current[name].shape, (pages * 256, self.vals))
-            del current
-        self.assertEqual([call["shape"] for call in self.allocator.calls],
-                         [(pages * 256, self.vals) for pages in (2, 3, 5)
-                          for _ in range(2)])
-
     def test_growth_retires_old_pair_before_first_replacement_allocation(self):
         self.stage_buffers(self.dev, 2, self.vals)
-        for pages in (3, 5):
+        for pages in (33, 65):
             self.stages[self.dev]["ident"] = _InertTensor((pages - 1,))
             self.allocator.watched_refs = tuple(
                 weakref.ref(self.stages[self.dev][name])
                 for name in ("k", "v", "ident"))
             start = len(self.allocator.calls)
             current = self.stage_buffers(self.dev, pages, self.vals)
+            self.assertEqual(len(self.allocator.calls) - start, 2,
+                             "each boundary crossing must allocate a replacement pair")
             for call in self.allocator.calls[start:]:
                 self.assertEqual(call["watched_alive"], (False, False, False),
                                  "old K/V/identity still reachable during replacement")
@@ -194,7 +247,7 @@ class StageBufferMemoryTests(unittest.TestCase):
         start = len(self.allocator.calls)
         self.allocator.fail_at = start + 2
         with self.assertRaisesRegex(MemoryError, "inert second allocation failure"):
-            self.stage_buffers(self.dev, 3, self.vals)
+            self.stage_buffers(self.dev, 33, self.vals, max_pages=40)
         gc.collect()
         self.assertNotIn(self.dev, self.stages,
                          "failed replacement must not publish stale or partial scratch")
@@ -208,12 +261,12 @@ class StageBufferMemoryTests(unittest.TestCase):
             self.assertEqual(call["watched_alive"], (False, False, False))
 
         self.allocator.fail_at = None
-        current = self.stage_buffers(self.dev, 3, self.vals)
+        current = self.stage_buffers(self.dev, 33, self.vals, max_pages=40)
         self.assertIs(self.stages[self.dev], current)
         self.assertIsNone(current["ident"])
         self.assertEqual(len(self.allocator.calls) - start, 4)
         for name in ("k", "v"):
-            self.assertEqual(current[name].shape, (3 * 256, self.vals))
+            self.assertEqual(current[name].shape, (40 * 256, self.vals))
         for call in self.allocator.calls[start + 2:]:
             self.assertFalse(call["published"])
 

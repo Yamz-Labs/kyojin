@@ -28,6 +28,7 @@ import time
 import torch
 
 from ..util.disk_store import DiskStore, env_dir, namespace
+from ..util.attention_mode import ATTENTION_CACHE_MODE
 from .pagetable import PAGE_SIZE, _randomhash, tensor_hash_checksum
 from .slot_store import SlotStore
 
@@ -74,7 +75,11 @@ class PagedPrefixDisk:
         self.model_id = model_id
         tensors = slots._tensors()
         layout = [(tuple(t.shape[1:]), str(t.dtype)) for t in tensors]
-        self.ns = namespace(FORMAT, model_id, layout, extra)
+        parts = (FORMAT, model_id, layout, extra)
+        # Normal mode retains the legacy namespace, including its argument count.
+        if ATTENTION_CACHE_MODE is not None:
+            parts += (ATTENTION_CACHE_MODE,)
+        self.ns = namespace(*parts)
         self.disk = DiskStore(root or env_dir(), self.ns)
         self.pages: dict[bytes, tuple[str, int]] = {}                 # page hash -> (segment, position in segment)
         self.stashes: dict[bytes, tuple[str, int]] = {}               # anchor hash -> (entry, depth in pages)

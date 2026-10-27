@@ -146,12 +146,13 @@ affects quantized caches.
 
 ### `EXL3_CK_PAGEDKV` (default: unset) -- EXPERIMENTAL
 
-Experimental, off by default, and approximate: sparse prefill skips part of the past pages, so output and the
-K/V it writes differ from the normal path. Optional Composable Kernel sparse prefill for the MiMo global-attention shape on a gfx1151 ROCm
-system. Set to `sparse` before importing the engine to register handlers for both fp16 and 8-bit
-KV caches. The handlers own only batch-one, causal Q/K=192, 64-query-head/4-KV-head, V=128
-prefill chunks; every other shape, decode step, SWA layer, and unaligned past length falls back
-to the normal Triton handler. The option is off by default.
+Experimental, default-off, approximate Composable Kernel sparse prefill for the MiMo
+global-attention shape on gfx1151 ROCm. Skipping past pages changes attention output and
+therefore later layers' K/V. This is research functionality, not a general quality-adoption
+recommendation. Set to `sparse` before importing the engine to register handlers for fp16 and
+8-bit KV caches when the optional library is available. The handlers own only batch-one,
+causal Q/K=192, 64-query-head/4-KV-head, V=128 prefill chunks; unsupported shapes, decode,
+SWA and unaligned past lengths fall back to the normal backend.
 
 Build the required MIT-licensed CK specialization with local `git`, `cmake`, `nm`,
 `/usr/bin/python3`, and an already-expanded ROCm SDK (including `lib/llvm/bin/clang{,++}`):
@@ -178,18 +179,48 @@ success proves source compilation/linking and export checks only, not native loa
 numerical correctness. The first implementation stages all used K and V pages from an 8-bit
 cache; selected-V-only staging is not implemented yet.
 
-If the library is missing or does not load, one warning is printed and the normal backend stays in place; a kernel
-rejection at run time also falls back to the normal backend for that chunk. The MiMo server tags its slot files
-with `+ck-sparse` in this mode, so approximate slots are never restored into a normal session (and the reverse).
-Pages cached inside a running sparse process are approximate for the life of that process: restart without the
-flag for exact serving. The 8-bit staging buffer grows in steps of 128 pages (32K tokens), capped at the cache pool.
+A missing/unloadable optional library or missing entry point warns once and leaves the normal
+handlers in place for the process. An explicit kernel rejection (`-1`) declines for that chunk;
+other invalid results and execution errors are not treated as unsupported shapes. Restart after
+building or replacing an unavailable library.
+
+The 8-bit staging pair grows in 32-page steps, capped by the packed cache's physical capacity,
+and is reused within each step. A width/bound change retires incompatible scratch; replacements
+retire the old pair first under the engine's single-stream, fully-overwritten-scratch contract.
+
+Sparse mode, retention and minimum length are frozen together at import time. Use a new process
+to change them. Sparse page hashes, disk-prefix namespaces and saved sessions are isolated from
+ordinary mode and from other sparse policies, including fallback requests in a sparse process.
+Ordinary session formats 1/2 remain readable in ordinary mode. Sparse sessions use incompatible
+formats 3/4 so older ordinary readers reject them too; current readers check the exact policy
+before restoring any pages, stash or rootless tail. The MiMo server's `+ck-sparse` model tag is
+retained as an additional separation layer.
+
+Focused CPU tests need no Torch, Triton, native extension or CUDA/HIP toolchain. Run each directly
+from the repository root to avoid package initialization:
+
+```bash
+python3 -I -S -B tests/test_ck_pagedkv_cpu.py -v
+python3 -I -S -B tests/test_ck_pagedkv_fallback_cpu.py -v
+python3 -I -S -B tests/test_ck_pagedkv_admission_cpu.py -v
+python3 -I -S -B tests/test_ck_pagedkv_sparse_memory_cpu.py -v
+python3 -I -S -B tests/test_ck_sparse_cache_cpu.py -v
+python3 -I -S -B tests/test_ck_dispatch_mode_cpu.py -v
+```
 
 ### `EXL3_CK_SPARSE_RETAIN` (default: `0.5`)
 
 Nominal fraction of total pages (past plus current chunk) retained by the optional CK selector.
 Current-chunk and sink pages are always kept, even if they exceed that budget; the most-recent
-past pages are not forced. This is a quality/performance knob; evaluate it with the same model
-and context before changing the default.
+past pages are not forced. Read once before engine import and included in the sparse cache
+identity. This is a quality/performance knob; evaluate it with the same model and context before
+changing the default.
+
+### `EXL3_CK_MIN_SK` (default: `0`)
+
+Experimental minimum total KV length for sparse selection in the fp16 and packed8 handlers.
+Calls below it use the ordinary backend. Frozen at import time and included in the sparse cache
+identity. It does not enable CK for otherwise unsupported shapes.
 
 ### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
 

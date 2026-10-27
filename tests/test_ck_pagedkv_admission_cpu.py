@@ -64,7 +64,7 @@ def _entry_points():
     ext = SimpleNamespace(paged_kv_cache_update=_forbidden("cache update"))
     dense = _load("ck_pagedkv.py", ("_supported_device", "owns", "fn_ck_paged_attn"),
                   {"torch": torch, "ext": ext, "_PAGE": 256,
-                   "_kernel": _forbidden("native"), "kernel_or_none": lambda: object(),
+                   "_kernel": _forbidden("optional loader"),
                    "_stats": {"accepted": 0, "rejected": 0}})
     sparse = _load(
         "ck_pagedkv_sparse.py",
@@ -147,6 +147,14 @@ class DeviceAdmissionTests(_AdmissionFixture):
             with self.subTest(entry=name):
                 self.assertTrue(owned)
 
+    def test_optional_cache_formats_decline_every_predicate(self):
+        for field in ("ov", "tq"):
+            args = _args(self.entries.half)
+            setattr(args, field, object())
+            for name, owned in self.predicates(args).items():
+                with self.subTest(field=field, entry=name):
+                    self.assertFalse(owned, "CK does not implement KVWIN or TurboQuant cache semantics")
+
     def test_unsupported_device_declines_every_predicate(self):
         args = _args(self.entries.half, arch="gfx1100")
         for name, owned in self.predicates(args).items():
@@ -158,6 +166,11 @@ class DeviceAdmissionTests(_AdmissionFixture):
         self.assertEqual(self.entries.engine["_stats"]["declined"], 1)
 
     def test_supported_installed_engine_reaches_selector(self):
+        # Availability is checked before selection; supply an inert available entry
+        # rather than turning a native lookup into a launch or hiding that lookup.
+        self.entries.sparse["_kernel"] = lambda: object()
+        self.entries.sparse["CK_SPARSE_RETAIN"] = 0.5
+        self.entries.sparse["CK_SPARSE_MIN_SK"] = 0
         with self.assertRaisesRegex(AssertionError, "unexpected selector work"):
             self.installed()(_args(self.entries.half))
 
@@ -172,6 +185,61 @@ class DeviceAdmissionTests(_AdmissionFixture):
     def test_unsupported_device_declines_direct_qc_before_work(self):
         self.assertIsNone(self.entries.qc["fn_ck_paged_attn_sparse_qc"](
             _args(self.entries.half, arch="gfx1100")))
+
+
+class SpanMaskAdmissionTests(_AdmissionFixture):
+    def args_with_spans(self, spans):
+        args = _args(self.entries.half)
+        args.q.shape = (1, 64, 64, 192)
+        args.q_len = args.kv_len = 64
+        args.k_cache.shape = (3, 256, 4, 192)
+        args.q_cache[0].shape = (3, 256, 192)
+        args.q_cache[1].shape = (3, 256, 24)
+        args.cache_seqlens = [SimpleNamespace(item=lambda: 512)]
+        args.non_causal_spans = spans
+        return args
+
+    def test_nonempty_spans_decline_every_predicate(self):
+        args = self.args_with_spans([(0, 64, True)])
+        for name, owned in self.predicates(args).items():
+            with self.subTest(entry=name):
+                self.assertFalse(owned, "CK does not implement non-causal span masks")
+
+    def test_none_or_empty_spans_accept_every_predicate(self):
+        for spans in (None, []):
+            for name, owned in self.predicates(self.args_with_spans(spans)).items():
+                with self.subTest(spans=spans, entry=name):
+                    self.assertTrue(owned)
+
+    def test_nonempty_spans_decline_direct_dense_before_work(self):
+        self.assertIsNone(self.entries.dense["fn_ck_paged_attn"](
+            self.args_with_spans([(0, 64, True)])))
+
+    def test_nonempty_spans_decline_direct_sparse_before_work(self):
+        self.assertIsNone(self.entries.sparse["fn_ck_paged_attn_sparse"](
+            self.args_with_spans([(0, 64, True)]), object()))
+
+    def test_nonempty_spans_decline_auto_sparse_before_work(self):
+        self.assertEqual(self.entries.sparse["fn_ck_paged_attn_sparse_auto"](
+            self.args_with_spans([(0, 64, True)])), (None, None))
+
+    def test_nonempty_spans_decline_installed_engine_before_work(self):
+        self.assertIsNone(self.installed()(self.args_with_spans([(0, 64, True)])))
+        self.assertEqual(self.entries.engine["_stats"]["declined"], 1)
+
+    def test_nonempty_spans_decline_direct_qc_before_work(self):
+        self.assertIsNone(self.entries.qc["fn_ck_paged_attn_sparse_qc"](
+            self.args_with_spans([(0, 64, True)])))
+
+    def test_none_or_empty_spans_installed_engine_reaches_selector(self):
+        self.entries.sparse["_kernel"] = lambda: object()
+        self.entries.sparse["CK_SPARSE_RETAIN"] = 0.5
+        self.entries.sparse["CK_SPARSE_MIN_SK"] = 0
+        handler = self.installed()
+        for spans in (None, []):
+            with self.subTest(spans=spans):
+                with self.assertRaisesRegex(AssertionError, "unexpected selector work"):
+                    handler(self.args_with_spans(spans))
 
 
 class ValueWidthAdmissionTests(_AdmissionFixture):

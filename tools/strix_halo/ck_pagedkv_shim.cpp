@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 #include <hip/hip_runtime.h>
 #include "bias.hpp"
@@ -33,12 +34,27 @@ extern "C" float ck_pagedkv_forward(
     const void* q, const void* k, const void* v, void* out,
     const int32_t* block_table, const int32_t* lengths,
     int q_len, int kv_len, int pages, float scale, int q_head_major,
-    int value_stride, hipStream_t stream, int time_it) {
+    int value_stride, hipStream_t stream, int time_it) try {
     constexpr int q_heads = 64;
     constexpr int kv_heads = 4;
     constexpr int qk_dim = 192;
     constexpr int value_dim = 128;
     constexpr int page_size = 256;
+
+    // -1 is reserved for rejection before the specialization can launch.
+    // Null stream is valid: HIP uses it for the default stream.
+    if (q == nullptr || k == nullptr || v == nullptr || out == nullptr ||
+        block_table == nullptr || lengths == nullptr || q_len <= 0 ||
+        kv_len < q_len || (q_head_major != 0 && q_head_major != 1) ||
+        value_stride != qk_dim) {
+        return -1.0f;
+    }
+    // Avoid overflowing either ceiling division or CK's int32 stride fields.
+    const int required_pages = kv_len / page_size + (kv_len % page_size != 0 ? 1 : 0);
+    if (pages < required_pages ||
+        q_len > std::numeric_limits<ck_tile::index_t>::max() / q_heads / qk_dim) {
+        return -1.0f;
+    }
 
     fmha_fwd_pagedkv_args args{};
     args.q_ptr = const_cast<void*>(q);
@@ -86,7 +102,10 @@ extern "C" float ck_pagedkv_forward(
     }
     const ck_tile::stream_config config{stream, time_it != 0, 0, 0, 1, false};
     const float elapsed = fmha_fwd_pagedkv_<ck_trait, ck_tile::gfx11_t>(config, args);
-    if (elapsed < 0.0f) return -1.0f;
+    if (!std::isfinite(elapsed) || elapsed < 0.0f) return -2.0f;
     if (time_it == 0) return 1.0f;
-    return std::isfinite(elapsed) && elapsed > 0.0f ? elapsed : -2.0f;
+    return elapsed > 0.0f ? elapsed : -2.0f;
+} catch (...) {
+    // CK's HIP checks throw; no C++ exception may unwind into ctypes.
+    return -2.0f;
 }

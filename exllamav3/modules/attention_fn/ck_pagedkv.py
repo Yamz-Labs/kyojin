@@ -11,17 +11,20 @@ repository. Set ``EXL3_CK_PAGEDKV_SO`` to test a different locally-built copy.
 """
 
 import ctypes
+import math
 import os
 from pathlib import Path
+import warnings
 
 import torch
 
+from ...ext import exllamav3_ext as ext
 from .common import AttnArgs
 
 _PAGE = 256
 _fn: ctypes._CFuncPtr | None = None
+_load_failed = False
 _stats = {"accepted": 0, "rejected": 0}
-_unavailable: str | None = None   # why the native library cannot be used; set once, then every call declines
 
 
 def ck_library_path() -> Path:
@@ -43,17 +46,36 @@ def _supported_device(device: torch.device) -> bool:
     return arch.split(":", 1)[0] == "gfx1151"
 
 
-def _kernel() -> ctypes._CFuncPtr:
-    global _fn
+def _kernel() -> ctypes._CFuncPtr | None:
+    """Resolve once per process; an unavailable optional library uses the fallback."""
+    global _fn, _load_failed
+    if _load_failed:
+        return None
     if _fn is None:
         path = ck_library_path()
+        reason = None
+        fn = None
         if not path.is_file():
-            raise RuntimeError(
-                f"CK paged-prefill library not found at {path}. "
-                "Build it with tools/strix_halo/build_ck_pagedkv.sh or set EXL3_CK_PAGEDKV_SO."
+            reason = "file not found"
+        else:
+            try:
+                library = ctypes.CDLL(str(path))
+            except OSError as exc:
+                reason = str(exc)
+            else:
+                try:
+                    fn = library.ck_pagedkv_forward
+                except AttributeError as exc:
+                    reason = str(exc)
+        if fn is None:
+            _load_failed = True
+            warnings.warn(
+                f"CK paged-prefill library unavailable at {path}: {reason}; "
+                "using the ordinary fallback. Build it with tools/strix_halo/build_ck_pagedkv.sh "
+                "or set EXL3_CK_PAGEDKV_SO before starting the process.",
+                RuntimeWarning, stacklevel=2,
             )
-        library = ctypes.CDLL(str(path))
-        fn = library.ck_pagedkv_forward
+            return None
         fn.restype = ctypes.c_float
         fn.argtypes = (
             [ctypes.c_void_p] * 4
@@ -68,23 +90,6 @@ def _kernel() -> ctypes._CFuncPtr:
     return _fn
 
 
-def kernel_or_none() -> ctypes._CFuncPtr | None:
-    """The native entry point, or None (with one warning) if the library is missing or does not load.
-
-    The caller declines to the normal attention backend instead of raising, so a missing build never takes a
-    request down.
-    """
-    global _unavailable
-    if _unavailable is not None:
-        return None
-    try:
-        return _kernel()
-    except (RuntimeError, OSError, AttributeError) as exc:
-        _unavailable = str(exc)
-        print(f"[ck_pagedkv] disabled, using the normal attention backend: {exc}", flush=True)
-        return None
-
-
 def owns(args: AttnArgs) -> bool:
     return (
         _supported_device(args.q.device)
@@ -94,7 +99,10 @@ def owns(args: AttnArgs) -> bool:
         and args.cu_seqlens is None
         and args.softcap == 0.0
         and args.sinks is None
+        and getattr(args, "ov", None) is None
+        and getattr(args, "tq", None) is None
         and args.causal
+        and not getattr(args, "non_causal_spans", None)
         and args.dim == 192
         and args.num_q_heads == 64
         and args.num_kv_heads == 4
@@ -111,10 +119,10 @@ def fn_ck_paged_attn(args: AttnArgs) -> torch.Tensor | None:
         _stats["rejected"] += 1
         return None
 
-    kernel = kernel_or_none()
+    kernel = _kernel()
     if kernel is None:
+        _stats["rejected"] += 1
         return None
-    from ...ext import exllamav3_ext as ext
 
     q, k, v = args.q, args.k, args.v
     k_cache, v_cache = args.k_cache, args.v_cache
@@ -138,8 +146,13 @@ def fn_ck_paged_attn(args: AttnArgs) -> torch.Tensor | None:
         identity_table.data_ptr(), lengths.data_ptr(), q_len, total_kv, pages_needed,
         float(args.sm_scale), 0, value_stride, torch.cuda.current_stream().cuda_stream, 0,
     )
-    if result < 0:
+    if result == -1.0:
+        # Explicit CK decline only. Invocation/device exceptions are not recoverable
+        # here. The preceding cache update does not advance cache_seqlens, so the
+        # fallback writes the same K/V to the same positions, not an extra append.
         _stats["rejected"] += 1
-        return None   # the cache rows are already written (same data again on the fallback path)
+        return None
+    if not math.isfinite(result) or result <= 0:
+        raise RuntimeError(f"CK paged-prefill returned an invalid result (rc={result})")
     _stats["accepted"] += 1
     return out

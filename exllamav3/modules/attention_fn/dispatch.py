@@ -1,6 +1,7 @@
 import os
 
 import torch
+from ...util.attention_mode import CK_SPARSE_ENABLED
 from ...cache import CacheLayer, Cache, CacheLayer_quant
 from .common import AttnArgs, AttnFn
 from ...cache.kvwin import MAX_DRAFT
@@ -224,10 +225,10 @@ def attn_dispatch(
 # `sparse` installs both the fp16 and packed-8-bit KV handlers; every unsupported
 # shape returns None and retains the normal Triton fallback.
 # A missing or unloadable library leaves the normal handlers untouched (one warning, no error).
-if os.environ.get("EXL3_CK_PAGEDKV", "").lower() == "sparse":
-    from .ck_pagedkv import kernel_or_none
+if CK_SPARSE_ENABLED:
+    from .ck_pagedkv import _kernel
 
-    if kernel_or_none() is not None:
+    if _kernel() is not None:
         from .ck_pagedkv_sparse_engine import install_sparse_engine
         from .ck_pagedkv_sparse_qc import install_sparse_qc
 

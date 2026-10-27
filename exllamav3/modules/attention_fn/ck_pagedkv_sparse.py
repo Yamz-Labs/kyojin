@@ -13,7 +13,9 @@ import os
 
 import torch
 
-from .ck_pagedkv import kernel_or_none, _PAGE as _page, _supported_device
+from ...ext import exllamav3_ext as ext
+from ...util.attention_mode import CK_SPARSE_RETAIN, CK_SPARSE_MIN_SK
+from .ck_pagedkv import _kernel, _PAGE as _page, _supported_device
 
 _stats = {"dense": 0, "sparse": 0, "declined": 0}
 
@@ -62,7 +64,10 @@ def fn_ck_paged_attn_sparse(args, keep_past_pages):
         and args.cu_seqlens is None
         and args.softcap == 0.0
         and args.sinks is None
+        and getattr(args, "ov", None) is None
+        and getattr(args, "tq", None) is None
         and args.causal
+        and not getattr(args, "non_causal_spans", None)
         and args.dim == 192
         and args.num_q_heads == 64
         and args.num_kv_heads == 4
@@ -75,11 +80,10 @@ def fn_ck_paged_attn_sparse(args, keep_past_pages):
         _stats["declined"] += 1
         return None
 
-    kernel = kernel_or_none()
+    kernel = _kernel()
     if kernel is None:
         _stats["declined"] += 1
         return None
-    from ...ext import exllamav3_ext as ext
 
     q = args.q
     k = args.k
@@ -115,9 +119,11 @@ def fn_ck_paged_attn_sparse(args, keep_past_pages):
         q_len, s_k_compact, n_pages, float(args.sm_scale), 0, head_pad,
         torch.cuda.current_stream().cuda_stream, 0,
     )
-    if t < 0:
+    if t == -1.0:
         _stats["declined"] += 1
-        return None   # the new rows are already in the cache; the normal backend writes the same data
+        return None
+    if not math.isfinite(t) or t <= 0:
+        raise RuntimeError(f"CK paged-prefill returned an invalid result (rc={t})")
     _stats["sparse"] += 1
     return o
 
@@ -382,7 +388,10 @@ def _owned(args):
         and args.cu_seqlens is None
         and args.softcap == 0.0
         and args.sinks is None
+        and getattr(args, "ov", None) is None
+        and getattr(args, "tq", None) is None
         and args.causal
+        and not getattr(args, "non_causal_spans", None)
         and args.dim == 192
         and args.num_q_heads == 64
         and args.num_kv_heads == 4
@@ -408,10 +417,13 @@ def fn_ck_paged_attn_sparse_auto(args, retain=None, n_sink=None, n_local=None, p
     """
     # Ownership FIRST: a shape the sparse path does not own must fall through to the dense
     # handler without the selector having done any work.
-    if not _owned(args) or kernel_or_none() is None:
+    if not _owned(args):
+        return None, None
+    if _kernel() is None:
+        _stats["declined"] = (_stats.get("declined") or 0) + 1
         return None, None
 
-    retain = float(os.environ.get("EXL3_CK_SPARSE_RETAIN", "0.5")) if retain is None else retain
+    retain = CK_SPARSE_RETAIN if retain is None else retain
     n_sink = 2 if n_sink is None else n_sink
     n_local = 1 if n_local is None else n_local
     probe = 512 if probe is None else probe
@@ -423,9 +435,8 @@ def fn_ck_paged_attn_sparse_auto(args, retain=None, n_sink=None, n_local=None, p
     cs = args.cache_seqlens
     past = int(cs[0].item())
     q_len = q.shape[1]
-    # Optional minimum total KV length for sparse selection. Calls below this
-    # threshold decline to the next dispatcher handler without selector work.
-    if past + q_len < int(os.environ.get("EXL3_CK_MIN_SK", "0")):
+    # Like retain, this threshold is frozen with the persistent cache identity.
+    if past + q_len < CK_SPARSE_MIN_SK:
         _stats["declined"] += 1
         return None, None
     # RAGGED FINAL-CHUNK GUARD. The selector needs page-aligned `past`: every page it scores
