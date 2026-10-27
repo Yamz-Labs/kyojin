@@ -89,7 +89,10 @@ bool exl3_gemm_shape_compat(int shape_idx, int size_m, int size_k, int size_n, i
     int tilesize_k = exl3_gemm_tilesize_k[shape_idx];
     int tilesize_n = exl3_gemm_tilesize_n[shape_idx];
     // A wider row tile only pays once it replaces at least two 16-row passes
-    if (exl3_gemm_tilesize_m[shape_idx] > 16 && size_m <= exl3_gemm_tilesize_m[shape_idx] / 2) return false;
+    int tilesize_m = exl3_gemm_tilesize_m[shape_idx];
+    if (tilesize_m > 16 && size_m <= 16) return false;
+    // The 24-row swapped tile is one pass only
+    if (tilesize_m == 24 && size_m > 24) return false;
     return (size_k % tilesize_k == 0) && (size_n % tilesize_n == 0);
 }
 

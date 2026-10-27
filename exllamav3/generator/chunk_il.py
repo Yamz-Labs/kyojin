@@ -9,6 +9,12 @@ alternates with the queued short work of other jobs:
   leader chunk : exactly one leader chunk; every other job is parked / held, so the chunk does not share its step with them
   ... repeat until the leader's deferral budget is used, then leader chunks only (= FIFO order) until its prefill is done.
 
+Decode priority (EXL3_CIL_DECODE_PRIO=1, for GPUs that decode several users in one batch): while another job is decode-ready the
+deferral budget does not apply and a leader chunk is not exclusive. The leader takes EXL3_CIL_DPRIO_CHUNK rows (default 768, about
+0.75 s on a 3090) per step and shares the step with the decode round of every ready job; between two leader chunks the ready jobs
+decode, all of them in one batch, for up to EXL3_CIL_SLICE_S (a short prefill beside a decoding job takes the same short chunks). A running stream waits one chunk, not the whole big prefill; the
+leader keeps about two thirds of the GPU time. Without a decode-ready job the leader runs at full chunk size as before.
+
 Hard bound: the leader's deferral (wall time of steps in which it did not run) is capped per leader by
 min(EXL3_CIL_MAX_DEFER_S, EXL3_CIL_DEFER_FRAC x its estimated prefill time), so a smaller big prefill pays a proportionally
 smaller price (default 8 s and 18 %: a 45K prefill of 36 s defers at most 6.5 s, an 8K one of 6.5 s at most 1.2 s). A slice step
@@ -45,6 +51,7 @@ class Plan(NamedTuple):
     parked: set         # keys that skip prefill this step
     mode: str | None    # None (no interleave), 'shorts', 'chunk'
     leader: Any
+    chunk_rows: int = 0  # decode priority: prefill rows per job this step (0 = the generator's own chunk size)
 
 
 class _Leader:
@@ -60,6 +67,7 @@ class _Leader:
         self.rows_chunked = 0
         self.t_start = now
         self.rows = 0             # prompt rows left when it took the lead (budget base)
+        self.dprio_on = False     # the last plan ran under decode priority (its slice time is not charged to the deferral budget)
 
 
 class ChunkPlanner:
@@ -73,7 +81,9 @@ class ChunkPlanner:
         self.slice_s = float(e("EXL3_CIL_SLICE_S", "0.6")) if slice_s is None else slice_s
         self.row_s = float(e("EXL3_CIL_ROW_S", "0.0007")) if row_s is None else row_s     # 2.9 s per 4096-row chunk until measured
         self.decode_s = float(e("EXL3_CIL_DECODE_S", "0.05")) if decode_s is None else decode_s
-        self.single_decode = (e("EXL3_CIL_SINGLE_DECODE", "1") != "0") if single_decode is None else single_decode
+        self.dprio = e("EXL3_CIL_DECODE_PRIO", "0") == "1"
+        self.dprio_chunk = max(256, int(e("EXL3_CIL_DPRIO_CHUNK", "768")) // 256 * 256)
+        self.single_decode = (e("EXL3_CIL_SINGLE_DECODE", "1") != "0" and not self.dprio) if single_decode is None else single_decode
         self._clock = clock
         self._lead: _Leader | None = None
         self._resync = False
@@ -125,7 +135,8 @@ class ChunkPlanner:
         if ld is None:
             bigs = sorted((v for v in live if v.remaining > self.short_tok), key=lambda v: v.order)
             if not bigs:
-                return Plan(set(), None, None)
+                # decode priority also for the short prefills (a 2-3K-row tool result): they take the short chunk while someone decodes
+                return Plan(set(), None, None, self.dprio_chunk if self.dprio and live and any(v.done for v in views) else 0)
             lv = bigs[0]
             ld = self._lead = _Leader(lv.key, lv.kv, now)
             ld.rows = lv.remaining
@@ -139,7 +150,8 @@ class ChunkPlanner:
             ld.t_last, ld.kv_last, ld.mode = now, lv.kv, None
         dt = max(now - ld.t_last, 0.0)
         if ld.mode == "shorts":
-            ld.used += dt
+            if not ld.dprio_on:
+                ld.used += dt
             ld.slice_used += dt
         elif ld.mode == "chunk" and lv.kv > ld.kv_last and dt > 0:
             rows = lv.kv - ld.kv_last                          # the leader's own chunk(s) since the last step: measured s/row
@@ -150,8 +162,11 @@ class ChunkPlanner:
         bigs_other = [v for v in others if not v.done and v.remaining > self.short_tok]
         shorts = [v for v in others if v not in bigs_other]
         budget = self._budget(ld)
+        # decode priority: with a decode-ready job beside the leader the shorts slice is not bounded by the deferral budget
+        dprio = self.dprio and any(v.done for v in others)
+        ld.dprio_on = dprio
         # next mode
-        run = self._pick(shorts, budget - ld.used)
+        run = self._pick(shorts, float("inf") if dprio else budget - ld.used)
         fits = bool(run)
         if ld.mode in (None, "chunk"):
             if fits:
@@ -162,8 +177,8 @@ class ChunkPlanner:
         elif not fits or ld.slice_used >= self.slice_s:         # 'shorts' continues until its slice / the budget is spent
             ld.mode = "chunk"
         if ld.mode == "shorts":
-            return Plan({ld.key} | {v.key for v in others if not v.done and v.key not in run}, "shorts", ld.key)
-        return Plan({v.key for v in others if not v.done}, ld.mode, ld.key)
+            return Plan({ld.key} | {v.key for v in others if not v.done and v.key not in run}, "shorts", ld.key, self.dprio_chunk if dprio else 0)
+        return Plan({v.key for v in others if not v.done}, ld.mode, ld.key, self.dprio_chunk if dprio else 0)
 
     # ---- generation round (after the prefill round: jobs that just finished their prefill are decode-ready)
     def plan_decode(self, views: list[View], plan: Plan) -> set:
@@ -172,7 +187,8 @@ class ChunkPlanner:
             return set()
         ready = [v for v in views if v.done and v.key != plan.leader]     # the leader (just finished) decodes at once
         if plan.mode == "chunk":
-            return {v.key for v in ready}                      # the leader chunk does not share its step with a decode
+            return set() if plan.chunk_rows else {v.key for v in ready}   # decode priority: the decode round shares the leader's chunk step
+            # (otherwise the leader chunk does not share its step with a decode)
         if not self.single_decode or len(ready) <= 1:
             return set()
         run = min(ready, key=lambda v: (self._last_decoded.get(v.key, -1), v.order))   # one batch-1 decode, least recently served

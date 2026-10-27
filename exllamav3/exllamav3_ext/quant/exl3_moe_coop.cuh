@@ -65,6 +65,8 @@ struct MoeCoopParams
     int dbg;                    // diagnostics (EXL3_MOE_COOP_DBG): 1 skip A epilogue, 2 skip B reduction
     int* runs;                  // run table (bsz > 1): [n_runs, -, run_start[slots_max + 1], order[slots_max]]
     int slots_max;
+    int rows_ref;               // > 0: batches of up to rows_ref rows size their split-k / stream-K / run-table layout as if the
+                                // scratch held rows_ref * topk slots (the layout of the 8-row scratch), larger ones use all of it
     int rows_max;               // token rows the output scratch holds
     int n_local;                // entries in the pointer tables
     int sh_gate_n;              // shared gate weight length (checked against H per call)

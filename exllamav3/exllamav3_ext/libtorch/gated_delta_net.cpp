@@ -214,6 +214,32 @@ void BC_GatedDeltaNetSplit::set_qkvz_bundle
     qkvz_mul1 = mul1;
 }
 
+#if !defined(USE_ROCM)
+#define SIDE_CHECK(call) TORCH_CHECK((call) == cudaSuccess, "side branch: " #call " failed")
+
+// Side branch for a launch-bound kernel inside an outer (whole-forward) graph capture: fork from the capturing
+// stream, run on a per-device side stream, join back before the result is read. The graph executes the branch
+// concurrently with whatever the main stream runs meanwhile.
+struct SideBranch
+{
+    cudaStream_t stream = nullptr;
+    cudaEvent_t fork_ev = nullptr, join_ev = nullptr;
+};
+
+static SideBranch& side_branch(int device)
+{
+    static SideBranch branches[16];
+    SideBranch& b = branches[device];
+    if (!b.stream)
+    {
+        SIDE_CHECK(cudaStreamCreateWithFlags(&b.stream, cudaStreamNonBlocking));
+        SIDE_CHECK(cudaEventCreateWithFlags(&b.fork_ev, cudaEventDisableTiming));
+        SIDE_CHECK(cudaEventCreateWithFlags(&b.join_ev, cudaEventDisableTiming));
+    }
+    return b;
+}
+#endif
+
 void BC_GatedDeltaNetSplit::run_bszN_gr
 (
     const at::Tensor& x,
@@ -228,6 +254,33 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
 )
 {
     int R = (int) (x.size(0) * x.size(1));
+
+    // The b/a gate GEMV is tiny and launch-bound (~6 us for microseconds of work): under an outer capture it runs
+    // on a forked branch next to the qkv/z projection instead of after it. Same kernel, same inputs: bit-identical.
+    // EXL3_GDN_BA_FORK=0 keeps it in line.
+    bool ba_forked = false;
+    cudaStream_t ba_main_stream = nullptr;
+    cudaEvent_t ba_join_ev = nullptr;
+#if !defined(USE_ROCM)
+    static const bool ba_fork_on = [] { const char* e = getenv("EXL3_GDN_BA_FORK"); return !e || atoi(e) != 0; }();
+    if (ba_fork_on && !kda && !graph)
+    {
+        cudaStream_t main_stream = at::cuda::getCurrentCUDAStream().stream();
+        if (graph_outer_capture(main_stream))
+        {
+            int device;
+            cudaGetDevice(&device);
+            SideBranch& sb = side_branch(device);
+            SIDE_CHECK(cudaEventRecord(sb.fork_ev, main_stream));
+            SIDE_CHECK(cudaStreamWaitEvent(sb.stream, sb.fork_ev, 0));
+            gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, nullptr, sb.stream);
+            SIDE_CHECK(cudaEventRecord(sb.join_ev, sb.stream));
+            ba_forked = true;
+            ba_main_stream = main_stream;
+            ba_join_ev = sb.join_ev;
+        }
+    }
+#endif
     bool use_qkvz = qkvz_ptrs_trellis.has_value() && !kda && R <= 32;
 
     // qkv/z projections: bypass BC_LinearEXL3::run_gr, which hard-refuses graph capture above 1
@@ -277,7 +330,12 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
                 add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
         }
 
-        gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+        if (!ba_forked)
+            gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
+#if !defined(USE_ROCM)
+        else
+            SIDE_CHECK(cudaStreamWaitEvent(ba_main_stream, ba_join_ev, 0));      // join: s.ba is read below
+#endif
 
         gated_delta_net_fused_op_3_gr
         (

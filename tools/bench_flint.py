@@ -64,7 +64,10 @@ if ttft is None:    # no token came back: the job errored (printed above), e.g. 
     print(json.dumps({"depth": a.depth, "kv": a.kv, "error": "no tokens generated", "ctx": ctx}), flush=True)
     sys.exit(1)
 tg = (len(times) - 1) / (times[-1] - times[0]) if len(times) > 2 else 0.0
-res = {"depth": a.depth, "kv": a.kv, "ttft": ttft, "pp": a.depth / ttft, "tg": tg, "ntok": ntok,
+# --gen of 3 x 64 or more: also report the steady decode rate of each consecutive 64-token window and their median (shared-box noise)
+wins = [(63 / (times[i + 63] - times[i])) for i in range(0, len(times) - 63, 64)] if len(times) >= 127 else []
+if wins: tg = sorted(wins)[len(wins) // 2]
+res = {"depth": a.depth, "kv": a.kv, "ttft": ttft, "pp": a.depth / ttft, "tg": tg, "tg_windows": wins, "ntok": ntok,
        "peak_gib": torch.cuda.max_memory_allocated() / 2**30, "reserved_gib": torch.cuda.max_memory_reserved() / 2**30}
 print(json.dumps(res), flush=True)
 if a.out: json.dump(res, open(a.out, "w"))

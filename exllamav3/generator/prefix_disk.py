@@ -53,6 +53,16 @@ def _hx(h) -> str:
 PIN_PAGES = 32                      # every checkpoint of the first 8K tokens is kept: the system prompt + tools of any session resumes near its end
 
 
+def tail_page_usable(e: dict, ph, L: int) -> bool:
+    """Whether the partial page of an in-memory prompt-end checkpoint still holds its K/V: it is an unreferenced page, another job
+    may have taken it. The job refuses such an entry (Job._tail_restore); counting it as resumable here kept the deeper copy on
+    the disk from being restored (a follow-up turn re-prefilled 2-4K tokens while the disk held its prompt end)."""
+    src = e.get("page")
+    if src is None:
+        return True
+    return src.prev_hash == ph and src.kv_position >= L and torch.equal(src.sequence[:, :L], e["ids"].view(1, -1).to(src.sequence.device))
+
+
 def _pow2(d: int) -> bool:
     return d >= 8 and d & (d - 1) == 0          # 8 pages = 2048 tokens
 
@@ -148,6 +158,7 @@ class PagedPrefixDisk:
         if tail is not None and (tail[0] < deepest or "tp_handle" in tail[1]["stashed"]):
             tail = None
         keep_depth = max(deepest, 0 if tail is None else tail[0])
+        if os.environ.get("EXL3_PD_DEBUG"): print(f"PDDBG save N={ids.shape[1]} pages={len(hashes)} stash_depths={sorted(stash_at)} tail={None if tail is None else tail[0]} keep={keep_depth}", flush=True)
         if keep_depth == 0:
             return {"saved": 0}
         want = {d for d in stash_at if d == deepest or _pow2(d) or d <= PIN_PAGES}
@@ -238,10 +249,12 @@ class PagedPrefixDisk:
             return None
         # what RAM can resume from
         ram_depth = 0
+        ram_res = 0
         for i, h in enumerate(hashes):
             pg = pt.referenced_pages.get(h) or pt.unreferenced_pages.get(h)
             if pg is None or pg.kv_position != PAGE_SIZE:
                 break
+            ram_res = i + 1
             s = rc.get(h)
             if s is not None and s["position"] == (i + 1) * PAGE_SIZE:
                 ram_depth = i + 1
@@ -249,10 +262,10 @@ class PagedPrefixDisk:
         for e in g.tail_ckpts:
             ph = e["prev_hash"]
             k = 0 if ph is None else (hashes.index(ph) + 1 if ph in hashes else -1)
-            if k < 0:
-                continue
+            if k < 0 or k > ram_res:
+                continue    # tail without its resident page chain is unreachable: prefill matches pages from page 0
             L = e["ids"].shape[-1]
-            if torch.equal(e["ids"].cpu().view(1, -1), ids[:, k * PAGE_SIZE:k * PAGE_SIZE + L]):
+            if torch.equal(e["ids"].cpu().view(1, -1), ids[:, k * PAGE_SIZE:k * PAGE_SIZE + L]) and tail_page_usable(e, ph, L):
                 ram_pos = max(ram_pos, k * PAGE_SIZE + L)
         # what the disk has: pages are needed from 0, so the usable chain stops at the first page it lacks
         avail = 0
@@ -280,6 +293,7 @@ class PagedPrefixDisk:
             if k * PAGE_SIZE + L > tail_pos:
                 tail_ix, tail_name, tail_pos = ix, nm, k * PAGE_SIZE + L
         disk_pos = max(disk_depth * PAGE_SIZE, tail_pos)
+        if os.environ.get("EXL3_PD_DEBUG"): print(f"PDDBG restore N={N} ram_pos={ram_pos} ram_depth={ram_depth} avail={avail} disk_depth={disk_depth} tail_pos={tail_pos} disk_pos={disk_pos} stashes={len(self.stashes)} tails={len(self.tails)} rc={len(rc)}", flush=True)
         if disk_pos <= ram_pos:
             return None
         need_pages = max(disk_depth, 0 if tail_ix is None else tail_ix["pages"])
@@ -291,6 +305,11 @@ class PagedPrefixDisk:
             if pg is not None and pg.kv_position == PAGE_SIZE:
                 continue
             want.setdefault(self.pages[h][0], []).append((i, h))
+        # every page to put back takes an unreferenced page: while a long prompt holds the pool there is none to take (the restore
+        # raised IndexError on the empty eviction order and the request prefilled from zero)
+        take = sum(len(v) for v in want.values()) + (0 if tail_ix is None else 1)
+        if take > pt.num_unreferenced_pages():
+            return None
         loaded = {}
         try:
             for nm in want:
@@ -318,6 +337,7 @@ class PagedPrefixDisk:
                 prev = h
                 continue
             if live is not None:
+                print(f"prefix_disk: restore aborted at page {i} kv={live.kv_position} idx={len(self.pages)}", flush=True)
                 return None
             nm, pos = self.pages[h]
             d = loaded[nm]

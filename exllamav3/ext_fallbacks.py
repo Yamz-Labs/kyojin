@@ -837,11 +837,12 @@ def quant_cache_paged(
     k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
     cache_seqlens, block_table, page_size, seq_len, compand_a = 0.0, in_contiguous = False,
 ):
-    """Paged cache append: native Triton writer for the 8-bit layout, torch fallback otherwise."""
+    """Paged cache append: native Triton writer (8-bit layout, or any 2..8-bit plane layout), torch fallback otherwise."""
     if (
         not _QW_OFF and compand_a == 0.0 and seq_len > 0 and k_in.is_cuda and
         k_out.ndim == 3 and v_out.ndim == 3 and k_out_scales.shape[-1] in (8, 16, 32, 64) and
-        k_out.shape[-1] == k_out_scales.shape[-1] * 8 and v_out.shape[-1] == k_out.shape[-1] and
+        k_out.shape[-1] % k_out_scales.shape[-1] == 0 and v_out.shape[-1] % k_out_scales.shape[-1] == 0 and
+        2 <= k_out.shape[-1] // k_out_scales.shape[-1] <= 8 and 2 <= v_out.shape[-1] // k_out_scales.shape[-1] <= 8 and
         v_out_scales.shape == k_out_scales.shape and
         k_in.dtype == torch.float16 and v_in.dtype == torch.float16 and
         k_in.is_contiguous() and v_in.is_contiguous() and page_size == 256 and
@@ -851,9 +852,16 @@ def quant_cache_paged(
         k_in.shape == v_in.shape and k_in.numel() >= block_table.shape[0] * seq_len * (k_out_scales.shape[-1] * 32) and
         (in_contiguous or k_in.numel() == k_out.shape[0] * page_size * k_out_scales.shape[-1] * 32)
     ):
-        from .modules.attention_fn.qwrite_triton import quant_cache_paged8
-        quant_cache_paged8(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
-                           cache_seqlens, block_table, seq_len, in_contiguous)
+        kb = k_out.shape[-1] // k_out_scales.shape[-1]
+        vb = v_out.shape[-1] // k_out_scales.shape[-1]
+        if kb == 8 and vb == 8:
+            from .modules.attention_fn.qwrite_triton import quant_cache_paged8
+            quant_cache_paged8(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
+                               cache_seqlens, block_table, seq_len, in_contiguous)
+        else:
+            from .modules.attention_fn.qwrite_triton import quant_cache_paged_bits
+            quant_cache_paged_bits(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
+                                   cache_seqlens, block_table, seq_len, in_contiguous, kb, vb)
         return
     _quant_cache_paged_torch(k_in, k_out, k_out_scales, v_in, v_out, v_out_scales,
                              cache_seqlens, block_table, page_size, seq_len, compand_a, in_contiguous)

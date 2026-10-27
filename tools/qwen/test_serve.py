@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import os
 import sys
+import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -120,6 +123,31 @@ class ParserTests(unittest.TestCase):
                 self.assertEqual(os.environ["EXL3_DRAFT2S"], "")
         self.assertNotIn("EXL3_DRAFT2S", dict(serve.SERVE_ENV))
         self.assertFalse(serve.DRAFT2S_IN_PACK.endswith(".safetensors"))
+
+    def test_quoted_tool_call_tag_is_text(self):
+        # reasoning and answers that mention the tag: no call, nothing swallowed (streamed in 3-character pieces too)
+        text = "the Splitter (handles `<tool_call>` blocks) matters\n</think>\n\nUse <tool_call> then </tool_call> like this."
+        for step in (len(text), 3, 1):
+            sp = serve.Splitter(True)
+            pieces = []
+            for i in range(0, len(text), step):
+                pieces += sp.feed(text[i:i + step])
+            pieces += sp.finish()
+            self.assertEqual("".join(t for k, t in pieces if k == "reasoning"), "the Splitter (handles `<tool_call>` blocks) matters")
+            self.assertEqual("".join(t for k, t in pieces if k == "content"), "Use <tool_call> then </tool_call> like this.")
+            self.assertEqual(sp.tool_text, "")
+
+    def test_real_call_after_a_quotation(self):
+        text = "see `<tool_call>` here\n</think>\n\n<tool_call>\n<function=f>\n<parameter=a>1</parameter>\n</function>\n</tool_call>"
+        for step in (len(text), 2, 1):
+            sp = serve.Splitter(True)
+            for i in range(0, len(text), step):
+                sp.feed(text[i:i + step])
+            sp.finish()
+            self.assertEqual([c["function"]["name"] for c in serve.parse_tool_calls(sp.tool_text, None)], ["f"])
+        sp = serve.Splitter(False)
+        sp.feed('<tool_call>\n{"name": "g", "arguments": {}}\n</tool_call>'); sp.finish()
+        self.assertEqual([c["function"]["name"] for c in serve.parse_tool_calls(sp.tool_text, None)], ["g"])
 
     def test_reasoning_first_split(self):
         m = serve.split_completion("let me think\nmore\n</think>\n\nThe answer.\n", True, None)
@@ -685,6 +713,20 @@ class HttpTests(unittest.TestCase):
         self.assertIn("kaput", [e for e in ev if "error" in e][0]["error"]["message"])
         self.assertEqual(ev[-1]["choices"][0]["finish_reason"], "error")
 
+    def test_failed_requests_are_logged_on_stderr(self):
+        # the request log is off by default: an OOM on a long prompt left no server line at all (only the client saw the error event)
+        import contextlib, io
+        class Boom(FakeEngine):
+            async def generate(self, prompt, **kw):
+                raise RuntimeError("CUDA out of memory")
+                yield ""
+        for stream in (False, True):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.chat(Boom(""), {"messages": [{"role": "user", "content": "hi"}]}, stream=stream)
+            self.assertIn("request failed", err.getvalue())
+            self.assertIn("CUDA out of memory", err.getvalue())
+
 
 class LogprobsTests(unittest.TestCase):
     ENTRIES = [(-0.5, [(1, -0.5), (9, -1.5)]), (-2.0, [(2, -0.25), (3, -2.0)]), None]
@@ -1179,6 +1221,277 @@ class SSEKeepAliveTests(unittest.TestCase):
         body = with_client(Slow("hello"), fn)
         self.assertEqual([line for line in body.split(b"\n") if line.startswith(b":")], [])
         self.assertIn(b"hel", body)
+
+
+class PrefixDiskConcurrencyTests(unittest.TestCase):
+    """The disk cache must work while other requests run (3 users): restore with a busy Generator, save of the request's own prompt."""
+
+    def _engine(self):
+        eng = serve.QwenEngine.__new__(serve.QwenEngine)
+        calls = []
+
+        class PD:
+            def restore(self, ids):
+                calls.append(("restore", ids))
+                return {"resume_at": 256, "ram_at": 0, "pages": 1, "ms": 1.0}
+
+            def save(self, ids):
+                calls.append(("save", ids))
+                return {"saved": 1}
+
+        class Gen:
+            def num_remaining_jobs(self):
+                return 2    # other users are decoding
+
+        async def post(fn, *args):
+            return fn(*args)
+        eng.prefix_disk, eng.generator, eng._post, eng._disk_ids = PD(), Gen(), post, {}
+        return eng, calls
+
+    def test_restore_runs_at_job_start_with_other_jobs(self):
+        eng, calls = self._engine()
+        job = types.SimpleNamespace(_restore_ids="ids-a")
+        eng._pre_start(job)
+        self.assertEqual(calls, [("restore", "ids-a")])
+        eng._pre_start(job)                        # once per job
+        eng._pre_start(types.SimpleNamespace())    # a job without ids (images, cache_prompt=false)
+        self.assertEqual(calls, [("restore", "ids-a")])
+
+    def test_save_uses_the_ids_of_its_own_request(self):
+        eng, calls = self._engine()
+        stats_a, stats_b = {}, {}
+        eng._disk_ids[id(stats_a)] = "ids-a"
+        eng._disk_ids[id(stats_b)] = "ids-b"     # B started after A and is still running when A ends
+        asyncio.run(eng.disk_save(stats_a))
+        self.assertEqual(calls, [("save", "ids-a")])
+        asyncio.run(eng.disk_save(stats_a))       # nothing left for A
+        asyncio.run(eng.disk_save(stats_b))
+        self.assertEqual(calls, [("save", "ids-a"), ("save", "ids-b")])
+
+
+class VramHeadroomTests(unittest.TestCase):
+    def test_enough_is_none(self):
+        self.assertIsNone(serve.vram_headroom_problem(2200, 262144, 0.0182, 1))
+
+    def test_three_sessions_262144_names_a_context_that_fits(self):
+        msg = serve.vram_headroom_problem(468, 262144, 0.0182, 3)   # measured on the 24 GB 3090: Qwen3.8-27B K4V4, sessions 3
+        self.assertIn("-c ", msg)
+        fits = int(msg.split("-c ")[1].split()[0])
+        self.assertEqual(fits % 256, 0)
+        self.assertLessEqual(fits, 262144 - (1024 - 468) / 0.0182)
+        self.assertGreater(fits, 200000)
+
+    def test_override(self):
+        self.assertIsNone(serve.vram_headroom_problem(468, 262144, 0.0182, 3, min_free_mib=256))
+
+    def test_free_vram_is_the_device_figure_after_the_cache_is_returned(self):
+        calls = []
+        cuda = types.SimpleNamespace(empty_cache=lambda: calls.append("empty"), mem_get_info=lambda: (1369 * 2**20, 24124 * 2**20))
+        self.assertEqual(serve.free_vram_mib(types.SimpleNamespace(cuda=cuda)), 1369)
+        self.assertEqual(calls, ["empty"])
+
+    def test_1369_mib_left_at_262144_sessions_3_is_refused(self):
+        # measured on the 24 GB 3090: this start was accepted (limit 1024), then the third distinct 50K prompt died with CUDA OOM
+        msg = serve.vram_headroom_problem(1369, 262144, 0.0182, 3)
+        self.assertIn("-c ", msg)
+        self.assertLess(int(msg.split("-c ")[1].split()[0]), 262144)
+
+    def test_196608_sessions_3_is_accepted(self):
+        self.assertIsNone(serve.vram_headroom_problem(2600, 196608, 0.0182, 3))   # measured: ~2.6 GiB left, 50 calls clean in realA
+
+    def test_lazy_draft_head_subset_counts_against_the_floor(self):
+        # measured on the 24 GB 3090, Qwen3.8-27B k6v6 sessions 3 -c 183040: 1551 MiB left after load passed the 1536 floor, the 150 MiB
+        # draft-head subset appeared in the first 32K request and the second distinct 32K prompt died with CUDA out of memory (48 MiB short)
+        self.assertIsNone(serve.vram_headroom_problem(1551, 183040, 0.0182, 3))
+        msg = serve.vram_headroom_problem(1551, 183040, 0.0182, 3, lazy_mib=150)
+        self.assertIn("-c ", msg)
+        fits = int(msg.split("-c ")[1].split()[0])
+        self.assertLessEqual(fits, 183040 - (1536 - 1401) / 0.0182)
+        self.assertIsNone(serve.vram_headroom_problem(1551 + 150, 183040, 0.0182, 3, lazy_mib=150))
+
+    def test_lazy_bytes_of_the_draft_subset(self):
+        import torch
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from exllamav3.architecture.qwen3_5_mtp import Qwen3_5MTPModel as M
+        inner = type("LinearEXL3", (), {})()
+        inner.trellis, inner.svh, inner.K, inner.bias = torch.zeros(256, 1024, 16, dtype=torch.int16), torch.zeros(16384, dtype=torch.float16), 4, None
+        lm = types.SimpleNamespace(inner=inner, out_features=16384, pre_scale=1.0, post_scale=1.0, softcap=0.0)
+        model = types.SimpleNamespace(modules=[lm], logit_layer_idx=0)
+        mtp = types.SimpleNamespace(attached_model=lambda: model, _head_plain=staticmethod(M._head_plain), __dict__={})
+        env = {"EXL3_DRAFT_VOCAB": "4096"}
+        with unittest.mock.patch.dict(os.environ, env):
+            self.assertEqual(M.lazy_vram_bytes(mtp), 256 * 1024 * 16 * 2 // 4 + 4096 * 2)     # a quarter of the head rows
+            with unittest.mock.patch.dict(os.environ, {"EXL3_DRAFT_ADAPT": "0"}):
+                self.assertEqual(M.lazy_vram_bytes(mtp), 0)
+            mtp.__dict__["_dad"] = {"sub": object()}
+            self.assertEqual(M.lazy_vram_bytes(mtp), 0)       # already built: it is in the measured free figure
+        with unittest.mock.patch.dict(os.environ, {"EXL3_DRAFT_VOCAB": "0"}):
+            self.assertEqual(M.lazy_vram_bytes(types.SimpleNamespace(__dict__={})), 0)
+
+
+class DflashFlagTests(unittest.TestCase):
+    def test_dflash_policy_needs_a_drafter_directory(self):
+        err = io.StringIO()
+        with unittest.mock.patch.object(sys, "argv", ["serve.py", "--model", "m", "--draft-policy", "dflash"]), \
+                unittest.mock.patch.object(sys, "stderr", err), self.assertRaises(SystemExit) as cm:
+            serve.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--dflash-dir", err.getvalue())
+
+    def _adapt_env(self, *extra, env=None):
+        """EXL3_DFLASH_ADAPT as main() leaves it for the engine (load_all stubbed out)."""
+        argv = ["serve.py", "--model", "m", "--draft-policy", "dflash", "--dflash-dir", "d", *extra]
+        seen = {}
+
+        def fake_load(args):
+            seen["adapt"] = os.environ.get("EXL3_DFLASH_ADAPT")
+            raise RuntimeError("stop")
+        sh = serve.startup_health
+        with unittest.mock.patch.dict(os.environ, env or {}), unittest.mock.patch.object(sys, "argv", argv), \
+                unittest.mock.patch.object(serve, "load_all", fake_load), \
+                unittest.mock.patch.object(sh, "check_model_dir"), unittest.mock.patch.object(sh, "start"), \
+                unittest.mock.patch.object(sh, "report_compiler"), unittest.mock.patch.object(sh, "abort"), \
+                self.assertRaises(RuntimeError):
+            if not env:
+                os.environ.pop("EXL3_DFLASH_ADAPT", None)
+            serve.main()
+        return seen["adapt"]
+
+    def test_adaptive_depth_is_on_by_default(self):
+        self.assertEqual(self._adapt_env(), "1")
+
+    def test_adapt_off_flag_selects_the_fixed_block(self):
+        self.assertEqual(self._adapt_env("--dflash-adapt", "off"), "0")
+
+    def test_environment_wins_over_the_flag(self):
+        self.assertEqual(self._adapt_env("--dflash-adapt", "on", env={"EXL3_DFLASH_ADAPT": "0"}), "0")
+
+    def test_adapt_flag_rejects_other_values(self):
+        err = io.StringIO()
+        with unittest.mock.patch.object(sys, "argv", ["serve.py", "--model", "m", "--dflash-adapt", "maybe"]), \
+                unittest.mock.patch.object(sys, "stderr", err), self.assertRaises(SystemExit) as cm:
+            serve.main()
+        self.assertEqual(cm.exception.code, 2)
+
+
+class DflashVramGuardTests(unittest.TestCase):
+    def test_min_free_is_the_measured_peak_plus_slack_and_context_scratch(self):
+        self.assertAlmostEqual(serve.dflash_min_free_mib(1900, 45056), 1900 + 256 + 352)
+        self.assertGreater(serve.dflash_min_free_mib(1900, 131072), serve.dflash_min_free_mib(1900, 45056))
+
+    def test_nanbeige_45056_x2_with_2113_mib_left_is_refused_with_a_context_that_fits(self):
+        # measured on the 24 GB 3090: 2113 MiB left after load passed the 1536 floor, then 28 CUDA OOM under two parallel streams
+        need = serve.dflash_min_free_mib(1900, 45056)
+        msg = serve.vram_headroom_problem(2113, 45056, 0.19, 2, need)
+        self.assertIn("-c ", msg)
+        fits = int(msg.split("-c ")[1].split()[0])
+        self.assertEqual(fits % 256, 0)
+        self.assertLess(fits, 45056)
+        # the suggested context leaves the needed headroom (the context scratch term shrinks with it)
+        self.assertIsNone(serve.vram_headroom_problem(2113 + (45056 - fits) * 0.19, fits, 0.19, 2, serve.dflash_min_free_mib(1900, fits)))
+
+    def test_enough_headroom_passes(self):
+        self.assertIsNone(serve.vram_headroom_problem(3000, 45056, 0.19, 2, serve.dflash_min_free_mib(1900, 45056)))
+
+    def test_guard_floor_is_kept_when_the_measured_peak_is_small(self):
+        self.assertEqual(max(serve.MIN_FREE_MIB, serve.dflash_min_free_mib(100, 4096)), serve.MIN_FREE_MIB)
+
+
+class DraftDepthTests(unittest.TestCase):
+    """exllamav3/generator/draft_depth.py (pure Python, loaded by path so no torch import)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        path = Path(__file__).resolve().parents[2] / "exllamav3" / "generator" / "draft_depth.py"
+        spec = importlib.util.spec_from_file_location("draft_depth_t", path)
+        cls.M = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.M)
+
+    def ctl(self, **kw):
+        return self.M.DraftDepth(7, **kw)
+
+    def run_rounds(self, c, accepted, n):
+        """n steps; `accepted` is a number or a repeating pattern of accepted counts per speculative round."""
+        pat = accepted if isinstance(accepted, (list, tuple)) else (accepted,)
+        for i in range(n):
+            d = c.want()
+            c.record(d, min(pat[i % len(pat)], d) if d else 0)
+
+    def switch_off(self, c):
+        while c.depth:
+            self.run_rounds(c, 0, 1)
+
+    def test_starts_at_full_depth(self):
+        self.assertEqual(self.ctl().want(), 7)
+
+    def test_warm_up_never_cuts(self):
+        c = self.ctl()
+        self.run_rounds(c, 0, 2)
+        self.assertEqual(c.want(), 7)
+
+    def test_high_acceptance_stays_full(self):
+        c = self.ctl()
+        self.run_rounds(c, 3, 50)
+        self.assertEqual(c.want(), 7)
+
+    def test_chat_like_acceptance_switches_off(self):
+        c = self.ctl()
+        self.run_rounds(c, 0, 8)
+        self.assertEqual(c.depth, 0)
+        self.assertEqual(c.want(), 0)
+
+    def test_middle_acceptance_gets_the_short_block(self):
+        c = self.ctl()
+        self.run_rounds(c, (1, 2, 1, 0), 20)
+        self.assertEqual(c.depth, 3)
+        self.assertEqual(c.want(), 3)
+
+    def test_short_block_returns_to_full_when_acceptance_climbs(self):
+        c = self.ctl()
+        self.run_rounds(c, (1, 2, 1, 0), 20)
+        self.assertEqual(c.depth, 3)
+        self.run_rounds(c, 3, 12)
+        self.assertEqual(c.depth, 7)
+
+    def test_off_probes_with_a_doubling_interval(self):
+        c = self.ctl()
+        self.switch_off(c)
+        plain = 0
+        while c.want() == 0:
+            c.record(0, 0)
+            plain += 1
+        self.assertEqual(plain, 4)                      # first probe after probe_min plain steps
+        c.record(c.want(), 0)                           # failed probe
+        self.assertEqual(c.depth, 0)
+        plain = 0
+        while c.want() == 0:
+            c.record(0, 0)
+            plain += 1
+        self.assertEqual(plain, 8)                      # doubled
+        for _ in range(10):                             # capped at probe_max
+            c.record(c.want() or 0, 0) if c.want() else None
+            while c.want() == 0:
+                c.record(0, 0)
+            c.record(c.want(), 0)
+        self.assertLessEqual(c.probe, 32)
+
+    def test_good_probe_switches_speculation_back_on(self):
+        c = self.ctl()
+        self.switch_off(c)
+        while c.want() == 0:
+            c.record(0, 0)
+        for _ in range(4):                              # a request that turned agentic: probes accept the whole block
+            c.record(c.want() or 7, 7)
+            while c.want() == 0:
+                c.record(0, 0)
+        self.assertGreater(c.depth, 0)
+
+    def test_env_overrides_the_thresholds(self):
+        with unittest.mock.patch.dict(os.environ, {"EXL3_DFLASH_ADAPT_OFF": "5", "EXL3_DFLASH_ADAPT_WARM": "1"}):
+            c = self.ctl()
+        self.run_rounds(c, 3, 3)
+        self.assertEqual(c.depth, 0)
 
 
 if __name__ == "__main__":

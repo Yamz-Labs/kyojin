@@ -64,3 +64,26 @@ __device__ __forceinline__ void cp4(void* dst, const void* src, bool pred)
     int sz = pred ? 4 : 0;
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" :: "r"(smem_u32(dst)), "l"(src), "r"(sz));
 }
+
+// L2 cache hints: the K/V stream is read once per decode step (evict_first) while the per-token scale sectors are shared
+// by the kv-head CTAs of a split, which run unsynchronized (evict_last keeps them resident for the siblings). Without
+// the hints the 8-byte scale pieces were refetched from HBM by every head: 794 -> 860 GB/s on a load-only kernel.
+#ifndef KEY_LO
+#define KEY_LO 0       // KVWIN: tokens below KEY_LO are not attended (the fp16 ring serves the sinks)
+#endif
+#ifndef L2HINT
+#define L2HINT 1
+#endif
+typedef unsigned long long u64;
+__device__ __forceinline__ u64 pol_first() { u64 p; asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(p)); return p; }
+__device__ __forceinline__ u64 pol_last() { u64 p; asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(p)); return p; }
+__device__ __forceinline__ void cp16h(void* dst, const void* src, bool pred, u64 pol)
+{
+    int sz = pred ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;" :: "r"(smem_u32(dst)), "l"(src), "r"(sz), "l"(pol));
+}
+__device__ __forceinline__ void cp4h(void* dst, const void* src, bool pred, u64 pol)
+{
+    int sz = pred ? 4 : 0;
+    asm volatile("cp.async.ca.shared.global.L2::cache_hint [%0], [%1], 4, %2, %3;" :: "r"(smem_u32(dst)), "l"(src), "r"(sz), "l"(pol));
+}

@@ -50,6 +50,7 @@ EXL3_CUDA_GRAPH_MAX (6). purge() releases everything (call between harness arms 
 from __future__ import annotations
 
 import os
+import time
 import weakref
 from collections import Counter, OrderedDict
 
@@ -82,6 +83,9 @@ set_multi(os.environ.get("EXL3_CUDA_GRAPH_MULTI", "0") == "1")
 CUDA_GRAPH_CLONE = os.environ.get("EXL3_CUDA_GRAPH_CLONE", "1") != "0"
 CUDA_GRAPH_FALLBACK = os.environ.get("EXL3_CUDA_GRAPH_FALLBACK", "closed")
 CUDA_GRAPH_DEBUG = os.environ.get("EXL3_CUDA_GRAPH_DEBUG", "0") == "1"
+CUDA_GRAPH_LOG_CAPTURES = os.environ.get("EXL3_CUDA_GRAPH_LOG_CAPTURES", "0") == "1"
+# EXL3_CUDA_GRAPH_DIAG=1: event-time 300 replays and print the mean GPU time per graph step and the replay-to-replay median
+_DIAG = [None] if os.environ.get("EXL3_CUDA_GRAPH_DIAG") else None
 
 # Only these params keys may be present; anything else (export_state_layers, activate_all_experts,
 # autosplit_measure, reconstruct, capture, ovr, sim_kvq, non_causal_spans, last_tokens_only, skip_logits,
@@ -307,6 +311,9 @@ class CudaGraphRunner:
             return "no_block_table"
         if params.get("indexed_embeddings"):
             return "state"
+        from ..cache import kvwin
+        if kvwin.ANY_ACTIVE and kvwin.any_cold(params):
+            return "kvwin_cold"   # the cold ring fill is a host step: eager this step, graph again from the next one
         rs = params.get("recurrent_states")
         if self.has_gdn or self.has_conv or self.has_mamba or self.has_swa:
             slots = params.get("recurrent_slots")
@@ -375,11 +382,25 @@ class CudaGraphRunner:
                 if "export_states" in p:
                     params["export_states"] = p["export_states"]
                 return y
-            if not self._capture(key, e, tail, x, params):
+            t_cap = time.perf_counter()
+            ok = self._capture(key, e, tail, x, params)
+            if CUDA_GRAPH_LOG_CAPTURES:   # EXL3_CUDA_GRAPH_LOG_CAPTURES=1: one line per capture, with the time the decode of every job waited
+                print(f"[cudagraph] capture {time.perf_counter() - t_cap:.2f} s key={key[1:5]} captures={self.stats['captures']} "
+                      f"evictions={self.stats.get('evictions', 0)} entries={len(self.entries)}", flush = True)
+            if not ok:
                 return self._run_tail(tail, x, params)   # FALLBACK=eager decline
         try:
             with torch.cuda.device(dev):
+                if _DIAG:
+                    ev0 = torch.cuda.Event(enable_timing = True); ev1 = torch.cuda.Event(enable_timing = True); ev0.record()
                 e.graph.replay()
+                if _DIAG:
+                    ev1.record(); _DIAG.append((ev0, ev1, time.perf_counter()))
+                    if len(_DIAG) == 301:
+                        torch.cuda.synchronize(); d = _DIAG[1:]
+                        gpu = sum(a.elapsed_time(b) for a, b, _ in d)
+                        dl = sorted((y[2] - x[2]) * 1000 for x, y in zip(d, d[1:]))
+                        print(f"DIAG graph gpu {gpu / len(d):.3f} ms/step, replay-to-replay median {dl[len(dl) // 2]:.3f} ms, p10 {dl[len(dl) // 10]:.3f}", flush = True)
         except Exception:
             self._drop(key)
             self.disabled.add(key)

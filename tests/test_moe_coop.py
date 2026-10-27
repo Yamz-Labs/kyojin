@@ -134,8 +134,8 @@ def run_case(seed, Kg, Ku, Kd, cb, act = "silu", gated = True, bias = False, lim
     gu_u = torch.empty((smax, 1, I), dtype = gu_dt, device = DEV)
     act_out = torch.empty((smax, 1, I), dtype = torch.half, device = DEV)
     d_out = torch.empty((smax, 1, Ho), dtype = torch.float, device = DEV)
-    out = torch.full((8, H_out), float("nan"), dtype = torch.float, device = DEV)
-    ctr = torch.zeros((smax * (I // 128) + 8 * (Ho // 128) + 2 * smax + 3,), dtype = torch.int, device = DEV)
+    out = torch.full((max(8, bsz), H_out), float("nan"), dtype = torch.float, device = DEV)
+    ctr = torch.zeros((smax * (I // 128) + max(8, bsz) * (Ho // 128) + 2 * smax + 3,), dtype = torch.int, device = DEV)
     had_g = torch.empty((slots, Hi), dtype = torch.half, device = DEV); had_u = torch.empty_like(had_g)
     gtabs = gate.tabs if gated else up.tabs
     gK = gate.K if gated else up.K
@@ -236,6 +236,16 @@ def test_batch_extremes():
     run_case(13, 4, 4, 4, 1, bsz = 1, topk = 1)
     run_case(14, 4, 4, 4, 1, bsz = 8, topk = 8, E = 12)
     run_case(15, 2, 2, 2, 2, bsz = 8, topk = 32, E = 40, H = 512, Hi = 512, I = 384, Ho = 512, H_out = 512)
+
+
+def test_many_rows():
+    # 9..32 rows (verify batches of several requests): duplicates grouped into runs of ROWS, runs spanning the run table,
+    # shared expert, expert-range masking, K widths on both register-dequant and staged paths
+    run_case(30, 3, 3, 3, 2, bsz = 9, topk = 6, E = 24, H = 512, Hi = 512, I = 256, Ho = 512, H_out = 512, shared = "gated")
+    run_case(31, 4, 4, 4, 1, bsz = 16, topk = 6, E = 20, H = 512, Hi = 512, I = 256, Ho = 512, H_out = 512)
+    run_case(32, 2, 2, 5, 2, bsz = 32, topk = 8, E = 64, H = 256, Hi = 256, I = 256, Ho = 256, H_out = 256, shared = "plain")
+    run_case(33, 4, 4, 4, 1, bsz = 32, topk = 8, E = 10, H = 256, Hi = 256, I = 256, Ho = 256, H_out = 256, min_e = 2, max_e = 8)
+    run_case(34, 6, 6, 6, 0, bsz = 24, topk = 4, E = 5, H = 256, Hi = 256, I = 256, Ho = 256, H_out = 256, bias = True)
 
 
 def test_odd_shapes():

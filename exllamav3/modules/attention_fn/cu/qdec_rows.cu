@@ -37,15 +37,24 @@
 
 // dynamic smem layout: [Sx][Px][ring: NW x ST x STAGE_B]   (q lives in registers as this warp's MMA B fragments)
 
-__device__ __forceinline__ void cp_sc(void* dst, const void* src, bool pred)
+__device__ __forceinline__ void cp_sc(void* dst, const void* src, bool pred, u64 pol)
 {
     int sz = pred ? (G * 2) : 0;
+#if L2HINT
+    if (G * 2 == 16) asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;" :: "r"(smem_u32(dst)), "l"(src), "r"(sz), "l"(pol));
+    else             asm volatile("cp.async.ca.shared.global.L2::cache_hint [%0], [%1], 8, %2, %3;" :: "r"(smem_u32(dst)), "l"(src), "r"(sz), "l"(pol));
+#else
     if (G * 2 == 16) asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(smem_u32(dst)), "l"(src), "r"(sz));
     else             asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(smem_u32(dst)), "l"(src), "r"(sz));
+#endif
 }
-template<int CP> __device__ __forceinline__ void cpw(void* dst, const void* src, bool pred)
+template<int CP> __device__ __forceinline__ void cpw(void* dst, const void* src, bool pred, u64 pol)
 {
+#if L2HINT
+    if (CP == 4) cp16h(dst, src, pred, pol); else cp4h(dst, src, pred, pol);
+#else
     if (CP == 4) cp16(dst, src, pred); else cp4(dst, src, pred);
+#endif
 }
 
 #ifndef ABL
@@ -128,6 +137,11 @@ qdec_split_rows(
         for (int j = 0; j < NT; j++) { O[i][j][0] = O[i][j][1] = O[i][j][2] = O[i][j][3] = 0.f; }
 
     unsigned char* wring = ring + (size_t)warp * ST * STAGE_B;
+#if L2HINT
+    const u64 pol_f = pol_first(), pol_l = pol_last();
+#else
+    const u64 pol_f = 0, pol_l = 0;
+#endif
     const int nslabs = (n_end > n_start) ? (n_end - n_start + 15) / 16 : 0;
 
     auto fill = [&](int it) {
@@ -142,15 +156,15 @@ qdec_split_rows(
             #pragma unroll
             for (int c = lane; c < 16 * (KWW / KCP); c += 32) {
                 int tk = c / (KWW / KCP), pt = c % (KWW / KCP);
-                cpw<KCP>(ksm + tk * KSW + pt * KCP, k_cache + (row0 + tk) * (GPT * KB) + kvh * KCHW + warp * KWW + pt * KCP, n0 + tk < n_end);
+                cpw<KCP>(ksm + tk * KSW + pt * KCP, k_cache + (row0 + tk) * (GPT * KB) + kvh * KCHW + warp * KWW + pt * KCP, n0 + tk < n_end, pol_f);
             }
             #pragma unroll
             for (int c = lane; c < 16 * (VWW / VCP); c += 32) {
                 int tk = c / (VWW / VCP), pt = c % (VWW / VCP);
-                cpw<VCP>(vsm + tk * VSW + pt * VCP, v_cache + (row0 + tk) * (GPT * VB) + kvh * VCHW + warp * VWW + pt * VCP, n0 + tk < n_end);
+                cpw<VCP>(vsm + tk * VSW + pt * VCP, v_cache + (row0 + tk) * (GPT * VB) + kvh * VCHW + warp * VWW + pt * VCP, n0 + tk < n_end, pol_f);
             }
-            if (lane < 16) cp_sc(ksc + lane * G, k_scales + (row0 + lane) * GPT + kvh * G, n0 + lane < n_end);
-            else           cp_sc(vsc + (lane - 16) * G, v_scales + (row0 + lane - 16) * GPT + kvh * G, n0 + lane - 16 < n_end);
+            if (lane < 16) cp_sc(ksc + lane * G, k_scales + (row0 + lane) * GPT + kvh * G, n0 + lane < n_end, pol_l);
+            else           cp_sc(vsc + (lane - 16) * G, v_scales + (row0 + lane - 16) * GPT + kvh * G, n0 + lane - 16 < n_end, pol_l);
         }
         asm volatile("cp.async.commit_group;");
     };
@@ -215,7 +229,7 @@ qdec_split_rows(
                 for (int e = 0; e < 4; e++) {
                     int tk = n0 + g + ((e >> 1) << 3);
                     int ri = e & 1;
-                    ok[e] = rvalid[o][ri] && tk < n_end && (!CAUSAL || (float)tk <= qabs[o][ri]);
+                    ok[e] = rvalid[o][ri] && tk < n_end && tk >= KEY_LO && (!CAUSAL || (float)tk <= qabs[o][ri]);
                     s[e] = ok[e] ? sv[e] * sl : -INFINITY;
                 }
                 float alpha[2];
