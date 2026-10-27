@@ -50,7 +50,7 @@ def geometry(cfg):
     sc_b = (16 * g * 2 + 15) // 16 * 16
     stage_b = 16 * kstr * 4 + 16 * vstr * 4 + 2 * sc_b
     ring = cfg["nw"] * cfg["st"] * stage_b
-    qs = (nt * 8 * (hd + 8) * 2 + 15) // 16 * 16
+    qs = (nt * 8 * (hd + 8) * 2 + 15) // 16 * 16 + (nt * 8 * hd * 2 + 15) // 16 * 16     # rotated q rows + the raw rows staged by cp.async
     merge = (cfg["nw"] * nt * 8 * hd + 2 * cfg["nw"] * nt * 8) * 4
     return dict(nt=nt, rows=rows, stage_b=stage_b, shared=qs + max(ring, merge, 4096))
 
@@ -161,8 +161,11 @@ def rows_nw(hd):
 
 
 def static_smem(cfg) -> int:
-    """static shared memory of qdec.cu: the TurboQuant pair tables (codebook entry pairs as 32-bit words, K and V)"""
-    return 4 * ((1 << 2 * cfg["kb"]) + (1 << 2 * cfg["vb"])) if cfg.get("tq") and not cfg.get("rows_kernel") else 0
+    """static shared memory of qdec.cu: the TurboQuant pair tables (codebook entry pairs as 32-bit words, K and V), else the 32x32 fp32
+    H32 matrix of the q prologue (the many-row kernel keeps it in its ring)"""
+    if cfg.get("rows_kernel"):
+        return 0
+    return 4 * ((1 << 2 * cfg["kb"]) + (1 << 2 * cfg["vb"])) if cfg.get("tq") else 2048
 
 
 def pick_nw_st(cfg):
