@@ -491,6 +491,10 @@ bool exl3_gemv_int8_pair
     if (K < 1 || K > exl3_gemv_int8_max_k(device)) return false;
     bool residual = exl3_gemv_int8_mode() == 1;
     if (size_m > (residual ? 1 : 2)) return false;
+    // Pair rows cap: at m == 2 the pair kernel (more registers, 2x staging and partials per unit) measures SLOWER than two
+    // single launches on 3090 (gate/up 5120x17408 K4: 134-140 us vs 2 x 64); bit-identical either way. EXL3_GEMV_PAIR_MAXM=2 restores it.
+    static const int pair_maxm = [] { const char* e = getenv("EXL3_GEMV_PAIR_MAXM"); return e ? atoi(e) : 1; }();
+    if (size_m > pair_maxm) return false;
     int num_sms = DevCtx::instance().get_num_sms(device);
     return exl3_gemv_int8_sq(
         (const half*) A.data_ptr(), (const uint16_t*) B1.data_ptr(), C1.data_ptr(),
