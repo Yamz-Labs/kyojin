@@ -742,6 +742,53 @@ def _prefill_fa2_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
             out[:, s:e].copy_(o.transpose(1, 2))
     return out
 
+# ROCm gfx1151, staged quantized-cache prefill, head_dim 128 / 256, one sequence: after the staging pass the window is contiguous fp16,
+# so the chunk runs as one Composable Kernel fmha_fwd call (stock gfx115 128x64 tiles, causal bottom-right, GQA) over past + chunk keys.
+# Qwen3.8 geometry (hd 256, 24q/4kv), 4096-row chunk at 4K/32K/120K past: 27.3/158.9/571.7 -> 21.6/122.8/461.7 ms (x1.26/1.29/1.24, 22 ->
+# 28 TFLOPS); hd 128 32q/4kv x1.4-1.6; error vs an fp32 reference equal to the Triton kernel's. Served Qwen27 k4v4, 108K-token prompt (74K new):
+# TTFT 270.6/271.4 -> 252.2/251.7 s (-7 %), 35K prompt -1.4 %. Needs the library built by tools/strix_halo/ck_fmha/build.sh (EXL3_PF_CK_SO
+# overrides the path). EXL3_PF_CK=auto (default): used when the library exists, silently Triton otherwise; 1 = required (warns if missing); 0 = off.
+# Any miss falls back to the Triton kernel
+_pf_ck_mode = os.environ.get("EXL3_PF_CK", "auto")
+_pf_ck = _pf_ck_mode != "0" and bool(torch.version.hip)
+_pf_ck_fn = None
+
+
+def _pf_ck_load():
+    global _pf_ck_fn, _pf_ck
+    if _pf_ck_fn is None:
+        import ctypes
+        from pathlib import Path
+        so = Path(os.environ.get("EXL3_PF_CK_SO") or Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "kyojin" / "ck-fmha" / "libckpf.so")
+        try:
+            fn = ctypes.CDLL(str(so)).ckpf_fwd
+        except OSError as e:
+            if _pf_ck_mode == "1":
+                print(f" !! EXL3_PF_CK=1 but {so} cannot be loaded ({e}); using the Triton prefill kernel")
+            _pf_ck = False
+            return None
+        fn.restype = ctypes.c_float
+        fn.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_int] * 7 + [ctypes.c_float, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        _pf_ck_fn = fn
+    return _pf_ck_fn
+
+
+def _prefill_ck_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
+    """CK fmha_fwd over the contiguous fp16 staged window; None if the kernel declines (caller keeps the Triton path)."""
+    fn = _pf_ck_load()
+    if fn is None:
+        return None
+    q_len = q.shape[1]
+    k1 = kd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
+    v1 = vd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
+    r = fn(q.data_ptr(), k1.data_ptr(), v1.data_ptr(), out.data_ptr(), 1, q_len, past + q_len, q.shape[2], n_kvh,
+           head_dim, head_dim, float(scale), 1, torch.cuda.current_stream(q.device).cuda_stream, 0)
+    if r >= 0 and not getattr(_prefill_ck_contig, "_logged", False):
+        _prefill_ck_contig._logged = True
+        print(f" -- EXL3_PF_CK: CK fmha_fwd prefill attention active (head_dim {head_dim}, {q.shape[2]}q/{n_kvh}kv)")
+    return out if r >= 0 else None
+
+
 def _get_h32(device):
     if device not in _h32_cache:
         h = torch.ones(1, 1, dtype = torch.float32)
@@ -2076,6 +2123,16 @@ def paged_attn_triton_prefill(
                 if out is None:
                     out = torch.empty_like(q)
                 return _prefill_fa2_contig(q, kd, vd, max_kv_len, n_kvh, head_dim, softmax_scale, out)
+            if (_pf_ck and bsz == 1 and kv_append_len == q_len
+                    and head_dim in (128, 256) and v_dim == head_dim
+                    and window_left < 0 and window_right < 0 and not softcap and not has_sinks
+                    and num_splits is None and block_m is None and q.is_contiguous() and tq is None):
+                if out is None:
+                    out = torch.empty_like(q)
+                # ROCm callers leave max_kv_len unset outside QSA: read the past from the device copy (one tiny sync per call)
+                past = max_kv_len if max_kv_len is not None else int(cache_seqlens[0].item())
+                if _prefill_ck_contig(q, kd, vd, past, n_kvh, head_dim, softmax_scale, out) is not None:
+                    return out
     else:
         k_scales, v_scales, qck, qcv = q, q, 0, 0
         h32 = q
