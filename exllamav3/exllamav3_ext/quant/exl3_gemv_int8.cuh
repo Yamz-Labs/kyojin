@@ -30,3 +30,20 @@ bool exl3_gemv_int8
     cudaStream_t stream,
     Graph* graph
 );
+
+// Two same-shape mul1 GEMVs over one activation tensor in a single launch (see the definition).
+bool exl3_gemv_int8_pair
+(
+    const at::Tensor& A,
+    const at::Tensor& B1, at::Tensor& C1, const c10::optional<at::Tensor>& suh1, const c10::optional<at::Tensor>& svh1,
+    const at::Tensor& B2, at::Tensor& C2, const c10::optional<at::Tensor>& suh2, const c10::optional<at::Tensor>& svh2,
+    cudaStream_t stream,
+    Graph* graph
+);
+
+bool exl3_gemv_int8_pair_eager
+(
+    const at::Tensor& A,
+    const at::Tensor& B1, at::Tensor& C1, const c10::optional<at::Tensor>& suh1, const c10::optional<at::Tensor>& svh1,
+    const at::Tensor& B2, at::Tensor& C2, const c10::optional<at::Tensor>& suh2, const c10::optional<at::Tensor>& svh2
+);

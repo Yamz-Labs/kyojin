@@ -1,0 +1,178 @@
+"""IQ2_XXS dequant reference (ggml, numpy-only).
+
+"Almost true" 2-bit quantization at 2.0625 bits/weight: each super-block of
+256 values is 66 bytes. After llama.cpp ``ggml/src/ggml-common.h``
+(MIT License, Copyright (c) llama.cpp contributors,
+https://github.com/ggml-org/llama.cpp)::
+
+    typedef struct { ggml_half d; uint16_t qs[QK_K/8]; } block_iq2_xxs;  // QK_K = 256
+
+i.e. a little-endian fp16 scale followed by 32 little-endian uint16 indices
+into the 256-entry ``iq2xxs_grid`` codebook (each grid entry holds eight
+{8, 25, 43}-valued magnitudes; per-group signs come from ``ksigns_iq2xs`` /
+``kmask_iq2xs``). Decoded by ``dequantize_row_iq2_xxs``
+(``ggml/src/ggml-quants.c``), ported here op-for-op in float32.
+
+In the Bolt safetensors, IQ2_XXS tensors are stored as raw bytes with shape
+``[..., num_256_blocks, 66]`` (e.g. an expert ``up_proj`` is
+U8 ``[2048, 4, 66]`` for latent dim 1024 = 4 x 256).
+"""
+from __future__ import annotations
+
+import numpy as np
+
+IQ2_XXS_GROUP_SIZE = 256
+IQ2_XXS_BLOCK_BYTES = 66
+
+# Codebook + sign tables, verbatim from llama.cpp ggml/src/ggml-common.h
+# (iq2xxs_grid, ksigns_iq2xs, kmask_iq2xs). MIT License, see module docstring.
+_IQ2XXS_GRID = (
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+)
+_KSIGNS_IQ2XS = (
+    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
+    144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
+    160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
+    48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
+    80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
+    96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+)
+_KMASK_IQ2XS = (1, 2, 4, 8, 16, 32, 64, 128)
+
+assert len(_IQ2XXS_GRID) == 256 and len(_KSIGNS_IQ2XS) == 128 and len(_KMASK_IQ2XS) == 8
+
+# Grid entries as (256, 8) little-endian magnitude bytes, like the C cast
+# ``(const uint8_t *)(iq2xxs_grid + idx)``.
+_GRID_BYTES = np.array(
+    [[(g >> (8 * j)) & 0xFF for j in range(8)] for g in _IQ2XXS_GRID],
+    dtype=np.uint8,
+)
+_KSIGNS = np.array(_KSIGNS_IQ2XS, dtype=np.uint8)
+_KMASK = np.array(_KMASK_IQ2XS, dtype=np.uint8)
+
+_F32 = np.float32
+
+
+def _dequant_block(b66: np.ndarray, out: np.ndarray) -> None:
+    """Port of llama.cpp ``dequantize_row_iq2_xxs`` for one block.
+
+    Same op order in float32 (``db`` then ``db * grid * sign``) so output is
+    bit-identical to the C reference; verified by tests/test_foreign_quant_cpu.py
+    against the compiled C oracle.
+    """
+    d = _F32(b66[:2].view("<f2").astype(_F32)[0])
+    # 32 little-endian uint16 indices, assembled explicitly (endian-safe,
+    # no alignment-sensitive wider view).
+    lo = b66[2::2].astype(np.uint32)
+    hi = b66[3::2].astype(np.uint32)
+    qs = lo | (hi << np.uint32(8))
+    pos = 0
+    for ib32 in range(8):  # QK_K / 32 sub-blocks of 32 values
+        a0 = qs[4 * ib32] | (qs[4 * ib32 + 1] << np.uint32(16))
+        a1 = qs[4 * ib32 + 2] | (qs[4 * ib32 + 3] << np.uint32(16))
+        a1 = int(a1)
+        db = _F32(d * _F32(0.5 + (a1 >> 28)) * _F32(0.25))
+        aux = (int(a0) & 0xFFFFFFFF).to_bytes(4, "little")
+        for elle in range(4):
+            grid = _GRID_BYTES[aux[elle]]
+            signs = int(_KSIGNS[(a1 >> (7 * elle)) & 127])
+            for j in range(8):
+                mag = _F32(int(grid[j]))
+                sgn = _F32(-1.0) if (signs & int(_KMASK[j])) else _F32(1.0)
+                out[pos] = _F32(db * mag * sgn)
+                pos += 1
+
+
+def _as_bytes(data: object) -> np.ndarray:
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        return np.frombuffer(data, dtype=np.uint8)
+    return np.asarray(data, dtype=np.uint8)
+
+
+def dequant_iq2_xxs_block(block: object) -> np.ndarray:
+    """Dequantize one 66-byte IQ2_XXS block to float32 shape (256,)."""
+    b = np.ascontiguousarray(_as_bytes(block)).reshape(IQ2_XXS_BLOCK_BYTES)
+    out = np.empty(IQ2_XXS_GROUP_SIZE, dtype=_F32)
+    _dequant_block(b, out)
+    return out
+
+
+def dequant_iq2_xxs(data: object) -> np.ndarray:
+    """Dequantize IQ2_XXS payload(s) to float32.
+
+    :param data: uint8 array of shape (..., 66); one 256-value group per block.
+    :return: float32 array of shape (..., 256).
+    """
+    a = np.ascontiguousarray(_as_bytes(data))
+    if a.shape[-1] != IQ2_XXS_BLOCK_BYTES:
+        raise ValueError(f"IQ2_XXS trailing dim must be 66, got shape {a.shape}")
+    flat = a.reshape(-1, IQ2_XXS_BLOCK_BYTES)
+    out = np.empty((flat.shape[0], IQ2_XXS_GROUP_SIZE), dtype=_F32)
+    for i in range(flat.shape[0]):
+        _dequant_block(flat[i], out[i])
+    return out.reshape(np.shape(data)[:-1] + (IQ2_XXS_GROUP_SIZE,))

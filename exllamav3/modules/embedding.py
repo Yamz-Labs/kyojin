@@ -1,9 +1,12 @@
 from __future__ import annotations
+import os
 from typing_extensions import override
+import os
 import torch
 from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
+from ..util.device_copy import to_device
 from . import Module
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX, mm_rows
 from ..model.model_tp_alloc import TPAllocation
@@ -45,7 +48,12 @@ class Embedding(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         self.device = device
-        weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
+        weight = None
+        if self.device.type == "cpu" and os.environ.get("EXL3_EMB_MMAP", "1") != "0" and hasattr(self.config.stc, "get_tensor_mmap"):
+            # The table is only gathered from: map it from the file (page cache) rather than holding a 2+ GiB anonymous copy
+            weight = self.config.stc.get_tensor_mmap(self.key + ".weight")
+        if weight is None:
+            weight = self.config.stc.get_tensor(self.key + ".weight", self.device, float2half = True, allow_bf16 = True)
         self._numel = weight.numel()
         self.embedding = nn.Embedding(
             self.vocab_size,
@@ -83,6 +91,7 @@ class Embedding(Module):
 
         indexed_emb = params.get("indexed_embeddings")
         input_ids = x
+        explicit_dtype = out_dtype is not None
         out_dtype = out_dtype or self.out_dtype or x.dtype
 
         # Indexed embedding masks
@@ -147,6 +156,9 @@ class Embedding(Module):
 
         # No indexed embeddings, or none in current batch
         else:
+            dev = params.get("emb_next_device")
+            if dev is not None and not explicit_dtype and self._narrow_upload_ok(x, params):
+                return self._upload_narrow(self._gather_narrow(x), x, out_dtype, dev)
             x = self.embedding.forward(x)
             if self.multiplier != 1.0:
                 x *= self.multiplier
@@ -168,6 +180,53 @@ class Embedding(Module):
                 buf.copy_(x)
                 x = buf
             return x
+
+    # EXL3_PF_EMB_UPLOAD=1: a long chunk (>= 1024 rows) of a CPU-resident embedding is gathered straight into a pinned buffer in the
+    # table's own 16-bit dtype and uploaded asynchronously; the widening to out_dtype (exact, fp16/bf16 -> fp32) happens on the device
+    # in Module.prepare_for_device (finish_narrow). The default path gathers, widens on the host and copies 4 bytes per element from
+    # pageable memory (94 MB per 4583-row chunk: ~25 ms with the GPU idle, 3.8 GB/s). Same values bit for bit.
+    def _narrow_upload_ok(self, ids: torch.Tensor, params: dict) -> bool:
+        if os.environ.get("EXL3_PF_EMB_UPLOAD", "0") != "1" or ids.device.type != "cpu" or self.normalize or params.get("pinned_staging"):
+            return False
+        w = self.embedding.weight
+        return w.device.type == "cpu" and w.dtype in (torch.half, torch.bfloat16) and ids.numel() >= 1024 and torch.cuda.is_available()
+
+    def forward_device(self, ids: torch.Tensor, params: dict, out_dtype: torch.dtype, device) -> torch.Tensor:
+        """forward(ids, params, out_dtype) followed by a move to `device`, with the long-chunk upload of _gather_narrow."""
+        if ids.device.type == "cpu" and not params.get("indexed_embeddings") and self._narrow_upload_ok(ids, params):
+            # the MTP block embeds the very rows the target forward just uploaded: reuse them (same bf16 -> fp16 rounding, on the device)
+            hit = getattr(self, "_dev_rows", None)
+            self._dev_rows = None
+            if hit is not None and hit[0].shape == ids.shape and hit[1].device == torch.device(device) and torch.equal(hit[0], ids):
+                return hit[1] if hit[1].dtype == out_dtype else hit[1].to(out_dtype)
+            return self._upload_narrow(self._gather_narrow(ids), ids, out_dtype, device)
+        return to_device(self.forward(ids, params, out_dtype = out_dtype), device)
+
+    def _gather_narrow(self, ids: torch.Tensor) -> torch.Tensor:
+        w = self.embedding.weight.detach()
+        n = ids.numel()
+        buf = getattr(self, "_narrow_buf", None)
+        if buf is not None and getattr(self, "_narrow_ev", None) is not None:
+            self._narrow_ev.synchronize()           # the previous upload out of this buffer has completed
+        if buf is None or buf.shape[0] < n or buf.dtype != w.dtype:
+            buf = torch.empty((n, self.hidden_size), dtype = w.dtype, pin_memory = True)
+            self._narrow_buf = buf
+            self._narrow_ev = None
+        y = buf[:n]
+        torch.index_select(w, 0, ids.reshape(-1), out = y)
+        if self.multiplier != 1.0:
+            y *= self.multiplier
+        return y.view(*ids.shape, self.hidden_size)
+
+    def _upload_narrow(self, y: torch.Tensor, ids: torch.Tensor, out_dtype, device) -> torch.Tensor:
+        """Upload the pinned 16-bit rows without blocking the host and widen on the device (exact for bf16/fp16 -> fp32, the same
+        round-to-nearest the host conversion does for bf16 -> fp16). The rows stay cached for the MTP block (forward_device)."""
+        d = y.to(device, non_blocking = True)
+        if self._narrow_ev is None:
+            self._narrow_ev = torch.cuda.Event()
+        self._narrow_ev.record()
+        self._dev_rows = (ids.clone(), d)        # consumed by forward_device (the MTP block), else replaced by the next chunk
+        return d if d.dtype == out_dtype else d.to(out_dtype)
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         return []

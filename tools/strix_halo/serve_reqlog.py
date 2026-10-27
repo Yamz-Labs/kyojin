@@ -416,6 +416,11 @@ class Lifecycle:
 
     def stream_error(self, rid: str | None, exc: BaseException) -> None:
         self.reqlog.log("stream_error", req=rid, error=sanitize(exc))
+        print(f"qserve: request failed mid-stream, error event sent: {type(exc).__name__}: {str(exc)[:300]}", file=sys.stderr, flush=True)
+
+    def request_failed(self, exc: BaseException) -> None:
+        """A non-streaming request ended in HTTP 500 (the request log is off by default: stderr is the only trace)."""
+        print(f"qserve: request failed, HTTP 500: {type(exc).__name__}: {str(exc)[:300]}", file=sys.stderr, flush=True)
 
     # ---- stream level ----------------------------------------------------------------------------
 

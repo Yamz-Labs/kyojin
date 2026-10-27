@@ -1,0 +1,113 @@
+We need to respond to user: "Write a funny riddle in Hindi, about a man named Aarav who never spoke. Your entire response should be written in Hindi. Also, you cannot use any commas in your entire response."
+
+Need produce final answer in Hindi, no commas. Need likely a funny riddle about Aarav who never spoke. Entire response Hindi. Cannot use commas anywhere. Ensure no commas. Need likely no punctuation comma. Could use question mark? Hindi can use question mark, but not comma. Avoid comma. Need maybe use Devanagari. Ensure no ASCII comma. Maybe no Hindi viram? Need no commas. Could include line breaks? okay. Need ensure no comma characters. Let's craft simple:
+
+"एक आरव था जो कभी नहीं बोला
+उसने रूख-रूख से गपसप की
+क्या है वो जो आरव की चुप्पी?"
+
+But question asks funny riddle about a man named Aarav who never spoke. It should be a riddle. Need maybe answer? Could include answer maybe without comma. But riddle likely. Need only response no comma. Ensure no commas. Could use spaces or line breaks. Need maybe no commas in Hindi punctuation. Avoid "रूख-रूख" no comma. Could be okay. Need funny.
+
+Maybe:
+"आरव बोलता नहीं कभी
+मगर चुप रहने का ठेका है उसका
+आवाज़ बंद दुकान है उसकी
+पहचानो बताओ क्या है?"
+
+No commas. But user wants about a man named Aarav who never spoke. Funny riddle. Could include answer hidden? Entire response Hindi. Could answer with no comma. Need no commas. If include answer use colon? Colon okay? But no comma. Use line breaks. Need maybe not mention answer? Riddle maybe answer not required. But could be a funny riddle with answer. If answer in parentheses no comma. Parentheses okay. Could answer "मूक"? Hmm.
+
+Need avoid commas. Could produce:
+
+आरव नाम का एक चुप्पू
+आरव ने कभी नहीं कहा कि बोलूँ
+उसकी जबान पर ताला है
+मगर हँसी में धमाका है
+क्या है वो आरव
+
+No commas. But need riddle maybe ask: "पहचानो बताओ यह क्या है?" No comma. Need funny. Could include answer: "उत्तर: चुप आरव" no comma. But entire response Hindi. Could final just riddle.
+
+Need ensure no comma in entire response. Check punctuation: no commas. Could use line breaks. Need maybe use question mark? okay. But if line has question mark maybe okay. No comma.
+
+Potential issue Hindi words with Dandas? avoid. No commas.
+
+Could write:
+
+आरव नाम का एक आदमी कभी नहीं बोला
+उसने चुप्पी का व्यापार खोल दिया
+ग्राहक भी खड़े और आरव मौन खड़ा
+बोलो क्या है ये चुपचाप मज़ाक
+
+This is funny and riddle. No commas. But "मौन" etc.
+
+Need maybe riddle: "क्या है वो जो आरव ने बोला ही नहीं?" Hmm. Need about a man named Aarav who never spoke. Maybe a funny riddle:
+
+आरव था नाम उसका चुप ही रहता था
+जब सब हँसते थे आरव चप-चप हाथी बन जाता था
+क्या है वो जहाँ आरव की आवाज़ नहीं मरी
+बताओ बस चुपके से हँस के
+
+No commas. But maybe too weird.
+
+Need likely final answer only. Ensure no comma. Could include "आरव" correctly. User says Aarav named in Hindi? We can use आरव. 
+
+Let's craft a funny riddle with no commas:
+
+आरव नाम का आदमी कभी नहीं बोला
+उसने चुप्पी की दुकान खोल दी
+अब सब आते हैं चुप होने
+और आरव चुपचाप अकाउंट देखता है
+क्या है ये चुपचाप बिज़नेस
+
+No commas. Is this riddle? Yes. But answer maybe "चुप्पी का व्यापार"? Need funny. Could include answer:
+
+उत्तर चुप्पी का ठेका
+
+No comma. Entire response Hindi. Could answer. User says Write a funny riddle... likely doesn't need answer. But maybe answer makes complete. Need no commas.
+
+Could final:
+
+आरव नाम का आदमी कभी नहीं बोला
+उसने चुप्पी की दुकान खोल दी
+ग्राहक चुप आते हैं और चुप जाते हैं
+और आरव चुपचाप हिसाब बढ़ाता है
+क्या है ये चुपचाप बिज़नेस
+
+उत्तर चुप्पी का व्यापार
+
+No commas. Check if any commas: none. Could "बिज़नेस" maybe okay. But maybe riddle not very Hindi? Could use "कारोबार".
+
+Final:
+
+आरव नाम का आदमी कभी नहीं बोला
+उसने चुप्पी का कारोबार खोल दिया
+ग्राहक चुप आते हैं और चुप जाते हैं
+और आरव चुपचाप हिसाब बढ़ाता है
+क्या है ये चुपचाप बिज़नेस
+
+उत्तर चुप्पी का व्यापार
+
+No commas. Need maybe "बिज़नेस" Hindi okay? Could use "धंधा".
+
+आरव नाम का आदमी कभी नहीं बोला
+उसने चुप्पी का धंधा खोल दिया
+ग्राहक चुप आते हैं और चुप जाते हैं
+और आरव चुपचाप हिसाब बढ़ाता है
+क्या है ये चुपचाप धंधा
+
+उत्तर चुप्पी का व्यापार
+
+No commas. Good.
+
+Need ensure response in Hindi entirely. Yes. But "Aarav" maybe आरव. Fine.
+
+Could there be any invisible comma? No. Ensure no comma after line breaks.
+
+Let's final with just that. Need no comma. Also maybe no colon? No colon. Use line breaks.
+
+Potential risk: answer includes "उत्तर" no comma. Fine.</think>आरव नाम का आदमी कभी नहीं बोला
+उसने चुप्पी का धंधा खोल दिया
+ग्राहक चुप आते हैं और चुप जाते हैं
+और आरव चुपचाप हिसाब बढ़ाता है
+क्या है ये चुपचाप धंधा
+
+उत्तर चुप्पी का व्यापार

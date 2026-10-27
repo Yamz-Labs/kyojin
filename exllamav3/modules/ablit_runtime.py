@@ -125,6 +125,38 @@ def prepare(block, device):
     block.ablit = (wa, wm) + per_dev[key]
 
 
+
+def prepare_dsv41(n_layers, device, model_dir = None):
+    """DS4.1 serving / reference graph (no TransformerBlock): per trunk layer (w_attn, w_ffn, r_fp32, r_fp16) or None.
+    Same spec, same precedence (EXL3_ABLIT_RUNTIME=off|<path>, else <model_dir>/uncensor_spec.json) as prepare().
+    The projection goes on the sublayer outputs (attention wo_b output, MoE routed + shared output) right before
+    the mHC post/comb mix, which is the exact image of editing wo_b, the shared w2 and every routed expert w2.
+    Layers >= spec n_layers (MTP / dspark stages carry n_layers..) are never edited. Returns None when inactive."""
+    path, source = resolve(model_dir)
+    if path is None:
+        return None
+    spec, r, per_dev = _load(path, source)
+    key = str(device)
+    if key not in per_dev:
+        r32 = r.to(device)
+        per_dev[key] = (r32, r32.half())
+        warmup(device, r32.shape[0])
+    out = []
+    scale = 1e-30 if os.environ.get("EXL3_ABLIT_COST_ONLY", "0") != "0" else 1.0
+    for L in range(n_layers):
+        if L >= spec["n_layers"]:
+            out.append(None)
+            continue
+        wa, wm = float(spec["attn_w"][L]) * scale, float(spec["mlp_w"][L]) * scale
+        if abs(wa) <= 1e-9: wa = 0.0
+        if abs(wm) <= 1e-9: wm = 0.0
+        out.append(None if wa == 0.0 and wm == 0.0 else (wa, wm) + per_dev[key])
+    if not any(out):
+        return None
+    _log_once(("dsv41", path), f" -- ablit runtime: DS4.1 hook on {sum(1 for o in out if o)} of {n_layers} layers")
+    return out
+
+
 try:
     import triton
     import triton.language as tl

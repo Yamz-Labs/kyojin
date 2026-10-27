@@ -5,6 +5,21 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
+
+
+def _draft_pages_shared(g) -> bool:
+    """True when the draft cache can take a target page index (as many physical pages as the target cache). A smaller
+    draft cache (a ring of pages remapped by the caller, e.g. a DFlash2 drafter ring: 16 pages vs ~770) cannot:
+    page copies by target index would overflow it or land in the wrong ring slot, so those paths replay instead."""
+    if not g.draft_model or g.draft_cache is None:
+        return True
+    r = getattr(g, "_draft_pages_shared", None)
+    if r is None:
+        def pages(c):
+            l = next(iter(c.layers.values()), None)
+            return getattr(l, "max_num_tokens", 0) // PAGE_SIZE
+        r = g._draft_pages_shared = pages(g.draft_cache) >= pages(g.cache)
+    return r
 import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
@@ -44,10 +59,27 @@ def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | No
     return concat_strings, offsets
 
 
+import itertools
+# Write generation of a cache page (EXL3_PF_SPLIT exactness tags): every prefill write of a page takes a fresh number, so a
+# checkpoint that recorded the numbers of the pages below it can tell whether any of them was rewritten since.
+_PAGE_GEN = itertools.count(1)
+
+
+def _split_offsets() -> list:
+    """EXL3_PF_SPLIT (read per call): comma-separated tail sizes in rows, e.g. "256" or "1536,256"; empty = off."""
+    s = os.environ.get("EXL3_PF_SPLIT", "").replace(" ", "")
+    return sorted({int(x) for x in s.split(",") if x}, reverse = True)
+
+
 _TT = bool(os.environ.get("KYO_TURN_TRACE"))
 # EXL3_TAIL_REPLY=1 (default off): a finished job also stashes a tail checkpoint at the END of its reply, so the
 # next turn (prompt = old prompt + reply + new message) resumes after the reply instead of replaying its last page
 _TAIL_REPLY = os.environ.get("EXL3_TAIL_REPLY", "0") == "1"
+# CUDA: prompt-end tail checkpoints go to pinned host buffers asynchronously (GDNLayerState.stash); EXL3_TAIL_PIN=0 = synchronous .cpu()
+_TAIL_PIN = torch.version.hip is None and torch.cuda.is_available() and os.environ.get("EXL3_TAIL_PIN", "1") != "0"
+# EXL3_TAIL_RING=1 (default off): allow a tail restore into a partial page when the draft cache is a ring smaller than the target cache
+# (e.g. a DFlash2 drafter ring). Only the target K/V is copied; the drafter keeps what its ring slot holds. Drafts only, the target verifies
+_TAIL_RING = os.environ.get("EXL3_TAIL_RING", "0") == "1"
 def _ttrace_begin():
     if not _TT: return 0.0
     torch.cuda.synchronize()
@@ -394,7 +426,11 @@ class Job:
             return f"Generator job #{self.serial_number}"
 
 
+    _cil_hold = False   # EXL3_SCHED_CHUNK_IL: decode-ready but held this step (Generator._cil_hold): reads as "not decodable"
+
     def is_prefill_done(self):
+        if self._cil_hold:
+            return False
         return all(seq.kv_position == len(seq.sequence_ids) - 1 for seq in self.sequences)
 
 
@@ -842,7 +878,13 @@ class Job:
 
         # Decode and buffer output
         id_to_piece = self.generator.tokenizer.get_id_to_piece_list(self.decode_special_tokens)
-        new_text = id_to_piece[next_token.item()]
+        if 0 <= next_token_i < len(id_to_piece):
+            new_text = id_to_piece[next_token_i]
+        else:
+            # An id the tokenizer has no piece for (the padded rows of the head, or worse) must never kill the process:
+            # it decodes to nothing and the first one is logged. The sampler and the drafters mask these ids already
+            new_text = ""
+            self.generator.note_unknown_token(next_token_i, len(id_to_piece))
 
         if self.new_tokens == 0:
             unhealed = id_to_piece[self.prefix_token[0].item()]
@@ -935,6 +977,9 @@ class Job:
                 rw = self.recurrent_state.position - target
                 if rw <= self.recurrent_state.rollback_capacity():
                     self.recurrent_state.rewind(rw)
+                elif self.generator.ring_states:
+                    self.recurrent_state.free()
+                    self.recurrent_state = self._cold_ring_state(target)   # the K/V pool is complete: only the ring is rebuilt
                 else:
                     stashed = self.find_recurrent_stash(target)
                     self.recurrent_state.free()
@@ -1085,7 +1130,7 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
-            "rq_new_tokens": self.new_tokens,   # every token accepted so far counts; the requeued segment starts after them
+            "rq_new_tokens": self.rq_new_tokens + self.new_tokens,   # every token accepted so far counts, over any number of requeues; the requeued segment starts after them
             "accepted_draft_tokens": self.accepted_draft_tokens,
             "rejected_draft_tokens": self.rejected_draft_tokens,
             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
@@ -1272,7 +1317,23 @@ class Job:
             # (last 2 * max_chunk_size tokens, see is_checkpoint_boundary), so the tail keeps every
             # recurrent checkpoint of plain max_chunk_size chunking
             chunk = self.generator.max_chunk_size
-            big = int(os.environ.get("EXL3_PREFILL_BIG_CHUNK", "4096"))
+            # Models whose only recurrent state is the SWA ring (no GDN / KDA checkpoint cadence to protect) take the big chunk as soon as the
+            # prompt needs more than one plain chunk: a 4K prompt is one pass instead of 2048 + 1792 (+ tail), every
+            # expert's weights decoded once, ~2x the rows per expert (Flint 4K prefill +16 %). Block-sparse MoE
+            # models also default to 8192-row chunks below 64K of kv (more rows per expert: Flint 16K +1.5 %, 32K
+            # +4.7 %, 64K +3.6 %; +0.36 GiB workspace); EXL3_PREFILL_BIG_CHUNK sets it explicitly,
+            # EXL3_PREFILL_WIDE=0 restores the previous plan
+            swa_only, fused_moe = self.generator.wide_prefill_chunks()
+            no_rec = swa_only and not self.embeddings and os.environ.get("EXL3_PREFILL_WIDE", "1") != "0"
+            big_default = "4096"
+            if no_rec and fused_moe and seq.kv_position + 8192 <= 65536:
+                big_default = "8192"
+                self._wide_chunk_used = True
+            elif getattr(self, "_wide_chunk_used", False):
+                # past 64K: back to 4096-row chunks, release the wider workspace once (256K contexts are tight)
+                self._wide_chunk_used = False
+                torch.cuda.empty_cache()
+            big = int(os.environ.get("EXL3_PREFILL_BIG_CHUNK", big_default))
             if big > 65535:
                 raise ValueError(f"EXL3_PREFILL_BIG_CHUNK={big}: a forward is limited to 65535 rows (mixer kernel grid.y)")
             # EXL3_PREFILL_BIG_CHUNK_MAXPOS (default 0 = off): from this kv position on, plain chunks again (smaller
@@ -1285,6 +1346,13 @@ class Job:
                     self._big_chunk_released = True
                     torch.cuda.empty_cache()
             remaining = len(seq.sequence_ids) - 1 - seq.kv_position
+            # a runtime-lowered max_chunk_size (decode priority, see Generator.base_chunk_size) disables big chunks, and so
+            # (CUDA) does any other job active or waiting: a big chunk would hold a short request behind 4096 rows of this
+            # prompt. ROCm lanes keep their measured chunking
+            g = self.generator
+            if chunk < getattr(g, "base_chunk_size", chunk) or \
+                    (not torch.version.hip and (len(g.active_jobs) > 1 or g.pending_jobs)):
+                big = chunk
             big_tail = big > chunk and big % chunk == 0 and self.big_tail_enabled()
             if big_tail:
                 # EXL3_PREFILL_BIG_TAIL=1 (with EXL3_MIDCHUNK_CKPT=2): big chunks also inside the tail window, the
@@ -1301,7 +1369,8 @@ class Job:
                 keep = 3 if os.environ.get("EXL3_NC2_CKPT4", "0") == "1" else 1
                 if len(interior) > keep:
                     chunk = interior[keep] - seq.kv_position
-            elif big > chunk and big % chunk == 0 and remaining > big + chunk:
+            elif big > chunk and big % chunk == 0 and (
+                    remaining > big + chunk or (no_rec and remaining > chunk)):
                 chunk = big
             prefill_end = seq.kv_position + chunk
             if not (big_tail and prefill_end >= len(seq.sequence_ids) - 1):
@@ -1347,6 +1416,22 @@ class Job:
             if prefill_end <= prefill_start:
                 continue
 
+            # EXL3_PF_SPLIT (GDN no-tail path): the last chunk is cut at page boundaries a fixed number of rows before the prompt
+            # end, and the state at each cut is kept as an exact checkpoint (see split_plan, _stash_exact). A later prompt whose
+            # cold plan has the same cut resumes there and replays the same chunk shapes as its cold prefill, so the result
+            # is bitwise a cold prefill (a resume with another row count differs numerically, see split_plan)
+            split_sig = None
+            if (gdn_nt or big_tail) and prefill_end == len(seq.sequence_ids) - 1 and prefill_start % PAGE_SIZE == 0 and \
+                    len(self.sequences) == 1 and not self._unaligned_start:
+                plan = self.split_plan(prefill_end, "gdn" if gdn_nt else "kda")
+                if plan is not None and prefill_start in plan:
+                    i = plan.index(prefill_start)
+                    if i + 1 < len(plan):
+                        prefill_end = plan[i + 1]
+                        split_sig = plan[:i + 2]
+                        m = self.generator.recurrent_cache.metrics
+                        m["split_passes"] = m.get("split_passes", 0) + 1
+
             assert prefill_start % PAGE_SIZE == 0 or mm_exact_chunks or self._unaligned_start
             prefill_ids = seq.sequence_ids.torch_slice(prefill_start, prefill_end)
 
@@ -1355,7 +1440,8 @@ class Job:
             # since the recurrent checkpoint will always be on a page boundary
             p0 = prefill_start // PAGE_SIZE
             p1 = prefill_end // PAGE_SIZE
-            if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None:
+            if prefill_start == p0 * PAGE_SIZE and self.generator.recurrent_cache is None and \
+                    _draft_pages_shared(self.generator):
                 prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
                 best_match = 0
                 best_match_page = None
@@ -1410,6 +1496,13 @@ class Job:
                 resume_pos = self.cached_pages * PAGE_SIZE
                 off_grid = os.environ.get("EXL3_TAIL_OFFGRID", "0") == "1" and resume_pos % self.generator.max_chunk_size != 0
                 gap_base = resume_pos if self._unaligned_start or off_grid else 0
+                # a resume at a cut of the EXL3_PF_SPLIT plan measures the gap from the prompt start like the cold prefill does,
+                # so its last passes have the shapes of the cold ones (the checkpoint there is an exact one, see exact_gate)
+                if gap_base and not self._unaligned_start and len(self.sequences) == 1:
+                    smode = self.split_mode()
+                    splan = self.split_plan(seqlen, smode) if smode else None
+                    if splan is not None and resume_pos in splan[1:]:
+                        gap_base = 0
                 # EXL3_PF_NO_TAIL=1 (default 0, big-tail mode only): no separate pass for the prompt's last page
                 # (a 4K prompt ran 3840 + 255, the 255-row tail cost ~1 s); the chunk runs whole and the KDA
                 # kernel side-writes the last-page state as a second mid-chunk checkpoint (stash_midchunk)
@@ -1422,7 +1515,7 @@ class Job:
                     no_tail_row = last_page_b - prefill_start
                 elif prefill_start < last_page_b <= prefill_end and not (
                         prefill_end > last_page_b and self._tail_ok(seq) and seqlen % PAGE_SIZE != 0 and
-                        last_page_b - gap_base < int(os.environ.get("EXL3_TAIL_MAXGAP", "1024"))):
+                        last_page_b - gap_base < self._tail_maxgap()):
                     # (a prompt-end tail checkpoint, see _tail_stash, replaces this separate pass; it is still taken
                     # when the last full-page checkpoint is EXL3_TAIL_MAXGAP tokens behind, which bounds the replay
                     # after a restart from the disk slot)
@@ -1440,6 +1533,14 @@ class Job:
                 L = getattr(self, "kv_only_end", 0)
                 if prefill_start < L < prefill_end and L - prefill_start != no_tail_row:
                     branch_row = L - prefill_start
+
+            # Dense prompt-tail checkpoints (GDN no-tail path): the kernel also side-writes the state at the page boundaries
+            # just below the last full page, so a request that shares the prompt up to some point inside its final
+            # EXL3_TAIL_DENSE pages (same document, another question) resumes at most one page before the divergence
+            dense_rows = []
+            if gdn_nt and prefill_start % PAGE_SIZE == 0:
+                sub_rows = self.sub_ckpt_rows(seq, prefill_start, prefill_end, [no_tail_row, branch_row])
+                dense_rows = sub_rows + self.tail_ckpt_rows(seq, prefill_start, prefill_end, [no_tail_row, branch_row] + sub_rows)
 
             # Exact multimodal chunking (DeepSeek-V4 vision): an image span is prefilled as
             # exactly one chunk (non-causal within itself) and never re-fed, since the
@@ -1517,16 +1618,18 @@ class Job:
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
                 }
+                # the prompt and where this chunk ends: lets a model warm host-side lookup tables for the chunks to come
+                params["pf_ahead"] = (seq, prefill_start + prefill_ids.shape[-1])
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
                 # EXL3_MIDCHUNK_CKPT=1 (default off): a chunk that crosses a recurrent checkpoint boundary also
                 # saves the recurrent state at that boundary (KDA layers split conv + core there), stashed below
                 if self.recurrent_state is not None and not self.embeddings and \
                         (os.environ.get("EXL3_MIDCHUNK_CKPT", "0") in ("1", "2") or
-                         (gdn_nt and (no_tail_row is not None or branch_row is not None))) and \
+                         (gdn_nt and (no_tail_row is not None or branch_row is not None or dense_rows))) and \
                         not self.generator.model.loaded_tp and prefill_start % PAGE_SIZE == 0:
                     if gdn_nt:
-                        rows = sorted(r for r in (branch_row, no_tail_row) if r is not None)   # the kernel side-writes 2
+                        rows = sorted([r for r in (branch_row, no_tail_row) if r is not None] + dense_rows)   # the kernel side-writes up to 8
                     else:
                         rows = [
                             p - prefill_start
@@ -1540,6 +1643,14 @@ class Job:
                                2 if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 1)
                         if branch_row is not None and branch_row not in rows and len(rows) < cap:
                             rows = sorted(rows + [branch_row])
+                        if os.environ.get("EXL3_MIDCHUNK_CKPT") == "2":
+                            # the CK8 kernel build side-writes 8 rows: sub-page prompt-tail checkpoints first, then the dense
+                            # page-boundary ones fill the free slots. Only in mode 2: mode 1 splits the layer at every row and
+                            # declines when a segment is 256 rows or less (GatedDeltaNet._midchunk_segments), which rows one page
+                            # (or 64 rows) apart always are, so such a row would drop every mid-chunk checkpoint of the chunk
+                            rows = sorted(rows + self.sub_ckpt_rows(seq, prefill_start, prefill_end, rows))
+                            if int(os.environ.get("EXL3_TAIL_DENSE", "0")) > 0:
+                                rows = sorted(rows + self.tail_ckpt_rows(seq, prefill_start, prefill_end, rows))
                     if rows:
                         params["checkpoint_rows"] = rows
                         # 1: split conv + KDA core (reference), 2: in-kernel S side-write + async D2H (the only GDN mode)
@@ -1638,7 +1749,11 @@ class Job:
                     # (exact multimodal chunking) that page starts after prefill_end
                     if pfp_b > pfp_a:
                         page.sequence[:, pfp_a:pfp_b].copy_(seq.sequence_ids.torch_slice(pf_a, pf_b))
+                        page.wgen = next(_PAGE_GEN)
                     page.can_revert = False
+
+                if split_sig is not None:
+                    self._stash_exact(seq, split_sig)
 
                 if params.get("checkpoint_rows"):
                     # a requested row the forward did not save (split declined) is a lost checkpoint: count it
@@ -1687,7 +1802,14 @@ class Job:
 
         for seq in self.sequences:
             allocated_pages, cached_pages, non_sequential_pages, stashed_recurrent_state = \
-                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache, protected_hashes)
+                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache, protected_hashes,
+                                   self.exact_gate(seq) if self.generator.recurrent_cache is not None and
+                                   (self.generator.recurrent_cache.exact_meta or _split_offsets()) else None)
+            rc = self.generator.recurrent_cache
+            if rc is not None and cached_pages > 0 and rc.exact_meta:
+                meta = rc.exact_meta.get(seq.page_hashes[cached_pages - 1])
+                if meta is not None and meta["eid"] == id(stashed_recurrent_state):
+                    rc.metrics["exact_hits"] = rc.metrics.get("exact_hits", 0) + 1
 
             # Free the previous state before acquiring a new one. A bare assignment drops
             # the handle without returning the slot index to the cache free list, so every
@@ -1705,6 +1827,8 @@ class Job:
                         position = cached_pages * PAGE_SIZE,
                     )
                     self.last_recurrent_checkpoint_pos = self.recurrent_state.position
+            elif self.generator.ring_states:
+                self.recurrent_state = self._cold_ring_state(cached_pages * PAGE_SIZE)
 
             # End of the pages found by hash past the recurrent checkpoint (K/V valid, state not), read by EXL3_BRANCH_CKPT. Taken
             # here, before any chunk runs: a chunk's page bookkeeping touches the page after its end, so a later chunk can't rescan
@@ -1769,7 +1893,7 @@ class Job:
                 f.is_active = f.trigger_token is None and not self.filters_suspended
 
 
-    def gdn_no_tail_enabled(self):
+    def gdn_no_tail_enabled(self, alloc = False):
         """
         EXL3_PF_NO_TAIL=1 for GDN (non-KDA) recurrent models: text-only job, no TP, every recurrent layer a GatedDeltaNet (or the
         Qwen PLE layer) with the fused HIP chain (EXL3_GDN_FUSE=1, EXL3_GDN_PF on), the only path that side-writes the mid-chunk state.
@@ -1777,14 +1901,14 @@ class Job:
         if os.environ.get("EXL3_PF_NO_TAIL", "0") != "1" or os.environ.get("EXL3_GDN_FUSE", "0") != "1" or \
                 os.environ.get("EXL3_GDN_PF", "1") != "1":
             return False
-        if self.recurrent_state is None or self.embeddings:
+        if (self.recurrent_state is None and not alloc) or self.embeddings:   # alloc: asked before the job has its state
             return False
         g = self.generator
         ok = getattr(g, "_gdn_no_tail_ok", None)
         if ok is None:
             from ..modules.gated_delta_net import GatedDeltaNet
             from ..modules.ple import PLELayer   # Qwen 3.8: one PLE layer also holds a recurrent state (it saves its own mid-chunk state)
-            rl = g.model.get_recurrent_layers()
+            rl = g.model.get_checkpoint_layers()
             ok = bool(rl) and not g.model.loaded_tp and \
                 all(isinstance(m, PLELayer) or (isinstance(m, GatedDeltaNet) and not m.kda) for m in rl) and \
                 any(isinstance(m, GatedDeltaNet) for m in rl)
@@ -1792,20 +1916,20 @@ class Job:
         return ok
 
 
-    def big_tail_enabled(self):
+    def big_tail_enabled(self, alloc = False):
         """
         EXL3_PREFILL_BIG_TAIL=1, honored only with EXL3_MIDCHUNK_CKPT=2 and where the mid-chunk path can stash every
         boundary: text-only recurrent job, no TP, every recurrent layer a KDA GatedDeltaNet (the mode-2 kernel).
         """
         if os.environ.get("EXL3_PREFILL_BIG_TAIL", "0") != "1" or os.environ.get("EXL3_MIDCHUNK_CKPT", "0") != "2":
             return False
-        if self.recurrent_state is None or self.embeddings:
+        if (self.recurrent_state is None and not alloc) or self.embeddings:   # alloc: asked before the job has its state
             return False
         g = self.generator
         ok = getattr(g, "_big_tail_ok", None)
         if ok is None:
             from ..modules.gated_delta_net import GatedDeltaNet
-            rl = g.model.get_recurrent_layers()
+            rl = g.model.get_checkpoint_layers()
             ok = bool(rl) and not g.model.loaded_tp and \
                 all(isinstance(m, GatedDeltaNet) and m.kda for m in rl)
             g._big_tail_ok = ok
@@ -1854,6 +1978,136 @@ class Job:
             self._mm_exact_spans = spans
         return spans
 
+    def split_mode(self, alloc = False):
+        """Which prefill planner a split follows: "gdn" (GDN no-tail path), "kda" (KDA big-tail path) or None."""
+        if self.gdn_no_tail_enabled(alloc = alloc):
+            return "gdn"
+        if self.big_tail_enabled(alloc = alloc):
+            return "kda"
+        return None
+
+    def split_plan(self, total: int, mode = "gdn"):
+        """
+        Cold chunk plan of a prompt of `total` prefill rows under EXL3_PF_SPLIT: (ks, b1, ..., bn), the starts of the chunks of
+        the last region (ks = start of the merged last chunk, 4096-row chunks before it) and the page-aligned cuts that
+        end all but the last pass, each at least off_j rows before the prompt end. None = no split (switch off, prompt shorter
+        than EXL3_PF_SPLIT_MIN, adaptive chunking with the GDN planner, or no room for a first pass of EXL3_PF_SPLIT_HEAD rows).
+        mode "kda" follows the big-tail planner instead: chunks of EXL3_PREFILL_BIG_CHUNK rows, the last one is what remains
+        (<= that size, no merge window). The cuts are multiples of
+        EXL3_PF_SPLIT_Q rows (default one page): a coarser grid keeps a cut when the prompt length changes a little, at the price
+        of a longer last pass.
+        Why: LinearEXL3, hipBLASLt and the routed-MoE kernel pick algorithms by the row count of a forward, so a resume that
+        replays a chunk of another size than the cold prefill computed there is not bitwise the cold result, while the same
+        chunk at the same position is (state, conv state and K/V restore exactly). The cuts make the replay after a resume a
+        chunk the cold prefill of the same prompt ran too. The plan only depends on the prompt length, so a prompt of another
+        length has other cuts and cannot use these checkpoints (it falls back to the chunk start, like without the switch).
+        """
+        offs = _split_offsets()
+        if not offs:
+            return None
+        g = self.generator
+        chunk = g.max_chunk_size
+        big = int(os.environ.get("EXL3_PREFILL_BIG_CHUNK", "4096"))
+        if int(os.environ.get("EXL3_PREFILL_BIG_CHUNK_MAXPOS", "0")):
+            return None
+        if mode == "kda":
+            # KDA big-tail path: chunks of `big` rows, the last one is whatever remains (<= big, no merge window)
+            if big <= chunk or big % chunk or big % PAGE_SIZE:
+                return None
+            chunk, merge = big, 0
+        else:
+            if big > chunk:
+                return None
+            merge = int(os.environ.get("EXL3_PF_TAIL_MERGE", "0"))
+        if total < int(os.environ.get("EXL3_PF_SPLIT_MIN", "4096")) or chunk % PAGE_SIZE:
+            return None
+        ks = 0
+        while total - ks > chunk + merge:
+            ks += chunk
+        plan = [ks]
+        lo = ks + int(os.environ.get("EXL3_PF_SPLIT_HEAD", "1024"))
+        step = int(os.environ.get("EXL3_PF_SPLIT_STEP", "512"))
+        q = max(PAGE_SIZE, int(os.environ.get("EXL3_PF_SPLIT_Q", str(PAGE_SIZE))) // PAGE_SIZE * PAGE_SIZE)
+        for off in offs:
+            b = (total - off) // q * q
+            if b >= lo:
+                plan.append(b)
+                lo = b + step
+        return tuple(plan) if len(plan) > 1 else None
+
+
+    def exact_gate(self, seq):
+        """
+        Filter for the recurrent checkpoints an allocation may resume from (Sequence.allocate_pages): gate(state, page hash, page
+        index) -> bool. A checkpoint stashed by _stash_exact is usable only if this prompt's cold plan has the same cuts up to it
+        and none of the pages under it was rewritten since; a state without that tag at a cut of this plan is refused (it cannot
+        be shown to come from the cold chunk shapes). Every other checkpoint passes as before, except that allocate_pages drops those
+        deeper than the deepest accepted exact checkpoint (gate.tagged).
+        """
+        rc = self.generator.recurrent_cache
+        total = len(seq.sequence_ids) - 1
+        cache = []
+
+        def gate(state, ph, pi):
+            if not cache:
+                mode = self.split_mode(alloc = True) if len(self.sequences) == 1 else None
+                cache.append(self.split_plan(total, mode) if mode else None)
+            plan = cache[0]
+            meta = rc.exact_meta.get(ph)
+            m = rc.metrics
+            if meta is not None and meta["eid"] == id(state):
+                sig = meta["sig"]
+                ok = plan is not None and plan[:len(sig)] == sig
+                if ok:
+                    pt = self.pagetable
+                    hs = seq.page_hashes[sig[0] // PAGE_SIZE: sig[-1] // PAGE_SIZE]
+                    for h, w in zip(hs, meta["pw"]):
+                        p = pt.referenced_pages.get(h) or pt.unreferenced_pages.get(h)
+                        if p is None or getattr(p, "wgen", 0) != w:
+                            ok = False
+                            break
+                if ok:
+                    gate.tagged.append(pi)
+                else:
+                    m["exact_rejected"] = m.get("exact_rejected", 0) + 1
+                return ok
+            if plan is not None and (pi + 1) * PAGE_SIZE in plan[1:]:
+                m["exact_rejected"] = m.get("exact_rejected", 0) + 1
+                return False
+            return True
+
+        gate.tagged = []                 # page indices of the exact checkpoints accepted (allocate_pages prefers the deepest)
+        return gate
+
+
+    def _stash_exact(self, seq, sig: tuple):
+        """
+        Keep the recurrent state at the end of a split pass (position sig[-1], a page boundary) as an exact checkpoint, with the
+        plan prefix it belongs to and the write generations of the pages under it (see exact_gate). Replaces any state stashed
+        under the same page hash, which could come from a prefill with other chunk shapes.
+        """
+        rc = self.generator.recurrent_cache
+        b = sig[-1]
+        if rc is None or self.recurrent_state is None or self.recurrent_state.position != b:
+            return
+        page = seq.allocated_pages[b // PAGE_SIZE - 1]
+        if page.kv_position != PAGE_SIZE:
+            return
+        key = page.phash
+        if key in rc:
+            rc.drop(key)
+        rc.put(key, self.recurrent_state)
+        entry = dict.get(rc, key)                      # not rc.get: that would wait for the asynchronous stash
+        if entry is None:
+            return
+        pw = tuple(getattr(p, "wgen", 0) for p in seq.allocated_pages[sig[0] // PAGE_SIZE: b // PAGE_SIZE])
+        rc.exact_meta[key] = {"eid": id(entry), "sig": sig, "pw": pw}
+        while len(rc.exact_meta) > 256:
+            rc.exact_meta.pop(next(iter(rc.exact_meta)))
+        self.last_recurrent_checkpoint_pos = b
+        rc.metrics["split_stashes"] = rc.metrics.get("split_stashes", 0) + 1
+
+
     def maybe_stash_recurrent(self, cache, interval = None):
         """
         Store the current recurrent state if the sequence is at a checkpoint boundary.
@@ -1887,6 +2141,54 @@ class Job:
             self.last_recurrent_checkpoint_pos = seq.kv_position
 
 
+    def tail_ckpt_rows(self, seq, prefill_start: int, prefill_end: int, taken):
+        """
+        Chunk rows of the dense prompt-tail checkpoints: the page boundaries last_page - k * PAGE_SIZE, k = 1 ..
+        EXL3_TAIL_DENSE, that fall strictly inside [prefill_start, prefill_end) and are not already requested (taken).
+        The GDN kernel has 8 side-write slots; the last page and a branch row come first, the dense rows fill the rest
+        (the deepest first). Reuse contract: a later prompt resumes at min(end of the hash-matched K/V pages, latest
+        recurrent checkpoint at or before it), so with a checkpoint on every page of the last EXL3_TAIL_DENSE pages a
+        prompt that diverges there replays at most one page plus its own new tokens.
+        """
+        n = int(os.environ.get("EXL3_TAIL_DENSE", "0"))
+        if n <= 0:
+            return []
+        last_page_b = (len(seq.sequence_ids) - 1) // PAGE_SIZE * PAGE_SIZE
+        have = [r for r in taken if r is not None]
+        rows = []
+        for k in range(1, n + 1):
+            r = last_page_b - k * PAGE_SIZE - prefill_start
+            if r <= 0:
+                break
+            if r not in have and 0 < r < prefill_end - prefill_start:
+                rows.append(r)
+        return rows[:max(0, 8 - len(have))]
+
+
+    def sub_ckpt_rows(self, seq, prefill_start: int, prefill_end: int, taken):
+        """
+        Chunk rows of the sub-page prompt-tail checkpoints (EXL3_TAIL_SUB = how many): the last multiples of 64 rows of
+        the chunk that holds the prompt end (the recurrent kernels write state at 64-row granularity), so a prompt that
+        diverges in its final tokens resumes at most 64 rows plus its own new tokens before the divergence, not up to a
+        page before it. Rows on a page boundary become ordinary page checkpoints; the others are kept by stash_midchunk
+        as sub-page entries (generator.sub_ckpts) that _tail_restore picks when they are the deepest match.
+        Only for a page-aligned chunk start (the kernel rows are then also multiples of 64 in absolute position).
+        """
+        n = int(os.environ.get("EXL3_TAIL_SUB", "0"))
+        if n <= 0 or getattr(self.generator, "sub_ckpt_max", 1) <= 0 or prefill_start % PAGE_SIZE != 0 or not self._tail_ok(seq):
+            return []   # EXL3_TAIL_SUB_MAX=0 keeps no entry, so no kernel slot is spent on one
+        if prefill_end != len(seq.sequence_ids) - 1:
+            return []
+        have = [r for r in taken if r is not None]
+        rows = []
+        r = (prefill_end - prefill_start - 1) // 64 * 64
+        while r >= 64 and len(rows) < n:
+            if r not in have and prefill_start + r >= self.generator.tail_ckpt_min:
+                rows.append(r)
+            r -= 64
+        return rows[:max(0, 8 - len(have))]
+
+
     def stash_midchunk(self, saved: dict, prefill_start: int):
         """
         Stash the mid-chunk recurrent states saved by the forward pass (EXL3_MIDCHUNK_CKPT), keyed like
@@ -1896,23 +2198,69 @@ class Job:
         seq = self.sequences[0]
         rc = self.generator.recurrent_cache
         layers = self.generator.cache.get_all_recurrent_layers()
+        # KVWIN rings are not captured mid-chunk (the ring has already advanced to the chunk end): such a checkpoint restores
+        # with a cold ring that is rebuilt from the pool (quant-level window for the first W tokens)
+        ring_layers = {k for k, l in layers.items() if getattr(l, "kvwin", False)}
         n = 0
         for r, per_layer in sorted(saved.items()):
-            if set(per_layer) != set(layers):
+            if set(per_layer) != set(layers) - ring_layers:
                 continue
             pos = prefill_start + r
-            page = seq.allocated_pages[pos // PAGE_SIZE - 1]
-            assert pos % PAGE_SIZE == 0 and page.kv_position == PAGE_SIZE
             stashed = {"position": pos, "checkpoint_size": self.recurrent_state.checkpoint_size}
             for k in layers:
+                if k in ring_layers:
+                    stashed[k] = None
+                    continue
                 s, c = per_layer[k][:2]
                 if len(per_layer[k]) == 3:
                     per_layer[k][2].synchronize()  # mode 2: pinned host copies, D2H event on the side stream
                 stashed[k] = (s.cpu(), c.cpu())
+            if pos % PAGE_SIZE:
+                n += self._stash_sub(seq, pos, stashed)
+                continue
+            page = seq.allocated_pages[pos // PAGE_SIZE - 1]
+            assert page.kv_position == PAGE_SIZE
             rc.put(page.phash, None, stashed = stashed)
             rc.metrics["midchunk_stashes"] = rc.metrics.get("midchunk_stashes", 0) + 1
             n += 1
         return n
+
+
+    def _stash_sub(self, seq, pos: int, stashed: dict) -> int:
+        """
+        Keep a mid-page recurrent checkpoint (position pos, not a page boundary) as a sub-page entry: the same content-keyed
+        format as a prompt-end tail checkpoint (hash of the preceding full page + the token ids of the partial page), with
+        the page that holds the K/V rows. Reuse contract: _tail_restore resumes a later prompt at the deepest entry whose
+        ids are a prefix of it, copying the first (pos % PAGE_SIZE) K/V rows of the partial page. No MTP carry is kept
+        (the replay recomputes it), like a page checkpoint.
+        """
+        g = self.generator
+        p0 = pos // PAGE_SIZE
+        if g.sub_ckpt_max <= 0 or len(seq.allocated_pages) <= p0 or (p0 > 0 and seq.allocated_pages[p0 - 1].kv_position != PAGE_SIZE):
+            return 0
+        prev_hash = None if p0 == 0 else seq.allocated_pages[p0 - 1].phash
+        ids = seq.sequence_ids.torch_slice(p0 * PAGE_SIZE, pos).clone()
+        for e in g.sub_ckpts:
+            if e["prev_hash"] == prev_hash and e["ids"].shape == ids.shape and torch.equal(e["ids"], ids):
+                # same content: replace it (fresh page reference), most recent. By identity: list.remove() compares the
+                # entries with ==, which is a tensor comparison inside the dicts and raises
+                g.sub_ckpts[:] = [x for x in g.sub_ckpts if x is not e]
+                break
+        while g.sub_ckpts and len(g.sub_ckpts) >= g.sub_ckpt_max:
+            g.sub_ckpts.pop(0)
+        g.sub_ckpts.append({
+            "prev_hash": prev_hash, "ids": ids, "stashed": stashed, "carry": None,
+            "page": seq.allocated_pages[p0], "draft_ok": not self.mtp_defer,
+        })
+        return 1
+
+
+    def _cold_ring_state(self, position: int):
+        """Ring-only job state at `position`; its rings are rebuilt from the quantized pool at the first attention."""
+        cache = self.generator.cache
+        if position == 0:
+            return cache.get_new_state()
+        return cache.new_from_stashed({"position": position}, position)
 
 
     def find_recurrent_stash(self, target_pos: int):
@@ -1927,6 +2275,14 @@ class Job:
             if stashed is not None and stashed["position"] == (pi + 1) * PAGE_SIZE:
                 return stashed
         return None
+
+
+    def _tail_maxgap(self) -> int:
+        # EXL3_TAIL_MAXGAP_RESUME (default = EXL3_TAIL_MAXGAP): the bound for a prefill resumed from a tail checkpoint (a conversation
+        # turn). A large value drops the separate last-page forward there (+0.15-0.3 s per turn on an RTX 3090 with Qwen3.8-27B) while cold
+        # prompts keep their chunking and last-page checkpoint
+        g = int(os.environ.get("EXL3_TAIL_MAXGAP", "1024"))
+        return int(os.environ.get("EXL3_TAIL_MAXGAP_RESUME", g)) if self._unaligned_start else g
 
 
     def _tail_ok(self, seq) -> bool:
@@ -1982,7 +2338,7 @@ class Job:
         if rc is not None and rc.async_stash_ok(self.recurrent_state):
             stashed = rc.stash_async(self.recurrent_state)   # EXL3_NC2_ASYNC_STASH: settled before _tail_restore reads it
         else:
-            stashed = self.recurrent_state.stash()
+            stashed = self.recurrent_state.stash(pinned = True) if _TAIL_PIN else self.recurrent_state.stash()
         g.tail_ckpts.append({
             "prev_hash": prev_hash, "ids": ids, "stashed": stashed,
             "carry": None if carry is None else carry.clone(), "page": seq.allocated_pages[p0],
@@ -1991,6 +2347,36 @@ class Job:
         })
         _ttrace_end("tail checkpoint stash", t)
 
+
+    def _tail_peek(self, seq) -> int:
+        """
+        Read-only twin of the match scan in _tail_restore: the kv position the first prefill step would resume at (0 = no tail
+        checkpoint applies). Optimistic (it does not test the source page), so it can only over-estimate the skipped rows.
+        The chunk planner (EXL3_SCHED_CHUNK_IL) classifies big / short from it before the job has run any step.
+        """
+        if not self._tail_ok(seq):
+            return 0
+        g = self.generator
+        start = seq.kv_position
+        if not g.tail_ckpts or start % PAGE_SIZE != 0:
+            return 0
+        total = len(seq.sequence_ids) - 1
+        pages = seq.allocated_pages
+        valid = 0
+        while valid < len(pages) and pages[valid].kv_position == PAGE_SIZE:
+            valid += 1
+        first = start // PAGE_SIZE
+        for e in reversed(g.tail_ckpts):
+            L = e["ids"].shape[-1]
+            ph = e["prev_hash"]
+            i = 0 if ph is None else next((k + 1 for k in range(max(first - 1, 0), min(valid, len(pages))) if pages[k].phash == ph), -1)
+            if i < first or i > valid or i >= len(pages):
+                continue
+            pos = i * PAGE_SIZE
+            if pos + L > total or not torch.equal(e["ids"], seq.sequence_ids.torch_slice(pos, pos + L)):
+                continue
+            return pos + L
+        return 0
 
     def _tail_restore(self, seq) -> int:
         """
@@ -2005,7 +2391,7 @@ class Job:
             return 0
         g = self.generator
         start = seq.kv_position
-        if not g.tail_ckpts or start % PAGE_SIZE != 0:
+        if not (g.tail_ckpts or g.sub_ckpts) or start % PAGE_SIZE != 0:
             return 0
         total = len(seq.sequence_ids) - 1
         pages = seq.allocated_pages
@@ -2013,22 +2399,33 @@ class Job:
         while valid < len(pages) and pages[valid].kv_position == PAGE_SIZE:
             valid += 1
         first = start // PAGE_SIZE
-        for e in reversed(g.tail_ckpts):
+        # candidates: every entry (exact prompt-end ones and sub-page ones) whose chain and token ids match this prompt,
+        # deepest resume position first; on a tie the exact prompt-end entry (it carries the MTP carry), then the most recent
+        cands = []
+        for lst in (g.tail_ckpts, g.sub_ckpts):
+            for e in reversed(lst):
+                L = e["ids"].shape[-1]
+                ph = e["prev_hash"]
+                if ph is None:
+                    i = 0
+                else:
+                    i = next((k + 1 for k in range(max(first - 1, 0), min(valid, len(pages))) if pages[k].phash == ph), -1)
+                if i < first or i > valid or i >= len(pages):
+                    continue
+                pos = i * PAGE_SIZE
+                if pos + L > total or not torch.equal(e["ids"], seq.sequence_ids.torch_slice(pos, pos + L)):
+                    continue
+                cands.append((pos + L, e, lst, i))
+        cands.sort(key = lambda c: -c[0])
+        for _, e, lst, i in cands:
             L = e["ids"].shape[-1]
             ph = e["prev_hash"]
-            if ph is None:
-                i = 0
-            else:
-                i = next((k + 1 for k in range(max(first - 1, 0), min(valid, len(pages))) if pages[k].phash == ph), -1)
-            if i < first or i > valid or i >= len(pages):
-                continue
             pos = i * PAGE_SIZE
-            if pos + L > total or not torch.equal(e["ids"], seq.sequence_ids.torch_slice(pos, pos + L)):
-                continue
             dst = pages[i]
             if dst.kv_position == PAGE_SIZE and dst.prev_hash != ph:   # a complete revived page must follow the entry's chain
                 continue
-            if dst.kv_position != PAGE_SIZE and g.draft_model and not e.get("draft_ok", True):
+            ring = g.draft_model is not None and _TAIL_RING and not _draft_pages_shared(g)
+            if dst.kv_position != PAGE_SIZE and g.draft_model and (not e.get("draft_ok", True) or not (_draft_pages_shared(g) or ring)):
                 continue
             if dst.kv_position != PAGE_SIZE:            # a complete revived page already holds this K/V
                 src = e["page"]
@@ -2037,10 +2434,11 @@ class Job:
                     if _TT: print(f"trace: tail ckpt found but source page unusable (same={src is dst} kvp={src.kv_position})", flush=True)
                     continue
                 t = _ttrace_begin()
-                for c in [g.cache] if not g.draft_model else [g.cache, g.draft_cache]:
+                for c in [g.cache] if not g.draft_model or ring else [g.cache, g.draft_cache]:
                     c.copy_page(c, src.page_index, dst.page_index, L)
                 dst.prev_hash = ph
                 dst.sequence[:, :L].copy_(e["ids"])
+                dst.wgen = next(_PAGE_GEN)
                 dst.kv_position = L
                 dst.can_revert = False
                 _ttrace_end(f"tail restore page copy rows={L}", t)
@@ -2057,8 +2455,8 @@ class Job:
             self._unaligned_start = True
             skipped = pos + L - start
             self.cached_tokens += skipped
-            g.tail_ckpts[:] = [x for x in g.tail_ckpts if x is not e]
-            g.tail_ckpts.append(e)
+            lst[:] = [x for x in lst if x is not e]
+            lst.append(e)
             return skipped
         return 0
 

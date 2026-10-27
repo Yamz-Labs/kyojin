@@ -104,6 +104,16 @@ enum GraphedParams
     GP_moe_bias_add_weighted_weights
 };
 
+#if !defined(USE_ROCM)
+// True while `stream` is being captured by an outer (whole-forward) CUDA graph. BC objects then launch their
+// kernels eagerly into that capture (pointers taken from the current call) instead of capturing or patching their own graph.
+inline bool graph_outer_capture(cudaStream_t stream)
+{
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(stream, &st) == cudaSuccess && st != cudaStreamCaptureStatusNone;
+}
+#endif
+
 class Graph
 {
 public:

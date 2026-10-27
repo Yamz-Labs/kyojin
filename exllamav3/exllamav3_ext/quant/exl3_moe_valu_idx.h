@@ -15,9 +15,13 @@ MV_FN int tw(int bits)                 { return 8 * bits; }
 MV_FN long sst(int bits, int ntiles)   { return (long) ntiles * tw(bits); }                       // u32 per k-slice row
 MV_FN int chunk(int ks)                { return (ks + NCH - 1) / NCH; }                           // k-slices per chunk
 MV_FN int myn(int ks, int c)           { int ch = chunk(ks); int r = ks - c * ch; r = r < ch ? r : ch; return r > 0 ? r : 0; }
-// u32 offset in the expert region of the lane's own words (bits of them, contiguous) and of its wrap word
+// u32 offset in the expert region of the lane's own words (bits of them, contiguous) and of its wrap word.
+// wrap is the true (mod tw) predecessor of own word 0: the old & (tw-1) mask is mod tw only for
+// power-of-2 tw (K=2: 16, K=4: 32) and mis-indexes K=3 (tw = 24) lanes g8 = 3, 4, 5, so K=3 needs
+// the modulo form. It is value-identical for tw = 16/32 over every reachable x = bits*g8 - 1
+// (exhaustively checked on CPU, see scratch/bounds_k3.md), so K=2/K=4 addressing is unchanged.
 MV_FN long own(int bits, int ntiles, int tile, int g8, int s)  { return (long) s * sst(bits, ntiles) + (long) tile * tw(bits) + bits * g8; }
-MV_FN long wrap(int bits, int ntiles, int tile, int g8, int s) { return (long) s * sst(bits, ntiles) + (long) tile * tw(bits) + ((bits * g8 - 1) & (tw(bits) - 1)); }
+MV_FN long wrap(int bits, int ntiles, int tile, int g8, int s) { long t = tw(bits); long x = (long) bits * g8 - 1; return (long) s * sst(bits, ntiles) + (long) tile * t + (((x % t) + t) % t); }
 // A (fp16, row-major, K halves per row), as u32: row r, k-slice s covers 8 u32
 MV_FN long a_idx(int r, int k, int s)  { return (long) r * (k / 2) + 8 * s; }
 // wave-private reduction scratch [waves][4 chunk lanes][16 cols][4 rows] floats

@@ -6,6 +6,7 @@
 #include "../util.h"
 #include "../hgemm.cuh"
 #include "../quant/exl3_gemm.cuh"
+#include "../quant/exl3_gemv_int8.cuh"
 #include "../activation.cuh"
 #include "../add.cuh"
 
@@ -69,8 +70,19 @@ void BC_GatedMLP::run_bszN_gr
         at::Tensor u2 = gu_n.select(0, 1);
         at::Tensor gate_xh = guh_n.select(0, 0);
         at::Tensor up_xh   = guh_n.select(0, 1);
-        exl3_gemm_gr(x, gate->trellis, g2, gate->suh, gate_xh, gate->svh, -1, gate->mcg, gate->mul1, 0, graph);
-        exl3_gemm_gr(x, up->trellis, u2, up->suh, up_xh, up->svh, -1, up->mcg, up->mul1, 0, graph);
+        // Gate and up are two independent same-shape GEMVs over x: one sq launch for both when the int8
+        // GEMV path takes them (same graph patch sites as the two separate launches), else two GEMMs
+        bool paired = false;
+        if (gate->mul1 && up->mul1 && x.dtype() == at::kHalf && g2.dtype() == u2.dtype())
+        {
+            cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+            paired = exl3_gemv_int8_pair(x, gate->trellis, g2, gate->suh, gate->svh, up->trellis, u2, up->suh, up->svh, stream, graph);
+        }
+        if (!paired)
+        {
+            exl3_gemm_gr(x, gate->trellis, g2, gate->suh, gate_xh, gate->svh, -1, gate->mcg, gate->mul1, 0, graph);
+            exl3_gemm_gr(x, up->trellis, u2, up->suh, up_xh, up->svh, -1, up->mcg, up->mul1, 0, graph);
+        }
         if (gate->bias) add_gr(g2, gate->bias.value(), g2, graph);
         if (up->bias) add_gr(u2, up->bias.value(), u2, graph);
     }
@@ -105,7 +117,7 @@ void BC_GatedMLP::run_bszN
 
     Graph& g = graph_bszN[graphidx];
 
-    if (g.disabled || (!g.ready && !g.ready_to_record))
+    if (g.disabled || graph_outer_capture(stream) || (!g.ready && !g.ready_to_record))
     {
         run_bszN_gr(x, d, num_tokens, nullptr);
         g.ready_to_record = true;
@@ -194,7 +206,7 @@ void BC_MLP::run_bsz1
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (graph_bsz1.disabled || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
+    if (graph_bsz1.disabled || graph_outer_capture(stream) || (!graph_bsz1.ready && !graph_bsz1.ready_to_record))
     {
         run_bsz1_gr(x, d, nullptr);
         graph_bsz1.ready_to_record = true;

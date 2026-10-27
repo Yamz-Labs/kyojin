@@ -61,7 +61,7 @@ def gdn_hf_ok(q_raw, v, qn, kn, g, beta, initial_state):
 
 
 def chunk_gdn_hf(q_raw, v, qn, kn, g, beta, scale, initial_state, output_final_state, ckpt=None):
-    """Returns (o [1, T, HV, 128] bf16, final_state or None). ckpt: None, a dict or a list of <= 2 dicts {"s": fp32 [1, HV, K, V]
+    """Returns (o [1, T, HV, 128] bf16, final_state or None). ckpt: None, a dict or a list of <= 8 dicts {"s": fp32 [1, HV, K, V]
     contiguous, "chunk": n} (gdn_fused_h_hip contract): the state after row 64 n is written to ck["s"] and ck["ok"] set."""
     try:
         fn = _load()
@@ -81,10 +81,10 @@ def chunk_gdn_hf(q_raw, v, qn, kn, g, beta, scale, initial_state, output_final_s
             ctypes.c_float(scale), ctypes.c_int(1)]
     cks = [] if ckpt is None else (list(ckpt) if isinstance(ckpt, (list, tuple)) else [ckpt])
     cks = [c for c in cks if 0 < 64 * c["chunk"] <= T]
-    assert len(cks) <= 2
+    assert len(cks) <= 8
     for c in cks:
         assert c["s"].dtype == torch.float32 and c["s"].is_contiguous() and c["s"].shape == (1, HV, K, K)
-    for i in range(2):
+    for i in range(8):
         c = cks[i] if i < len(cks) else None
         args += [P(0 if c is None else c["s"].data_ptr()), ctypes.c_int(-1 if c is None else 64 * c["chunk"])]
     params = (ctypes.c_void_p * len(args))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in args])

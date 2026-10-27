@@ -7,6 +7,7 @@
 #include <unistd.h>
 #endif
 #include <algorithm>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 #include <mutex>
@@ -209,7 +210,11 @@ struct GatherPool
         if (!started)
         {
             started = true;
-            int n = (int) std::min(32u, std::max(4u, std::thread::hardware_concurrency()));
+            // A cold gather is bound by the queue depth the disk sees (one blocking pread per worker):
+            // 32 workers keep a consumer NVMe at ~45k random reads/s, 128 at ~85k
+            int cap = 128;
+            if (const char* e = std::getenv("EXL3_NGRAM_IO_THREADS")) cap = std::max(1, std::atoi(e));
+            int n = (int) std::min((unsigned) cap, std::max(4u, std::thread::hardware_concurrency() * 8));
             for (int i = 0; i < n; ++i)
                 std::thread(&GatherPool::worker, this).detach();
         }
@@ -288,11 +293,11 @@ void ngram_gather_cpu
         return;
     }
 
-    // One span task per run keeps every cold read in flight at once; past ~64 runs, group
+    // One span task per run keeps every cold read in flight at once; past ~256 runs, group
     // whole runs into span tasks so the queue overhead stays negligible (a worker issues its
     // group's runs sequentially -- pool-width reads still in flight)
     std::vector<std::pair<int64_t, int64_t>> tasks;
-    size_t group = (n_runs + 63) / 64;
+    size_t group = (n_runs + 255) / 256;
     tasks.reserve((n_runs + group - 1) / group);
     for (size_t r = 0; r < n_runs; r += group)
     {

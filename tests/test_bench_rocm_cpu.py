@@ -35,6 +35,7 @@ def bare(tmp_path, monkeypatch):
     empty directory (so the venv running the tests cannot leak a real rocm-sdk or hipconfig in) and a sh()
     that answers nothing. rocm_version() then reports "unknown"."""
     monkeypatch.setattr(bench, "ROCM_INFO_FILES", ())
+    monkeypatch.setattr(bench, "AMDGPU_VERSION_FILE", str(tmp_path / "no-amdgpu-version"))
     monkeypatch.setattr(bench, "sdk_trees", lambda: [])
     monkeypatch.setattr(bench.shutil, "which", lambda tool: None)
     monkeypatch.setattr(bench, "sys", SimpleNamespace(executable=str(tmp_path / "nowhere" / "python")))
@@ -148,3 +149,13 @@ def test_read_version_of_a_missing_or_empty_file(tmp_path):
 
 def test_tool_version_returns_nothing_without_the_tool(bare):
     assert bench.tool_version("rocm-sdk version") == ""
+
+
+def test_package_manager_then_amdgpu_driver_before_unknown(bare, tmp_path, monkeypatch):
+    monkeypatch.setattr(bench, "sh", lambda cmd: "7.1.0.70100-1" if "rocm-core" in cmd else "")
+    assert bench.rocm_version() == "7.1.0.70100-1 (rocm-core package)"
+    monkeypatch.setattr(bench, "sh", lambda cmd: "package rocm-core is not installed" if "rocm-core" in cmd else "")
+    f = tmp_path / "amdgpu-version"
+    f.write_text("6.12.12\n")
+    monkeypatch.setattr(bench, "AMDGPU_VERSION_FILE", str(f))
+    assert bench.rocm_version() == "unknown (amdgpu driver 6.12.12)"

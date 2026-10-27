@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include "hc_mix.cuh"
+#include "port.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
@@ -1581,7 +1582,10 @@ static void hc_mix_launch
 int hc_mix_num_chunks(int R, int row_len)
 {
     TORCH_CHECK(R >= 0 && row_len > 0, "hc_mix_num_chunks: R must be nonnegative and row_len must be positive");
-    int chunks_a = std::min(128, std::max(1, 512 / std::max(R, 1)));
+    // Verify rows (R <= 32) split the row like an 8-row call does: the chunk size, hence the partial-sum order of every row, then does not
+    // depend on how many rows the call carries (R = 9 used to halve the chunk count and change the bits of every row)
+    const int r_split = R <= 32 ? std::min(R, 8) : R;
+    int chunks_a = std::min(128, std::max(1, 512 / std::max(r_split, 1)));
     const int target_cols = (row_len + chunks_a - 1) / chunks_a;
     int chunk_cols = ((target_cols + 4 * NUM_THREADS_A - 1) / (4 * NUM_THREADS_A)) * (4 * NUM_THREADS_A);
     return (row_len + chunk_cols - 1) / chunk_cols;
@@ -2093,7 +2097,7 @@ __device__ __forceinline__ void unpack_s8x4(uint32_t v, float& f0, float& f1, fl
 // The product must be rounded to fp32 BEFORE the half rounding (the fp16 twin sees half(fp32(q * sc))); without the barrier the compiler
 // fuses mul + convert into one v_fma_mix and rounds once (differs on exact half ties).
 #ifndef GS_NOFUSE
-#define GS_NOFUSE(p) asm volatile("" : "+v"(p))
+#define GS_NOFUSE(p) asm volatile("" : "+" PORT_ASM_F32(p))
 #endif
 __device__ __forceinline__ float gs_dq(float q, float sc) { float p = q * sc; GS_NOFUSE(p); return __half2float(__float2half_rn(p)); }
 __device__ __forceinline__ void gs_unpack_s8x4(uint32_t v, float sc, float& f0, float& f1, float& f2, float& f3)

@@ -106,6 +106,8 @@ include = ["exllamav3*"]
 exllamav3 = [
     "py.typed",
     "util/hadamard_data/*",
+    "kernel_seed/*.tar.xz",
+    "model/dense_gemm_tune_seed.txt",
     "conversion/standard_cal_data/*.utf8",
     "exllamav3_ext/**/*",
     "**/*.hip",

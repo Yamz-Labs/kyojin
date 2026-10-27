@@ -458,6 +458,13 @@ static bool tuned_device(int device)
 {
     // The layout/shape sweep was measured on GeForce Blackwell. Other Ampere+ parts retain
     // their existing layout; the rate probe still determines whether FP16 MMA is worthwhile.
+    return at::cuda::getDeviceProperties(device)->major >= 8;
+}
+
+// Which shapes take the fp16-accumulate kernel instead of cuBLAS (fp32 accumulate) is a numerics decision, kept per
+// architecture: the broader Blackwell coverage (M >= 64, small batched grids) stays Blackwell-only
+static bool wide_coverage(int device)
+{
     return at::cuda::getDeviceProperties(device)->major == 12;
 }
 
@@ -479,7 +486,7 @@ static bool worthwhile(const at::Tensor& a, const at::Tensor& b)
     const auto* props = at::cuda::getDeviceProperties(device);
     int64_t M = a.size(-2), N = b.size(-1), K = a.size(-1);
     int64_t batch = a.dim() == 3 ? a.size(0) : 1;
-    if (tuned_device(device) && M >= 64 && M * batch >= MIN_ROWS && N >= 1024 && K >= 512)
+    if (wide_coverage(device) && M >= 64 && M * batch >= MIN_ROWS && N >= 1024 && K >= 512)
     {
         const int tile_n = narrow_tile(a, b) ? 64 : 128;
         int64_t blocks = ((M + BM - 1) / BM) * (N / tile_n) * batch;

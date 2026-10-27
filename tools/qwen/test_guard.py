@@ -66,7 +66,7 @@ class StubGenerator:
             if len(self.out) >= j.max_new:
                 eos, reason = True, "max_new_tokens"
                 break
-        ev = {"job": j, "serial": j.serial_number, "token_ids": torch.tensor(toks), "text": "".join("</think>" if t == CLOSE else f"<{t}>" for t in toks)}
+        ev = {"job": j, "serial": j.serial_number, "token_ids": torch.tensor(toks), "text": "".join("</think>" if t == CLOSE else f"<w{t}>" for t in toks)}
         if eos:
             ev |= {"eos": True, "eos_reason": reason, "new_tokens": len(self.out), "prompt_tokens": len(j.ids),
                    "cached_tokens": 0}
@@ -153,7 +153,7 @@ class GuardEngineTests(unittest.TestCase):
         self.assertEqual(st["loop_guard"]["kind"], "final")
         self.assertEqual(text.count("</think>"), 1)
         self.assertFalse(loops.is_loop(text), text[-200:])
-        self.assertIn("<1007>", text)
+        self.assertIn("<w1007>", text)
         self.assertEqual(len(StubJob.jobs), 2)
 
     def test_final_check_recovers_think_loop_that_ends_at_the_cap(self):
@@ -171,7 +171,7 @@ class GuardEngineTests(unittest.TestCase):
         text, st = collect(make_engine(drift, per_iter=1), reasoning_first=True, loop_guard=True, max_tokens=300)
         self.assertEqual(st["loop_guard"]["kind"], "final")
         self.assertFalse(loops.is_loop(text), text[-200:])
-        self.assertIn("<1007>", text)                         # the answer was generated after the cut
+        self.assertIn("<w1007>", text)                         # the answer was generated after the cut
         self.assertLessEqual(len(st["token_ids"]), 300)       # discarded tokens are not charged to max_tokens
 
     def test_final_cut_unit(self):
@@ -198,7 +198,7 @@ class GuardEngineTests(unittest.TestCase):
         text, st = collect(e, reasoning_first=True, loop_guard=True)
         self.assertEqual(text.count("</think>"), 1)
         self.assertIn("\n</think>\n\n", text)
-        self.assertIn("<1007>", text)                       # the answer proceeded (8 answer tokens then eos)
+        self.assertIn("<w1007>", text)                       # the answer proceeded (8 answer tokens then eos)
         self.assertEqual(st["loop_guard"]["kind"], "period")
         self.assertEqual(len(StubJob.jobs), 2)
         # restart context = prompt + thinking up to the end of the FIRST cycle + forced close
@@ -207,7 +207,7 @@ class GuardEngineTests(unittest.TestCase):
         self.assertGreater(st["new_tokens"], len(st["token_ids"]))
 
     def test_visible_text_matches_kept_tokens_with_speculative_batches(self):
-        piece = lambda x: f"<{x}>"
+        piece = lambda x: f"<w{x}>"
         for per_iter in (1, 2, 3, 4, 5):
             text, st = collect(make_engine(loop_model(), per_iter=per_iter), reasoning_first=True, loop_guard=True)
             toks = st["token_ids"]
@@ -653,6 +653,157 @@ class DetectorTests(unittest.TestCase):
         samples += ["".join(rng.choice("abc def\n") for _ in range(2500)) for _ in range(5)]
         for s in samples:
             self.assertEqual(serve.text_loop(s), bool(loops.is_loop(s)))
+
+
+class TextGenerator(StubGenerator):
+    """StubGenerator whose events carry real text: tokens >= 3000 map to pieces of `answer`."""
+    pieces: list = []
+
+    def iterate(self):
+        evs = super().iterate()
+        for ev in evs:
+            ev["text"] = "".join("</think>" if t == CLOSE else (self.pieces[t - 3000] if t >= 3000 else "x") for t in ev["token_ids"].tolist())
+        return evs
+
+
+class FinalCheckKeepsValidCodeTests(unittest.TestCase):
+    def test_long_valid_answer_after_thinking_is_not_regenerated(self):
+        import loopguard_corpus
+        answer = loopguard_corpus.legit()["pagoda_kyojin_original.txt"]
+        self.assertTrue(serve.text_loop(answer))                # the release-gate rule alone would trigger the final check
+        pieces = [answer[i:i + 4] for i in range(0, len(answer), 4)]
+
+        def model(ctx, job):
+            gen = ctx[3:]
+            n = len(gen)
+            if n < 5:
+                return 200 + n
+            if n == 5:
+                return CLOSE
+            return 3000 + (n - 6) if n - 6 < len(pieces) else 0
+        eng = make_engine(model, per_iter=4)
+        eng.generator = TextGenerator(model, per_iter=4)
+        eng.generator.pieces = pieces
+        text, st = collect(eng, reasoning_first=True, loop_guard=True, max_tokens=len(pieces) + 50)
+        self.assertNotIn("loop_guard", st)
+        self.assertEqual(len(StubJob.jobs), 1)
+        self.assertTrue(text.endswith(answer))
+
+
+class GuardStopVisibleTests(unittest.TestCase):
+    """A guard stop ends the answer early: clients must be able to tell it from a natural end."""
+
+    def post(self, path, payload, stats):
+        eng = FakeEngine("cut here", dict(FakeEngine("").stats, **stats))
+
+        async def fn(client):
+            r = await client.post(path, json={"model": "m", "messages": [{"role": "user", "content": "x"}], "prompt": "x"} | payload)
+            return await (r.text() if payload.get("stream") else r.json())
+        return with_client(eng, fn)
+
+    GUARD = {"eos_reason": "loop_guard", "loop_guard": {"phase": "answer", "kind": "text"}}
+
+    def test_chat_json(self):
+        c = self.post("/v1/chat/completions", {}, self.GUARD)["choices"][0]
+        self.assertEqual((c["finish_reason"], c["stop_reason"]), ("length", "loop_guard"))
+
+    def test_chat_stream(self):
+        raw = self.post("/v1/chat/completions", {"stream": True}, self.GUARD)
+        self.assertIn('"finish_reason":"length"', raw)
+        self.assertIn('"stop_reason":"loop_guard"', raw)
+
+    def test_completions_json(self):
+        c = self.post("/v1/completions", {}, self.GUARD)["choices"][0]
+        self.assertEqual((c["finish_reason"], c["stop_reason"]), ("length", "loop_guard"))
+
+    def test_natural_stop_unchanged(self):
+        c = self.post("/v1/chat/completions", {}, {})["choices"][0]
+        self.assertEqual(c["finish_reason"], "stop")
+        self.assertNotIn("stop_reason", c)
+
+
+# ------------------------------------------------------------------ answer rule: labelled corpus
+
+class AnswerCorpusTests(unittest.TestCase):
+    """Valid repetitive answers are never cut; degenerate ones are. Word-level tokens stand in for the BPE here;
+    tools/qwen/loopguard_gate.py replays the same corpus with the real Qwen and GLM tokenizers."""
+
+    @classmethod
+    def setUpClass(cls):
+        import loopguard_corpus
+        cls.legit, cls.loops = loopguard_corpus.legit(), loopguard_corpus.loops()
+
+    def test_pagoda_answer_that_was_cut_is_not_cut_now(self):
+        t = self.legit["pagoda_kyojin_original.txt"]
+        self.assertTrue(serve.text_loop(t))                # the release-gate rule alone does flag it ...
+        self.assertFalse(serve.answer_text_loop(t))        # ... the answer rule does not
+        self.assertIsNone(run_monitor(t, "answer", chunk=4))
+
+    def test_legit_never_stopped(self):
+        for name, text in self.legit.items():
+            self.assertIsNone(run_monitor(text, "answer", chunk=4), name)
+
+    def test_loops_always_stopped(self):
+        for name, text in self.loops.items():
+            if name == "char_loop":      # one giant word for the word-level stand-in tokenizer: the real-tokenizer gate covers it
+                continue
+            self.assertIsNotNone(run_monitor(text, "answer", chunk=4), name)
+
+    def test_repetitive_data_is_not_cut_but_endless_data_is(self):
+        # a zero grid, identical JSON records and a zeroed hex dump repeat because the data does: the period / text rules wait
+        # DATA_SUSTAIN tokens for them (the first two were cut after about 100 tokens before)
+        import loopguard
+        for name in ("zero_grid", "zero_grid_json", "json_lines_identical", "hex_dump_zero", "hex_dump_zero_plain"):
+            self.assertTrue(loopguard.data_like(self.legit[name][:1500]), name)
+            self.assertIsNone(run_monitor(self.legit[name], "answer", chunk=1), name)
+        for name in ("zero_run_endless", "json_lines_endless"):
+            hit = run_monitor(self.loops[name], "answer", chunk=4)
+            self.assertIsNotNone(hit, name)
+            self.assertGreaterEqual(hit["at"], loopguard.DATA_SUSTAIN, name)    # the backstop, not the 100-token period rule
+
+    def test_prose_and_code_are_not_data(self):
+        import loopguard
+        self.assertFalse(loopguard.data_like("I think the answer is yes. But wait, let me reconsider. " * 20))
+        self.assertFalse(loopguard.data_like("renderTile(x, y, z); tick++;\n" * 30))
+        self.assertFalse(loopguard.data_like("0 0"))                           # too short to tell
+        self.assertTrue(loopguard.data_like('{"a": 1, "b": "x"}\n' * 8))      # JSON lines
+
+    def test_think_phase_keeps_the_gate_rule(self):
+        t = self.legit["pagoda_kyojin_original.txt"]
+        self.assertTrue(serve.text_loop(t))
+        hit = run_monitor(t, "think", chunk=4)
+        self.assertIsNotNone(hit)                          # a thinking block that writes this much replayed idiom is cut
+
+
+class AnswerTapTests(unittest.TestCase):
+    def test_think_block_is_not_watched_then_answer_loop_stops(self):
+        from loopguard import AnswerTap
+        tap = AnswerTap(True)
+        for _ in range(200):                       # a looping think block is left alone
+            self.assertIsNone(tap.feed([5, 6], "ab "))
+        self.assertIsNone(tap.feed([7], "</thi"))  # tag split across events
+        self.assertIsNone(tap.feed([8], "nk>\n"))
+        hit = None
+        for i in range(2000):
+            hit = tap.feed([11, 12, 13], "foo bar baz ")
+            if hit:
+                break
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["kind"], "period")
+
+    def test_no_think_block_watches_from_start(self):
+        from loopguard import AnswerTap
+        tap = AnswerTap(False)
+        hits = [tap.feed([1, 2, 3], "x y z ") for _ in range(400)]
+        self.assertTrue(any(hits))
+
+    def test_text_after_the_close_tag_reaches_the_monitor(self):
+        from loopguard import AnswerTap
+        tap = AnswerTap(True)
+        self.assertIsNone(tap.feed([7], "thinking...</think>The answer"))
+        self.assertEqual(tap.mon.text, "The answer")       # it used to be dropped with the tokens of that event
+        self.assertIsNone(tap.feed([8], " is 42."))
+        self.assertEqual(tap.mon.text, "The answer is 42.")
 
 
 if __name__ == "__main__":

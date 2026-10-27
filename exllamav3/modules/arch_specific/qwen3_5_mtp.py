@@ -101,7 +101,11 @@ class Qwen3_5MTPInputLayer(Module):
 
         # Token embedding
         if not self.attached_model().loaded_tp:
-            x = self.attached_model().modules[0].forward(x, params, out_dtype = torch.half)
+            emb = self.attached_model().modules[0]
+            if hasattr(emb, "forward_device"):
+                x = emb.forward_device(x, params, torch.half, self.device)
+            else:
+                x = emb.forward(x, params, out_dtype = torch.half)
         else:
             x = self.attached_model().tp_producer.send(x)
             x = self.attached_model().tp_dispatch_master(mp_model_forward_embedding, (x, params))

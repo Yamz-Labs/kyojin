@@ -1,0 +1,48 @@
+--- a/tools/ds41/plan.py
++++ b/tools/ds41/plan.py
+@@ -162,6 +162,35 @@
+     }
+ 
+ 
++RE_EXPERT_KEY = re.compile(r"^(layers\.\d+\.ffn)\.experts\.(\d+)\.(w[123])$")
++
++
++def expert_bits(entries) -> dict:
++    """quantization_config["expert_bits"]: {"layers.L.ffn": [bits of expert 0, 1, ...]} for the backbone routed
++    experts. The three projections of an expert must carry the same bits (the grouped kernels share one K per
++    launch). The loader checks the field against the K of the tensors it reads."""
++    seen = {}
++    for e in entries:
++        if e.get("action") not in ("quant", "pruned") or e.get("kind") != "routed":
++            continue
++        m = RE_EXPERT_KEY.match(e["key"])
++        if m:
++            seen.setdefault(m.group(1), {}).setdefault(int(m.group(2)), {})[m.group(3)] = int(e["bits"])
++    out = {}
++    for layer, per in seen.items():
++        n = max(per) + 1
++        if sorted(per) != list(range(n)):
++            raise ValueError(f"{layer}: experts are not 0..{n - 1}")
++        row = []
++        for ex in range(n):
++            b = per[ex]
++            if len(b) != 3 or len(set(b.values())) != 1:
++                raise ValueError(f"{layer} expert {ex}: projections {b} must all have the same bits")
++            row.append(next(iter(b.values())))
++        out[layer] = row
++    return out
++
++
+ def units(plan) -> list:
+     """Unit ids in processing order (global, layers, mtp, engram tables last)."""
+     seen = []
+--- a/tools/ds41/stream_convert.py
++++ b/tools/ds41/stream_convert.py
+@@ -288,6 +288,7 @@
+     bits = plan["bits"]
+     qcfg = {"quant_method": "exl3", "bits": round(s["routed_avg_bpw"], 4), "head_bits": bits["head"],
+             "mtp_bits": bits["mtp"], "codebook": "mul1", "out_scales": "always",
++            "expert_bits": P.expert_bits(plan["entries"]),
+             "plan": {"target": plan["target"], "bits": bits, "expert_frequency": plan["freq"]},
+             "original_quantization_config": cfg.get("quantization_config")}
+     cfg["quantization_config"] = qcfg

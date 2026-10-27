@@ -7,6 +7,8 @@ from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
+from .moe_mixedk import MixedKStore, MixedKUnsupported, expert_ks, layer_is_mixed, check_expert_bits, \
+    PrunedLinear, pruned_experts, parse_expert_bits
 from ..ext import exllamav3_ext as ext
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
@@ -18,6 +20,7 @@ from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .quant.exl3 import dec_workspace
+from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
@@ -42,10 +45,46 @@ MTILE_T1, MTILE_T2 = 16, 32
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
 # beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
 FUSED_ROWS_WIDE = int(os.environ.get("EXL3_MOE_FUSED_ROWS_WIDE", 256))
+# Grouped prefill tier (exl3_moe_grouped: token-parallel hadamard kernels + two grouped one-CTA-per-tile GEMMs) for the
+# experts above MOEG_LO rows, instead of the persistent expert-group kernel's 64-row launch. Needs the deterministic slot
+# path, the mul1 codebook and 2..6 bit tensors; EXL3_MOE_GROUPED=0 restores the persistent kernel
+MOEG = os.environ.get("EXL3_MOE_GROUPED", "1") != "0"
+MOEG_LO = int(os.environ.get("EXL3_MOE_GROUPED_LO", 33))
+# Row capacity of the grouped tier per expert (the persistent kernel is capped by its temp buffers, this tier is not); experts above
+# it take the batched reconstruct tier as before
+MOEG_ROWS = int(os.environ.get("EXL3_MOE_GROUPED_ROWS", 1 << 20))
 # Deterministic (slot + gather) accumulation for the fused kernel's outputs; EXL3_MOE_FUSED_DET=0
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+# R-row union MoE (exl3_dec_moe_union): one kernel call carries at most MAX_BSZN (= MOE_R_MAX in exl3_dec.cu) rows; a verify step of 9..UNION_ROWS
+# rows runs as job-aligned slices of at most MAX_BSZN rows (each slice is the exact 2..8 row call, rows are independent in an MoE block).
+# ROCm only (the CUDA fused kernels have their own COOP_ROWS); EXL3_ROW_INV_MAX_ROWS=8 restores the single-call cap.
+UNION_ROWS = max(MAX_BSZN, ROW_INV_MAX_ROWS) if torch.version.hip else MAX_BSZN
+# Row capacity of the fused decode kernels (exl3_moe_coop): up to this many token rows (bounded by 256 slots = rows * top_k) take
+# them instead of the prefill-shaped exl3_moe kernel or row chunks; rows <= MAX_BSZN run exactly as before. The kernels group the
+# slots by expert, so each picked expert is decoded once for all of its rows. CUDA only; EXL3_MOE_COOP_ROWS=8 restores the old cap
+COOP_ROWS = max(MAX_BSZN, int(os.environ.get("EXL3_MOE_COOP_ROWS", "32"))) if torch.version.hip is None else MAX_BSZN
+# Row chunking: 9..EXL3_MOE_ROW_CHUNK_MAX rows of a pack without a fused MoE kernel run as <= MAX_BSZN-row slices through
+# the bszN decode kernels instead of the per-expert tier (host readback of the expert counts + one launch group per expert,
+# per layer); rows are independent in an MoE block. 0 disables. Measured on an RTX 3090 (Qwen3-30B-A3B 3INST)
+_ROW_CHUNK_MAX = int(os.environ.get("EXL3_MOE_ROW_CHUNK_MAX", "64"))
+# Fused exl3_moe kernel for 3INST packs (no mcg / mul1 codebook, e.g. upstream-quantized public packs), CUDA. Without it their
+# > MAX_BSZN-row blocks take the row chunks above or the per-expert tier. 0 restores that.
+_FUSED_3INST = os.environ.get("EXL3_MOE_FUSED_3INST", "1") != "0"
+# ... but up to this many rows the row chunks stay faster (2 bszN slices beat one exl3_moe launch at 9-16 rows on a 3090)
+_FUSED_3INST_MIN = int(os.environ.get("EXL3_MOE_FUSED_3INST_MIN", "16"))
+# Sync-free fused tier bound: top-k picks distinct experts, so no expert holds more rows than there are tokens and
+# num_tokens <= fused_rows already keeps every expert inside the fused tier (the num_tokens * top_k bound skipped the
+# expert-count readback only up to fused_rows / top_k tokens). EXL3_MOE_SYNC_FREE_TOKENS=0 restores the top-k bound.
+# CUDA default only (measured there); ROCm keeps the top-k bound unless set to 1
+SYNC_FREE_TOKENS = os.environ.get("EXL3_MOE_SYNC_FREE_TOKENS", "1" if torch.version.hip is None else "0") != "0"
+
+
+def _union_slices(x: torch.Tensor, rows: int) -> list:
+    """Row ranges (lo, hi) of the union MoE kernel calls for `rows` token rows: one call up to MAX_BSZN rows, else job-aligned slices
+    (util.row_inv.job_slices). x is the MoE input (jobs, rows per job, H) of a verify forward."""
+    return job_slices(rows, int(x.shape[-2]) if x.dim() >= 3 else 1, MAX_BSZN)
 
 
 # Expert-deduplicated grouped MoE (verify batches decode each picked expert once for all of its
@@ -166,6 +205,17 @@ class FusedBuffers:
     temp_intermediate_u: torch.Tensor
 
 
+_SHARED_SIDE_HIP = bool(torch.version.hip)   # EXL3_SHARED_SIDE=1 is read per call (A/B inside one process)
+_side_state: dict = {}
+
+
+def _side(device):
+    st = _side_state.get(device)
+    if st is None:
+        st = _side_state[device] = (torch.cuda.Stream(device = device), torch.cuda.Event(), torch.cuda.Event())
+    return st
+
+
 @dataclass
 class HIPGroupedBuffers:
     gu_had: torch.Tensor
@@ -198,6 +248,43 @@ class ExpertsCFG:
     min_expert: int
     max_expert: int
     out_bszn: torch.Tensor | None = None   # (MAX_BSZN, H) fp32 routed sum of the bsz<=MAX_BSZN path
+
+
+# Routed-weighted per-expert Hessians for the quantizer (see Linear.cap_rkey, convert_model.build_rwh_blends)
+_RWH = os.environ.get("EXL3_RWH", "0") == "1"
+
+class _RouteTrace:
+    """Diagnostic (EXL3_ROUTE_TRACE=path): append every MoE layer's router top-k, one record per forward
+    (layer id, rows, k, segment, int16 experts). Read-only hook, outputs unchanged; SIGUSR1 starts a new segment
+    (= a new conversation). Syncs once per layer, run with graphs off."""
+    def __init__(self, path):
+        import signal, threading
+        self.f = open(path, "ab", buffering = 1 << 20)
+        self.keys = {}
+        self.seg = 0
+        self.kf = open(path + ".keys", "a")
+        self.lock = threading.Lock()
+        signal.signal(signal.SIGUSR1, self._seg)
+
+    def _seg(self, *a):
+        self.seg += 1
+        self.f.flush()
+
+    def record(self, key, bsz, sel):
+        import numpy as np
+        if torch.cuda.is_current_stream_capturing():
+            return
+        kid = self.keys.get(key)
+        if kid is None:
+            kid = self.keys[key] = len(self.keys)
+            self.kf.write(f"{kid} {key}\n"); self.kf.flush()
+        a = sel.detach().to(torch.int16).cpu().numpy().reshape(bsz, -1)
+        with self.lock:
+            np.array([kid, bsz, a.shape[1], self.seg], dtype = np.int32).tofile(self.f)
+            a.tofile(self.f)
+
+
+_ROUTE_TRACE = _RouteTrace(os.environ["EXL3_ROUTE_TRACE"]) if os.environ.get("EXL3_ROUTE_TRACE") else None
 
 
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
@@ -415,7 +502,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             # The experts' input is the block input, or the latent projection of it (a
             # different activation, so a different Hessian) in a latent MoE
             expert_qmap = (qmap + (".latent" if latent_size else ".input")) if qmap else None
+            # K = 0 experts (pack config expert_bits == 0): no tensors, stand-ins that are never loaded
+            qcfg = getattr(config, "config_dict", {}).get("quantization_config") if config is not None else None
+            pruned = pruned_experts(qcfg, key, self.num_local_experts) if self.num_local_experts == num_experts else set()
             for idx in range(self.num_local_experts):
+
+                if idx in pruned:
+                    pk = f"{key}.experts.{idx}"
+                    self.ups.append(PrunedLinear(pk + ".w3", self.expert_size, intermediate_size))
+                    if self.gated:
+                        self.gates.append(PrunedLinear(pk + ".w1", self.expert_size, intermediate_size))
+                    self.downs.append(PrunedLinear(pk + ".w2", intermediate_size, self.expert_size))
+                    continue
 
                 fkey_gate, fkey_up, fkey_down = (
                     f"{key}.{key_gate_up_split}" if key_gate_up_split else
@@ -485,6 +583,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     qbits_key = qbits_key,
                 )
 
+                if _RWH and qmap:
+                    for lin, nm in ((gate, "input"), (up, "input"), (down, "down")):
+                        if lin is not None:
+                            lin.cap_rkey = f"{qmap}.r{idx}.{nm}"
+                            lin.qmap_q = f"{qmap}.q{idx}.{nm}"
+
                 self.ups.append(up)
                 if gate is not None:
                     self.gates.append(gate)
@@ -526,13 +630,24 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.is_quantized = False
         self.support_fused = False
+        self.fused_3inst = False
         self.support_quant_paths = False
         self.multi_gate = None
         self.multi_up = None
         self.multi_down = None
+        # Per-expert K inside the layer (hot-3 / cold-2): one MultiLinear triple per K, see moe_mixedk.py
+        self.mixed_k = None
+        self.mixed_outputs = None
+        self.expert_bits = None     # optional pack config row (quantization_config["expert_bits"]), validated at load
+        self.pruned = set(i for i, u in enumerate(self.ups) if getattr(u, "pruned", False))   # K0 experts
+        if self.ups and config is not None and gates is None and self.num_local_experts == num_experts:
+            _q = getattr(config, "config_dict", {}).get("quantization_config")
+            _b = parse_expert_bits(_q, key, len(self.ups)) if _q else None
+            self.expert_bits = _b
 
         self.routing_cfg = None
         self.experts_cfg = None
+        self.coop_rows = MAX_BSZN   # raised to the fused kernels' row capacity when the buffers are built
 
         # Persistent broadcast targets for TP ranks without the router (see forward)
         self.bcast_sel_bsz1 = None
@@ -589,6 +704,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.wmma_mcg = None         # uniform codebook flag for exl3_moe_prefill_wmma (None = off)
         self._pf_assignments = 0
         self.hip_grouped_lora_blocked = False
+        self.tier = None             # expert_store.LayerTier when EXL3_EXPERT_BUDGET_GIB tiers this layer's experts
         self._cpu_init_state()
 
     @override
@@ -687,13 +803,28 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             print(f" !! Warning, partially quantized block-sparse MLP layer: {self.key}")
         self.is_quantized = (num_exl3_tensors > 0 and num_nonexl3_tensors == 0)
 
+        # Per-expert K: a layer whose experts differ in trellis bitrate cannot use the single-K tables
+        # (MultiLinear, BC_BlockSparseMLP, exl3_dec_moe, exl3_moe). It runs the per-K grouped HIP kernels
+        # (moe_mixedk.MixedKStore) and the dense per-expert path (K-agnostic, each Linear carries its own K).
+        # Decided here, before the single-K gates below.
+        self.mixed_k = None
+        mixed_ks = None
+        if self.is_quantized and self.gated and len(self.ups) > 1:
+            try:
+                mixed_ks = expert_ks(self.gates, self.ups, self.downs)
+            except MixedKUnsupported:
+                mixed_ks = None
+            if mixed_ks is not None and self.expert_bits is not None:
+                check_expert_bits(self.expert_bits, mixed_ks)
+        is_mixed = mixed_ks is not None and layer_is_mixed(mixed_ks)
+
         # The quantized fast paths (mgemm/BC/fused kernels) don't yet support per-expert biases,
         # activations other than silu/gelu (or gateless relu2), or trimmed (padded) down
         # projections; configurations with any of those run every batch size through the dense
         # per-expert path, which handles all of them (gpt-oss)
         has_mgemm = hasattr(ext, "exl3_mgemm")
         self.support_quant_paths = (
-            has_mgemm and self.is_quantized and
+            has_mgemm and self.is_quantized and not is_mixed and
             (self.activation_fn in ("silu", "gelu") if self.gated else self.activation_fn == "relu2") and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs)
@@ -707,7 +838,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             has = [l.inner.bias is not None for l in ls]
             return all(has) or not any(has)
         self.support_bc_bszn = (
-            has_mgemm and self.is_quantized and
+            has_mgemm and self.is_quantized and not is_mixed and
             (self.activation_fn in ("silu", "gelu", "swiglu_oai") if self.gated else self.activation_fn == "relu2") and
             _uniform_bias(self.gates) and _uniform_bias(self.ups) and _uniform_bias(self.downs) and
             not self.config.infer_params.no_reconstruct
@@ -756,11 +887,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.support_hip_grouped = (
             hip_grouped_device and self.is_quantized and self.gated and self.activation_fn == "silu" and
             # Shapes the grouped kernel handles: hidden and intermediate are 128-aligned (its grids
-            # are width/128 and width/32), top-k 8 (MiMo-V2) or 10 (Qwen3.8). The old
-            # 2560 / 640-768 / top-10 gate was the Qwen3.8-Flash-Next pack only.
+            # are width/128 and width/32), top-k 6 (DeepSeek-V4.1), 8 (MiMo-V2) or 10 (Qwen3.8).
+            # The old 2560 / 640-768 / top-10 gate was the Qwen3.8-Flash-Next pack only.
             self.hidden_size % 128 == 0 and self.intermediate_size_padded % 128 == 0 and
-            self.num_experts_per_tok in (8, 10) and self.interm_dtype == torch.half and
-            self.act_limit == 0 and self.tp_mode is None and not self.hip_grouped_lora_blocked and
+            self.num_experts_per_tok in (6, 8, 10) and self.interm_dtype == torch.half and
+            # A swiglu limit (DeepSeek-V4.1: 10.0) is applied in moe_silu_mul_kernel. Only taken where the
+            # fused exl3_dec_moe epilogue cannot serve the shape (I % 512 != 0, e.g. DS4.1's 2304), so models
+            # that already run the fused path (GLM-5.3-Flash) keep their routing; EXL3_MOE_GROUPED_LIMIT=0 off.
+            (self.act_limit == 0 or (
+                0.0 < self.act_limit <= 65504.0 and os.environ.get("EXL3_MOE_GROUPED_LIMIT", "1") != "0" and
+                (self.hidden_size % 512 != 0 or self.intermediate_size_padded % 512 != 0))) and
+            self.tp_mode is None and not self.hip_grouped_lora_blocked and
             full_expert_layer and
             all(l.inner.bias is None for l in self.gates + self.ups + self.downs) and
             all(not l.trim_padded_out or l.out_features == l.out_features_unpadded for l in self.downs) and
@@ -775,7 +912,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.support_dec_moe = (
             bool(torch.version.hip) and hasattr(ext, "exl3_dec_moe") and
             os.environ.get("EXL3_DEC", "1") != "0" and os.environ.get("EXL3_DEC_MOE", "1") != "0" and
-            self.is_quantized and self.gated and self.activation_fn == "silu" and
+            self.is_quantized and self.gated and self.activation_fn == "silu" and not is_mixed and
             self.interm_dtype == torch.half and 0.0 <= self.act_limit <= 65504.0 and
             self.tp_mode is None and
             full_expert_layer and not self.hip_grouped_lora_blocked and
@@ -815,11 +952,35 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Make fused modules (only used by the quantized fast paths). Gateless experts have no
         # gate MultiLinear; the up module doubles as a placeholder wherever the fast paths want
         # gate pointer tables (never dereferenced, the gate GEMMs are skipped)
-        if (self.support_quant_paths or self.support_bc_bszn or self.support_hip_grouped or
+        if is_mixed and (self.support_hip_grouped or self.support_hip_wmma) and \
+                not self.config.infer_params.no_reconstruct:
+            # One MultiLinear triple per K group; the single-K tables, fused kernels and BC graph stay off
+            # (support_quant_paths / support_bc_bszn / support_dec_moe were cleared above)
+            try:
+                self.mixed_k = MixedKStore(self.device, self.gates, self.ups, self.downs)
+            except MixedKUnsupported:
+                self.mixed_k = None
+            self.support_hip_grouped = self.support_hip_grouped and self.mixed_k is not None and self.mixed_k.decode_ok
+            self.support_hip_wmma = self.support_hip_wmma and self.mixed_k is not None and self.mixed_k.wmma_ok
+            if self.mixed_k is not None and not (self.support_hip_grouped or self.support_hip_wmma):
+                self.mixed_k.unload()
+                self.mixed_k = None
+            self.support_hip_prefill = False
+            if self.tier is not None and self.mixed_k is not None:
+                # tiered per-expert-K layer: each K group's tables become views of the store's group buffer
+                self.tier.bind_mixed(self.mixed_k)
+        elif (self.support_quant_paths or self.support_bc_bszn or self.support_hip_grouped or
             self.support_dec_moe or self.support_hip_wmma) and not self.config.infer_params.no_reconstruct:
             self.multi_gate = MultiLinear(self.device, self.gates, allow_bias = True) if self.gated else None
             self.multi_up = MultiLinear(self.device, self.ups, allow_bias = True)
             self.multi_down = MultiLinear(self.device, self.downs, allow_bias = True)
+            if self.tier is not None:
+                # the kernels address experts through these tables: they become views of the store's
+                # per-layer table buffer, patched in place as experts enter and leave the slots
+                lt = self.tier
+                lt.build_tables(self.device)
+                for i, m in enumerate((self.multi_gate, self.multi_up, self.multi_down)):
+                    m.ptrs_trellis, m.ptrs_suh, m.ptrs_svh = lt.view(i * 3), lt.view(i * 3 + 1), lt.view(i * 3 + 2)
 
             # Enable fully fused kernel if possible (uniform mcg or mul1 codebook across gate/up/down,
             # and an activation the fused kernel implements)
@@ -830,15 +991,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
             self.support_fused = (
                 hasattr(ext, "exl3_moe") and hasattr(ext, "exl3_moe_max_concurrency") and
-                cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
+                cbs[0] == cbs[1] == cbs[2] and
+                cbs[0] in (((True, False), (False, True), (False, False)) if _FUSED_3INST else ((True, False), (False, True))) and
                 self.support_quant_paths and
                 (self.fused_fp16_interm or self.interm_dtype in (None, torch.half))
             )
+            self.fused_3inst = self.support_fused and cbs[0] == (False, False)
             # One K for the whole layer: the grouped GEMV is templated on the experts' trellis
             # bitrate and gate/up/down share it (the allocator assigns per layer).
             ks = {multi.K for multi in (self.multi_gate, self.multi_up, self.multi_down)}
             self.support_hip_grouped = self.support_hip_grouped and len(ks) == 1 and all(
-                multi.K in (2, 2.5, 3, 4, 5, 6) and multi.mul1 and not multi.mcg
+                multi.K in (1, 2, 2.5, 3, 4, 5, 6) and multi.mul1 and not multi.mcg
                 for multi in (self.multi_gate, self.multi_up, self.multi_down)
             )
             # The prefill kernel (exl3_moe_gfx12_k3_prefill) is still Qwen3.8-only: K=3, top-10 and
@@ -872,7 +1035,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 Ipad = self.intermediate_size_padded
                 Ru = MAX_BSZN
                 self.dec_moe_union_out = g_tensor_cache.get(
-                    self.device, (Ru, self.hidden_size), torch.float, "dec_moe_union_out")
+                    self.device, (UNION_ROWS, self.hidden_size), torch.float, "dec_moe_union_out")
                 self.dec_moe_union_act = g_tensor_cache.get(
                     self.device, (Ru * numex, Ipad), torch.half, "dec_moe_union_act")
                 self.dec_moe_union_down_part = g_tensor_cache.get(
@@ -886,7 +1049,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Ipad, 8*H) for this model's shapes; a TORCH_CHECK in the kernel catches it if a
                 # future shape needs more.
             self.support_hip_wmma = self.support_hip_wmma and all(
-                multi.K in (2, 2.5, 3, 4, 5, 6) and (multi.mul1 != multi.mcg)
+                multi.K in (1, 2, 2.5, 3, 4, 5, 6) and (multi.mul1 != multi.mcg)
                 for multi in (self.multi_gate, self.multi_up, self.multi_down)
             ) and self.multi_gate.K == self.multi_up.K
             # Codebook: mpw_gemm is templated on it and takes one flag for all three projections
@@ -898,6 +1061,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 if wmma_mul1 != wmma_mcg:
                     self.wmma_mcg = wmma_mcg
             self.support_hip_wmma = self.support_hip_wmma and self.wmma_mcg is not None
+
+        if self.tier is not None and self.multi_up is None and self.mixed_k is None:
+            raise RuntimeError(f"{self.key}: tiered experts need the quantized MoE fast paths (mgemm tables)")
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
@@ -914,7 +1080,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # graph loop's TEMP_ROWS_GRAPH requirement is larger, sharing the one cache entry per name
         # (g_tensor_cache is exact-shape-keyed and never evicts -- growing a differently-shaped
         # second entry under the same name would silently double memory forever)
-        bszn_rows = MAX_BSZN * numex
+        self.coop_rows = max(MAX_BSZN, min(COOP_ROWS, 256 // numex))
+        bszn_rows = self.coop_rows * numex
 
         temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
         temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
@@ -934,7 +1101,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Completion counters + expert-run table of the fused decode kernels
         # (BC_BlockSparseMLP.run_bszN): the kernels reset each other's counters for the next
         # call, so they only need zeroing once
-        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
+        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + self.coop_rows * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
         coop_ctr.zero_()
         # Rotated up-projection input per slot for the fused kernels at bsz > 1 (yh holds the gate's)
         had_u = g_tensor_cache.get(device, (bszn_rows, Hi), torch.half, "moe1_temp_hidden_u")
@@ -946,7 +1113,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Routed sum of the fused decode path, one exact-width row per token (the kernel trims the
         # padded down width on the way out)
-        out_bszn = g_tensor_cache.get(device, (MAX_BSZN, H), torch.float, "moe1_out_bszn")
+        out_bszn = g_tensor_cache.get(device, (self.coop_rows, H), torch.float, "moe1_out_bszn")
 
         cfg = ExpertsCFG(
             yh = yh,
@@ -978,6 +1145,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 output = g_tensor_cache.get(
                     device, (_HIP_GROUPED_MAX_ROWS, H), torch.float, "moe_gfx12_output"),
             )
+            if self.mixed_k is not None:
+                # One fp32 output per K group (group 0 uses the usual buffer); the partial sums are added
+                self.mixed_outputs = [self.hip_grouped_buffers.output] + [
+                    g_tensor_cache.get(device, (_HIP_GROUPED_MAX_ROWS, H), torch.float, f"moe_gfx12_output_k{i}")
+                    for i in range(1, self.mixed_k.num_groups)
+                ]
 
         if self.support_hip_prefill:
             # Workspace is allocated lazily at dispatch sized to the actual chunk
@@ -1004,7 +1177,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             ):
                 self.bc_sh_exp = True
                 sh_exp_bc = self.shared_experts.bc
-                sh_exp_t = torch.empty((1, MAX_BSZN, self.hidden_size), dtype = torch.float, device = self.device)
+                sh_exp_t = torch.empty((1, self.coop_rows, self.hidden_size), dtype = torch.float, device = self.device)
                 if self.shared_gate:
                     assert self.shared_gate.quant_type == "fp16"
                     sh_gate_bc = self.shared_gate.inner.bc
@@ -1023,6 +1196,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             gu_trellis_ptr = torch.stack((g_trellis_ptr, u_trellis_ptr), dim = 0).T.contiguous().to(self.device)
             gu_suh_ptr = torch.stack((g_suh_ptr, u_suh_ptr), dim = 0).T.contiguous().to(self.device)
             gu_svh_ptr = torch.stack((g_svh_ptr, u_svh_ptr), dim = 0).T.contiguous().to(self.device)
+            if self.tier is not None:
+                gu_trellis_ptr, gu_suh_ptr, gu_svh_ptr = (self.tier.gu_view(i) for i in range(3))
 
             dq_temp_up = g_tensor_cache.get(device, (Hi, I), torch.half, "dq_temp")
             dq_temp_down = dq_temp_up.view(I, Ho)
@@ -1112,6 +1287,37 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.f_threshold = min(self.num_experts // self.num_experts_per_tok, 4)
 
 
+    def _tier_register(self, device):
+        """LayerTier when the expert store is on and this layer qualifies, else None (resident load)"""
+        if (device is None or torch.device(device).type != "cuda" or
+                self.cpu_split_first is not None or self.cpu_offload or
+                os.environ.get("EXL3_EXPERT_BUDGET_GIB", "") == ""):
+            return None
+        from .expert_store import get_store
+        return get_store(self.config).register(self, device)
+    def _moeg_ok(self):
+        # Grouped prefill tier preconditions (see MOEG), evaluated once
+        ok = self.__dict__.get("_moeg_ok_cache")
+        if ok is None:
+            ok = self._moeg_ok_eval()
+            self._moeg_ok_cache = ok
+        return ok
+
+    def _moeg_ok_eval(self):
+        if not MOEG or self.fused_mode_buffers is None or not self.gated or not self.mtile_ok:
+            return False
+        if self.activation_fn_idx not in (0, 1):
+            return False
+        I = self.fused_mode_buffers.temp_intermediate_g.shape[2]
+        H = self.hidden_size
+        if H % 128 or I % 128 or H % 32 or I % 32:
+            return False
+        if not (self.multi_gate.mul1 and self.multi_up.mul1 and self.multi_down.mul1):
+            return False
+        if not hasattr(ext, "exl3_moe_grouped"):
+            return False
+        return bool(ext.exl3_moe_grouped_supported(self.multi_gate.K, self.multi_up.K, self.multi_down.K))
+
     def load_routing(self, **kwargs):
 
         if self.interm_div != 1.0 and self.router_type == "std":
@@ -1156,7 +1362,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.cpu_maybe_offload_load(device, **kwargs):
             return
         self.cpu_maybe_split_load(device, **kwargs)
-        super().load(device, **kwargs)
+        # Tiered experts (expert_store.py, EXL3_EXPERT_BUDGET_GIB): the routed experts are not loaded here, only
+        # registered; their bytes are read on demand into the store's slots
+        tier = self._tier_register(device)
+        if tier is None:
+            super().load(device, **kwargs)
+        else:
+            self.device = device
+            expert_set = set(self.gates + self.ups + self.downs)
+            for module in self.modules:
+                if module not in expert_set:
+                    module.load(device, **kwargs)
+            self.tier = tier
 
         if self.e_score_correction_bias_key:
             for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
@@ -1206,6 +1423,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         if self.batch_recon is None:
             ok = (
+                self.tier is None and  # reads the per-expert scale tensors, which a tiered layer does not keep
                 BATCH_RECON and self.bc is not None and self.support_quant_paths and
                 hasattr(ext, "reconstruct_batch") and
                 self.interm_dtype in (torch.half, None, torch.float) and self.multi_up is not None and
@@ -1240,9 +1458,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         is the working set on top. The autosplit measuring forward routes a dummy state, so
         what it sees of these depends on that routing; the loader takes this bound instead
         (autosplit_extra_measure)"""
-        if self.cpu_offload or self.multi_up is None:
+        if self.cpu_offload or (self.multi_up is None and self.mixed_k is None):
             return 0, 0
         h = self.expert_size
+        if self.mixed_k is not None:
+            # compacted picks + per-pick fp32 results + workspace of the largest group (moe_mixedk.prefill)
+            return (rows + 1) * h * 4, assignments * h * 4 * 2
         fixed = (rows + 1) * h * 4 + rows * h * 2
         if FUSED_DET:
             fixed += (int(assignments * PAD_MAX) + 1) * h * 4
@@ -1299,8 +1520,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         slot = None
         if scratch is not None:
             # groups were laid out after the fused slots, in plan order, len(grp) * cmax each
-            slot = sum(c for c in expert_count_list[:self.num_local_experts or self.num_experts]
-                       if 0 < c <= self.fused_rows) if self.fused_mode_buffers is not None else 0
+            slot = self._fused_slots if self.fused_mode_buffers is not None else 0
         for grp in groups:
             out_slab = None
             if scratch is not None:
@@ -1317,6 +1537,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
     @override
     def unload(self):
         self.cpu_unload()
+        if self.tier is not None:
+            self.tier.store.unregister(self.tier)
+            self.tier = None
         self.bc = None
         self.fused_mode_buffers = None
         self.dec_moe_mcg = None
@@ -1330,6 +1553,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.support_hip_wmma = False
         self._pf_assignments = 0
         self.hip_grouped_lora_blocked = False
+        if self.mixed_k is not None:
+            self.mixed_k.unload()
+            self.mixed_k = None
+        self.mixed_outputs = None
         if self.multi_gate is not None:
             self.multi_gate.unload()
             self.multi_gate = None
@@ -1381,12 +1608,438 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             act = g_tensor_cache.get(self.device, (self.num_experts_per_tok + 1, I), torch.half, "dec_shf_act"),
         )
 
+    def _fq_grouped_ok(self, y: torch.Tensor) -> bool:
+        """Eligibility for the foreign-quant grouped decode path (Bolt latent
+        MoE: gateless relu2, IQ2_XXS routed experts, Q8_0 latent projs). Any
+        configuration this does not cover returns False and the caller falls
+        through to the established paths. BOLT_FQ_MOE_GROUPED=0 disables."""
+        if os.environ.get("BOLT_FQ_MOE_GROUPED", "1") == "0":
+            return False
+        if not hasattr(ext, "fq_moe_iq2xxs_grouped"):
+            return False
+        if self.gated:
+            return False
+        if y.dtype != torch.half or not y.is_contiguous():
+            return False
+        from .foreign_linear import ForeignLinear
+        if self.latent_in is None or self.latent_out is None:
+            return False
+        if not (isinstance(self.latent_in, ForeignLinear) and self.latent_in.format == "q8_0"):
+            return False
+        if not (isinstance(self.latent_out, ForeignLinear) and self.latent_out.format == "q8_0"):
+            return False
+        if len(self.ups) != self.num_experts or len(self.downs) != self.num_experts:
+            return False
+        for m in self.ups + self.downs:
+            if not (isinstance(m, ForeignLinear) and m.format == "iq2_xxs"):
+                return False
+            if m.packed is None or not m.packed.is_contiguous():
+                return False
+        if self.shared_experts is not None:
+            se = self.shared_experts
+            if len(getattr(se, "ups", [None])) != 1 or len(getattr(se, "downs", [None])) != 1:
+                return False
+            for m in se.ups + se.downs:
+                if not (isinstance(m, ForeignLinear) and m.format == "iq2_xxs"):
+                    return False
+                if m.packed is None or not m.packed.is_contiguous():
+                    return False
+        if self.router_pre_norm is not None or self.routed_pre_norm is not None:
+            return False
+        if self.routed_post_norm is not None or self.shared_gate is not None:
+            return False
+        if self.shared_experts_post_norm is not None:
+            return False
+        if self.alt_residual_channel or self.tp_reduce or self.tp_mode is not None:
+            return False
+        if self.routing_device is not None or self.cpu_split_first is not None:
+            return False
+        if self.cpu_offload:
+            return False
+        K = self.expert_size
+        I = self.intermediate_size
+        if K % 256 != 0 or I % 256 != 0 or K > 4096 or I > 4096:
+            return False
+        if self.ups[0].in_features != K or self.ups[0].out_features != I:
+            return False
+        if self.downs[0].in_features != I or self.downs[0].out_features != K:
+            return False
+        return True
+
+    def _forward_foreign_grouped(self, x, y, selected_experts, routing_weights,
+                                 params, out_dtype, eshape):
+        """Grouped foreign MoE for batch-1 latent decode. Returns the routed
+        sum projected back to the residual width (same value as the dense
+        per-expert torch path within fp16 tolerance), or None when ineligible.
+        Skips the dense path's argsort / bincount+tolist host sync /
+        index_select / index_add_ as well as its 2*topk launches: experts run
+        in one fq_moe_iq2xxs_grouped call (slot kernel + weighted fold)."""
+        if not self._fq_grouped_ok(y):
+            return None
+        S = self.num_experts_per_tok
+        if tuple(selected_experts.shape) != (1, S):
+            return None
+        sel = selected_experts.reshape(-1)
+        wts = routing_weights.reshape(-1)
+        if wts.dtype != torch.half:
+            return None
+        if not sel.is_contiguous():
+            sel = sel.contiguous()
+        if not wts.is_contiguous():
+            wts = wts.contiguous()
+        h = y.reshape(1, -1)
+        dev = h.device
+        K = h.shape[1]
+        # Expert pointer tables (weights are static: rebuild only when the
+        # allocations change).
+        tbl = getattr(self, "_fq_ptrs", None)
+        if tbl is None or tbl[0] != self.ups[0].packed.data_ptr() or \
+                tbl[1] != self.downs[0].packed.data_ptr() or tbl[4] != dev:
+            up_ptrs = torch.tensor([u.packed.data_ptr() for u in self.ups],
+                                   dtype=torch.int64, device=dev)
+            down_ptrs = torch.tensor([d.packed.data_ptr() for d in self.downs],
+                                     dtype=torch.int64, device=dev)
+            up_stride = (self.ups[0].in_features // 256) * 66
+            down_stride = (self.downs[0].in_features // 256) * 66
+            tbl = (self.ups[0].packed.data_ptr(), self.downs[0].packed.data_ptr(),
+                   up_ptrs, down_ptrs, dev, up_stride, down_stride)
+            self._fq_ptrs = tbl
+        _, _, up_ptrs, down_ptrs, _, up_stride, down_stride = tbl
+        if getattr(self, "_fq_partial", None) is None or \
+                self._fq_partial.shape != (S, K) or self._fq_partial.device != dev:
+            self._fq_partial = torch.empty((S, K), dtype=torch.float, device=dev)
+            self._fq_routed = torch.empty((1, K), dtype=torch.float, device=dev)
+        ext.fq_moe_iq2xxs_grouped(h, sel, wts, up_ptrs, down_ptrs,
+                                   up_stride, down_stride,
+                                   self._fq_partial, self._fq_routed)
+        final_hidden_states = self.latent_out.forward(self._fq_routed, params)
+        if self.shared_experts is not None:
+            se_params = {**params, "moe_valu": True} if _MOE_VALU else params
+            se = self._forward_foreign_shared(x, se_params)
+            if se is None:
+                se = self.shared_experts.forward(x, se_params)
+            final_hidden_states = final_hidden_states + se.to(torch.float)
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states
+
+    def _fq_grouped_kq_ok(self, y: torch.Tensor) -> str | None:
+        """Eligibility for the KQ grouped decode path (MiniCPM SwiGLU MoE:
+        gated, ForeignLinear KQ/IQ4_XS routed experts, no latent). Returns the
+        format string or None. MCPM_FQ_MOE_GROUPED=0 disables."""
+        if os.environ.get("MCPM_FQ_MOE_GROUPED", "1") == "0":
+            return None
+        if not self.gated:
+            return None
+        if y.dtype != torch.half or not y.is_contiguous():
+            return None
+        from .foreign_linear import ForeignLinear
+        if self.latent_in is not None or self.latent_out is not None:
+            return None
+        if len(self.gates) != self.num_experts or len(self.ups) != self.num_experts \
+                or len(self.downs) != self.num_experts:
+            return None
+        fmt = None
+        for m in self.gates + self.ups + self.downs:
+            if not isinstance(m, ForeignLinear):
+                return None
+            if m.format not in ("q4_k", "q5_k", "q6_k", "iq4_xs"):
+                return None
+            if fmt is None:
+                fmt = m.format
+            elif m.format != fmt:
+                return None  # mixed formats (Q4_K_M gate/up vs down) need separate dots
+            if m.packed is None or not m.packed.is_contiguous():
+                return None
+        if self.router_pre_norm is not None or self.routed_pre_norm is not None:
+            return None
+        if self.routed_post_norm is not None:
+            return None
+        if self.shared_experts_post_norm is not None:
+            return None
+        if self.alt_residual_channel or self.tp_reduce or self.tp_mode is not None:
+            return None
+        if self.routing_device is not None or self.cpu_split_first is not None:
+            return None
+        if self.cpu_offload:
+            return None
+        K = self.expert_size
+        I = self.intermediate_size
+        if K % 256 != 0 or I % 256 != 0:
+            return None
+        if self.gates[0].in_features != K or self.gates[0].out_features != I:
+            return None
+        if self.downs[0].in_features != I or self.downs[0].out_features != K:
+            return None
+        if self.activation_fn not in ("silu", None):
+            return None
+        return fmt
+
+    def _forward_foreign_grouped_kq(self, x, y, selected_experts, routing_weights,
+                                    params, out_dtype, eshape):
+        """Grouped KQ MoE for batch-1 SwiGLU decode. One fq_moe kernel runs
+        all selected experts (gate+up dots, torch-half SwiGLU, down dots,
+        weighted fold), replacing the per-expert torch loop (top-k launches
+        + python dispatch per layer). Returns routed+shared sum or None."""
+        fmt = self._fq_grouped_kq_ok(y)
+        if fmt is None:
+            return None
+        S = self.num_experts_per_tok
+        if tuple(selected_experts.shape) != (1, S):
+            return None
+        sel = selected_experts.reshape(-1)
+        wts = routing_weights.reshape(-1)
+        if wts.dtype != torch.half:
+            return None
+        if not sel.is_contiguous():
+            sel = sel.contiguous()
+        if not wts.is_contiguous():
+            wts = wts.contiguous()
+        h = y.reshape(1, -1)
+        dev = h.device
+        K = h.shape[1]
+        _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136}
+        bb = _BB[fmt]
+        tbl = getattr(self, "_fq_kq_ptrs", None)
+        if tbl is None or tbl[0] != self.gates[0].packed.data_ptr() or tbl[4] != dev:
+            gate_ptrs = torch.tensor([m.packed.data_ptr() for m in self.gates],
+                                     dtype=torch.int64, device=dev)
+            up_ptrs = torch.tensor([m.packed.data_ptr() for m in self.ups],
+                                   dtype=torch.int64, device=dev)
+            down_ptrs = torch.tensor([m.packed.data_ptr() for m in self.downs],
+                                     dtype=torch.int64, device=dev)
+            tbl = (self.gates[0].packed.data_ptr(), gate_ptrs, up_ptrs, down_ptrs, dev)
+            self._fq_kq_ptrs = tbl
+        _, gate_ptrs, up_ptrs, down_ptrs, _ = tbl
+        I = self.intermediate_size
+        gate_stride = (K // 256) * bb
+        up_stride = gate_stride
+        down_stride = (I // 256) * bb
+        if getattr(self, "_fq_kq_partial", None) is None or \
+                self._fq_kq_partial.shape != (S, K) or self._fq_kq_partial.device != dev:
+            self._fq_kq_partial = torch.empty((S, K), dtype=torch.float, device=dev)
+            self._fq_kq_routed = torch.empty((1, K), dtype=torch.float, device=dev)
+        _FN = {"q4_k": "fq_moe_q4k_grouped_q8", "q5_k": "fq_moe_q5k_grouped_q8",
+               "q6_k": "fq_moe_q6k_grouped_q8", "iq4_xs": "fq_moe_iq4xs_grouped_q8"}
+        getattr(ext, _FN[fmt])(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
+                               gate_stride, up_stride, down_stride,
+                               self._fq_kq_partial, self._fq_kq_routed)
+        final_hidden_states = self._fq_kq_routed
+        if self.shared_experts is not None:
+            se_params = {**params, "moe_valu": True} if _MOE_VALU else params
+            se = self.shared_experts.forward(x, se_params)
+            if self.shared_gate is not None:
+                ext.add_sigmoid_gate_proj(se, x, final_hidden_states,
+                                          self.shared_gate.inner.weight)
+            else:
+                final_hidden_states = final_hidden_states + se.to(torch.float)
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states
+
+    def _forward_foreign_shared(self, x, params):
+        """Fused dense shared-expert up+relu2 (fq_mlp.cu) + ForeignLinear
+        down for batch-1 decode. Bit-identical to the shared MLP torch path
+        (same up dot grid, torch-exact relu2 epilogue, same down dot), so it
+        only kills the torch relu/square launches, the intermediate u
+        allocation, and u's global round-trip. Any configuration this does
+        not cover returns None and the caller falls through to the torch
+        path. BOLT_FQ_MLP_SHARED=0 disables."""
+        if os.environ.get("BOLT_FQ_MLP_SHARED", "1") == "0":
+            return None
+        if not hasattr(ext, "fq_mlp_shared_iq2xxs"):
+            return None
+        se = self.shared_experts
+        if se is None or se.num_slices != 1:
+            return None
+        if se.activation_fn != "relu2" or se.interm_dtype == torch.float:
+            return None
+        from .foreign_linear import ForeignLinear
+        up, down = se.ups[0], se.downs[0]
+        if not (isinstance(up, ForeignLinear) and up.format == "iq2_xxs"):
+            return None
+        if not (isinstance(down, ForeignLinear) and down.format == "iq2_xxs"):
+            return None
+        if up.packed is None or down.packed is None:
+            return None
+        K, I = up.in_features, up.out_features
+        if down.in_features != I or I != se.intermediate_size:
+            return None
+        if x.shape[-1] != K or x.numel() != K:
+            return None
+        xr = x.reshape(1, K)
+        if xr.dtype != torch.half or not xr.is_contiguous():
+            return None
+        dev = xr.device
+        h = getattr(self, "_fq_shared_h", None)
+        if h is None or tuple(h.shape) != (1, I) or h.device != dev:
+            h = torch.empty((1, I), dtype=torch.half, device=dev)
+            self._fq_shared_h = h
+        ext.fq_mlp_shared_iq2xxs(xr, up.packed.reshape(I, -1, 66), h)
+        return down.forward(h, params)
+
+    def _forward_foreign_prefill_grouped(self, x, y, selected_experts, routing_weights,
+                                         params, out_dtype, eshape):
+        """MiniCPM IQ4_XS prefill MoE (rows >= MCPM_FQ_PF_GROUPED_MIN): two fused
+        Triton grouped GEMMs over expert-sorted rows (gate+up+SwiGLU, then
+        down x routing weight) that decode the IQ4_XS weights in the K loop
+        (fq_moe_prefill.py), tile map built on device (no host sync, ~15
+        launches per layer instead of thousands). Same fp16-rounded weights
+        and fp32 accumulation as the per-expert path. Returns the block output
+        or None. MCPM_FQ_PF_GROUPED=0 disables."""
+        if os.environ.get("MCPM_FQ_PF_GROUPED", "1") == "0":
+            return None
+        R = y.shape[0]
+        if R < int(os.environ.get("MCPM_FQ_PF_GROUPED_MIN", "256")):
+            return None
+        if self._fq_grouped_kq_ok(y) != "iq4_xs" or self.act_limit or self.activation_fn not in ("silu", None):
+            return None
+        if (self.num_local_experts or self.num_experts) != self.num_experts:
+            return None
+        top_k = self.num_experts_per_tok
+        if tuple(selected_experts.shape) != (R, top_k) or selected_experts.dtype != torch.long:
+            return None
+        from .fq_moe_prefill import build_tiles, gmm_iq4, perm_cols
+        E = self.num_experts
+        dev = y.device
+        K = y.shape[1]
+        I = self.intermediate_size
+        wts = routing_weights
+        if wts.dtype != torch.half:
+            wts = wts.to(torch.half)
+        flat_expert = selected_experts.reshape(-1)
+        order = flat_expert.argsort(stable=True)
+        token_sorted = order // top_k
+        weight_sorted = wts.reshape(-1)[order]
+        counts = _scatter_expert_count(flat_expert, E + 1)[:E]
+        M = R * top_k
+        tile_e, tile_r0, offs = build_tiles(counts, M, 64)
+        tbl = getattr(self, "_fq_pf_ptrs", None)
+        if tbl is None or tbl[0] != self.gates[0].packed.data_ptr() or tbl[3] != dev:
+            gu = torch.tensor([m.packed.data_ptr() for m in self.gates + self.ups], dtype=torch.int64, device=dev)
+            dn_p = torch.tensor([m.packed.data_ptr() for m in self.downs], dtype=torch.int64, device=dev)
+            tbl = (self.gates[0].packed.data_ptr(), gu, dn_p, dev)
+            self._fq_pf_ptrs = tbl
+        _, gu_ptrs, dn_ptrs, _ = tbl
+        xs = perm_cols(y.index_select(0, token_sorted))
+        a = torch.empty((M, I), dtype=torch.half, device=dev)
+        gmm_iq4(xs, gu_ptrs, a, tile_e, tile_r0, offs, I, K, E, swiglu=True)
+        dn = torch.empty((M, K), dtype=torch.half, device=dev)
+        gmm_iq4(a, dn_ptrs, dn, tile_e, tile_r0, offs, K, I, E, wrow=weight_sorted)
+        inv = torch.empty_like(order)
+        inv[order] = torch.arange(order.numel(), device=dev)    # row of each (token, k) pick in the sorted layout
+        final_hidden_states = dn.index_select(0, inv).view(R, top_k, K).float().sum(1)
+        final_hidden_states = final_hidden_states.reshape(eshape)
+        if self.shared_experts:
+            y_se = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+            if self.shared_gate:
+                ext.add_sigmoid_gate(y_se, self.shared_gate.forward(x, params), final_hidden_states)
+            else:
+                final_hidden_states += y_se
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states
+
+    def _forward_foreign_prefill(self, x, y, selected_experts, routing_weights,
+                                 params, out_dtype, eshape):
+        """Lean foreign prefill MoE (rows > 1): the dense per-expert torch
+        path (full-fp16 dequant + cublas mm per expert) WITHOUT the EXL3
+        tier machinery around it (fused/recon tier planning, numpy slot
+        tables, prefill-shaped scratch + gather, extra syncs). Same op
+        sequence per expert (sort, index_select, up, act, down, weighted
+        index_add_), hence bitwise-identical to the stock dense path for
+        foreign configs; only the scaffolding is skipped. Returns the
+        full block output (routed + shared + latent_out, like the tail
+        below), or None when ineligible. BOLT_FQ_PF=0 disables."""
+        if os.environ.get("BOLT_FQ_PF", "1") == "0":
+            return None
+        if not self._fq_grouped_ok(y):
+            return None
+        if (self.num_local_experts or self.num_experts) != self.num_experts:
+            return None
+        R = y.shape[0]
+        if R <= 1:
+            return None
+        if tuple(selected_experts.shape)[0] != R:
+            return None
+        num_tokens, top_k = selected_experts.shape
+        if top_k != self.num_experts_per_tok:
+            return None
+        if selected_experts.dtype != torch.long:
+            return None
+        if not selected_experts.is_contiguous():
+            selected_experts = selected_experts.contiguous()
+        wts = routing_weights
+        if wts.dtype != torch.half:
+            wts = wts.to(torch.half)
+        if not wts.is_contiguous():
+            wts = wts.contiguous()
+        if not x.is_contiguous() or x.dtype != torch.half:
+            return None
+        num_ex = self.num_experts
+        E = num_ex
+        dev = y.device
+        K = y.shape[1]
+        flat_expert = selected_experts.reshape(-1)
+        flat_weight = wts.reshape(-1)
+        flat_token = buffered_interleaved_arange(num_tokens, top_k, device=dev)
+        order = flat_expert.argsort(stable=True)
+        token_sorted = flat_token[order]
+        weight_sorted = flat_weight[order]
+        expert_count = _scatter_expert_count(flat_expert, E + 1)
+        expert_count_list = expert_count.tolist()
+        final_hidden_states = torch.zeros((R, K), dtype=torch.float, device=dev)
+        # Single sorted gather; per-expert narrow views (no per-expert copy).
+        # Same values through the same kernels -> bitwise-identical
+        # (gated A/B: pf_1g.sh). BOLT_FQ_PF1G=0 restores per-expert
+        # index_select.
+        one_gather = os.environ.get("BOLT_FQ_PF1G", "1") != "0"
+        xs_all = y.index_select(0, token_sorted) if one_gather else None
+        start = 0
+        for expert_idx in range(num_ex):
+            count = expert_count_list[expert_idx]
+            end = start + count
+            if count > 0:
+                top_x = token_sorted[start:end]
+                w = weight_sorted[start:end].unsqueeze(1)
+                if one_gather:
+                    current_state = xs_all.narrow(0, start, count)
+                else:
+                    current_state = y.index_select(0, top_x)
+                u = self.ups[expert_idx].forward(current_state, params)
+                if self.gated:
+                    g = self.gates[expert_idx].forward(current_state, params)
+                    a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype=torch.half)
+                    self.activation_fn_call(g, u, a, self.act_limit)
+                else:
+                    a = self.gateless_act(u)
+                    if a.dtype != torch.half:
+                        a = a.half()
+                current_state = self.downs[expert_idx].forward(a, params)
+                current_state.mul_(w)
+                final_hidden_states.index_add_(0, top_x, current_state)
+            start = end
+        final_hidden_states = final_hidden_states.reshape(eshape)
+        if self.latent_out is not None:
+            final_hidden_states = self.latent_out.forward(final_hidden_states.to(torch.half), params)
+        if self.shared_experts:
+            y_se = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+            final_hidden_states += y_se
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states
+
     def forward(
         self,
         x: torch.Tensor,
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        if _ROW_CHUNK_MAX and self.coop_rows < x.numel() // x.shape[-1] <= \
+                (min(_ROW_CHUNK_MAX, _FUSED_3INST_MIN) if self.support_fused else _ROW_CHUNK_MAX) and self._row_chunk_ok() and \
+                not params.get("autosplit_measure"):
+            return self._forward_row_chunks(x, params, out_dtype)
 
         if self.alt_residual_channel:
             y = params["residual"].view(-1, self.hidden_size)
@@ -1396,6 +2049,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if os.environ.get("BSZ_DEBUG"):
             print(f"[bsz_debug] layer={self.key} bsz={bsz} union={os.environ.get('EXL3_DEC_MOE_UNION')}")
         bc_sh_exp = False
+        side_y = None
         #  R-row union MoE with the unique-expert table built on device (no host sync),
         # fed by the batched router -- independent of EXL3_DEC_MOE_UNION's bit-exact per-row loops
         union_dev = os.environ.get("EXL3_DEC_MOE_UNION_DEV", "0") != "0"
@@ -1415,7 +2069,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        bszn_eligible = self.bc is not None and bsz <= self.coop_rows
 
         # Routing
         if self.router_pre_norm:
@@ -1439,6 +2093,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             selected_experts = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.long, device = self.device)
             routing_weights = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.half, device = self.device)
 
+        if _ROUTE_TRACE is not None:
+            _ROUTE_TRACE.record(self.key, bsz, selected_experts)
+
         # Extra norm (Gemma4)
         if self.routed_pre_norm:
             y = self.routed_pre_norm.forward(y, params, out_dtype = torch.half)
@@ -1447,10 +2104,47 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.latent_in is not None:
             y = self.latent_in.forward(y, params)
 
+        # Foreign-quant grouped decode (Bolt latent MoE): one kernel runs all
+        # selected experts (see _forward_foreign_grouped). Strict eligibility
+        # inside; falls through to the paths below otherwise.
+        # KQ grouped decode (MiniCPM SwiGLU MoE): same idea via the KQ dots
+        # (see _forward_foreign_grouped_kq). Tried first (Bolt returns None
+        # without latent projs anyway).
+        if bsz == 1 and not params.get("activate_all_experts") and \
+                not params.get("reconstruct") and not params.get("autosplit_measure"):
+            grouped = self._forward_foreign_grouped_kq(
+                x, y, selected_experts, routing_weights, params, out_dtype, eshape)
+            if grouped is not None:
+                return grouped
+            grouped = self._forward_foreign_grouped(
+                x, y, selected_experts, routing_weights, params, out_dtype, eshape)
+            if grouped is not None:
+                return grouped
+
+        # Lean foreign prefill (Bolt latent MoE, rows > 1): same values as
+        # the dense per-expert torch path, minus the EXL3 tier scaffolding
+        # (see _forward_foreign_prefill). Strict eligibility inside; falls
+        # through otherwise. Skipped for DFlash verify batches (bit-exact
+        # union path owns those).
+        if bsz > 1 and not params.get("activate_all_experts") and \
+                not params.get("reconstruct") and not params.get("autosplit_measure") and \
+                not params.get("dflash_verify"):
+            pf = self._forward_foreign_prefill_grouped(
+                x, y, selected_experts, routing_weights, params, out_dtype, eshape)
+            if pf is None:
+                pf = self._forward_foreign_prefill(
+                    x, y, selected_experts, routing_weights, params, out_dtype, eshape)
+            if pf is not None:
+                return pf
+
         # Broadcast routing indices and weights
         if self.routing_device is not None:
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
+
+        # Tiered experts: make the routed union resident and the pointer tables current before any expert kernel
+        if self.tier is not None:
+            self.tier.store.prepare(self.tier, selected_experts, params, z)
 
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
@@ -1491,6 +2185,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.latent_out is None and self.routed_post_norm is None and (shf or not self.shared_experts) and
                 cpu_partial is None and cpu_pending is None and not self.tp_reduce and out_dtype is None
             )
+            if (
+                _SHARED_SIDE_HIP and os.environ.get("EXL3_SHARED_SIDE", "0") != "0" and not shf and self.shared_experts is not None and isinstance(self.shared_experts, GatedMLP) and
+                self.shared_gate is None and self.shared_experts_post_norm is None and cpu_partial is None and cpu_pending is None and
+                not self.tp_reduce and not self.routed_post_norm
+            ):
+                # batch-1 decode: the shared expert's three small GEMVs do not depend on the routed experts, run them on a side
+                # stream (own GEMV scratch/counters) while the routed kernels occupy the main one; joined at the shared add below
+                from .quant.exl3 import dec_side_workspace
+                side, ev_in, ev_out = _side(y.device)
+                ev_in.record(torch.cuda.current_stream(y.device))
+                with torch.cuda.stream(side):
+                    side.wait_event(ev_in)
+                    with dec_side_workspace():
+                        side_y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+                    ev_out.record(side)
             if shf:
                 ext.exl3_dec_moe_shared(
                     y,
@@ -1557,7 +2266,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # build dominates), only R=2..5; EXL3_DEC_MOE_UNION=1 to use it anyway (e.g. to get a
         # bit-exact verify path even before that's fixed).
         elif (
-            1 < bsz <= MAX_BSZN and self.support_dec_moe and self.tp_mode is None and
+            1 < bsz <= UNION_ROWS and self.support_dec_moe and self.tp_mode is None and
             not (_MOE_VALU and self.support_hip_grouped and bsz <= 8) and
             hasattr(ext, "exl3_dec_moe_union") and
             (union_dev or union_v2 or os.environ.get("EXL3_DEC_MOE_UNION", "0") != "0") and params.get("dflash_verify") and
@@ -1578,32 +2287,59 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
             out_buf = res.view(bsz, -1) if fuse_res else self.dec_moe_union_out[:bsz]
             scratch, counters = dec_workspace(y.device)
-            ext.exl3_dec_moe_union(
-                y, out_buf, selected_experts.contiguous(), routing_weights.contiguous(),
-                self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh, self.multi_gate.ptrs_svh,
-                self.multi_up.ptrs_trellis, self.multi_up.ptrs_suh, self.multi_up.ptrs_svh,
-                self.multi_down.ptrs_trellis, self.multi_down.ptrs_suh, self.multi_down.ptrs_svh,
-                self.dec_moe_union_act[:bsz * numex],
-                self.dec_moe_union_down_part[:bsz * numex],
-                scratch, counters,
-                self.intermediate_size_padded,
-                self.multi_up.K,
-                self.multi_down.K,
-                fuse_res,
-                self.act_limit,
-                self.dec_moe_mcg,
-                union_dev or union_v2,
-            )
+            sel_c, wts_c = selected_experts.contiguous(), routing_weights.contiguous()
+            for lo, hi in _union_slices(x, bsz):
+                # one slice = the exact 2..8 row call (_union_slices never leaves a lone row: that would be the batch-1 kernel)
+                ext.exl3_dec_moe_union(
+                    y[lo:hi], out_buf[lo:hi], sel_c[lo:hi], wts_c[lo:hi],
+                    self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh, self.multi_gate.ptrs_svh,
+                    self.multi_up.ptrs_trellis, self.multi_up.ptrs_suh, self.multi_up.ptrs_svh,
+                    self.multi_down.ptrs_trellis, self.multi_down.ptrs_suh, self.multi_down.ptrs_svh,
+                    self.dec_moe_union_act[:(hi - lo) * numex],
+                    self.dec_moe_union_down_part[:(hi - lo) * numex],
+                    scratch, counters,
+                    self.intermediate_size_padded,
+                    self.multi_up.K,
+                    self.multi_down.K,
+                    fuse_res,
+                    self.act_limit,
+                    self.dec_moe_mcg,
+                    union_dev or union_v2,
+                )
             if fuse_res:
                 params["mlp_residual_done"] = True
                 return res
             final_hidden_states = self.dec_moe_union_out[:bsz].view(eshape)
 
+        # Per-expert K layer (hot-3 / cold-2): one grouped launch set per K group on lut-remapped picks, the
+        # group partial sums added (moe_mixedk.MixedKStore.decode). Rows above the grouped cap and below the
+        # WMMA threshold run the dense per-expert path, which is K-agnostic.
+        elif (
+            self.mixed_k is not None and self.support_hip_grouped and self.tp_mode is None and
+            _hip_grouped_rows_eligible(bsz, False) and
+            tuple(y.shape) == (bsz, self.expert_size) and y.dtype == torch.half and
+            tuple(selected_experts.shape) == (bsz, self.num_experts_per_tok) and
+            selected_experts.dtype == torch.long and
+            tuple(routing_weights.shape) == (bsz, self.num_experts_per_tok) and
+            routing_weights.dtype == torch.half and
+            y.is_contiguous() and selected_experts.is_contiguous() and routing_weights.is_contiguous() and
+            os.environ.get("EXL3_HIP_GROUPED_MOE", "1") != "0" and
+            (bsz == 1 or os.environ.get("EXL3_HIP_GROUPED_MOE_MULTIROW", "1") != "0") and
+            os.environ.get("EXL3_GEMV", "1") != "0" and
+            not params.get("activate_all_experts") and
+            not params.get("reconstruct") and not params.get("autosplit_measure")
+        ):
+            final_hidden_states = self.mixed_k.decode(
+                ext, y, selected_experts, routing_weights, self.hip_grouped_buffers, self.mixed_outputs,
+                self.act_limit, _MOE_DEDUP,
+            ).view(x.shape)
+
         # gfx12 grouped decode/verification path: selected IDs and weights stay on-device,
         # and every row-major assignment slot remains distinct.
         elif (
+            self.mixed_k is None and
             _hip_grouped_rows_eligible(bsz, self.support_hip_prefill) and self.support_hip_grouped and
-            self.tp_mode is None and self.act_limit == 0 and
+            self.tp_mode is None and
             tuple(y.shape) == (bsz, self.expert_size) and y.dtype == torch.half and
             tuple(selected_experts.shape) == (bsz, self.num_experts_per_tok) and
             selected_experts.dtype == torch.long and
@@ -1639,6 +2375,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 buffers.down_out[:assignments],
                 float(self.multi_up.K),
                 _MOE_DEDUP,
+                float(self.act_limit),
             )
             final_hidden_states = output.view(x.shape)
 
@@ -1703,10 +2440,42 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
             final_hidden_states = output.view(x.shape)
 
+        # Per-expert K layer, prefill: picks grouped by K, one WMMA launch set per group (compacted picks,
+        # the kernel has no masked picks), per-token sum in routing-slot order (moe_mixedk.MixedKStore.prefill)
+        elif (
+            self.mixed_k is not None and self.support_hip_wmma and bsz >= _HIP_WMMA_MIN_ROWS and
+            y.dtype == torch.half and (y.is_contiguous() or
+                                       (y.dim() == 2 and y.stride(1) == 1 and y.stride(0) >= y.size(1) and y.stride(0) % 4 == 0)) and
+            os.environ.get("EXL3_MOE_WMMA", "1") != "0" and
+            not params.get("activate_all_experts") and
+            not params.get("reconstruct") and not params.get("autosplit_measure")
+        ):
+            sh_add = None
+            if (_nc2_shared_fuse() and self.shared_experts and not self.shared_gate and
+                    not self.shared_experts_post_norm and not self.tp_reduce and
+                    self.routed_post_norm is None and self.latent_out is None):
+                sh_params = {**params, "moe_valu": True} if _MOE_VALU else dict(params)
+                sh_params["nc2_down_half"] = True
+                sh_add = self.shared_experts.forward(x, sh_params)
+                if sh_add.dtype == torch.half and sh_add.is_contiguous():
+                    sh_add = sh_add.view(bsz, self.hidden_size)
+                    bc_sh_exp = True    # shared expert summed in below: skip the tail add
+                else:
+                    raise RuntimeError(f"EXL3_NC2_SHARED_FUSE: shared expert output {sh_add.dtype}, contiguous "
+                                       f"{sh_add.is_contiguous()}: fp16 contiguous needed")
+            final_hidden_states = self.mixed_k.prefill(
+                ext, y, selected_experts.contiguous(), routing_weights.float().contiguous(),
+                lambda a, e: _hip_wmma_workspace(self.device, a, self.hidden_size, self.intermediate_size_padded, e),
+                _scatter_expert_count if _moe_sync_free_count() else
+                (lambda flat, bins: torch.bincount(flat, minlength = bins)),
+                self.act_limit, self.hidden_size, self.intermediate_size_padded,
+                sh_add = sh_add, chunk = _MOE_ALIGN_CHUNK,
+            ).view(eshape)
+
         # Grouped WMMA prefill (gfx11.5): one launch per projection over all experts, trellis
         # decoded inside the GEMM; replaces the per-expert reconstruct + hgemm loop at prefill
         elif (
-            self.support_hip_wmma and bsz >= _HIP_WMMA_MIN_ROWS and
+            self.mixed_k is None and self.support_hip_wmma and bsz >= _HIP_WMMA_MIN_ROWS and
             y.dtype == torch.half and (y.is_contiguous() or                 # or a row-padded producer view
                                        (y.dim() == 2 and y.stride(1) == 1 and y.stride(0) >= y.size(1) and y.stride(0) % 4 == 0)) and
             os.environ.get("EXL3_MOE_WMMA", "1") != "0" and
@@ -1821,17 +2590,23 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 token_sorted = flat_token[order]
                 weight_sorted = flat_weight[order]
 
-                # Count how many assignments per expert. With few enough total assignments no
-                # expert can exceed the fused kernel's row capacity, so the readback (a CPU sync
-                # per layer, ~33% idle at MTP verify shapes) is skipped and everything is fused
+                # Count how many assignments per expert. With few enough tokens no expert can exceed
+                # the fused kernel's row capacity (an expert gets at most one row per token), so the
+                # readback (a CPU sync per layer, ~33% idle at MTP verify shapes) is skipped and
+                # everything is fused
                 if _moe_sync_free_count():
                     expert_count = _scatter_expert_count(flat_expert_local, E + 1)
                 else:
                     expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
-                if self.fused_mode_buffers is not None and num_tokens * top_k <= self.fused_rows:
+                if self.fused_mode_buffers is not None and \
+                        (num_tokens if SYNC_FREE_TOKENS else num_tokens * top_k) <= self.fused_rows:
                     expert_count_list = None
                 else:
                     expert_count_list = expert_count.tolist()
+
+                moeg = expert_count_list is not None and FUSED_DET and self._moeg_ok()
+                fused_cap = max(self.fused_rows, MOEG_ROWS) if moeg else self.fused_rows
+                self._fused_cap = fused_cap
 
                 # Tier plan: fused kernel for experts up to self.fused_rows rows, batched
                 # reconstruct groups above that up to the tile cap, per-expert reconstruct beyond
@@ -1843,8 +2618,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 else:
                     fused_total = 0
                     if self.fused_mode_buffers is not None:
-                        min_rows = self.fused_rows
-                        fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows)
+                        min_rows = fused_cap
+                        fused_total = sum(c for c in expert_count_list[:num_ex] if 0 < c <= fused_cap)
                     recon = self._batch_recon_layer(y)
                     if recon is not None:
                         lim = max(min_rows, TEMP_ROWS_GRAPH)
@@ -1863,6 +2638,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # call. Its traffic (written once by the GEMMs, read once by the gather) matches
                 # what the atomic index_add_ path moved
                 scratch = tables = inv_order = None
+                n_grouped = n_slots = 0
                 if FUSED_DET and (fused_total or groups):
                     A = flat_expert_local.shape[0]
                     inv_order = torch.empty_like(order).scatter_(
@@ -1880,18 +2656,25 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         base = np.zeros(E1, dtype = np.int64)
                         kind = np.zeros(E1, dtype = np.int64)
                         starts_np = np.cumsum([0] + expert_count_list[:-1]).astype(np.int64)
+                        gbase = np.zeros(E1, dtype = np.int64)
                         n_slots = 0
+                        n_grouped = 0
                         if self.fused_mode_buffers is not None:
                             for e in range(num_ex):
                                 c = expert_count_list[e]
-                                if 0 < c <= self.fused_rows:
-                                    base[e] = n_slots; kind[e] = 1; n_slots += c
+                                if 0 < c <= fused_cap:
+                                    if moeg and c >= MOEG_LO:
+                                        # Grouped tier: compact work rows, combined per token by the tier itself (kind 0 for the gather)
+                                        gbase[e] = n_grouped; n_grouped += c
+                                    else:
+                                        base[e] = n_slots; kind[e] = 1; n_slots += c
+                        self._fused_slots = n_slots
                         for grp in groups:
                             cmax = max(expert_count_list[e] for e in grp)
                             for b, e in enumerate(grp):
                                 base[e] = n_slots + b * cmax; kind[e] = 2
                             n_slots += len(grp) * cmax
-                        tables = torch.from_numpy(np.stack([base, starts_np, kind])).to(y.device, non_blocking = True)
+                        tables = torch.from_numpy(np.stack([base, starts_np, kind, gbase])).to(y.device, non_blocking = True)
                     scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
 
                 def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
@@ -1933,19 +2716,57 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         count_lo, count_hi, m_tile
                     )
 
+                def run_grouped(count_lo, count_hi):
+                    ext.exl3_moe_grouped(
+                        y,
+                        expert_count,
+                        tables[1],
+                        token_sorted,
+                        weight_sorted,
+                        self.activation_fn_idx,
+                        self.multi_gate.K,
+                        self.multi_up.K,
+                        self.multi_down.K,
+                        self.multi_gate.ptrs_trellis,
+                        self.multi_gate.ptrs_suh,
+                        self.multi_gate.ptrs_svh,
+                        self.multi_up.ptrs_trellis,
+                        self.multi_up.ptrs_suh,
+                        self.multi_up.ptrs_svh,
+                        self.multi_down.ptrs_trellis,
+                        self.multi_down.ptrs_suh,
+                        self.multi_down.ptrs_svh,
+                        self.act_limit,
+                        final_hidden_states,
+                        flat_expert_local,
+                        inv_order,
+                        tables[3],
+                        n_grouped,
+                        count_lo, count_hi, 64,
+                        self.fused_mode_buffers.temp_intermediate_g.shape[2]
+                    )
+
                 # num_active -1 = unknown (all fused), kernel launches at max concurrency
                 if self.fused_mode_buffers is not None:
                     if expert_count_list is None:
                         run_fused(-1)
                     else:
-                        counts = [c for c in expert_count_list[:num_ex] if 0 < c <= self.fused_rows]
+                        counts = [c for c in expert_count_list[:num_ex] if 0 < c <= fused_cap]
                         t1 = sum(1 for c in counts if MTILE_T1 < c <= MTILE_T2)
                         t2 = sum(1 for c in counts if c > MTILE_T2)
                         if self.mtile_ok and (t1 or t2):
                             # One launch per row tile over its expert range, largest first
                             t0 = len(counts) - t1 - t2
-                            if t2:
-                                run_fused(t2, MTILE_T2 + 1, self.fused_rows, 64)
+                            if t2 and moeg and scratch is not None:
+                                # Grouped GEMM tier for the experts above MOEG_LO rows, the persistent kernel keeps the rest
+                                tg = sum(1 for c in counts if c >= MOEG_LO)
+                                if tg:
+                                    run_grouped(MOEG_LO, max(counts))
+                                tm = t2 - tg
+                                if tm:
+                                    run_fused(tm, MTILE_T2 + 1, MOEG_LO - 1, 64)
+                            elif t2:
+                                run_fused(t2, MTILE_T2 + 1, fused_cap, 64)
                             if t1:
                                 run_fused(t1, MTILE_T1 + 1, MTILE_T2, 32)
                             if t0:
@@ -1961,7 +2782,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         scratch, tables)
 
                 # One fixed-order gather over every slot
-                if scratch is not None:
+                if scratch is not None and n_slots:
                     ext.exl3_moe_gather(final_hidden_states, scratch, flat_expert_local, inv_order,
                                         tables[1, :num_ex], tables[0, :num_ex], tables[2, :num_ex], weight_sorted)
 
@@ -1972,15 +2793,23 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 start = 0
 
                 # expert_count_list None: everything already handled by the fused kernel above
+                rwh_w = self._rwh_true_weights(z) if (_RWH and "capture" in params and params.get("activate_all_experts")) else None
                 for expert_idx in range(num_ex if expert_count_list is not None else 0):
                     count = expert_count_list[expert_idx]
                     end = start + count
-                    if count <= min_rows or expert_idx in batched:
+                    if count <= min_rows or expert_idx in batched or expert_idx in self.pruned:
                         start = end
                         continue
 
+                    if self.tier is not None and not params.get("autosplit_measure"):
+                        raise RuntimeError(f"{self.key}: tiered experts do not support the per-expert graph/DQ/torch path "
+                                           f"({count} rows on expert {expert_idx}); use the fused/grouped/WMMA paths")
                     top_x = token_sorted[start:end]
                     w = weight_sorted[start:end].unsqueeze(1)
+                    if rwh_w is not None:
+                        w_e = rwh_w[top_x, expert_idx]
+                        sel = (w_e > 0).nonzero().squeeze(1)
+                        params["_cap_rw"] = (sel, w_e[sel])
 
                     current_state = y.index_select(0, top_x)
 
@@ -2030,6 +2859,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                         current_state = mlp(expert_idx, current_state)
 
+                    params.pop("_cap_rw", None)
                     current_state.mul_(w)
                     final_hidden_states.index_add_(0, top_x, current_state)
                     start = end
@@ -2046,9 +2876,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # quantized paths apply), so this is the last tier
         else:
             assert bszn_eligible
-            self.bc.run_bszN(y, selected_experts, routing_weights)
+            # Shared experts: merged in the kernel from their 8-row graph, or above MAX_BSZN rows by the regular tail below
+            # (their R-row kernels; measured 1.2-2 ms/step faster at 10-32 rows than 8-row slices of the graph)
+            sh_in_bc = self.bc_sh_exp and bsz <= MAX_BSZN
+            self.bc.run_bszN(y, selected_experts, routing_weights, sh_in_bc)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
-            bc_sh_exp = self.bc_sh_exp
+            bc_sh_exp = sh_in_bc
 
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)
@@ -2094,7 +2927,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             else:
                 ext.add_sigmoid_gate(yh.float(), z.float(), final_hidden_states)
         elif self.shared_experts and not bc_sh_exp:
-            y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+            if side_y is not None:
+                cur = torch.cuda.current_stream(final_hidden_states.device)
+                cur.wait_event(_side(final_hidden_states.device)[2])
+                side_y.record_stream(cur)
+                y = side_y
+            else:
+                y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
             if pre_norm_reduce:
                 params["backend"].all_reduce(y, True)
             if self.shared_experts_post_norm:
@@ -2118,6 +2957,41 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
+
+
+    def _rwh_true_weights(self, z: torch.Tensor) -> torch.Tensor:
+        """[rows, E] float: the model's actual top-k routing weights (sigmoid scores renormalised over the picks, no
+        scaling), zero for unselected experts. Used to weight the per-expert calibration Hessians (EXL3_RWH)."""
+        cfg = self.routing_cfg
+        zz = z.view(-1, z.shape[-1])
+        logits = torch.matmul(zz, cfg.gate_tensor)[:, :self.num_experts].float()
+        scores = torch.sigmoid(logits)
+        top = torch.topk(scores, self.num_experts_per_tok, dim = -1)
+        wv = top.values / (top.values.sum(dim = -1, keepdim = True) + 1e-20)
+        out = torch.zeros_like(scores)
+        out.scatter_(1, top.indices, wv)
+        return out
+
+
+    def _row_chunk_ok(self) -> bool:
+        # bszN decode kernels exist (BC, CUDA) and no fused MoE kernel would take the rows (or only the 3INST one, which
+        # loses below _FUSED_3INST_MIN rows); ROCm has no BC object
+        return (self.bc is not None and (not self.support_fused or self.fused_3inst) and self.support_bc_bszn and not self.alt_residual_channel and
+                self.cpu_split_first is None and not self.cpu_offload and self.routing_device is None and self.tp_mode is None)
+
+
+    def _forward_row_chunks(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None) -> torch.Tensor:
+        # Each slice gets its own params: no fused residual add (the caller adds y) and its rows of a pre-computed routing
+        y = x.reshape(-1, x.shape[-1])
+        routed = params.pop("dec_routed", None)
+        outs = []
+        for a in range(0, y.shape[0], self.coop_rows):
+            sub = {k: v for k, v in params.items() if k != "mlp_residual_out"}
+            if routed is not None:
+                sub["dec_routed"] = (routed[0][a:a + self.coop_rows], routed[1][a:a + self.coop_rows])
+            o = self.forward(y[a:a + self.coop_rows].unsqueeze(0), sub, out_dtype)
+            outs.append(o.reshape(-1, o.shape[-1]).clone())   # the bszN output buffer is reused by the next slice
+        return torch.cat(outs).view(x.shape[:-1] + (outs[0].shape[-1],))
 
 
     def dec_norm_route(self, norm, xa: torch.Tensor, r: torch.Tensor, params: dict, rows: int = 1):
@@ -2197,7 +3071,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Also refuse above MAX_BSZN: prefill calls this with R = chunk size (hundreds+), where
         # R sequential single-row launches would be catastrophically slower than the batched
         # prefill path this falls back to -- this is not what the flag or the kernel is for.
-        if os.environ.get("EXL3_DEC_MOE_UNION", "0") == "0" or R > MAX_BSZN or not params.get("dflash_verify"):
+        if os.environ.get("EXL3_DEC_MOE_UNION", "0") == "0" or R > UNION_ROWS or not params.get("dflash_verify"):
             return None
         try:
             xa.view(R, -1)

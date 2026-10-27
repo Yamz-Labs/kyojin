@@ -53,3 +53,26 @@ def usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int | None 
     if cached_tokens is not None:
         out["prompt_tokens_details"] = {"cached_tokens": max(0, min(int(cached_tokens), prompt_tokens))}
     return out
+
+
+RQ_MIN_TOKENS = 2048   # smallest reply span a job holds pages for before it yields them (each yield costs a short re-prefill)
+
+
+def rq_budget(ctx: int | None, sessions: int, prompt_tokens: int, max_new: int, draft: int = 0, page: int = 256) -> int | None:
+    """Job `max_rq_tokens` for a request, or None to leave the generator's default.
+
+    The generator reserves the cache pages for prompt + max_new_tokens + 1 + draft when a job starts, so a request that
+    allows a reply as long as the context (no max_tokens) takes every page and the other sessions wait for it to end.
+    With several sessions each job holds pages for its fair share of the context (ctx // sessions rounded down to pages, at
+    least RQ_MIN_TOKENS of reply) and, if the reply goes on, the generator requeues it: the pages are released, the job re-enters the queue
+    at the front and takes the pages again when they are free (the full pages are found by hash, only the tail is prefilled).
+    A lone request therefore still reaches the end of the context; a reply that fits the share is untouched.
+    None for one session (nothing competes) and when the whole reply fits the share."""
+    if sessions <= 1 or not ctx:
+        return None
+    room = ctx // page * page - prompt_tokens          # slots the page table can give this prompt's reply
+    share = ctx // sessions // page * page - prompt_tokens   # the same for a whole number of pages of the fair share
+    budget = min(max(share, RQ_MIN_TOKENS), room)
+    if budget < 1 or max_new + 1 + draft <= budget:
+        return None
+    return budget

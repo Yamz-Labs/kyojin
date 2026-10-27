@@ -9,6 +9,7 @@ def ck(c): return "500K" if int(c) == 499712 else f"{int(c) // 1024}K"   # 49971
 def b(m, v): return v if m.get("earlier") else f"<b>{v}</b>"
 def label(m): return f'{m["name"]} <sub>({m["earlier"]})</sub>' if m.get("earlier") else f'<b>{m["name"]}</b>'
 rows = "".join(f'<tr><td>{label(m)}</td><td align="right">{m["pack_gb"]:g} GB</td><td align="right">{m["table"]["prefill"]}</td><td align="right">{b(m, m["table"]["decode"])}</td></tr>\n' for m in F["models"])
+rows += "".join(r + "\n" for r in F.get("readme_extra_rows", []))   # rows with no chart curves (DeepSeek-V4.1-Flash)
 table = ('<table align="center">\n<tr><th align="left">Model</th><th>Pack</th><th>Prefill</th><th>Speculative decode</th></tr>\n' + rows + '</table>')
 CT = sorted({int(c) for m in F["models"] for c in m["prefill"]})
 in_main = F["models"]
@@ -46,8 +47,9 @@ def long_block():
     pts = [131072, 262144, 499712]
     ms = [m for m in F["models"] if all(str(c) in m["prefill"] and m["decode"].get(str(c)) for c in pts)]
     if not ms: return ""
+    # the release the figures were measured on (figures.json), not the version of the tree the README is built from
     vf = os.path.join(root, "exllamav3", "version.py")
-    ver = re.search(r'"([^"]+)"', open(vf).read()).group(1) if os.path.exists(vf) else F.get("version", "")
+    ver = F.get("version") or (re.search(r'"([^"]+)"', open(vf).read()).group(1) if os.path.exists(vf) else "")
     t = '<table align="center">\n<tr><th align="left">Model</th>' + "".join(f"<th>{ck(c)}</th>" for c in pts) + "</tr>\n"
     for m in ms:
         t += f'<tr><td>{label(m)}</td>' + "".join(f'<td align="right">{f(m["prefill"][str(c)])} / {f(m["decode"][str(c)])}</td>' for c in pts) + "</tr>\n"

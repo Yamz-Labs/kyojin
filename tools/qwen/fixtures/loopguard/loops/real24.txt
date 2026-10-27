@@ -1,0 +1,77 @@
+We need to respond to user: "Write a funny riddle in Hindi, about a man named Aarav who never spoke. Your entire response should be written in Hindi. Also, you cannot use any commas in your entire response."
+
+Need output only Hindi, no commas. Need likely riddle. Must ensure no commas anywhere. Need maybe avoid punctuation? Commas forbidden. Can use question mark? Probably okay. Hindi script? Entire response in Hindi. Could include no commas. Need funny riddle about Aarav who never spoke. Maybe:
+
+"एक आरव था चुपचाप बैठा रहता था।
+उसने एक शब्द भी नहीं बोला।
+फिर भी लोग उसे क्यों सुनते थे?
+क्योंकि वह रेडियो बनकर बजता था।"
+
+No commas. But "बोला।" okay. Need no commas. Ensure Hindi. Funny riddle. Maybe more riddle-ish: "वह आरव जो कभी नहीं बोला... लोग उसे कैसे सुनते?" Answer: "वह चुपचाप टेलीविजन देखता था"? Need funny.
+
+Need no commas. Could use question mark. Entire response Hindi. Maybe only one line? Need no commas. Check for comma character. Also avoid Devanagari virama? Commas only English comma? User says cannot use any commas. Avoid "," and maybe Hindi comma? There is no separate. Use periods, newlines, question marks.
+
+Potential final:
+"आरव कभी नहीं बोला फिर भी पूरा गाँव उसे सुनता था
+लोग हैंरान थे
+बताना पहाड़ी का रहस्य
+उत्तर
+वह चुपचाप रेडियो सुन रहा था"
+
+This is riddle maybe not answer? Could include answer. Need funny. But no commas. Need ensure all Hindi. "हैंरान" typo? "हैरान". Better:
+
+"आरव कभी नहीं बोला फिर भी पूरा गाँव उसे सुनता था
+लोग हैरान थे
+बताओ यह कैसे
+उत्तर
+वह चुपचाप रेडियो पर गा रहा था"
+
+But if he never spoke but sang? funny. Maybe "रेडियो बनकर". Riddle: "आरव कभी नहीं बोला फिर भी पूरा कमरा उसे सुनता था
+उत्तर
+वह चुपचाप टीवी देख रहा था और लाउडस्पीकर था"
+
+Need no commas. Could use only Hindi words. Also avoid English punctuation? question mark okay. Need no commas.
+
+Maybe:
+"आरव कभी नहीं बोला फिर भी सब उसे सुनते थे
+पहली बार बोला तो लोग डर गए
+क्यों
+क्योंकि वह बंद टेलीविजन था और लाउडस्पीकर में आवाज़ थी"
+
+Too long. Need funny riddle. "आरव कभी नहीं बोला फिर भी पूरा कमरा गूंजता था जब भी कोई बटन दबाता था।" No comma. Riddle and answer: "आरव कभी नहीं बोला फिर भी पूरा कमरा उसे सुनता था
+जब कोई बटन दबाता था
+क्यों
+क्योंकि वह चुपचाप रेडियो था"
+
+But "बटन दबाता था" no comma. Fine. Entire response Hindi. Maybe answer obvious.
+
+Need be careful no commas. Could include no punctuation except newlines and question mark. Need not use commas.
+
+Maybe final:
+"आरव कभी नहीं बोला फिर भी पूरा गाँव उसे सुनता था
+उत्तर
+वह चुपचाप रेडियो था"
+
+This is funny? Maybe too short. Need riddle. "आरव कभी नहीं बोला फिर भी लोग उसे सुनते थे जब वह खड़ा था नहीं बटा" no comma. Could be "आरव कभी नहीं बोला फिर भी लोग उसे सुनते थे जब वह चुप था" no. Need funny.
+
+Could include:
+"आरव कभी नहीं बोला फिर भी पूरा घर उसे सुनता था
+जब कोई बटन दबाता था
+उत्तर
+वह चुपचाप रेडियो था"
+
+Need no commas. Ensure Hindi all. "घर" Hindi. Good.
+
+Could user ask funny riddle, likely only response no commas. Maybe one riddle with answer. Ensure no comma char. Also maybe question mark. Let's final with question mark. No commas.
+
+"आरव कभी नहीं बोला फिर भी पूरा कमरा उसे सुनता था
+जब कोई बटन दबाता था
+क्यों
+क्योंकि वह चुपचाप रेडियो था"
+
+No commas. Funny? Yes.
+
+Need final only Hindi. Ensure no commas in analysis? final only. Use newline no comma. Good.</think>आरव कभी नहीं बोला फिर भी पूरा कमरा उसे सुनता था
+जब कोई बटन दबाता था
+क्यों
+क्योंकि वह चुपचाप रेडियो था
