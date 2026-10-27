@@ -56,6 +56,8 @@ def test_every_knob_is_read_through_the_helper():
 
 def test_module_state_follows_and_restores():
     from exllamav3.modules.attention_fn import bc_attn, qdec_cuda, triton_paged as tp
+    if not hasattr(bc_attn, "_kvwin_bc"):
+        pytest.skip("this tree has no EXL3_BC_KVWIN lever")
     base = (bc_attn._kvwin_bc, qdec_cuda.ENABLED, qdec_cuda.ROWS_MODE, qdec_cuda.GRAPH_ENABLED, tp._pf_waves_per_eu, tp._pf_ck_mode)
     eff = knobs.set_knobs({"EXL3_BC_KVWIN": "0", "EXL3_QDEC": "0", "EXL3_QDEC_ROWS": "2", "EXL3_QDEC_GRAPH": "0",
                            "EXL3_PF_WAVES_PER_EU": 4, "EXL3_PF_CK": "0"})

@@ -18,7 +18,7 @@ except top-k selection (random keys give the realistic score spread of a long do
 The speculative drafter is NOT loaded: spec-off and verify are the target model's cost; MTP acceptance is content.
 Run inside:  flock ~/ds41_work/gpu.lock ~/ds41_work/cur1510/quiet.sh ...  (needs ~110 GiB free for GLM).
 """
-import argparse, ast, collections, json, os, sys, time
+import argparse, ast, collections, hashlib, json, os, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PAGE = 256
@@ -57,6 +57,8 @@ def _main():
     ap.add_argument("--no-decode", action="store_true")
     ap.add_argument("--min-avail-gb", type=float, default=10.0)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--arm", action="append", default=[], help="NAME:K=V,K2=V2 (repeatable): A/B arms of exllamav3.util.knobs switched in this ONE load")
+    ap.add_argument("--order", default="", help="visit order of the arms, e.g. ABBAAB (default: each arm once, in the order given)")
     args = ap.parse_args()
     if args.serve != "none":
         for k, v in served_env(args.serve).items():
@@ -164,22 +166,55 @@ def _main():
     med = lambda x: sorted(x)[len(x) // 2]
     for d in depths:
         RES["points"][str(d)] = {}
-    if not args.no_decode:
+    def decode_points(P, hashes=None):
+        """decode and verify rows at depth d into P; hashes (arm runs) gets the md5 of the first step's last-row logits"""
+        for label, ids, n_rows in (("decode", one, 1), ("verify", rows, R)):
+            ver = label == "verify"
+            fresh(d)
+            timed_steps(ids, d, 3, ver)                  # graph capture / JIT / allocator at this length
+            fresh(d)
+            if hashes is not None:
+                hashes[label] = hashlib.md5(fwd(ids, d, verify=ver)[0, -1].float().cpu().numpy().tobytes()).hexdigest()[:12]
+                fresh(d)
+            ts = timed_steps(ids, d, args.steps, ver)
+            P[label] = {"ms": round(1e3 * med(ts), 3), "ms_min": round(1e3 * min(ts), 3), "rows": n_rows,
+                        "tok_s_per_row": round(n_rows / med(ts), 2)}
+            if args.kernels:
+                fresh(d)
+                P[label]["window"] = window(lambda: [fwd(ids, d + k, verify=ver) for k in range(4)], 4)
+
+    if not args.no_decode and not args.arm:
         for d in depths:
             P = RES["points"][str(d)]
-            for label, ids, n_rows in (("decode", one, 1), ("verify", rows, R)):
-                ver = label == "verify"
-                fresh(d)
-                timed_steps(ids, d, 3, ver)                  # graph capture / JIT / allocator at this length
-                fresh(d)
-                ts = timed_steps(ids, d, args.steps, ver)
-                P[label] = {"ms": round(1e3 * med(ts), 3), "ms_min": round(1e3 * min(ts), 3), "rows": n_rows,
-                            "tok_s_per_row": round(n_rows / med(ts), 2)}
-                if args.kernels:
-                    fresh(d)
-                    P[label]["window"] = window(lambda: [fwd(ids, d + k, verify=ver) for k in range(4)], 4)
+            decode_points(P)
             print(f"[dec] depth {d}: decode {P['decode']['ms']} ms, verify({R} rows) {P['verify']['ms']} ms", flush=True)
             guard(f"decode@{d}"); save()
+    if not args.no_decode and args.arm:
+        from exllamav3.util import knobs
+        arms = {}
+        for spec in args.arm:
+            name, _, kv = spec.partition(":")
+            arms[name] = {k: (None if v in ("", "default") else v) for k, _, v in (i.partition("=") for i in kv.split(",") if i)}
+        order = args.order or "".join(arms)
+        names = {k for a in arms.values() for k in a}
+        RES["arms"] = {a: {"knobs": arms[a], "visits": []} for a in arms}
+        for n, a in enumerate(order):
+            knobs.set_knobs({k: arms[a].get(k) for k in sorted(names)})        # one load: graphs and caches are dropped when a value changes
+            visit = {"n": n, "points": {}}
+            for d in depths:
+                P, H = {}, {}
+                decode_points(P, H)
+                P["md5"] = H
+                visit["points"][str(d)] = P
+                print(f"[dec] visit {n} arm {a} depth {d}: decode {P['decode']['ms']} ms ({H['decode']}), verify({R} rows) {P['verify']['ms']} ms ({H['verify']})", flush=True)
+                guard(f"decode@{d}"); save()
+            RES["arms"][a]["visits"].append(visit)
+        knobs.set_knobs({k: None for k in names})
+        for a in arms:
+            for d in depths:
+                vs = [v["points"][str(d)] for v in RES["arms"][a]["visits"]]
+                print(f"[arm {a}] depth {d}: decode {med([v['decode']['ms'] for v in vs])} ms  verify {med([v['verify']['ms'] for v in vs])} ms  "
+                      f"md5 {'stable' if all(v['md5'] == vs[0]['md5'] for v in vs) else 'UNSTABLE'} {vs[0]['md5']}", flush=True)
     if not args.no_prefill:
         fresh(depths[0])
         for _ in range(1):
