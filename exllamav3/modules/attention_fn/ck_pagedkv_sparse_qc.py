@@ -17,7 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .ck_pagedkv import _supported_device
+from .ck_pagedkv import _supported_device, kernel_or_none
 from .qwrite_triton import _h32_stage
 
 _page = 256
@@ -82,6 +82,12 @@ def _dequant8_pages_pad(qk, sk, qv, sv, pages, out_k, out_v, G, G_PAD):
 # Persistent, grow-only staging buffers, one pair per device. Capacity is in PAGES; the buffers
 # are never shrunk so the torch allocator sees a stable working set once warm.
 _STAGE = {}
+_STAGE_STEP_PAGES = 128   # grow in steps of 128 pages (32K tokens, about 50 MiB per buffer): few reallocations, no fragmentation
+
+
+def _stage_capacity(n_pages, pool_pages):
+    """Pages to stage for a request needing n_pages: rounded up to a step, never beyond the cache pool."""
+    return min(pool_pages, -(-n_pages // _STAGE_STEP_PAGES) * _STAGE_STEP_PAGES)
 
 
 def _stage_buffers(dev, cap_pages, vals_per_token):
@@ -132,7 +138,7 @@ def fn_ck_paged_attn_sparse_qc(args):
     """
     from .ck_pagedkv_sparse import _stats as sparse_stats, _page, select_pages, fn_ck_paged_attn_sparse
 
-    if not _owned_qc(args):
+    if not _owned_qc(args) or kernel_or_none() is None:
         return None
     qk, sk, qv, sv, k_bits, v_bits = args.q_cache
     if k_bits != 8 or v_bits != 8:
@@ -167,7 +173,7 @@ def fn_ck_paged_attn_sparse_qc(args):
     vals = G * 32                       # fp16 values per staged token (768)
     dev = q.device
 
-    st = _stage_buffers(dev, n_pages_needed, vals)
+    st = _stage_buffers(dev, _stage_capacity(n_pages_needed, max(P, n_pages_needed)), vals)
     cap_pages = st["k"].shape[0] // 256
     if st["ident"] is None or st["ident"].shape[0] < cap_pages:
         st["ident"] = torch.arange(cap_pages, dtype=torch.int32, device=dev)

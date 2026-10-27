@@ -64,7 +64,7 @@ def _entry_points():
     ext = SimpleNamespace(paged_kv_cache_update=_forbidden("cache update"))
     dense = _load("ck_pagedkv.py", ("_supported_device", "owns", "fn_ck_paged_attn"),
                   {"torch": torch, "ext": ext, "_PAGE": 256,
-                   "_kernel": _forbidden("native"),
+                   "_kernel": _forbidden("native"), "kernel_or_none": lambda: object(),
                    "_stats": {"accepted": 0, "rejected": 0}})
     sparse = _load(
         "ck_pagedkv_sparse.py",

@@ -89,6 +89,16 @@ def _stage_function(allocator):
     return namespace["_stage_buffers"], namespace["_STAGE"]
 
 
+class StageCapacityTests(unittest.TestCase):
+    def test_capacity_steps_up_and_stops_at_the_pool(self):
+        path, function = _function("ck_pagedkv_sparse_qc.py", "_stage_capacity")
+        namespace = {"min": min, "_STAGE_STEP_PAGES": 128}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+        capacity = namespace["_stage_capacity"]
+        self.assertEqual([capacity(n, 512) for n in (1, 128, 129, 300, 512)], [128, 128, 256, 384, 512])
+        self.assertEqual(capacity(130, 140), 140)
+
+
 class _InertTensor:
     def __init__(self, shape):
         self.shape = shape

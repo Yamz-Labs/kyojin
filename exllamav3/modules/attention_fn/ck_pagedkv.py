@@ -16,12 +16,12 @@ from pathlib import Path
 
 import torch
 
-from ...ext import exllamav3_ext as ext
 from .common import AttnArgs
 
 _PAGE = 256
 _fn: ctypes._CFuncPtr | None = None
 _stats = {"accepted": 0, "rejected": 0}
+_unavailable: str | None = None   # why the native library cannot be used; set once, then every call declines
 
 
 def ck_library_path() -> Path:
@@ -68,6 +68,23 @@ def _kernel() -> ctypes._CFuncPtr:
     return _fn
 
 
+def kernel_or_none() -> ctypes._CFuncPtr | None:
+    """The native entry point, or None (with one warning) if the library is missing or does not load.
+
+    The caller declines to the normal attention backend instead of raising, so a missing build never takes a
+    request down.
+    """
+    global _unavailable
+    if _unavailable is not None:
+        return None
+    try:
+        return _kernel()
+    except (RuntimeError, OSError, AttributeError) as exc:
+        _unavailable = str(exc)
+        print(f"[ck_pagedkv] disabled, using the normal attention backend: {exc}", flush=True)
+        return None
+
+
 def owns(args: AttnArgs) -> bool:
     return (
         _supported_device(args.q.device)
@@ -94,6 +111,11 @@ def fn_ck_paged_attn(args: AttnArgs) -> torch.Tensor | None:
         _stats["rejected"] += 1
         return None
 
+    kernel = kernel_or_none()
+    if kernel is None:
+        return None
+    from ...ext import exllamav3_ext as ext
+
     q, k, v = args.q, args.k, args.v
     k_cache, v_cache = args.k_cache, args.v_cache
     block_table, cache_seqlens = args.block_table, args.cache_seqlens
@@ -111,12 +133,13 @@ def fn_ck_paged_attn(args: AttnArgs) -> torch.Tensor | None:
     value_stride = int(k_cache.shape[3])
     out = torch.zeros(1, q_len, 64, value_stride, device=q.device, dtype=torch.float16)
     lengths = torch.tensor([total_kv], dtype=torch.int32, device=q.device)
-    result = _kernel()(
+    result = kernel(
         q.data_ptr(), k_canonical.data_ptr(), v_canonical.data_ptr(), out.data_ptr(),
         identity_table.data_ptr(), lengths.data_ptr(), q_len, total_kv, pages_needed,
         float(args.sm_scale), 0, value_stride, torch.cuda.current_stream().cuda_stream, 0,
     )
     if result < 0:
-        raise RuntimeError(f"CK paged-prefill kernel rejected the supported shape (rc={result})")
+        _stats["rejected"] += 1
+        return None   # the cache rows are already written (same data again on the fallback path)
     _stats["accepted"] += 1
     return out

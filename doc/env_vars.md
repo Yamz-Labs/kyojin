@@ -144,9 +144,10 @@ affects quantized caches.
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
   decode path reads the packed cache directly.
 
-### `EXL3_CK_PAGEDKV` (default: unset)
+### `EXL3_CK_PAGEDKV` (default: unset) -- EXPERIMENTAL
 
-Optional Composable Kernel sparse prefill for the MiMo global-attention shape on a gfx1151 ROCm
+Experimental, off by default, and approximate: sparse prefill skips part of the past pages, so output and the
+K/V it writes differ from the normal path. Optional Composable Kernel sparse prefill for the MiMo global-attention shape on a gfx1151 ROCm
 system. Set to `sparse` before importing the engine to register handlers for both fp16 and 8-bit
 KV caches. The handlers own only batch-one, causal Q/K=192, 64-query-head/4-KV-head, V=128
 prefill chunks; every other shape, decode step, SWA layer, and unaligned past length falls back
@@ -176,6 +177,12 @@ set `EXL3_CK_PAGEDKV_SO="$EXL3_CK_CACHE/libck_pagedkv.so"` before importing the 
 success proves source compilation/linking and export checks only, not native loading or
 numerical correctness. The first implementation stages all used K and V pages from an 8-bit
 cache; selected-V-only staging is not implemented yet.
+
+If the library is missing or does not load, one warning is printed and the normal backend stays in place; a kernel
+rejection at run time also falls back to the normal backend for that chunk. The MiMo server tags its slot files
+with `+ck-sparse` in this mode, so approximate slots are never restored into a normal session (and the reverse).
+Pages cached inside a running sparse process are approximate for the life of that process: restart without the
+flag for exact serving. The 8-bit staging buffer grows in steps of 128 pages (32K tokens), capped at the cache pool.
 
 ### `EXL3_CK_SPARSE_RETAIN` (default: `0.5`)
 

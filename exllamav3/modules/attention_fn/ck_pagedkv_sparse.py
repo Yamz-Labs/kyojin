@@ -13,8 +13,7 @@ import os
 
 import torch
 
-from ...ext import exllamav3_ext as ext
-from .ck_pagedkv import _kernel, _PAGE as _page, _supported_device
+from .ck_pagedkv import kernel_or_none, _PAGE as _page, _supported_device
 
 _stats = {"dense": 0, "sparse": 0, "declined": 0}
 
@@ -76,6 +75,12 @@ def fn_ck_paged_attn_sparse(args, keep_past_pages):
         _stats["declined"] += 1
         return None
 
+    kernel = kernel_or_none()
+    if kernel is None:
+        _stats["declined"] += 1
+        return None
+    from ...ext import exllamav3_ext as ext
+
     q = args.q
     k = args.k
     v = args.v
@@ -104,14 +109,15 @@ def fn_ck_paged_attn_sparse(args, keep_past_pages):
     head_pad = int(k_cache.shape[3])
     o = torch.zeros(1, q_len, 64, head_pad, device=q.device, dtype=torch.float16)
     skl = torch.tensor([s_k_compact], dtype=torch.int32, device=q.device)
-    t = _kernel()(
+    t = kernel(
         q.data_ptr(), kcan.data_ptr(), vcan.data_ptr(), o.data_ptr(),
         bt_id.data_ptr(), skl.data_ptr(),
         q_len, s_k_compact, n_pages, float(args.sm_scale), 0, head_pad,
         torch.cuda.current_stream().cuda_stream, 0,
     )
     if t < 0:
-        raise RuntimeError(f"ck_pagedkv kernel rejected (rc={t})")
+        _stats["declined"] += 1
+        return None   # the new rows are already in the cache; the normal backend writes the same data
     _stats["sparse"] += 1
     return o
 
@@ -402,7 +408,7 @@ def fn_ck_paged_attn_sparse_auto(args, retain=None, n_sink=None, n_local=None, p
     """
     # Ownership FIRST: a shape the sparse path does not own must fall through to the dense
     # handler without the selector having done any work.
-    if not _owned(args):
+    if not _owned(args) or kernel_or_none() is None:
         return None, None
 
     retain = float(os.environ.get("EXL3_CK_SPARSE_RETAIN", "0.5")) if retain is None else retain
