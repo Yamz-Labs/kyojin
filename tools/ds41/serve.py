@@ -143,6 +143,26 @@ ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/v
           "/v1/ds41/score": ("POST",)}
 
 
+def _memlog(prompt_tokens: int, new_tokens: int) -> None:
+    """DS41_MEMLOG=<csv>: one row per finished request (host and torch memory), to chase memory growth."""
+    path = os.environ.get("DS41_MEMLOG")
+    if not path:
+        return
+    import glob
+    import time
+    import torch
+    mi = {k: int(v.split()[0]) // 1024 for k, v in (ln.split(":") for ln in open("/proc/meminfo")) if k in ("MemAvailable", "SwapFree")}
+    rss = int([ln for ln in open("/proc/self/status") if ln.startswith("VmRSS")][0].split()[1]) // 1024
+    gtt = sum(int(open(f).read()) for f in glob.glob("/sys/class/drm/card*/device/mem_info_gtt_used")) // 2**20
+    new = not os.path.exists(path)
+    with open(path, "a") as f:
+        if new:
+            f.write("t,prompt,new,mem_avail_mib,swap_free_mib,rss_mib,gtt_mib,torch_alloc_mib,torch_reserved_mib,torch_peak_reserved_mib\n")
+        f.write(f"{time.time():.0f},{prompt_tokens},{new_tokens},{mi['MemAvailable']},{mi['SwapFree']},{rss},{gtt},"
+                f"{torch.cuda.memory_allocated() >> 20},{torch.cuda.memory_reserved() >> 20},{torch.cuda.max_memory_reserved() >> 20}\n")
+    torch.cuda.reset_peak_memory_stats()
+
+
 def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> web.Application:
     """Build the HTTP layer around an engine (the real one, or ds41_engine.StubEngine in tests)."""
     defaults = defaults or Defaults()
@@ -222,6 +242,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
             raise web.HTTPBadRequest(reason=str(exc)) from exc
 
     def observe(st: dict[str, Any], prompt_tokens: int) -> None:
+        _memlog(prompt_tokens, int(st.get("new_tokens", 0)))
         num_draft = int(getattr(getattr(engine, "greedy_generator", None), "num_draft_tokens", 0) or 0)
         accepted = int(st.get("accepted_draft_tokens", 0))
         rejected = int(st.get("rejected_draft_tokens", 0))

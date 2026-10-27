@@ -359,6 +359,9 @@ class PortEngine:
         if os.environ.get("DS41_PFX_LOG") == "1":
             print(f"[prefix] prompt={len(ids)} cached={stats.get('cached_tokens', 0)} lcp_miss={stats.get('prefix_lcp', 0)} "
                   f"store={len(store) if store is not None else 0}x{(store.nbytes() >> 20) if store is not None else 0}MiB", file=sys.stderr, flush=True)
+        if os.environ.get("DS41_EMPTY_CACHE", "1") != "0":
+            import torch
+            torch.cuda.empty_cache()    # hand the prefill workspace back: the caching allocator would keep the largest request's blocks
         t1 = time.perf_counter()
         t_first = t_first or t1
         stats.update({"cached_tokens": stats.get("cached_tokens", 0), "new_tokens": n_new, "prompt_tokens": len(ids),
