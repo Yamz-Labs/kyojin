@@ -851,6 +851,7 @@ class ExpertStore:
         remaining = max(self.budget - used, 0)
         tot = sum(c.total_bytes for c in new)
         dev = self.device
+        alloc_pace = float(os.environ.get("EXL3_EXPERT_ALLOC_GIBPS", "6")) * (1 << 30)   # pool allocation pace, bytes/s (0 = unpaced)
         shares = self._split_budget(new, remaining)
         for c in new:
             share = shares[c.cid]
@@ -862,6 +863,8 @@ class ExpertStore:
             for i in range(nch):
                 n = min(c.spc, c.nslots - i * c.spc)
                 c.chunks.append(torch.empty(n * c.slot_bytes, dtype = torch.uint8, device = dev))
+                if alloc_pace:
+                    time.sleep(c.chunks[-1].numel() / alloc_pace)   # a 90 GiB pool in 5 s reads as a memory runaway to host watchdogs
             c.slot_addr = np.array(
                 [c.chunks[s // c.spc].data_ptr() + (s % c.spc) * c.slot_bytes for s in range(c.nslots)], dtype = np.int64)
             c.owner_layer = np.full(c.nslots, -1, dtype = np.int32)
@@ -950,6 +953,7 @@ class ExpertStore:
         need = max(c.entry_bytes for c in self.classes.values())
         ring = self.ring_n * _ceil(need, ALIGN)
         cap = float(os.environ.get("EXL3_EXPERT_BUDGET_MAX_GIB", "inf")) * (1 << 30)
+        print(f" -- expert store: auto budget inputs: free {free / 2**30:.1f} GiB, reserve {self.reserve_gib:.1f} GiB, ring {ring / 2**30:.1f} GiB", flush = True)
         return int(max(min(free - self.reserve_gib * (1 << 30) - ring, cap), 0))
 
     def _fd(self, fid: int) -> int:
