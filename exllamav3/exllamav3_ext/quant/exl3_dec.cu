@@ -2698,7 +2698,14 @@ static void dec_gemv_r_impl
     // 5..8 rows only (the <= 4 row launches keep their grid); 9..32 rows swap by default (EXL3_GEMV_R_SWAP9=0 restores the plain grid):
     // the chunks of one weight block then run side by side and share its reads through L2 instead of re-streaming the weights per chunk
     jobs.swap = (env_int("EXL3_GEMV_R_CHUNK_FAST", 0) != 0 || (R > MOE_R_MAX && env_int("EXL3_GEMV_R_SWAP9", 1) != 0)) && R > 4 && R > rpb;
-    jobs.arr1 = env_int("EXL3_GEMV_R_ARR1", 1) != 0;
+    // EXL3_GEMV_R_ARR1 (default 1): one cross-block arrival per block instead of one per row. It uses ONE counter slot per
+    // strip (row 0's), so it is only sound when a block carries ALL rows of the job, i.e. a single chunk (nch = 1). With
+    // nch > 1 every chunk adds its own kbs arrivals to that same slot: the target is reached early and the barrier opens
+    // on a partially written partial buffer. Measured 2026-10-28 on a Qwen27 HIP 7-row verify: at 7 rows some matrices take
+    // the wide8 launch (nch 1) and others the two-chunk 4-row one (nch 2) -> the same verify repeated gave 3/3 distinct
+    // logits md5 (ARR1=1) vs 3/3 identical with ARR1=0, and the same at 8 rows. Rows <= 6 and the 9..32 row chunked launches
+    // all keep one chunk per block only when R <= rpb, so gate on exactly that.
+    jobs.arr1 = env_int("EXL3_GEMV_R_ARR1", 1) != 0 && R <= rpb;
     jobs.x_row_pitch = Kdim;
     int blocks = 0, part = 0, ctr = 0;
     for (int i = 0; i < n; ++i)
