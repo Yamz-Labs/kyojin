@@ -1400,8 +1400,18 @@ class Attention(Module):
                 cs_host = params.get("cache_seqlens")
                 if isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and cs_host.numel():
                     max_kv_len = int(cs_host.max())
+            # TurboQuant cache: the many-row kernel (cu/qdec_rows.cu) serves every row count 1..32 as one program per kv
+            # head (verified against the dequantized reference, relerr 0.7-1.9e-3), so the R verify rows run as ONE batched
+            # call like the quantized cache does through the BC graph path. The per-row loop below is a bitwise
+            # row-invariance device and costs R x the attention time (128K MTP verify: 49.3 ms/step of 98.0 vs 12.0 of
+            # 59.0 for the quant cache). EXL3_TQ_VERIFY_LOOP=1 keeps the loop.
+            tq_batch = False
+            if 1 < seqlen <= MAX_BSZN_GEMV_R and ov is None and os.environ.get("EXL3_TQ_VERIFY_LOOP", "0") == "0":
+                from ..cache import CacheLayer as _CLv
+                _lyr = cache if isinstance(cache, _CLv) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+                tq_batch = bool(getattr(_lyr, "tq", False))
             if (
-                1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and
+                1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and not tq_batch and
                 os.environ.get("EXL3_VERIFY_ATTN_LOOP", "0") != "0"
             ):
                 # Row-invariant verify: the R-row paged decode tiles the KV span from the batch's single
