@@ -38,7 +38,8 @@ The default (`--kv-mode quant` or nothing) is unchanged. A pack that went throug
   tq6 / tq5 once per model. The default format is kw6 when its KL is <= 0.9 x k6v6's (a 256-step doc scatters 10-30 %: a tie stays on
   k6v6), written to `kv_cache.json` as `kvwin: "4:128"` (`serve.py --kvwin`, sets `EXL3_KVWIN` before the model is built). tq6 / tq5 are
   measured and reported but stay opt-in (`--kv-mode tq`); `QUALIFY_KV_TQ=1` lets them win (fewest bytes among the formats within the
-  margin, a narrower one only if every wider one qualifies). `--no-kv-modes` skips the stage. The report also lists decode s/token per format.
+  margin, a narrower one only if every wider one qualifies). A model whose attention cannot hold a TurboQuant cache (QSA sparse attention, see below)
+  records tq6 / tq5 as `unsupported` and never picks them. The log-probs of the stage are kept in fp32 so close formats stay apart. `--no-kv-modes` skips the stage. The report also lists decode s/token per format.
 
 Qualify cells, RTX 3090, one 256-step 32K doc, KL vs k8v8 (decode s/tok): Nanbeige k6v6 .00495 (.0356) | kw6 .00267 (.0361) | tq6 .00251 | tq5 .00456
 -> kw6. Qwen27 k6v6 .00515 | kw6 .0478 | tq6 .0293 | tq5 .0061 -> k6v6 (one doc, noisy: the same doc gave tq6 .0125 before the kernel change).
@@ -62,3 +63,21 @@ production k6v6 on that model is the ring, not the codebook; k6v6 + ring is as g
 Served A/B, same session (decode tok/s, median of 3): 4K / 32K / 120K k6v6 46.29 / 44.20 / 37.45 | kw6 46.13 / 43.75 / 38.02 | tq6 45.68 / 43.33 / 37.24
 (tq6 vs kw6: -1.0 / -1.0 / -2.1 %). One 32K decode step is 27.2 ms of GPU time; tq6 adds ~0.32 ms over the same ring (q/k/v rotation 0.14, writer 0.10
 more than the quant writer, qdec 0.08), the ring itself ~0.30 ms in both kw6 and tq6.
+
+## Default status (28/10, branch feature/tq-default): NOT flipped
+
+tq stays opt-in (`--kv-mode tq`). The gate "tq6 >= the per-32 cache on speed and quality for every box model" is not met: the Qwen3.8 QSA lane
+cannot hold a TurboQuant cache at all, GLM (MLA) and MiMo (head dim 192) have no TQ path, no box model has a tq KL measurement, and tq6 still
+trails k6v6 at T1 (launch work; hd128 at 128K: about 0.85-1.0 vs 0.63 ms per layer). Qualify always passes `--kv-mode` explicitly.
+
+Known limits:
+* QSA models (Qwen3.8-Flash-Next family): `Attention.cache_layer_type` maps every quant layer to `CacheLayer_qsa_quant`, so `--kv-mode tq`
+  there is the plain quant cache (identical KL to k6v6 in the qualify run). Serve and qualify now say so (`tq.cache_is_tq`). A real fix needs
+  a `CacheLayer_qsa_tq` plus codebook loads in the QSA sparse split kernel.
+* MLA/DSA (GLM) keeps the fp16 latent cache, and head dim 192 (MiMo) has no codebook.
+
+HIP decode kernel (box, Strix Halo, per layer at 128K, hd 256, 2 KV heads, 24 q heads): verify steps of 5..8 rows now run as row chunks on
+`qdec_hip` (before: the Triton split kernels, 32 ms; after 2.2 ms at T5, 3.3 ms at T8), and the TQ V prefetch is limited to 2 q tiles (T3 / T4 spilled
+72-79 VGPRs: tq6 3.5 -> 1.7 ms). tq6 split-kernel time is now at or below k6v6's at every row count; what is left at T1 is launch work (rotate
+q, unrotate o, ring launch): +0.06 ms vs k6v6 at 128K, +0.08 ms at 8K per layer. `tools/bench_kv_attn.py` reproduces the table. CUDA must
+re-check the same >4-row verify fallback and the TQ spills in `qdec.cu` / `qdec_rows.cu`.

@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int); ap.add_argument("-c", type=int); ap.add_argument("--sessions", type=int, default=1)
 ap.add_argument("--model"); ap.add_argument("--model-id"); ap.add_argument("--k-bits"); ap.add_argument("--v-bits"); ap.add_argument("--draft-policy")
+ap.add_argument("--kv-mode"); ap.add_argument("--kvwin")
 ap.add_argument("--no-vision", action="store_true"); ap.add_argument("--chat-template")
 a = ap.parse_args()
 LIMIT = int(os.environ.get("LIMIT", "50000"))

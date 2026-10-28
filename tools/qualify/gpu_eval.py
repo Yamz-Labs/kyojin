@@ -114,6 +114,11 @@ def kvmode(pack, docs, out, n=256, only=None):
             os.environ["EXL3_KVWIN"] = "4:128" if name == "kw6" else "0"     # the production formats at >= 6 bits run without the window; kw6 = the same cache with the ring
             cache = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=CacheLayer_quant, k_bits=b, v_bits=b)
             os.environ.pop("EXL3_KVWIN")
+        if kind == "tq" and not tq.cache_is_tq(cache):
+            res[name] = dict(unsupported="the attention cache layers of this model do not take a TurboQuant cache (QSA sparse attention keeps the quant layer)")
+            print(name, res[name], flush=True)
+            del cache, m; gc.collect()
+            continue
         m.load(progressbar=False)
         with torch.inference_mode():
             st = cache.get_new_state() if cache.recurrent_state_cls is not None else None
@@ -128,13 +133,13 @@ def kvmode(pack, docs, out, n=256, only=None):
             t_dec = time.time()
             for j in range(n):
                 lg = m.forward(x[:, e + j: e + j + 1], par(e + j, 1))
-                rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-1], -1).half().cpu())
+                rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-1], -1).cpu())
             t_dec = (time.time() - t_dec) / n
             if st is not None:
                 st.free()
         lps[name] = torch.stack(rows).float()
         if name == "k8v8":
-            torch.save(lps[name].half(), out + ".k8v8.pt")
+            torch.save(lps[name], out + ".k8v8.pt")
         free(m, cache)
         if name != "k8v8":
             r8 = lps["k8v8"]

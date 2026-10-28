@@ -263,17 +263,19 @@ class KvModeRule(unittest.TestCase):
         self.assertEqual(rules.choose_kv_mode(kl, bpv), "kw6")
         self.assertEqual(rules.choose_kv_mode(kl, bpv, dec_s={"k6v6": 0.0068, "kw6": 0.0090, "tq6": 0.0118, "tq5": 0.0070}), "k6v6")      # ROCm 0.8B: ring +32 %
         self.assertEqual(rules.choose_kv_mode(kl, bpv, dec_s={"k6v6": 0.0068, "kw6": 0.0071}), "kw6")
+        self.assertEqual(rules.choose_kv_mode(kl, bpv, allowed=self.TQ, dec_s={"k6v6": 0.0068, "kw6": 0.0090, "tq6": 0.0118, "tq5": 0.0070}), "k6v6")
 
     def test_choose_kv_mode(self):
         bpv = self.BPV
         # tq opt-in (default): tq6 / tq5 never win, kw6 does when it beats k6v6 by the margin
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.0536, "kw6": 0.0216, "tq6": 0.0319, "tq5": 0.0544}, bpv), "kw6")      # Nanbeige 32K p1
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.0095, "tq6": 0.004, "tq5": 0.009}, bpv), "k6v6")       # kw6 inside the noise
-        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002}, {"k6v6": 6.5}), "k6v6")                                         # nothing else measured
-        # with tq allowed (QUALIFY_KV_TQ=1): the old rule, fewest bytes among the qualifying formats
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002}, {"k6v6": 6.5}), "k6v6")                                         # nothing else measured (tq unsupported by the model)
+        # with tq allowed (QUALIFY_KV_TQ=1): fewest bytes among the qualifying formats, a tq format needs the same 0.9 margin
         kw = dict(allowed=self.TQ)
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.005, "tq6": 0.004, "tq5": 0.009}, bpv, **kw), "tq5")
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.005, "tq6": 0.008, "tq5": 0.020}, bpv, **kw), "tq6")
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.005, "tq6": 0.0095, "tq5": 0.020}, bpv, **kw), "kw6")  # tq6 inside the noise
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.005, "kw6": 0.006, "tq6": 0.0125, "tq5": 0.0048}, bpv, **kw), "k6v6")
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002, "kw6": 0.0021, "tq6": 0.004, "tq5": 0.010}, bpv, **kw), "k6v6")
 
@@ -301,6 +303,7 @@ class KvModeRule(unittest.TestCase):
             c.data = dict(kv=kv)
             self.assertEqual((stages.chosen_kv_mode(c), stages.chosen_kvwin(c)), ("quant", "4:128"))
             f = packmod.serve_flags(c.meta, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6, kvwin=stages.chosen_kvwin(c))
+            self.assertEqual(f[f.index("--kv-mode") + 1], "quant")
             self.assertEqual(f[f.index("--kvwin") + 1], "4:128")
             # QUALIFY_KV_TQ=1: tq6 wins the same table (fewer bytes than kw6; tq5 fails the margin)
             os.environ["QUALIFY_KV_TQ"] = "1"
@@ -314,11 +317,26 @@ class KvModeRule(unittest.TestCase):
             c.data = dict(kv=kv)
             self.assertEqual(stages.chosen_kv_mode(c), "tq")
 
+    def test_job_kvmode_skips_an_unsupported_tq_format(self):
+        import contextlib
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as t:
+            t = Path(t)
+            out = t / "out"; out.mkdir(); (t / "pack").mkdir()
+            raw = {"tq6": dict(unsupported="QSA"), "tq5": dict(unsupported="QSA"), "kw6": dict(kl_vs_k8=0.01, top1_vs_k8=0.99, bits_per_val=6.5),
+                   "k6v6": dict(kl_vs_k8=0.01, top1_vs_k8=0.98, bits_per_val=6.5)}
+            def py(script, *a, **kw):
+                (out / "kvmode_raw.json").write_text(json.dumps(raw))
+            c = SimpleNamespace(out=out, args=dict(kvmode_steps=64), meta=dict(path=str(t / "pack")), py=py, locks=contextlib.nullcontext, repo=t, data={})
+            kv = stages.job_kvmode(c, out / "docs.pt")
+            self.assertEqual((kv["mode"], sorted(kv["modes"])), ("quant", ["k6v6", "kw6"]))
+
     def test_serve_flags_kv_mode(self):
         meta = dict(serve_entry="tools/qwen/serve.py", path="/p", vision=False, template=None, mtp_layers=0, kv_layers=16, kv_heads=4, head_dim=256)
         f = packmod.serve_flags(meta, port=1, ctx=4096, sessions=1, k_bits=5, v_bits=5, kv_mode="tq")
         self.assertEqual(f[f.index("--kv-mode") + 1], "tq")
-        self.assertNotIn("--kv-mode", packmod.serve_flags(meta, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6))
+        g = packmod.serve_flags(meta, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6)
+        self.assertEqual(g[g.index("--kv-mode") + 1], "quant")       # always explicit
         self.assertLess(packmod.kv_bytes_per_token(meta, 5, 5, "tq"), packmod.kv_bytes_per_token(meta, 6, 6))
 
 

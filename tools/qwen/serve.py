@@ -769,17 +769,20 @@ class QwenEngine:
         from exllamav3 import CacheLayer_quant
         qkw = dict(layer_type=CacheLayer_quant, k_bits=k_bits, v_bits=v_bits) if (k_bits and v_bits) else {}
         assert bool(k_bits) == bool(v_bits), "set both --k-bits and --v-bits (or --cache-bits)"
-        if kv_mode == "tq":
-            # TurboQuant KV pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector) with the fp16 sink + window ring
+        if kv_mode == "tq" and k_bits and v_bits:
+            # TurboQuant KV pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector) with the fp16 sink + window ring. Widths outside 4..6 and head dims without a codebook keep the per-32 quant pages
             from exllamav3.cache.tq import CacheLayer_tq, supported as tq_supported
             hd = getattr(self.config, "head_dim", None)
-            assert k_bits in (4, 5, 6) and v_bits in (4, 5, 6), "--kv-mode tq needs --k-bits and --v-bits in 4..6"
-            if hd and tq_supported(hd, k_bits) and tq_supported(hd, v_bits):
+            if k_bits in (4, 5, 6) and v_bits in (4, 5, 6) and hd and tq_supported(hd, k_bits) and tq_supported(hd, v_bits):
                 qkw["layer_type"] = CacheLayer_tq
             else:
-                print(f"qserve: --kv-mode tq: head_dim {hd} is not supported, keeping the quant cache", flush=True)
+                print(f"qserve: kv-mode tq: k{k_bits}v{v_bits} at head_dim {hd} has no TurboQuant codebook, keeping the quant cache", flush=True)
         # one recurrent (GDN) slot per session; the Generator caps its batch at the slot count
         self.cache = Cache(self.model, max_num_tokens=ctx, max_history=max(3, ndt), max_batch_size=sessions, **qkw)
+        if qkw.get("layer_type") is not None and getattr(qkw["layer_type"], "tq", False):
+            from exllamav3.cache.tq import cache_is_tq
+            if not cache_is_tq(self.cache):
+                print("qserve: kv-mode tq: this model's attention cache layers (QSA sparse attention) keep the quant cache", flush=True)
         if os.environ.get("EXL3_WARM_DENSE", "1") != "0":
             from exllamav3.model.dense_warmup import seed_dense_tune
             seed_dense_tune()
