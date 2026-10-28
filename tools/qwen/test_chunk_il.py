@@ -158,8 +158,23 @@ def solo_big_ttft(n=45000):
 class DecodePriorityTests(unittest.TestCase):
     """EXL3_CIL_DECODE_PRIO=1: a running stream waits one short chunk, not the whole big prefill (3 users on one 3090)."""
 
+    def setUp(self):
+        os.environ["EXL3_CIL_DPRIO_CHUNK"] = "768"       # these cases simulate the pinned 768-row chunk
+
     def tearDown(self):
         os.environ.pop("EXL3_SCHED_CHUNK_IL", None)
+        os.environ.pop("EXL3_CIL_DPRIO_CHUNK", None)
+
+    def test_dprio_chunk_follows_measured_row_time(self):
+        os.environ.pop("EXL3_CIL_DPRIO_CHUNK")
+        p = chunk_il.ChunkPlanner(row_s=0.0006)
+        self.assertEqual(p.dprio_chunk, 2048)             # fast model: capped
+        p.row_s = 0.00134
+        self.assertEqual(p.dprio_chunk, 1024)             # slow model: ~1.5 s per chunk
+        p.row_s = 1.0
+        self.assertEqual(p.dprio_chunk, 256)              # floor
+        os.environ["EXL3_CIL_DPRIO_CHUNK"] = "768"
+        self.assertEqual(chunk_il.ChunkPlanner(row_s=0.0006).dprio_chunk, 768)   # pin wins
 
     def run_case(self, flag, **kw):
         s = Sim(flag, **kw)

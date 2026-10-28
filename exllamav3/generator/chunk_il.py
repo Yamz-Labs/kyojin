@@ -82,7 +82,13 @@ class ChunkPlanner:
         self.row_s = float(e("EXL3_CIL_ROW_S", "0.0007")) if row_s is None else row_s     # 2.9 s per 4096-row chunk until measured
         self.decode_s = float(e("EXL3_CIL_DECODE_S", "0.05")) if decode_s is None else decode_s
         self.dprio = e("EXL3_CIL_DECODE_PRIO", "0") == "1"
-        self.dprio_chunk = max(256, int(e("EXL3_CIL_DPRIO_CHUNK", "768")) // 256 * 256)
+        # decode-priority chunk: EXL3_CIL_DPRIO_CHUNK=<rows> pins it; unset = time-based, EXL3_CIL_DPRIO_CHUNK_S (1.5 s) of the leader's
+        # measured s/row, capped at EXL3_CIL_DPRIO_CHUNK_MAX rows (2048), floor 256. Same decode share on a fast and on a slow
+        # model (fixed 768 rows: 0.5 s on Qwen3.8 but 1.0 s on GLM-5.3; 2048 fixed starved the GLM streams to 0.34 tok/s).
+        pin = e("EXL3_CIL_DPRIO_CHUNK", "")
+        self._dprio_pin = max(256, int(pin) // 256 * 256) if pin else 0
+        self._dprio_s = float(e("EXL3_CIL_DPRIO_CHUNK_S", "1.5"))
+        self._dprio_max = max(256, int(e("EXL3_CIL_DPRIO_CHUNK_MAX", "2048")) // 256 * 256)
         self.single_decode = (e("EXL3_CIL_SINGLE_DECODE", "1") != "0" and not self.dprio) if single_decode is None else single_decode
         self._clock = clock
         self._lead: _Leader | None = None
@@ -90,6 +96,12 @@ class ChunkPlanner:
         self._tick = 0
         self._last_decoded: dict[Any, int] = {}
         self.finished: list[dict] = []      # stats of the last leaders that completed (bounded)
+
+    @property
+    def dprio_chunk(self) -> int:
+        if self._dprio_pin:
+            return self._dprio_pin
+        return max(256, min(self._dprio_max, int(self._dprio_s / max(self.row_s, 1e-6)) // 256 * 256))
 
     # ---- helpers
     def _stats(self, ld: _Leader, now: float) -> dict:
