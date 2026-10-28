@@ -590,7 +590,13 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # Follow-up turns resume from the reply-end checkpoint (T2 prefill x0.90, quality gated).
              ("EXL3_TAIL_REPLY", "1"), ("EXL3_REPLY_FIRST", "1"),
              # 17/10: multi-block exact decode top-k (bitwise on 24+ cases, decode R<=1 T>=32768 only; saves 0.13/0.42/0.91 ms per token at 128K/256K/500K). 0 = one-block.
-             ("EXL3_TOPK_PAR", "1"))
+             ("EXL3_TOPK_PAR", "1"),
+             # 28/10 gfx1151: the 1-row draft step is 4.9 ms, 3.7 ms of it the shared 248K-row K5 head (at the DRAM roof, 0.80 GB);
+             # the MTP layer itself is 1.3 ms. Reading the head's own frequent 128-row blocks (adaptive subset, probe-guarded,
+             # target verifies every draft so the text cannot change) costs 0.8 ms: served cur rule 4K, 320 tokens, ABBA x2,
+             # prose 22.2 -> 22.9 t/s (+3.2 %), code 23.2 -> 25.0 (+7.4 %), tokens/round 3.08/3.33 unchanged (+-1 %), text identical.
+             # WARM 256 draft rows (~75 rounds) so a normal reply reaches the subset; after it the round's draft share is 15.6 -> 6.5 ms.
+             ("EXL3_DRAFT_VOCAB", "98304"), ("EXL3_DRAFT_WARM", "256"))
 
 # NVIDIA only (RTX 3090; the AMD values above stay as they are). The verify of 2..8 rows costs
 # 25-29 ms against 22 ms for one row, while a draft step costs ~1.5 ms, 0.93 ms of it the 248K-row K5 head: deeper drafts pay
