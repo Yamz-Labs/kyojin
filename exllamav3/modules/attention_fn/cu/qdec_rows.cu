@@ -34,6 +34,9 @@
 #define OWN ((NT + NW - 1) / NW)        // row tiles owned per warp
 #define SX_B (NW * NT * 32 * 16)       // partial S exchange
 #define PX_B (NT * 32 * 16)             // P fragments (2 words) + rescale factors (2 floats) per row tile and lane
+#ifndef TQ
+#define TQ 0           // TurboQuant cache (cache/tq.py): codebook LUT dequant, ONE fp16 scale per head vector, q / output rotated outside
+#endif
 
 // dynamic smem layout: [Sx][Px][ring: NW x ST x STAGE_B]   (q lives in registers as this warp's MMA B fragments)
 
@@ -60,15 +63,23 @@ template<int CP> __device__ __forceinline__ void cpw(void* dst, const void* src,
 #ifndef ABL
 #define ABL 0
 #endif
-extern "C" __global__ void __launch_bounds__(NTHREADS)
+// TurboQuant: packed raw pair (raw of the low / high half in bits 0.. / 16..) -> half2 of the codebook entries, from a pair table
+// in smem (index = raw lo | raw hi << B); the per-vector scale is folded into the scores (K) / the probabilities (V)
+template<int B> __device__ __forceinline__ u32 lut2(u32 x, const u32* cb)
+{
+    return cb[(x & ((1u << B) - 1)) | ((x >> (16 - B)) & (((1u << B) - 1) << B))];
+}
+extern "C" __global__ void __launch_bounds__(NTHREADS, 1)
 qdec_split_rows(
     const u16* __restrict__ q, const u32* __restrict__ k_cache, const u32* __restrict__ v_cache,
     const int* __restrict__ block_table, const int* __restrict__ cache_seqlens, u16* out_unused,
     float* __restrict__ partial_o, float* __restrict__ partial_ml,
     const u16* __restrict__ k_scales, const u16* __restrict__ v_scales, const u16* __restrict__ h32,
     int split_len, int num_pages_per_seq, int num_splits, const float* sinks_unused,
-    void* s0, void* s1)
+    const u16* __restrict__ cbk, const u16* __restrict__ cbv)
 {
+    __shared__ __align__(16) u32 cbk_s[TQ ? (1 << (2 * KB)) : 1];
+    __shared__ __align__(16) u32 cbv_s[TQ ? (1 << (2 * VB)) : 1];
     extern __shared__ __align__(16) unsigned char smem[];
     float4* Sx = (float4*)smem;
     uint2* Pp = (uint2*)(smem + SX_B);
@@ -87,6 +98,28 @@ qdec_split_rows(
 
     // ---- q rows -> rotated (h32) fp16, kept as this warp's B fragments (head-dim groups warp*GW ..)
     u32 qb[2 * GW][NT][2];
+#if TQ
+    {                                                    // q arrives already rotated: plain fp16 pairs, natural dim order
+        for (int i = tid; i < (1 << (2 * KB)); i += NTHREADS) cbk_s[i] = (u32)cbk[i & ((1 << KB) - 1)] | ((u32)cbk[i >> KB] << 16);
+        for (int i = tid; i < (1 << (2 * VB)); i += NTHREADS) cbv_s[i] = (u32)cbv[i & ((1 << VB) - 1)] | ((u32)cbv[i >> VB] << 16);
+        #pragma unroll
+        for (int kk = 0; kk < 2 * GW; kk++) {
+            const int d0 = (warp * 2 * GW + kk) * 16 + 2 * t;
+            #pragma unroll
+            for (int j = 0; j < NT; j++) {
+                const int r = 8 * j + g;
+                u32 w0 = 0, w1 = 0;
+                if (r < ROWS) {
+                    const u16* qr = q + ((size_t)((batch * QLEN + r % QLEN) * NQH + kvh * GROUP + r / QLEN)) * HD + d0;
+                    w0 = (u32)qr[0] | ((u32)qr[1] << 16);
+                    w1 = (u32)qr[8] | ((u32)qr[9] << 16);
+                }
+                qb[kk][j][0] = w0; qb[kk][j][1] = w1;
+            }
+        }
+        __syncthreads();                                 // the codebook tables are read by every warp
+    }
+#else
     {
         float* hs = (float*)(ring);                      // 32x32 fp32 scratch, ring is idle until the loop
         for (int i = tid; i < 1024; i += NTHREADS) hs[i] = h2f(h32[i]);
@@ -118,6 +151,7 @@ qdec_split_rows(
         }
         __syncthreads();
     }
+#endif
 
     float m[OWN][2], l[OWN][2], qabs[OWN][2];
     bool rvalid[OWN][2];
@@ -163,8 +197,14 @@ qdec_split_rows(
                 int tk = c / (VWW / VCP), pt = c % (VWW / VCP);
                 cpw<VCP>(vsm + tk * VSW + pt * VCP, v_cache + (row0 + tk) * (GPT * VB) + kvh * VCHW + warp * VWW + pt * VCP, n0 + tk < n_end, pol_f);
             }
+#if TQ
+            // one fp16 per (token, kv head): fetch the 4-byte word holding it (NKV is even), the pair's parity picks the half
+            if (lane < 16) cp4h(ksc + lane * 2, k_scales + (row0 + lane) * NKV + (kvh & ~1), n0 + lane < n_end, pol_l);
+            else           cp4h(vsc + (lane - 16) * 2, v_scales + (row0 + lane - 16) * NKV + (kvh & ~1), n0 + lane - 16 < n_end, pol_l);
+#else
             if (lane < 16) cp_sc(ksc + lane * G, k_scales + (row0 + lane) * GPT + kvh * G, n0 + lane < n_end, pol_l);
             else           cp_sc(vsc + (lane - 16) * G, v_scales + (row0 + lane - 16) * GPT + kvh * G, n0 + lane - 16 < n_end, pol_l);
+#endif
         }
         asm volatile("cp.async.commit_group;");
     };
@@ -192,15 +232,24 @@ qdec_split_rows(
         #pragma unroll
         for (int gi = 0; gi < GW; gi++) {
             const int gg = warp * GW + gi;
+#if !TQ
             u32 sc0 = scale2<KB>(ksc[g * G + gg], ksc[g * G + gg]);
             u32 sc1 = scale2<KB>(ksc[(g + 8) * G + gg], ksc[(g + 8) * G + gg]);
+#endif
             #pragma unroll
             for (int h = 0; h < 2; h++) {
                 int p0 = 16 * h + 2 * t, p1 = p0 + 8;
+#if TQ
+                u32 a0 = lut2<KB>(raw_pair<KB>(kr0 + gi * KB, p0), cbk_s);
+                u32 a1 = lut2<KB>(raw_pair<KB>(kr1 + gi * KB, p0), cbk_s);
+                u32 a2 = lut2<KB>(raw_pair<KB>(kr0 + gi * KB, p1), cbk_s);
+                u32 a3 = lut2<KB>(raw_pair<KB>(kr1 + gi * KB, p1), cbk_s);
+#else
                 u32 a0 = dequant2<KB>(raw_pair<KB>(kr0 + gi * KB, p0), sc0);
                 u32 a1 = dequant2<KB>(raw_pair<KB>(kr1 + gi * KB, p0), sc1);
                 u32 a2 = dequant2<KB>(raw_pair<KB>(kr0 + gi * KB, p1), sc0);
                 u32 a3 = dequant2<KB>(raw_pair<KB>(kr1 + gi * KB, p1), sc1);
+#endif
                 #pragma unroll
                 for (int j = 0; j < NT; j++) {
                     mma16816(S[j], a0, a1, a2, a3, qb[gi * 2 + h][j][0], qb[gi * 2 + h][j][1]);
@@ -225,12 +274,20 @@ qdec_split_rows(
                 }
                 float sv[4] = {acc.x, acc.y, acc.z, acc.w};
                 float s[4]; bool ok[4];
+#if TQ
+                const float kf0 = h2f(ksc[g * 2 + (kvh & 1)]) * sl, kf1 = h2f(ksc[(g + 8) * 2 + (kvh & 1)]) * sl;
+                const float vf0 = h2f(vsc[g * 2 + (kvh & 1)]), vf1 = h2f(vsc[(g + 8) * 2 + (kvh & 1)]);
+#endif
                 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     int tk = n0 + g + ((e >> 1) << 3);
                     int ri = e & 1;
                     ok[e] = rvalid[o][ri] && tk < n_end && tk >= KEY_LO && (!CAUSAL || (float)tk <= qabs[o][ri]);
+#if TQ
+                    s[e] = ok[e] ? sv[e] * ((e >> 1) ? kf1 : kf0) : -INFINITY;
+#else
                     s[e] = ok[e] ? sv[e] * sl : -INFINITY;
+#endif
                 }
                 float alpha[2];
                 #pragma unroll
@@ -248,6 +305,9 @@ qdec_split_rows(
                     l[o][ri] = l[o][ri] * alpha[ri] + p0 + p1;
                     m[o][ri] = mn;
                 }
+#if TQ
+                s[0] *= vf0; s[1] *= vf0; s[2] *= vf1; s[3] *= vf1;       // V scale rides on P (token g / g+8 of this lane's rows)
+#endif
                 Pp[j * 32 + lane] = make_uint2(movtrans(pack_h2(s[0], s[1])), movtrans(pack_h2(s[2], s[3])));
                 Pa[j * 32 + lane] = make_float2(alpha[0], alpha[1]);
             }
@@ -272,15 +332,24 @@ qdec_split_rows(
         #pragma unroll
         for (int gi = 0; gi < GW; gi++) {
             const int gg = warp * GW + gi;
+#if !TQ
             u32 sAB = scale2<VB>(vsc[(2 * t) * G + gg], vsc[(2 * t + 1) * G + gg]);
             u32 sCD = scale2<VB>(vsc[(2 * t + 8) * G + gg], vsc[(2 * t + 9) * G + gg]);
+#endif
             #pragma unroll
             for (int h = 0; h < 2; h++) {
                 int p1 = 16 * h + g, p2 = p1 + 8, i = gi * 2 + h;
+#if TQ
+                u32 a0 = lut2<VB>(raw_one<VB>(vA + gi * VB, p1) | (raw_one<VB>(vB + gi * VB, p1) << 16), cbv_s);
+                u32 a1 = lut2<VB>(raw_one<VB>(vA + gi * VB, p2) | (raw_one<VB>(vB + gi * VB, p2) << 16), cbv_s);
+                u32 a2 = lut2<VB>(raw_one<VB>(vC + gi * VB, p1) | (raw_one<VB>(vD + gi * VB, p1) << 16), cbv_s);
+                u32 a3 = lut2<VB>(raw_one<VB>(vC + gi * VB, p2) | (raw_one<VB>(vD + gi * VB, p2) << 16), cbv_s);
+#else
                 u32 a0 = dequant2<VB>(raw_one<VB>(vA + gi * VB, p1) | (raw_one<VB>(vB + gi * VB, p1) << 16), sAB);
                 u32 a1 = dequant2<VB>(raw_one<VB>(vA + gi * VB, p2) | (raw_one<VB>(vB + gi * VB, p2) << 16), sAB);
                 u32 a2 = dequant2<VB>(raw_one<VB>(vC + gi * VB, p1) | (raw_one<VB>(vD + gi * VB, p1) << 16), sCD);
                 u32 a3 = dequant2<VB>(raw_one<VB>(vC + gi * VB, p2) | (raw_one<VB>(vD + gi * VB, p2) << 16), sCD);
+#endif
                 #pragma unroll
                 for (int j = 0; j < NT; j++) mma16816(O[i][j], a0, a1, a2, a3, plo[j], phi[j]);
             }

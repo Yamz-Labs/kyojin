@@ -117,7 +117,7 @@ template<int B, int IL, int RH> __device__ __forceinline__ u32 vdq(const u32* wA
     return hfma2(x, sc, hmul2(sc, 0x38003800u));
 }
 #endif
-extern "C" __global__ void __launch_bounds__(NTHREADS)
+extern "C" __global__ void __launch_bounds__(NTHREADS, 1)
 qdec_split(
     const u16* __restrict__ q, const u32* __restrict__ k_cache, const u32* __restrict__ v_cache,
     const int* __restrict__ block_table, const int* __restrict__ cache_seqlens, u16* out_unused,
