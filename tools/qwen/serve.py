@@ -2316,6 +2316,13 @@ def load_all(args: argparse.Namespace):
         kv = sum(l.storage_size() for c in (engine.cache, engine.draft_cache) if c is not None for l in c.layers.values()) / 2**20 / args.ctx
         lazy = getattr(engine.draft_model, "lazy_vram_bytes", lambda: 0)() / 2**20 if engine.draft_model is not None else 0.0
         print(f"qserve: VRAM left after load: {free_mib:.0f} MiB, {lazy:.0f} MiB of it taken later by the draft-head subset (ctx={args.ctx}, sessions={args.sessions})", flush=True)
+        # KV format actually in use (CacheLayer_tq / CacheLayer_quant) + per-token cost: the two numbers a KV-mode A/B and the
+        # max-context gate are decided on, read straight from the allocated pages instead of guessed from the flags
+        _lay = next(iter(engine.cache.layers.values()), None)
+        _kv_max = int((free_mib - lazy) / kv + args.ctx) // 256 * 256 if kv > 0 else 0
+        print(f"qserve: KV {type(_lay).__name__} k{args.k_bits}v{args.v_bits}"
+              f" {kv:.4f} MiB/token/session = {kv * args.ctx:.0f} MiB at ctx {args.ctx}; "
+              f"~{_kv_max} tokens would fit with {free_mib - lazy:.0f} MiB free", flush=True)
         min_free = float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB)
         warm_peak = getattr(engine, "warm_peak_mib", None)
         if warm_peak is not None:
