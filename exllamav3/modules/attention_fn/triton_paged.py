@@ -1215,6 +1215,25 @@ def _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, so
     cfg = _qh.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, k_cache.shape[1], causal, softmax_scale,
                        window_left, window_right, softcap, kv_append_len, has_sinks, ring.cfg.S if ring is not None else 0, tq is not None)
     if cfg is None:
+        # A verify step with more rows than one pass of the kernel holds (accumulator budget: 4 tokens at GQA 12, hd 256) runs as
+        # row chunks, each one a smaller verify at the shifted position: the Triton split kernels cost 15-20x more at 128K
+        if q_len > 1 and kv_append_len == q_len:
+            n = next((n for n in range(q_len - 1, 0, -1) if _qh.make_cfg(n, n_q_heads, n_kv_heads, head_dim, qck, qcv, k_cache.shape[1], causal, softmax_scale,
+                                                                          window_left, window_right, softcap, n, has_sinks, ring.cfg.S if ring is not None else 0, tq is not None) is not None), 0)
+            if n:
+                if _QDEC_HIP_DEBUG: _qdec_hip_note(("hip-chunks", f"q_len {q_len} in {n}"))
+                if out is None:
+                    out = torch.empty_like(q)
+                for i0 in range(0, q_len, n):
+                    m = min(n, q_len - i0)
+                    qc_ = q[:, i0:i0 + m].contiguous() if bsz > 1 else q[:, i0:i0 + m]
+                    oc = _qdec_hip_decode(qc_, k_cache, v_cache, block_table, cache_seqlens + i0 if i0 else cache_seqlens, causal, softmax_scale, window_size,
+                                          softcap, sinks if has_sinks else None, None if bsz > 1 else out[:, i0:i0 + m], num_splits, max_kv_len, qc, m, n_kv_heads, ring, tq)
+                    if oc is None:
+                        return None
+                    if bsz > 1:
+                        out[:, i0:i0 + m] = oc
+                return out
         if _QDEC_HIP_DEBUG: _qdec_hip_note(("no", f"cfg q_len {q_len} hd {head_dim} {n_q_heads}/{n_kv_heads} bits {qck},{qcv} window {window_left},{window_right} softcap {softcap} append {kv_append_len}"))
         return None
     if _QDEC_HIP_DEBUG: _qdec_hip_note(("hip", f"q_len {q_len} hd {head_dim} bits {qck},{qcv} sinks {has_sinks}"))
