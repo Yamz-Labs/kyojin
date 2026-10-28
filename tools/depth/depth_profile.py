@@ -144,12 +144,17 @@ def _main():
     one = torch.randint(1000, min(V, 100000), (1, 1), generator=gen)
     rows = torch.randint(1000, min(V, 100000), (1, R), generator=gen)
 
+    import hashlib
+    HASH = hashlib.md5()
+
     def timed_steps(ids, d, n, verify=False):
         ts = []
         for k in range(n):
             torch.cuda.synchronize(); a = time.perf_counter()
             lg = fwd(ids, d + k, verify=verify)
             _ = lg[0, -1].argmax().item()            # the served step ends with the token readback
+            if os.environ.get("DP_HASH") == "1":     # bit-identity probe: md5 of the logits of every step
+                HASH.update(lg.float().cpu().numpy().tobytes())
             ts.append(time.perf_counter() - a)
         return ts
 
@@ -187,6 +192,7 @@ def _main():
         for d in depths:
             P = RES["points"][str(d)]
             decode_points(P)
+            if os.environ.get("DP_HASH") == "1": print(f"[hash] depth {d} {HASH.hexdigest()}", flush=True)
             print(f"[dec] depth {d}: decode {P['decode']['ms']} ms, verify({R} rows) {P['verify']['ms']} ms", flush=True)
             guard(f"decode@{d}"); save()
     if not args.no_decode and args.arm:
