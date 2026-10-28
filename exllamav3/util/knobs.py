@@ -14,6 +14,8 @@ KNOBS = {
     "EXL3_DEQ_WINDOW_TRITON": "1",
     "EXL3_GEMV_TRI": "1",
     "EXL3_GEMV_R_ARR1": "1",
+    "EXL3_GEMV_R_WIDE8": "1",
+    "EXL3_GEMV_R_RPB78": "4",
     "EXL3_BC_KVWIN": "1",
     "EXL3_CUDA_GRAPH_RING": "1",
     "EXL3_DEC_MOE_KBS_A": "0",
