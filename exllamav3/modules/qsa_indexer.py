@@ -899,6 +899,25 @@ class QSAIndexer(Module):
             n_used = (int(cache_seqlens_cpu.max().item()) + seq + page_size - 1) // page_size
             o = qsa_prefill_q8(q_rows, qk, sk, qv, sv, indices, attn.sm_scale, block_table[0], n_used, page_size)
             return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+        if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and os.environ.get("EXL3_QSA_PF_DEQ", "1") == "1" and qc is not None
+                and tq is not None and bsz == 1 and seq >= 64 and seq <= 4096 * 4
+                and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
+                and q_rows.dtype == torch.half and _pf_hip_ready()):
+            # TurboQuant prefill chunk: stage the used pages as rotated-domain fp16 (codebook lookup, one pass), run the fp16 HIP kernel
+            # on the rotated q, rotate the output back (the Triton split kernel below is ~70x slower per chunk on this shape)
+            from .attention_fn.qsa_prefill_hip import qsa_prefill_hip
+            from .attention_fn.tq_triton import tq_dequant_window
+            n_used = (int(cache_seqlens_cpu.max().item()) + seq + page_size - 1) // page_size
+            kd = torch.empty((n_used, page_size, attn.num_kv_heads, attn.head_dim), dtype = torch.half, device = q.device)
+            vd = torch.empty_like(kd)
+            bt = block_table[:, :n_used].int().contiguous()
+            sl = cache_seqlens_cpu[:1].to(device = q.device, dtype = torch.int32)
+            tq_dequant_window(qk, sk, tq.cbk, kd, sl, bt, page_size, seq, qc[2], attn.num_kv_heads, attn.head_dim)
+            tq_dequant_window(qv, sv, tq.cbv, vd, sl, bt, page_size, seq, qc[3], attn.num_kv_heads, attn.head_dim)
+            ids = torch.arange(n_used, dtype = torch.int32, device = q.device)
+            o = qsa_prefill_hip(q_rows, kd.view(-1, attn.num_kv_heads, attn.head_dim), vd.view(-1, attn.num_kv_heads, attn.head_dim),
+                                indices, attn.sm_scale, ids, page_size)
+            return tq.unrotate(o).view(bsz, seq, attn.num_q_heads, attn.head_dim)
         # Built only for the Triton fallback: the HIP paths above read block_table[0], and this copy is
         # rows x pages x 4 B (33 MB per layer per 4096-row chunk at -c 524288) written for nothing
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
