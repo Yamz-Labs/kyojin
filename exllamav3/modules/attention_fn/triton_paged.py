@@ -883,7 +883,7 @@ def _qc_load_kt(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
     if TQ:
         # TurboQuant: Lloyd-Max codebook gather, one fp16 scale (norm / ||centroids||) per head vector
         sc1 = tl.load(scales + tok_rows[None, :] * n_kv_heads + kv_head, mask = mask_n[None, :], other = 0.0)
-        res = (tl.load(cb + raw) * sc1.to(tl.float32)).to(tl.float16)
+        res = (tl.load(cb + raw).to(tl.float32) * sc1.to(tl.float32)).to(tl.float16)
     else:
         sgb = kv_head * G
         garr = tl.arange(0, G_PAD)
@@ -932,7 +932,7 @@ def _qc_load_v(qwords, scales, tok_rows, kv_head, offs_d, mask_n,
         raw = p if first else (raw << 1) | p
     if TQ:
         sc1 = tl.load(scales + tok_rows[:, None] * n_kv_heads + kv_head, mask = mask_n[:, None], other = 0.0)
-        res = (tl.load(cb + raw) * sc1.to(tl.float32)).to(tl.float16)
+        res = (tl.load(cb + raw).to(tl.float32) * sc1.to(tl.float32)).to(tl.float16)
     else:
         sgb = kv_head * G
         garr = tl.arange(0, G_PAD)

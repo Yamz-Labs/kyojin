@@ -406,3 +406,60 @@ class CacheLayer_MLA_quant(CacheLayer):
                 "v_bits": self.v_bits,
             }
         }
+
+
+class CacheLayer_MLA_tq(CacheLayer_MLA_quant):
+    """
+    TurboQuant MLA cache layer: the normalized latent (kv_lora_rank values, a power of two) is stored as
+    Lloyd-Max codebook indices of its rotated, unit-normalized vector plus ONE fp16 scale per token
+    (norm / ||centroids||), i.e. `bits + 16 / kv_lora_rank` bits per latent value. The pool keeps
+    CacheLayer_MLA_quant's packed plane layout; `sk` is (pages, PAGE_SIZE, 1).
+
+    The rotation R (cache/tq.py, Hadamard x random signs, orthonormal) is folded into the module: the MLA
+    attention keeps its latent in the ROTATED domain end to end (kv_b's W_UK / W_UV are stored left-multiplied
+    by R, the normalized latent is rotated once after kv_a_layernorm), so the cache, the query absorption, the
+    kernels and the output un-folding never rotate anything per token. The rope key stays fp16.
+    """
+
+    tq = True
+
+    def __init__(self, config, attention, cache_id: int, max_num_tokens: int, k_bits: int, v_bits: int | None = None,
+                 compand_a: float = 0.0):
+        super().__init__(config, attention, cache_id, max_num_tokens, k_bits, k_bits, 0.0)
+        from .tq import supported
+        if attention:
+            assert supported(self.kv_lora_rank, k_bits), \
+                f"tq cache: kv_lora_rank {self.kv_lora_rank} with {k_bits} bits is not supported"
+            self.sshape = (max_num_tokens // PAGE_SIZE, PAGE_SIZE, 1)
+        self.state = None
+
+    @override
+    def alloc(self, device: torch.device):
+        super().alloc(device)
+        from .tq import TQState
+        self.state = TQState.get(self.kv_lora_rank, self.k_bits, self.k_bits, device)
+
+    @override
+    def free(self):
+        super().free()
+        self.state = None
+
+    def get_tq(self):
+        return self.state
+
+    @override
+    def update_kv_direct(self, cache_seqlens, block_table, k, v, length: int):
+        """k: the ROTATED latent rows (bsz, length, kv_lora_rank) fp16; v: rope keys."""
+        from ..modules.attention_fn.tq_triton import tq_write
+        from ..modules.attention_fn.mla_triton import mla_plane_append
+        st = self.state
+        bsz = k.shape[0] if k.dim() == 3 else block_table.shape[0]
+        x = k.reshape(bsz, length, 1, self.kv_lora_rank).contiguous()
+        tq_write(x, self.qk, self.sk, st.cbk, st.midk, cache_seqlens, block_table, self.bits, 1, self.kv_lora_rank, PAGE_SIZE)
+        if self.qk_rope_head_dim:
+            mla_plane_append(v.reshape(bsz, length, self.qk_rope_head_dim),
+                             self.v.view(self.v.shape[0], PAGE_SIZE, self.qk_rope_head_dim), block_table, cache_seqlens)
+
+    @override
+    def tp_export(self, plan):
+        raise NotImplementedError("the tq MLA cache does not support tensor parallel loading")

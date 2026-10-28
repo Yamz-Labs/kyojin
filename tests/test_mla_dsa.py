@@ -31,7 +31,7 @@ device = "cuda:0"
 
 def build_dsa(H = 8, hidden = 512, kv_lora = 512, nope = 128, rope_dim = 64, v_head = 128,
               q_lora = 256, idx_heads = 4, idx_dim = 128, topk = 64, mode = "full",
-              seed = 0, wscale = 0.085):
+              seed = 0, wscale = 0.085, pre_load = None):
     g = torch.Generator(device = "cpu").manual_seed(seed)
 
     def rnd(*shape, scale = wscale):
@@ -68,6 +68,7 @@ def build_dsa(H = 8, hidden = 512, kv_lora = 512, nope = 128, rope_dim = 64, v_h
         indexer_mode = mode, index_n_heads = idx_heads, index_head_dim = idx_dim,
         index_topk = topk,
     )
+    if pre_load: pre_load(module)
     module.load(torch.device(device))
     return module, {k: v.to(device) for k, v in t.items()}, key
 
@@ -433,3 +434,44 @@ def test_dsa_cached_quant_decode(bits):
     tol = {8: 6e-3, 4: 2.5e-2}[bits]
     e = rel_err(out, ref[:, prefill:])
     assert e < tol, f"rel err {e:.3e} (tol {tol})"
+
+
+@pytest.mark.parametrize("bits", [6])
+def test_dsa_tq_cache_matches_fp16(bits):
+    """TurboQuant latent cache over a sparse (DSA) context: prefill chunks then single-token decode steps track the fp16 cache, and the
+    selected indices are the same (indexer planes are computed from the hidden state, never from the rotated latent)."""
+    from exllamav3.cache import CacheLayer_MLA_tq, CacheLayer_MLA_fp16
+    S, chunk, topk = 384, 128, 64
+    bsz = 1
+    x = None
+    res = {}
+    for name in ("fp16", "q", "tq"):
+        holder = {}
+        def pre(m):
+            if name == "tq":
+                holder["l"] = CacheLayer_MLA_tq(None, m, 0, 4 * PAGE_SIZE * bsz, k_bits = bits)
+            elif name == "q":
+                holder["l"] = CacheLayer_MLA_quant(None, m, 0, 4 * PAGE_SIZE * bsz, k_bits = bits)
+            else:
+                holder["l"] = CacheLayer_MLA_fp16(None, m, 0, 4 * PAGE_SIZE * bsz)
+        module, t, key = build_dsa(topk = topk, seed = 47, pre_load = pre)
+        layer = holder["l"]
+        layer.alloc(torch.device(device))
+        if x is None:
+            x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+        bt = torch.arange(4 * bsz, dtype = torch.int32, device = device).view(bsz, 4)
+        seqlens = torch.zeros((bsz,), dtype = torch.int32, device = device)
+        outs, idxs = [], []
+        pre_n = S - 16
+        for a, b in [(i, min(i + chunk, pre_n)) for i in range(0, pre_n, chunk)] + [(i, i + 1) for i in range(pre_n, S)]:
+            params = {"attn_mode": "flash_attn", "cache": layer, "block_table": bt, "cache_seqlens": seqlens, "positions": seqlens.clone()}
+            outs.append(module.forward(x[:, a:b].contiguous(), params))
+            idxs.append(params["dsa_topk_indices"].clone())
+            seqlens = seqlens + (b - a)
+        res[name] = (outs, idxs)
+    for i, (a, b) in enumerate(zip(res["tq"][0], res["fp16"][0])):
+        e = rel_err(a, b)
+        eq = rel_err(res["q"][0][i], b)
+        same = bool((res["tq"][1][i] == res["fp16"][1][i]).all())
+        print(f"  step {i}: tq {e:.3e} quant {eq:.3e} same_idx {same}")
+        assert e < 8e-2, f"step {i}: rel err {e:.3e}"

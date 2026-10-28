@@ -94,6 +94,8 @@ def kvmode(pack, docs, out, n=256, only=None):
     e = T - n
     cfg = Config.from_directory(pack)
     hd = cfg.head_dim
+    if hd <= 0 or getattr(cfg, 'kv_lora_rank', 0):
+        hd = getattr(cfg, 'kv_lora_rank', hd)       # MLA: the cached vector is the latent
     fmts = [("k8v8", "quant", 8), ("k6v6", "quant", 6), ("kw6", "quant", 6)] + [(f"tq{b}", "tq", b) for b in (6, 5) if hd > 0 and tq.supported(hd, b)]
     x = torch.tensor([ids])
     npg = (T + 256) // 256
