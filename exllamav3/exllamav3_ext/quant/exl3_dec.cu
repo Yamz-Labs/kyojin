@@ -2576,8 +2576,13 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
     if (jobs.arr1 && jobs.kbs > 1)
     {
         // One arrival for every row this block carries: rows differ only in their partial buffers,
-        // so a single fence + atomic (target kbs, row 0's counter slot) replaces one serialized
-        // arrival per row. Per-row reduction order (kb index order) and rotation are unchanged.
+        // so a single fence + atomic (target kbs) replaces one serialized arrival per row. Per-row
+        // reduction order (kb index order) and rotation are unchanged.
+        // The slot is the counter of this block's OWN row chunk (row0), never a fixed row 0: with
+        // grid.y = nch row chunks the chunks run concurrently and each must open its own barrier
+        // after its kbs blocks arrived. Sharing one slot across chunks made the target reach early
+        // and reduced a partially written partial buffer (Qwen27 HIP 7-8 row verify: 3/3 distinct
+        // logits md5 per arm, 2026-10-28).
         #pragma unroll
         for (int j = 0; j < RM; ++j)
         {
@@ -2588,7 +2593,7 @@ void gemv_kernel_r(const half* __restrict__ x, JobsR jobs, float* scratch, int* 
             float* part = scratch + job.part_base + (size_t) (row0 + j) * jobs.kbs * job.N + (size_t) kb * job.N + col0;
             for (int col = tid; col < ncols; col += THREADS) part[col] = z[col];
         }
-        if (!arrive_count(counters + job.ctr_base + strip, jobs.kbs, tid)) return;
+        if (!arrive_count(counters + job.ctr_base + row0 * job.strips + strip, jobs.kbs, tid)) return;
         #pragma unroll
         for (int j = 0; j < RM; ++j)
         {
@@ -2698,14 +2703,12 @@ static void dec_gemv_r_impl
     // 5..8 rows only (the <= 4 row launches keep their grid); 9..32 rows swap by default (EXL3_GEMV_R_SWAP9=0 restores the plain grid):
     // the chunks of one weight block then run side by side and share its reads through L2 instead of re-streaming the weights per chunk
     jobs.swap = (env_int("EXL3_GEMV_R_CHUNK_FAST", 0) != 0 || (R > MOE_R_MAX && env_int("EXL3_GEMV_R_SWAP9", 1) != 0)) && R > 4 && R > rpb;
-    // EXL3_GEMV_R_ARR1 (default 1): one cross-block arrival per block instead of one per row. It uses ONE counter slot per
-    // strip (row 0's), so it is only sound when a block carries ALL rows of the job, i.e. a single chunk (nch = 1). With
-    // nch > 1 every chunk adds its own kbs arrivals to that same slot: the target is reached early and the barrier opens
-    // on a partially written partial buffer. Measured 2026-10-28 on a Qwen27 HIP 7-row verify: at 7 rows some matrices take
-    // the wide8 launch (nch 1) and others the two-chunk 4-row one (nch 2) -> the same verify repeated gave 3/3 distinct
-    // logits md5 (ARR1=1) vs 3/3 identical with ARR1=0, and the same at 8 rows. Rows <= 6 and the 9..32 row chunked launches
-    // all keep one chunk per block only when R <= rpb, so gate on exactly that.
-    jobs.arr1 = env_int("EXL3_GEMV_R_ARR1", 1) != 0 && R <= rpb;
+    // EXL3_GEMV_R_ARR1 (default 1): one cross-block arrival per block instead of one per row (one fence + one atomic for
+    // all the rows a block carries). Sound for any chunking because the counter slot is the block's own row chunk
+    // (kernel: ctr_base + row0 * strips + strip): each chunk opens its own barrier after exactly its kbs blocks arrived.
+    // The earlier row-0-only slot was racy once a job ran more than one chunk (7..8 row verify, 9..32 row MoE rows:
+    // repeated runs gave different logits). Per-row reduction order is untouched, so output is bit-identical to ARR1=0.
+    jobs.arr1 = env_int("EXL3_GEMV_R_ARR1", 1) != 0;
     jobs.x_row_pitch = Kdim;
     int blocks = 0, part = 0, ctr = 0;
     for (int i = 0; i < n; ++i)
