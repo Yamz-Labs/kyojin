@@ -1289,6 +1289,8 @@ def _dsa_pool_expand_kernel(
 # the online path; _MAX_ENTRIES bounds the transient (1M entries * 576 dims ~ 1.2 GB)
 _dsa_qc_stage = os.environ.get("EXL3_DSA_QC_STAGE", "1") != "0"
 _dsa_qc_stage_min_r = int(os.environ.get("EXL3_DSA_QC_STAGE_MIN_R", "64"))
+_dsa_tq_gather = os.environ.get("EXL3_DSA_TQ_GATHER", "1") != "0"
+_dsa_tq_gather_max_r = int(os.environ.get("EXL3_DSA_TQ_GATHER_MAX_R", "8"))
 _dsa_qc_stage_max_entries = int(os.environ.get("EXL3_DSA_QC_STAGE_MAX_ENTRIES", str(1 << 20)))
 
 
@@ -1416,6 +1418,24 @@ def dsa_attn(
         pool_c, pool_r, block_table = _stage_packed_pool(
             pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r)
         qc = None
+        dummy_i = block_table
+    if (qc is not None and _dsa_tq_gather and len(qc) > 2 and qc[2] is not None and q_split and out_latent
+            and D_r == 0 and indices is not None and multirow is None and not nc_block and not nc_chunk
+            and not (win_len > 0 and kv_chunk is not None) and not dsa_debug_bounds
+            and R <= _dsa_tq_gather_max_r and pool_c.dtype == torch.int32):
+        # TurboQuant decode: dequantize only the gathered rows (one launch, ~K_pad x D_c fp16 per row) and run the fp16 decode
+        # split (dt / fast kernels) on them; the generic in-kernel plane loader costs ~6x the fp16 kernel per call (served GLM
+        # decode -10 %). Same fp16 values as the in-kernel loader, rotated domain, so the combine is the plain fp16 one.
+        from .tq_triton import tq_gather_dequant
+        pool_s_, bits_, tq_ = qc[0], qc[1], qc[2]
+        K_g = indices.shape[1]
+        st_out = g_tensor_cache.get(q.device, (R * K_g, D_c), torch.half, "dsa_tqg_rows")
+        st_idx = g_tensor_cache.get(q.device, (R, K_g), torch.int32, "dsa_tqg_idx")
+        tq_gather_dequant(pool_c, pool_s_.reshape(-1), tq_.cbk, indices, block_table, st_out, st_idx, page_size, bits_, D_c)
+        bt0 = g_tensor_cache.get(q.device, (1, 1), torch.int32, "dsa_tqg_bt")
+        bt0.zero_()
+        pool_c, block_table, indices, qc = st_out, bt0, st_idx, None
+        page_size = 1 << max(R * K_g - 1, 1).bit_length()
         dummy_i = block_table
     if qc is not None:
         pool_s, qc_bits, tq = (*qc, None)[:3]
