@@ -155,9 +155,9 @@ def cu_count(device):
 
 
 def num_splits(cfg, device, programs, max_k_len):
-    if os.environ.get("EXL3_QDEC_HIP_SPL"):
-        return int(os.environ["EXL3_QDEC_HIP_SPL"])
-    waves = int(os.environ.get("EXL3_QDEC_HIP_WAVES", "0")) or cu_count(device) * (16 if cfg.get("tq") and cfg["qlen"] * (cfg["nqh"] // cfg["nkv"]) <= 16 else 12)   # tq, one q tile: 4 waves per SIMD (its V loads stay in flight)
+    if knob("EXL3_QDEC_HIP_SPL"):
+        return int(knob("EXL3_QDEC_HIP_SPL"))
+    waves = knob_int("EXL3_QDEC_HIP_WAVES", 0) or cu_count(device) * (16 if cfg.get("tq") and cfg["qlen"] * (cfg["nqh"] // cfg["nkv"]) <= 16 else 12)   # tq, one q tile: 4 waves per SIMD (its V loads stay in flight)
     return max(1, min(-(-waves // (programs * cfg["nw"])), -(-max_k_len // 16 // cfg["nw"]), 128))
 
 
