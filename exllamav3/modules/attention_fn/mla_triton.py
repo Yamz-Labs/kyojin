@@ -1189,7 +1189,7 @@ def mla_attn_triton_decode(
     if block_h is None:
         # 16 rows fills the tl.dot M axis; more heads per program means fewer redundant passes
         # over the latent cache, which is what keeps large-head-count models compute-bound
-        block_h = max(16 // block_m, 1)
+        block_h = max((32 if tqf else 16) // block_m, 1)   # TurboQuant: the codebook expansion is the cost of a program, 32 rows halve the passes (GLM H64 at 4K: 0.91 -> 0.26 ms, rounding-level equal)
     block_h = min(block_h, max(1, triton.next_power_of_2(n_q_heads)))
     block_rows = block_m * block_h
     if block_n is None:

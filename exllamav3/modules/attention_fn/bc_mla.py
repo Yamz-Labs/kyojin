@@ -245,10 +245,10 @@ class BCMLA:
 
         # Same tuning as the dispatch wrapper (mla_attn_triton_decode)
         block_m = triton.next_power_of_2(q_len)
-        block_h = max(16 // block_m, 1)
+        block_h = max((32 if self.tq else 16) // block_m, 1)
         block_h = min(block_h, max(1, triton.next_power_of_2(H)))
         block_rows = block_m * block_h
-        block_n = 64 if self.quant else (32 if D_c <= 512 else 16)
+        block_n = 32 if self.tq else (64 if self.quant else (32 if D_c <= 512 else 16))
         n_warps = 8 if self.quant else 4
         n_stages = 1 if self.quant else 3
         h_blocks = triton.cdiv(H, block_h)
