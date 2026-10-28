@@ -792,11 +792,38 @@ def _prefill_ck_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
     q_len = q.shape[1]
     k1 = kd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
     v1 = vd.view(1, -1, n_kvh, head_dim)[:, :past + q_len]
-    r = fn(q.data_ptr(), k1.data_ptr(), v1.data_ptr(), out.data_ptr(), 1, q_len, past + q_len, q.shape[2], n_kvh,
-           head_dim, head_dim, float(scale), 1, torch.cuda.current_stream(q.device).cuda_stream, 0)
+    n_qh = q.shape[2]
+    stream = torch.cuda.current_stream(q.device).cuda_stream
+    # EXL3_PF_CK_GQA=1: one call per kv head group (hq/n_kvh q heads, hk=1) instead of one call over every q head.
+    # Same per-head math, but the K/V window in flight is one group's instead of all groups': the group's q heads then
+    # hit each other's key tiles in L2 instead of re-reading them from DRAM. hd256 24q/4kv, 4096-row chunk, 114K past:
+    # one 24-head call 405 ms (29.0 TF, 231 GB/s = the stream roof) -> 4 calls of 6 heads 4x86 = 343 ms (34.2 TF),
+    # i.e. the op is DRAM-bound on the q-tile re-reads, not ALU-bound. Costs one contiguous copy of the group's q/k/v
+    # (a per-group head slice is not row-contiguous): 194 ms of the 114K chunk, paid against 1000 ms of attention.
+    # head_dim >= 256 only: at hd128 32q/4kv the same split is +14 % (one call 185.8 ms = 42.2 TF, 335 GB/s of K/V,
+    # i.e. that shape still rides in L2), so the narrow-head class keeps the single call.
+    if knob_int("EXL3_PF_CK_GQA", 0) and head_dim >= 256 and n_kvh > 1 and n_qh % n_kvh == 0:
+        ratio = n_qh // n_kvh
+        for g in range(n_kvh):
+            qg = q[:, :, g * ratio:(g + 1) * ratio, :].contiguous()
+            kg = k1[:, :, g].contiguous()
+            vg = v1[:, :, g].contiguous()
+            og = torch.empty_like(qg)
+            r = fn(qg.data_ptr(), kg.data_ptr(), vg.data_ptr(), og.data_ptr(), 1, q_len, past + q_len, ratio, 1,
+                   head_dim, head_dim, float(scale), 1, stream, 0)
+            if r < 0:
+                return None
+            out[:, :, g * ratio:(g + 1) * ratio, :].copy_(og)
+        if not getattr(_prefill_ck_contig, "_logged", False):
+            _prefill_ck_contig._logged = True
+            print(f" -- EXL3_PF_CK: CK fmha_fwd prefill attention active (head_dim {head_dim}, {n_qh}q/{n_kvh}kv, "
+                  f"{n_kvh} group call{'s' if n_kvh > 1 else ''})")
+        return out
+    r = fn(q.data_ptr(), k1.data_ptr(), v1.data_ptr(), out.data_ptr(), 1, q_len, past + q_len, n_qh, n_kvh,
+           head_dim, head_dim, float(scale), 1, stream, 0)
     if r >= 0 and not getattr(_prefill_ck_contig, "_logged", False):
         _prefill_ck_contig._logged = True
-        print(f" -- EXL3_PF_CK: CK fmha_fwd prefill attention active (head_dim {head_dim}, {q.shape[2]}q/{n_kvh}kv)")
+        print(f" -- EXL3_PF_CK: CK fmha_fwd prefill attention active (head_dim {head_dim}, {n_qh}q/{n_kvh}kv)")
     return out if r >= 0 else None
 
 
