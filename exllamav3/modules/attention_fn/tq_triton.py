@@ -280,10 +280,31 @@ def _tq_rotate_kernel(
     tl.store(y2 + ro + cols[None, :], acc, mask = m2[:, None])
 
 
+@triton.jit
+def _tq_rotate_rows_kernel(x, y, rot_t, D: tl.constexpr, BK: tl.constexpr, BN: tl.constexpr):
+    """Decode rotation of a few rows: program (row, BN-wide column slice) = a matrix-vector product on the vector units,
+    no tile padding to the 16-row matrix-core shape (the tiled kernel costs ~29 us for one row, this one a few)."""
+    r = tl.program_id(0)
+    cols = tl.program_id(1) * BN + tl.arange(0, BN)
+    acc = tl.zeros((BN,), tl.float32)
+    for k0 in range(0, D, BK):
+        ks = k0 + tl.arange(0, BK)
+        xv = tl.load(x + r * D + ks).to(tl.float32)
+        w = tl.load(rot_t + ks[:, None] * D + cols[None, :]).to(tl.float32)
+        acc += tl.sum(xv[:, None] * w, axis = 0)
+    tl.store(y + r * D + cols, acc.to(tl.float16))
+
+
 def tq_rotate(rot_t, *xs):
     """Rotate each fp16 tensor (any leading shape, last dim = head_dim) with one launch; returns the rotated tensors (same shapes)."""
     D = rot_t.shape[0]
     cnt = len(xs)
+    if cnt == 1 and xs[0].numel() // D <= 8 and D % 128 == 0 and D % 32 == 0:
+        x = xs[0].contiguous()
+        y = torch.empty_like(x)
+        with torch.cuda.device(rot_t.device):
+            _tq_rotate_rows_kernel[(x.numel() // D, D // 32)](x, y, rot_t, D, 128, 32, num_warps = 1, num_stages = 1)
+        return [y]
     xs = [x.contiguous() for x in xs]
     ys = [torch.empty_like(x) for x in xs]
     ns = [x.numel() // D for x in xs]
