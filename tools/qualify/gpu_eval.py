@@ -115,7 +115,7 @@ def kvmode(pack, docs, out, n=256, only=None):
             cache = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=CacheLayer_quant, k_bits=b, v_bits=b)
             os.environ.pop("EXL3_KVWIN")
         if kind == "tq" and not tq.cache_is_tq(cache):
-            res[name] = dict(unsupported="the attention cache layers of this model do not take a TurboQuant cache (QSA sparse attention keeps the quant layer)")
+            res[name] = dict(unsupported="the attention cache layers of this model do not take a TurboQuant cache (no TurboQuant layer for this attention type)")
             print(name, res[name], flush=True)
             del cache, m; gc.collect()
             continue
