@@ -304,11 +304,12 @@ class CudaGraphRunner:
     # -- GPU embedding table (EXL3_GPU_EMB: auto | 0 | 1) ----------------------------------------------------------------
     # The table normally stays on the CPU (mmapped, gathered per step on the host: median 74 us, mean 345 us with ms-long page-fault
     # outliers inside the server). With enough free VRAM after load it is copied to the device once and the gather runs inside the
-    # captured graph from a static id buffer; auto = only when free VRAM > table + EXL3_GPU_EMB_MARGIN_MB (default 1536), so the
-    # max-context configurations that need the memory keep the CPU table.
+    # captured graph from a static id buffer; auto = only when free VRAM > table + EXL3_GPU_EMB_MARGIN_MB (default 2048), so the
+    # max-context configurations that need the memory keep the CPU table. The table only pays off for the lag-1 pipeline, so with
+    # EXL3_GPU_EMB unset it is built only when EXL3_LAG1=1: an unset switch leaves load-time VRAM exactly as in 1.8.2.
     def _gemb_setup(self, emb, ids):
         self._gemb = False
-        mode = os.environ.get("EXL3_GPU_EMB", "auto")
+        mode = os.environ.get("EXL3_GPU_EMB", "auto" if os.environ.get("EXL3_LAG1", "0") == "1" else "0")
         if mode == "0" or emb.embedding is None or emb.normalize or emb.multiplier != 1.0:
             return
         w = emb.embedding.weight
@@ -316,7 +317,7 @@ class CudaGraphRunner:
             return
         need = w.numel() * w.element_size()
         free, _ = torch.cuda.mem_get_info(self.dev)
-        margin = int(os.environ.get("EXL3_GPU_EMB_MARGIN_MB", "1536")) << 20
+        margin = int(os.environ.get("EXL3_GPU_EMB_MARGIN_MB", "2048")) << 20
         if mode == "auto" and free < need + margin:
             return
         probe = ids.detach().cpu().reshape(-1)[:4].reshape(1, -1).clone()
