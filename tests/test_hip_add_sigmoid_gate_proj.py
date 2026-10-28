@@ -4,6 +4,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.ext import exllamav3_ext as ext
 
 

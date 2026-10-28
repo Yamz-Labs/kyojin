@@ -13,8 +13,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import pytest
 import torch
-from compare_deepseek_v4_hf_ import make_checkpoint, TINY
+_cmp = pytest.importorskip("compare_deepseek_v4_hf_", reason = "needs compare_deepseek_v4_hf_, not in the repository")
+make_checkpoint, TINY = _cmp.make_checkpoint, _cmp.TINY
+from hardware import require
+require("ext")
 from exllamav3 import Config, Model
 from exllamav3.modules.dsv4 import DSV4CompressorState
 

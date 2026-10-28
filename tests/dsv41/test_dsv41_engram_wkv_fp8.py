@@ -6,6 +6,8 @@ import torch
 from safetensors.torch import save_file
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from hardware import require
+require("ext")
 from exllamav3.loader import SafetensorsCollection
 from exllamav3.modules import Linear
 

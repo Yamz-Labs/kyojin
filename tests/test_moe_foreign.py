@@ -32,6 +32,8 @@ def _load_pkg(name, path):
 
 iq2_xxs = _load_pkg("fq_iq2_ref", os.path.join(ENGINE, "exllamav3", "foreign_quant", "iq2_xxs.py"))
 
+from hardware import require  # noqa: E402
+require("ext")
 from exllamav3.modules.foreign_linear import ForeignLinear  # noqa: E402
 import exllamav3.modules.foreign_linear as fl_mod  # noqa: E402
 from exllamav3.modules.block_sparse_mlp import BlockSparseMLP  # noqa: E402

@@ -11,6 +11,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 
+from hardware import require
+require("ext")
 from exllamav3.cache import tq
 from exllamav3.cache.kvwin import KVWinLayerState, KVWinCtx, KVWinCfg, parse_spec
 

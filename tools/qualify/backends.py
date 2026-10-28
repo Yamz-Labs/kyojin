@@ -28,10 +28,10 @@ PROFILES = {
 _TORCH_PROBE = "import torch,sys; sys.exit(0 if (torch.version.{attr} and torch.__version__) else 3)"
 
 
-def find_python(backend: str, repo: str | None = None) -> str:
+def find_python(backend: str, repo: str | None = None, required: bool = True) -> str | None:
     """The interpreter whose torch matches the backend (cuda: torch.version.cuda, rocm: torch.version.hip): QUALIFY_PYTHON, then the
     engine checkout's own venv, $VIRTUAL_ENV, then every $QUALIFY_WORK_ROOT/*/{venv,.venv} (if set) and the current interpreter. No hand flag:
-    drill 0 tried the system python first (no torch) and had to be told which venv the lanes use."""
+    drill 0 tried the system python first (no torch) and had to be told which venv the lanes use. Not required (--dry-run): None when none is found."""
     import glob
     import subprocess
     if PYTHON:
@@ -55,6 +55,8 @@ def find_python(backend: str, repo: str | None = None) -> str:
                 return c
         except Exception:      # noqa: BLE001
             continue
+    if not required:
+        return None
     raise SystemExit(f"no python with a {attr} torch found (set QUALIFY_PYTHON)")
 
 

@@ -4,6 +4,8 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is None, reason = "ROCm only")
 
+from hardware import require
+require("ext")
 from exllamav3.modules.attention_fn import triton_paged as tp
 
 _SO = os.environ.get("EXL3_PF_CK_SO") or os.path.expanduser("~/.cache/kyojin/ck-fmha/libckpf.so")

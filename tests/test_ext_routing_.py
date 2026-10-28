@@ -11,6 +11,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hardware import require
+require("gpu", "ext")
 from exllamav3.ext import exllamav3_ext as ext
 
 # The routing kernels are excluded from non-CUDA builds; the module-level torch fallbacks in

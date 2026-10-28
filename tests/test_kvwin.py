@@ -14,6 +14,8 @@ import pytest
 
 pytestmark = pytest.mark.skipif(not CPU and not torch.cuda.is_available(), reason = "needs a GPU (or KVWIN_TEST_CPU=1)")
 
+from hardware import require
+require("ext")
 from exllamav3.cache.quant import CacheLayer_quant
 from exllamav3.cache import kvwin
 from exllamav3.cache.kvwin import KVWinLayerState, KVWinCtx, KVWinCfg, ring_rows, ring_positions, ov_write_ref, parse_spec

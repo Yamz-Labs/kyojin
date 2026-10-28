@@ -7,6 +7,8 @@ import os, sys
 from types import SimpleNamespace
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hardware import require
+require("ext")
 from exllamav3.modules.ple import PLELayerState
 
 

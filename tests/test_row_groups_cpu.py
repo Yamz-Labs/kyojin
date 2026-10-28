@@ -9,6 +9,8 @@ import types
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.generator import row_groups as RG
 from exllamav3.generator.generator import Generator
 from exllamav3.util.row_inv import ROW_INV_MAX_ROWS

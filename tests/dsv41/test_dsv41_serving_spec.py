@@ -16,6 +16,8 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "tools", "ds41"))
+from hardware import require
+require("ext")
 import test_dsv41_serving as S
 import test_dsv41_spec as T
 import dspark as ctl

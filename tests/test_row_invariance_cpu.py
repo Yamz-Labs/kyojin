@@ -7,6 +7,8 @@ import os
 import torch
 import pytest
 
+from hardware import require
+require("ext")
 from exllamav3.util.row_inv import ROW_INV, ROW_INV_MAX_ROWS
 from exllamav3.modules import block_sparse_mlp_routing as R
 from exllamav3.modules.mla_attn import MLAttention, _rowloop_max

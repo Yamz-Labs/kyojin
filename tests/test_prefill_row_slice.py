@@ -10,6 +10,8 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU (Triton)")
 
+from hardware import require
+require("ext")
 from exllamav3.modules.attention_fn import triton_paged as tp
 
 PAGE = 256

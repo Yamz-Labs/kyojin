@@ -2,6 +2,8 @@
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.modules import block_sparse_mlp as B
 from exllamav3.util.row_inv import ROW_INV_MAX_ROWS
 

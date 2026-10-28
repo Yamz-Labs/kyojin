@@ -2,6 +2,8 @@
 import json, os, subprocess, sys, tempfile
 from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from hardware import require
+require("ext")
 from exllamav3.util import kernel_seed
 
 REPO = str(Path(__file__).resolve().parents[1])

@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from exllamav3.modules import block_graph
 from exllamav3.modules.block_graph import BlockGraphRunner, maybe_graph_forward

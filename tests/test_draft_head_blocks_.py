@@ -7,6 +7,8 @@ try:
 except ImportError:      # plain-python run (the serving venv ships no pytest)
     pytest = None
 import torch
+from hardware import require
+require("ext")
 from exllamav3.architecture.qwen3_5_mtp import exl3_block_subhead
 from exllamav3.modules.quant.exl3 import LinearEXL3
 

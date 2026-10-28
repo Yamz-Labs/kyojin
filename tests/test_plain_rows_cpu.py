@@ -1,4 +1,6 @@
 """CPU gate: which decode steps take the R-row exact paths (params["dflash_verify"]) without drafting."""
+from hardware import require
+require("ext")
 from exllamav3.generator.row_groups import PLAIN_ROWS, plain_rows_verify
 from exllamav3.util.row_inv import ROW_INV, ROW_INV_MAX_ROWS
 

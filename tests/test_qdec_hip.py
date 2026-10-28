@@ -4,6 +4,8 @@ import argparse, math, os, sys, time
 os.environ.setdefault("EXL3_QDEC_HIP", "1")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import torch
+from hardware import require
+require("ext")
 from exllamav3.modules.attention_fn import triton_paged as tp
 
 ap = argparse.ArgumentParser()

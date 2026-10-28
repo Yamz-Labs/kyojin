@@ -11,6 +11,8 @@ import torch
 from safetensors.torch import save_file
 
 from hip_flash_quant import exl3_expert_quant
+from hardware import require
+require("ext")
 from exllamav3 import Config, Model
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.model.lora import LoRA

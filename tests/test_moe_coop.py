@@ -10,6 +10,8 @@ reconstructed weights.
 import os
 import pytest
 import torch
+from hardware import require
+require("ext")
 from exllamav3.ext import exllamav3_ext as ext
 
 pytestmark = pytest.mark.skipif(
@@ -18,6 +20,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 DEV = torch.device(os.environ.get("EXL3_TEST_DEVICE", "cuda:0"))
+if DEV.type == "cuda":
+    pytestmark = [pytestmark, pytest.mark.gpu]
 ACTS = {"silu": 0, "gelu": 1, "relu2": 2, "swiglu_oai": 3}
 
 

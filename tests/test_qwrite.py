@@ -3,6 +3,8 @@ python tests/test_qwrite.py"""
 import os, sys, time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import torch
+from hardware import require
+require("ext")
 from exllamav3 import ext_fallbacks as fb
 
 dev = torch.device("cuda"); torch.manual_seed(0)

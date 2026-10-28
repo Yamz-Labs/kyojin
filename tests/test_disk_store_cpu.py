@@ -4,6 +4,8 @@ import time
 
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.util import disk_store as ds
 
 

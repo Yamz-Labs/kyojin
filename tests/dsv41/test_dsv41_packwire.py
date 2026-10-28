@@ -23,6 +23,8 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools", "ds41"))
 
+from hardware import require  # noqa: E402
+require("ext")
 import tiny_ckpt  # noqa: E402
 from exllamav3.dsv41 import packspec as PS  # noqa: E402
 from exllamav3.dsv41.engram import MemoryEngramStore  # noqa: E402

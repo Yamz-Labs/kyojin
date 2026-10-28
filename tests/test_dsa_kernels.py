@@ -13,6 +13,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+from hardware import require
+require("ext")
 from exllamav3.modules.attention_fn.dsa_triton import dsa_attn, dsa_indexer_scores
 from exllamav3.ext import exllamav3_ext as ext
 

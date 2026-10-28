@@ -25,6 +25,8 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools", "ablit"))
 sys.path.insert(0, os.path.join(ROOT, "tools", "ds41"))
+from hardware import require  # noqa: E402
+require("ext")
 from test_dsv41_serving import make_world, build_ref, build_serving, ids_of  # noqa: E402
 from exllamav3.modules import ablit_runtime  # noqa: E402
 import arch as A  # noqa: E402

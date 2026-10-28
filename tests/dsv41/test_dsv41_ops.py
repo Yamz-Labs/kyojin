@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hardware import require
+require("ext")
 from harness import *
 from harness import _fp8_block_quant, _fp4_row_quant
 from exllamav3.dsv41 import ops, quant

@@ -251,6 +251,42 @@ class CliTests(unittest.TestCase):
             self.assertIn("serve command", buf.getvalue())
             self.assertEqual([p.name for p in (Path(t) / "o").iterdir()], [])
 
+    def test_dry_run_without_a_gpu_torch_names_qualify_python(self):
+        import io, contextlib, qualify
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as t:
+            (Path(t) / "p").mkdir()
+            pk = fake_pack(Path(t) / "p")
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(qualify.backends, "find_python", return_value=None), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = qualify.main(["--backend", "rocm", "--pack", str(pk), "--dry-run", "--out", str(Path(t) / "o")])
+            self.assertEqual(rc, 0)
+            self.assertIn("$QUALIFY_PYTHON", out.getvalue())
+            self.assertIn("QUALIFY_PYTHON", err.getvalue())
+
+    def test_a_bad_pack_is_one_line_naming_the_flag(self):
+        import qualify
+        with tempfile.TemporaryDirectory() as t:
+            (Path(t) / "empty").mkdir()
+            (Path(t) / "broken").mkdir()
+            (Path(t) / "broken" / "config.json").write_text("{not json")
+            (Path(t) / "partial").mkdir()
+            (Path(t) / "partial" / "config.json").write_text(json.dumps({"architectures": ["LlamaForCausalLM"]}))
+            for name, want in (("missing", "no such directory"), ("empty", "no config.json"), ("broken", "JSONDecodeError"), ("partial", "KeyError")):
+                with self.subTest(name), self.assertRaises(SystemExit) as cm:
+                    qualify.main(["--backend", "cuda", "--pack", str(Path(t) / name), "--dry-run", "--out", str(Path(t) / "o")])
+                self.assertIsInstance(cm.exception.code, str)
+                self.assertTrue(cm.exception.code.startswith("--pack "), cm.exception.code)
+                self.assertIn(want, cm.exception.code)
+
+    def test_a_bad_int_list_is_a_usage_error(self):
+        import io, contextlib, qualify
+        for flag, value in (("--sessions", "1,x"), ("--sessions", "0"), ("--kv-bits", "")):
+            with self.subTest(flag=flag, value=value), contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as cm:
+                qualify.parse(["--backend", "cuda", "--pack", "/p", flag, value])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn(flag, err.getvalue())
+
 
 
 class KvModeRule(unittest.TestCase):

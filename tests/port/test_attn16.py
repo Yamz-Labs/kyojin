@@ -19,6 +19,9 @@ except ImportError:   # the CUDA venv has no pytest: __main__ runs the same grid
 
 if pytest is not None:
     pytestmark = pytest.mark.skipif(not torch.cuda.is_available() or bool(torch.version.hip), reason = "CUDA only")
+if pytest is not None and __name__ != "__main__":     # collected by pytest (tests/hardware.py is on the path then)
+    from hardware import require
+    require("gpu", "ext")
 
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.modules.attention_fn import triton_paged as tp

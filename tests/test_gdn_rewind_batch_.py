@@ -7,6 +7,8 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from types import SimpleNamespace
 import torch
+from hardware import require
+require("ext")
 from exllamav3.modules import gated_delta_net as gdn
 
 dev = torch.device("cuda:0")

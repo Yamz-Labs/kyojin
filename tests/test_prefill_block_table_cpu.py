@@ -1,5 +1,7 @@
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.generator.generator import block_table_pages
 from exllamav3.generator.pagetable import Sequence

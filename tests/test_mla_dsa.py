@@ -5,6 +5,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from hardware import require
+require("ext")
 from exllamav3.modules import MLAttention
 from exllamav3.cache import CacheLayer_MLA_fp16, CacheLayer_MLA_quant
 from exllamav3.ext import exllamav3_ext as ext

@@ -3,6 +3,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import numpy as np
 import torch
+from hardware import require
+require("ext")
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3 import (
     TopKSampler,

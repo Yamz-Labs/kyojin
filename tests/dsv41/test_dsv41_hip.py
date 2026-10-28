@@ -16,6 +16,8 @@ import numpy as np
 import pytest
 import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hardware import require
+require("ext")
 from harness import *
 from test_dsv41_e2e import setup, build_mine
 from exllamav3.dsv41 import ops, quant

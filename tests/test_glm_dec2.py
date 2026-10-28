@@ -27,6 +27,8 @@ import pytest
 import torch
 
 sys.path.insert(0, os.environ.get("EXL3_REPO", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from hardware import require  # noqa: E402
+require("ext")
 from exllamav3.ext import exllamav3_ext as ext  # noqa: E402
 
 DEV = "cuda:0"

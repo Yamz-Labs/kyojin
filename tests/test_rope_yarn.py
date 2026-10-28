@@ -6,6 +6,8 @@ import pytest
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from hardware import require
+require("ext")
 from exllamav3.util.rope import RoPE, RopeSettings
 
 

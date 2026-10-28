@@ -18,6 +18,8 @@ import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hardware import require
+require("ext")
 from exllamav3.dsv41 import ops, quant
 from exllamav3.dsv41.engram import (EngramLayout, NgramHasher, MemoryEngramStore, dequant_rows, engram_inject)
 

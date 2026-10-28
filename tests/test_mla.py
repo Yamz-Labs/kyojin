@@ -4,6 +4,8 @@ import math
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.modules import MLAttention
 from exllamav3.cache import CacheLayer_MLA_fp16
 from exllamav3.constants import PAGE_SIZE

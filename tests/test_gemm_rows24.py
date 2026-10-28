@@ -2,6 +2,8 @@ import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import torch
+from hardware import require
+require("ext")
 from exllamav3.ext import exllamav3_ext as ext
 
 # Swapped-operand 24-row tile (kernel shape 6, CUDA): 17..24 rows against the 32-row tile (shape 5) and the 16-row tiles

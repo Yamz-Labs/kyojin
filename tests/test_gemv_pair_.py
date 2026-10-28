@@ -6,6 +6,8 @@ Needs a CUDA device and EXL3_INT8_GEMV on (default on CUDA).
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+from hardware import require
+require("gpu", "ext")
 from exllamav3.ext import exllamav3_ext as ext
 
 mode = int(os.environ.get("EXL3_GEMV_PAIR", "1"))

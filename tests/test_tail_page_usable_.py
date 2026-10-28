@@ -5,6 +5,8 @@ so the restore must take the deeper copy from the disk. Pure torch on CPU.
 import os, sys, types
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+from hardware import require
+require("ext")
 from exllamav3.generator.prefix_disk import tail_page_usable
 
 ids = torch.arange(100).view(1, -1)

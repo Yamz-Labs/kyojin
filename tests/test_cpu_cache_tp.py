@@ -3,6 +3,8 @@ import torch
 from collections import namedtuple
 from types import SimpleNamespace
 
+from hardware import require
+require("ext")
 from exllamav3.generator.cpu_cache import CPUPageCache
 from exllamav3.model.model_tp_fn import (
     mp_cpu_cache_init,

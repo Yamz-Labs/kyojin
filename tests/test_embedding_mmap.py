@@ -1,5 +1,7 @@
 import os, torch
 from safetensors.torch import save_file
+from hardware import require
+require("ext")
 from exllamav3.loader.safetensors import SafetensorsCollection
 
 

@@ -1,5 +1,24 @@
+import os
+import sys
+
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # tests/hardware.py, whatever the --import-mode
+import hardware  # noqa: E402
+
+
+def pytest_configure(config):
+    for need, reason in hardware.REASONS.items():
+        config.addinivalue_line("markers", f"{need}: {reason}; skipped without it (tests/hardware.py, EXL3_TESTS_STRICT=1 runs it anyway)")
+
+
+def pytest_collection_modifyitems(config, items):
+    for need, reason in hardware.REASONS.items():
+        if hardware.missing(need):
+            for item in items:
+                if item.get_closest_marker(need):
+                    item.add_marker(pytest.mark.skip(reason = reason))
 
 
 @pytest.fixture(autouse = True)

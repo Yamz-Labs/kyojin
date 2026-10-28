@@ -1,6 +1,8 @@
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.modules.attention_fn import triton_paged as tp
 
 

@@ -3,6 +3,8 @@ import torch
 from collections import namedtuple
 from types import SimpleNamespace
 
+from hardware import require
+require("ext")
 from exllamav3.generator.cpu_cache import CPUPageCache
 
 # The eviction policy is plain host-side bookkeeping over the slot table, so it can be driven directly with a
