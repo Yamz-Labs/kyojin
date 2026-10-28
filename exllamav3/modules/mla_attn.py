@@ -420,6 +420,9 @@ class MLAttention(Module):
         # serves every path, and no cuBLAS batched GEMM is involved anywhere in the module
         self.w_uk_flat = None   # (kv_lora_rank, H * qk_nope_head_dim)
         self.w_uv_flat = None   # (kv_lora_rank, H * v_head_dim)
+        self.tq_inv_gamma = None
+        self.tq_rot_g = None
+        self.tq_state = None    # TurboQuant cache: TQState whose rotation is folded into the two flats above
         self._scratch = {}
 
 
@@ -428,7 +431,9 @@ class MLAttention(Module):
         was constructed with. A quantized cache request maps to the packed-latent layer: k_bits
         sets the latent width, the shared rope key stays fp16 (v_bits is accepted but unused -
         there is no separate V)."""
-        from ..cache import CacheLayer_fp16, CacheLayer_MLA_fp16, CacheLayer_quant, CacheLayer_MLA_quant
+        from ..cache import CacheLayer_fp16, CacheLayer_MLA_fp16, CacheLayer_quant, CacheLayer_MLA_quant, CacheLayer_MLA_tq
+        if getattr(default, "tq", False):
+            return CacheLayer_MLA_tq, kwargs
         if issubclass(default, CacheLayer_quant):
             return CacheLayer_MLA_quant, kwargs
         if issubclass(default, CacheLayer_fp16):
@@ -500,6 +505,24 @@ class MLAttention(Module):
         self.w_uv_flat = torch.empty((D_c, H * v), dtype = torch.half, device = device)
         self.w_uv_flat.view(D_c, H, v).copy_(w[:, nope:, :].permute(2, 0, 1))
 
+        # TurboQuant cache: the module keeps its latent in the rotated domain end to end (cache/mla.py CacheLayer_MLA_tq): W_UK / W_UV are
+        # stored left-multiplied by R, so q_lat comes out rotated and the unfold un-rotates for free; the normalized latent is rotated once
+        # after kv_a_layernorm (_attend_pre, BC stage)
+        tqs = [bool(getattr(cl, "tq", False)) for cl in self.cache_layers]
+        assert all(tqs) or not any(tqs), "an MLA module cannot mix TurboQuant and other caches (its weights are folded for one domain)"
+        self.tq_state = None
+        if tqs and all(tqs):
+            from ..cache.tq import TQState
+            self.tq_state = TQState.get(D_c, self.cache_layers[0].k_bits, self.cache_layers[0].k_bits, device)
+            r = self.tq_state.rot32
+            # read the norm weight directly: the submodule's own tensor may still be a deferred (not yet filled) read at this point
+            g = self.config.stc.get_tensor(self.kv_a_layernorm.tensor_key, device, float2half = True, allow_bf16 = True, no_defer = True).float()
+            assert bool((g != 0).all()), "kv_a_layernorm weight has zeros: the TurboQuant fold divides by it"
+            self.tq_inv_gamma = (1.0 / g).contiguous()
+            self.tq_rot_g = (r * self.tq_inv_gamma[None, :]).t().contiguous().half()      # y = R (x / gamma) as one rotation GEMM: x @ (R diag(1/gamma))^T
+            self.w_uk_flat = (r @ (g[:, None] * self.w_uk_flat.float())).half()
+            self.w_uv_flat = (r @ (g[:, None] * self.w_uv_flat.float())).half()
+
 
     @override
     def load(self, device: torch.Device, **kwargs):
@@ -515,8 +538,12 @@ class MLAttention(Module):
         if self.w_uk_flat is not None:
             H, nope, v = self.num_q_heads, self.qk_nope_head_dim, self.v_head_dim
             D_c = self.kv_lora_rank
-            uk = self.w_uk_flat.view(D_c, H, nope).permute(1, 2, 0)
-            uv = self.w_uv_flat.view(D_c, H, v).permute(1, 2, 0)
+            wuk, wuv = self.w_uk_flat, self.w_uv_flat
+            if self.tq_state is not None:       # undo the fold: the checkpoint layout is the natural latent domain
+                wuk = (self.tq_inv_gamma[:, None] * (self.tq_state.rot32.t() @ wuk.float())).half()
+                wuv = (self.tq_inv_gamma[:, None] * (self.tq_state.rot32.t() @ wuv.float())).half()
+            uk = wuk.view(D_c, H, nope).permute(1, 2, 0)
+            uv = wuv.view(D_c, H, v).permute(1, 2, 0)
             t[f"{self.key}.{self.key_kv_b}.weight"] = \
                 torch.cat([uk, uv], dim = 1).reshape(H * (nope + v), D_c).contiguous()
         # K-pool compression parameters are raw (unquantized) module tensors, carried as-is
@@ -536,6 +563,7 @@ class MLAttention(Module):
         self.rope = None
         self.w_uk_flat = None
         self.w_uv_flat = None
+        self.tq_state = None
         self.idx_kpool_ape = None
         self.idx_kpool_gate = None
         self._idx_kpool_gate_t = None
@@ -1141,6 +1169,13 @@ class MLAttention(Module):
         )
         k_pe = ckv_kpe[..., self.kv_lora_rank:].reshape(bsz, seqlen, 1, self.qk_rope_head_dim).contiguous()
         _dbg_sync("kv_a_layernorm+slice", x.device)
+        if self.tq_state is not None:
+            # gamma-free latent n = c / gamma (gamma is folded into the weights): flat per-channel scale, much better TurboQuant KL
+            if ckv.numel() // self.kv_lora_rank > 1024:     # prefill rows: one library GEMM
+                ckv = (ckv.reshape(-1, self.kv_lora_rank) @ self.tq_rot_g).view(ckv.shape)
+            else:
+                from .attention_fn.tq_triton import tq_rotate
+                ckv = tq_rotate(self.tq_rot_g, ckv)[0]
 
         if self.rope is not None:
             q_pe, k_pe = self.rope.apply(
@@ -1517,7 +1552,7 @@ class MLAttention(Module):
             # Packed latent feeds the kernels directly (online dequant, rotated domain); the rope
             # key pages are fp16 either way
             ckv_cache, sk, kpe_cache, bits = layer.get_qc()
-            qc = (sk, bits)
+            qc = (sk, bits, layer.state if getattr(layer, "tq", False) else None)
         else:
             ckv_cache, kpe_cache = layer.get_kv(cache_seqlens, block_table)
             qc = None
