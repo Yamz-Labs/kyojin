@@ -57,6 +57,7 @@ def _main():
     ap.add_argument("--no-decode", action="store_true")
     ap.add_argument("--min-avail-gb", type=float, default=10.0)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--ndt-list", default="", help="draft depths to scan in ONE load, interleaved per --reps visit (e.g. 3,4,5,6 = verify rows 4..7); overrides --ndt")
     ap.add_argument("--arm", action="append", default=[], help="NAME:K=V,K2=V2 (repeatable): A/B arms of exllamav3.util.knobs switched in this ONE load")
     ap.add_argument("--order", default="", help="visit order of the arms, e.g. ABBAAB (default: each arm once, in the order given)")
     args = ap.parse_args()
@@ -72,8 +73,10 @@ def _main():
     torch.set_grad_enabled(False)
 
     depths = [int(x) for x in args.depths.split(",")]
+    ndt_scan = [int(x) for x in args.ndt_list.split(",")] if args.ndt_list else []
     R = args.ndt + 1
-    top = max(depths) + args.chunk + args.steps + R + 64
+    Rmax = max([R] + [n + 1 for n in ndt_scan])
+    top = max(depths) + args.chunk + args.steps + Rmax + 64
     cap = ((top + PAGE - 1) // PAGE + 1) * PAGE
     RES = {"model": args.model, "args": vars(args), "env": {k: v for k, v in os.environ.items() if k.startswith(("EXL3_", "MPW"))},
            "points": {}}
@@ -93,7 +96,7 @@ def _main():
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     qkw = dict(layer_type=CacheLayer_quant, k_bits=args.cache_bits, v_bits=args.cache_bits) if args.cache_bits < 16 else {}
-    cache = Cache(model, max_num_tokens=cap, max_history=max(3, R), max_batch_size=1, **qkw)
+    cache = Cache(model, max_num_tokens=cap, max_history=max(3, Rmax), max_batch_size=1, **qkw)
     model.load(device="cuda:0", progressbar=False)
     RES["load_s"] = round(time.time() - t0, 1)
     RES["avail_after_load_gb"] = round(avail_gb(), 1)
@@ -143,6 +146,12 @@ def _main():
     chunk_ids = torch.randint(1000, min(V, 100000), (1, args.chunk), generator=gen)
     one = torch.randint(1000, min(V, 100000), (1, 1), generator=gen)
     rows = torch.randint(1000, min(V, 100000), (1, R), generator=gen)
+    rows_of = {R: rows}
+
+    def rows_for(r):
+        if r not in rows_of:                       # one synthetic row set per row count, reused across visits
+            rows_of[r] = torch.randint(1000, min(V, 100000), (1, r), generator=gen)
+        return rows_of[r]
 
     import hashlib
     HASH = hashlib.md5()
@@ -171,9 +180,11 @@ def _main():
     med = lambda x: sorted(x)[len(x) // 2]
     for d in depths:
         RES["points"][str(d)] = {}
-    def decode_points(P, hashes=None):
+    def decode_points(P, hashes=None, R_=None, ids_rows=None):
         """decode and verify rows at depth d into P; hashes (arm runs) gets the md5 of the first step's last-row logits"""
-        for label, ids, n_rows in (("decode", one, 1), ("verify", rows, R)):
+        R_ = R_ or R
+        ids_rows = rows if ids_rows is None else ids_rows
+        for label, ids, n_rows in (("decode", one, 1), ("verify", ids_rows, R_)):
             ver = label == "verify"
             fresh(d)
             timed_steps(ids, d, 3, ver)                  # graph capture / JIT / allocator at this length
@@ -188,7 +199,7 @@ def _main():
                 fresh(d)
                 P[label]["window"] = window(lambda: [fwd(ids, d + k, verify=ver) for k in range(4)], 4)
 
-    if not args.no_decode and not args.arm:
+    if not args.no_decode and not args.arm and not ndt_scan:
         for d in depths:
             P = RES["points"][str(d)]
             decode_points(P)
@@ -221,6 +232,26 @@ def _main():
                 vs = [v["points"][str(d)] for v in RES["arms"][a]["visits"]]
                 print(f"[arm {a}] depth {d}: decode {med([v['decode']['ms'] for v in vs])} ms  verify {med([v['verify']['ms'] for v in vs])} ms  "
                       f"md5 {'stable' if all(v['md5'] == vs[0]['md5'] for v in vs) else 'UNSTABLE'} {vs[0]['md5']}", flush=True)
+    if ndt_scan and not args.no_decode:
+        RES["rows_scan"] = {str(n + 1): {} for n in ndt_scan}
+        for rep in range(args.reps):                 # visits interleaved over row counts: one CPU window for all of them
+            for n in ndt_scan:
+                r = n + 1
+                for d in depths:
+                    P = {}
+                    decode_points(P, None, r, rows_for(r))
+                    RES["rows_scan"][str(r)].setdefault(str(d), []).append(P)
+                    print(f"[rows] rep {rep} rows {r} depth {d}: decode {P['decode']['ms']} ms, "
+                          f"verify {P['verify']['ms']} ms (min {P['verify']['ms_min']})", flush=True)
+                save(); guard(f"rows@{r}")
+        for n in ndt_scan:
+            r = n + 1
+            for d in depths:
+                vs = RES["rows_scan"][str(r)][str(d)]
+                print(f"[rows {r}] depth {d}: verify med {med([v['verify']['ms'] for v in vs])} ms "
+                      f"(min {min(v['verify']['ms_min'] for v in vs)}, max {max(v['verify']['ms'] for v in vs)}), "
+                      f"decode med {med([v['decode']['ms'] for v in vs])} ms over {len(vs)} visits", flush=True)
+        save()
     if not args.no_prefill:
         fresh(depths[0])
         for _ in range(1):
