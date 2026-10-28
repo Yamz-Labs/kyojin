@@ -186,6 +186,20 @@ def test_verify_rows_beyond_one_pass_match_reference(bits):
 
 
 @needs_gpu
+@pytest.mark.parametrize("hd,kvh,qh,bits", [(128, 2, 8, 6), (128, 2, 16, 5), (256, 4, 24, 6), (256, 2, 8, 5)])
+def test_verify_rows_1_to_32_match_reference(hd, kvh, qh, bits):
+    """Spec / MTP verify steps and parallel-user rows: every row count 1..32 (rows = n x GQA group per kv head, 1..192) agrees with the
+    dequantized reference, whichever qdec kernel (qdec.cu, the many-row kernel) or Triton fallback serves it."""
+    rig = Rig(bits, hd = hd, kvh = kvh, qh = qh, pages = 6)
+    rig.step(600)
+    for n in range(1, 33):
+        q, o, L = rig.step(n)
+        r = rig.ref(q, L)
+        err = ((o.float() - r).norm() / r.norm()).item()
+        assert err < 6e-3, (hd, kvh, qh, bits, n, L, err)
+
+
+@needs_gpu
 @pytest.mark.parametrize("D", [128, 256])
 def test_fused_rotation_matches_gemm(D):
     from exllamav3.modules.attention_fn.tq_triton import _tq_rotate_kernel

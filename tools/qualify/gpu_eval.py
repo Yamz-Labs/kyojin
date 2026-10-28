@@ -133,13 +133,15 @@ def kvmode(pack, docs, out, n=256, only=None):
                 m.prefill(x[:, a: min(a + 2048, e)], par(a, min(a + 2048, e) - a))
             rows = []
             t_dec = time.time()
-            for j in range(n):
-                lg = m.forward(x[:, e + j: e + j + 1], par(e + j, 1))
-                rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-1], -1).cpu())
+            qs = int(os.environ.get("KVMODE_QS", "1"))        # rows per decode step: >1 exercises the verify path (spec / MTP / parallel users)
+            for j in range(0, n, qs):
+                k = min(qs, n - j)
+                lg = m.forward(x[:, e + j: e + j + k], par(e + j, k))
+                rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-k:], -1).half().cpu())
             t_dec = (time.time() - t_dec) / n
             if st is not None:
                 st.free()
-        lps[name] = torch.stack(rows).float()
+        lps[name] = torch.cat(rows).float()
         if name == "k8v8":
             torch.save(lps[name], out + ".k8v8.pt")
         free(m, cache)
