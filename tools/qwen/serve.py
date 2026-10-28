@@ -742,6 +742,14 @@ class QwenEngine:
         if sessions > 1 and not on_cuda:   # speculative rounds of N requests verify N * (depth + 1) rows: cap the depth so they stay in one 8-row forward
             # (NVIDIA keeps the spec_policy default: a 16-row budget for a dense model, no cap for a MoE model)
             os.environ.setdefault("QWSPEC_LOAD_ROWS", os.environ.get("EXL3_ROW_INV_GROUP_ROWS") or "8")
+            # chunked prefill beside decoding users (gfx1151, 4 streams + one 32K prompt, EXL3_ROW_INV_GROUPS=1):
+            # without it every running stream waits one full 4096-row chunk (0.4 tok/s each); with the decode-priority
+            # chunk the streams decode in the same step as the leader's chunk, 4.2 tok/s each (+10x) for a 2.1x TTFT
+            # of the new prompt (19.8 s -> 40.9 s). Pure chunk steps (EXL3_CIL_SLICE_S=0) only reached 2.2 tok/s.
+            # Opt out with EXL3_SCHED_CHUNK_IL=0.
+            os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
+            os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
+            os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
