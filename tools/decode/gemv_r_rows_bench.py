@@ -34,8 +34,11 @@ ARMS = {
  "D9r2": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RPB9": "2"},
  "D9r8": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RPB9": "8"},
  "D9ns": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_SWAP9": "0"},
+ # shipped verify env for 5..8 rows (tools/qwen/serve.py SERVE_ENV): RM6 + WIDE8 + DEC1
+ "S1": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RM6": "1", "EXL3_GEMV_R_WIDE8": "1"},
+ "S1a0": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RM6": "1", "EXL3_GEMV_R_WIDE8": "1", "EXL3_GEMV_R_ARR1": "0"},
 }
-KEYS = ["EXL3_GEMV_R_DEC1", "EXL3_GEMV_R_RPB", "EXL3_GEMV_R_CHUNK_FAST", "EXL3_GEMV_R_RPB78", "EXL3_GEMV_R_RM6", "EXL3_GEMV_R_RPB9", "EXL3_GEMV_R_SWAP9"]
+KEYS = ["EXL3_GEMV_R_DEC1", "EXL3_GEMV_R_RPB", "EXL3_GEMV_R_CHUNK_FAST", "EXL3_GEMV_R_RPB78", "EXL3_GEMV_R_RM6", "EXL3_GEMV_R_RPB9", "EXL3_GEMV_R_SWAP9", "EXL3_GEMV_R_WIDE8", "EXL3_GEMV_R_ARR1"]
 def setarm(name):
     for k in KEYS: os.environ.pop(k, None)
     os.environ.update(ARMS[name])
