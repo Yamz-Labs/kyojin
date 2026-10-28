@@ -18,8 +18,16 @@ from ..cache.recurrent import (
     new_checkpoint_handle,
 )
 from ..model.model_tp_alloc import TPAllocation
-from ..util import profile_opt
+from ..util import profile_opt, knobs
 import os
+
+
+def _verify_attn_loop() -> bool:
+    """EXL3_VERIFY_ATTN_LOOP, falling back to EXL3_DEC_MOE_UNION when neither is set (knob table default: "0")"""
+    v = knobs.knob("EXL3_VERIFY_ATTN_LOOP", "0")
+    if "EXL3_VERIFY_ATTN_LOOP" not in os.environ:
+        v = knobs.knob("EXL3_DEC_MOE_UNION", "0")
+    return v != "0"
 
 # Sliced Q/K/V(/G) projection bundle at decode (see attn.py); EXL3_QKV_SLICE=0 disables it
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
@@ -1157,7 +1165,7 @@ class SlidingAttention(Module):
             # call itself.
             if (
                 1 < seqlen <= MAX_BSZN_GEMV_R and params.get("dflash_verify") and
-                os.environ.get("EXL3_VERIFY_ATTN_LOOP", os.environ.get("EXL3_DEC_MOE_UNION", "0")) != "0"
+                _verify_attn_loop()
             ):
                 if os.environ.get("EXL3_VERIFY_ATTN_ROWS", "1") != "0" and q.shape[0] == 1 and bt.shape[0] == 1:
                     # one append + one attention launch, bitwise the R batch-1 calls below

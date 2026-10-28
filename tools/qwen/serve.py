@@ -510,7 +510,18 @@ class Retract(int):
 # prefill at 4K/16K), and EXL3_PF_SKIP (the MTP draft prefill fills K/V only and skips the 1-row lm_head, +0.5 % to +2 %).
 # Set any of them to 0 to go back.
 SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verify readback + fewer host dispatches: +0.8 % speculative, ids identical
-             ("EXL3_MOE_FUSED", "1"), ("EXL3_MOE_VALU", "1"), ("EXL3_VERIFY_ATTN_LOOP", "1"),
+             # 28/10 gfx1151: the verify block's attention runs as ONE R-row launch (qdec.hip, the ROCm many-row
+             # kernel, counterpart of cu/qdec_rows.cu on the 3090), not as R batch-1 calls: those re-dequantize the same
+             # KV window per row (16 full-attn layers x 5 launches at 5 rows). Price, ONE load per cell,
+             # ABBA, shipped env, k4v4, 10 steps: verify(3 rows) 4K 89.2 -> 83.8 ms, 32K 99.3 -> 87.2,
+             # 131K 128.8 -> 104.4, 262K 169.0 -> 131.3 (-6/-12/-19/-22 %); verify(6 rows) 4K
+             # 108.4 -> 102.6, 131K 181.6 -> 140.7 (-5/-22 %). Numerics: a different reduction order, gated
+             # per row against the bitwise loop at 4K/32K/131K (3 and 6 rows): top-1 equal on every row,
+             # max|dlogit| <= 0.078, KL <= 9.3e-5 (4-bit KV cache noise level). Served, ONE server life,
+             # /admin/knobs ABBA, 12K prompt, 200 tokens: per-round t_verify R2 77.4 -> 74.8, R3 83.6 ->
+             # 79.5, R4 88.5 -> 82.0, R5 97.9 -> 89.2, R8 110.7 -> 100.6 ms (=-3/-5/-7/-9/-9 %), tokens/round
+             # 3.0/3.0. 1 goes back to the batch-1 loop (bitwise vs plain decode).
+             ("EXL3_MOE_FUSED", "1"), ("EXL3_MOE_VALU", "1"), ("EXL3_VERIFY_ATTN_LOOP", "0"),
              ("EXL3_VERIFY_GEMV_R", "1"), ("EXL3_GEMV_R_DEC1", "1"), ("EXL3_MTP_FUSE_CATCHUP", "0"),
              ("EXL3_PLE_HIP", "1"), ("EXL3_DQ_HIP", "1"), ("EXL3_GR_HIP", "1"), ("EXL3_GDN_FUSE", "1"), ("EXL3_PF_SKIP", "1"),
              # the attention / GDN blocks keep o_proj's fp16 output (the residual apply widens in-kernel) and the ablit projection
