@@ -118,7 +118,9 @@ def decode_ref(words: torch.Tensor, scale: torch.Tensor, cb: torch.Tensor, bits:
     from ..ext_fallbacks import _unpack_cache_codes
     n = words.shape[0]
     codes = _unpack_cache_codes(words.view(n, dim // 32, bits).to(torch.int64) & 0xffffffff, bits)
-    return (cb[codes.reshape(n, dim)] * scale.float().unsqueeze(-1)).to(torch.float16)
+    # float64 product: one rounding to fp16, like the fused multiply-convert of the kernels (fp32 then fp16 rounds twice and
+    # differs on exact fp16 ties)
+    return (cb[codes.reshape(n, dim)].double() * scale.double().unsqueeze(-1)).to(torch.float16)
 
 
 class CacheLayer_tq(CacheLayer_quant):

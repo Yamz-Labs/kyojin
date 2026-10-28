@@ -83,7 +83,11 @@ def test_triton_write_and_window_dequant_exact(D, bits):
     rows = (bt.long().gather(1, tok // PAGE) * PAGE + tok % PAGE).reshape(-1)
     wr, sr = tq.encode_ref(x.reshape(-1, D), st.cbk, st.midk, bits)
     assert torch.equal(words.view(-1, words.shape[-1])[rows], wr.view(rows.numel(), -1))
-    assert torch.equal(sc.view(-1, HKV)[rows], sr.view(rows.numel(), -1))
+    # The kernel sums the squared norms in its own order, the reference in torch's: the fp32 norms differ in the last bit and the
+    # fp16 scale may land one step apart (about 1 in 300 draws). Codes are exact; scales must agree to one fp16 step.
+    sk = sc.view(-1, HKV)[rows]
+    assert (sk.view(torch.int16).int() - sr.view(rows.numel(), -1).view(torch.int16).int()).abs().max() <= 1
+    sr = sk.reshape(sr.shape)
     npps = bt.shape[1]
     out = torch.zeros(bsz * npps, PAGE, HKV, D, dtype = torch.half, device = DEV)
     T._tq_dequant_window_kernel[(bsz * npps * (PAGE // 16), HKV)](words, sc, st.cbk, out, bt, cs, length, npps, bits, PAGE, HKV, D, 16)
