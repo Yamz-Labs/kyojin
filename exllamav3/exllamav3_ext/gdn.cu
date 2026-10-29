@@ -991,6 +991,19 @@ void cuda_recurrent_gated_delta_rule_gr
         const char* vs_env = getenv("EXL3_GDN_VSPLIT_KDA");
         v_split = (vs_env && atoi(vs_env) == 4 && v_split == 4) ? 4 : 1;
     }
+    else
+    {
+        // Generic GDN (per-head decay) has the same state-access shape as KDA: at v_split 4 a block reads 128 B
+        // slices of 512 B state rows, only 128 of its 512 threads touch the state, and each block takes the whole
+        // VGPR file (104 regs x 512 threads) so the blocks run one per CU, 4.8 waves deep for 48 v heads. At
+        // v_split 1 the blocks are 48, every thread touches the state, and the state slice per thread is the same.
+        // The per-column arithmetic does not depend on v_split, so both are bit-identical. Measured on the iGPU
+        // (bit-equal out/state): 48 x 512 B state rows, 95 -> 172 GB/s at 1 row, 107 -> 197 GB/s at 5 rows with
+        // history, -45 % on the kernel and -2.5 % / -3.7 % on a 4K decode / 5-row verify in situ.
+        const char* vs_env = getenv("EXL3_GDN_VSPLIT_GDN");
+        const int vs = vs_env ? atoi(vs_env) : 1;
+        if ((vs == 1 || vs == 4) && v_head_dim % vs == 0) v_split = vs;
+    }
     TORCH_CHECK(v_head_dim % v_split == 0, "v_head_dim must be divisible by v_split");
 
     dim3 blocks(bsz, num_v_heads, v_split);  // group * num_k_heads

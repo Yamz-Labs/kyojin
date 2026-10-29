@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import os
+from .util.knobs import knob_on
 
 import torch
 import torch.nn.functional as F
@@ -691,7 +692,7 @@ def dequant_cache_paged_window(
     bonus_len: int, compand_a: float = 0.0,
 ) -> None:
     """Dequantize mapped pages into compact batch/page scratch storage in place."""
-    if torch.version.hip and os.environ.get("EXL3_DEQ_WINDOW_TRITON", "1") != "0":
+    if torch.version.hip and knob_on("EXL3_DEQ_WINDOW_TRITON"):
         from .modules.attention_fn.qdeq_window_triton import dequant_window_supported, dequant_window
         if dequant_window_supported(k_in, k_in_scales, k_out, v_in, v_in_scales, v_out, cache_seqlens, block_table, page_size, compand_a):
             dequant_window(k_in, k_in_scales, k_out, v_in, v_in_scales, v_out, cache_seqlens, block_table, bonus_len)

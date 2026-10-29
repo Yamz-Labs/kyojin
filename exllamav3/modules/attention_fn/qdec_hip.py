@@ -13,9 +13,18 @@ import subprocess
 
 import torch
 
+from ...util.knobs import knob, knob_int, knob_on, on_change
+
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qdec.hip")
 _CACHE = os.path.expanduser(os.environ.get("EXL3_QDEC_CACHE", "~/.cache/exllamav3"))
-ENABLED = bool(torch.version.hip) and os.environ.get("EXL3_QDEC_HIP", "1") != "0"
+ENABLED = bool(torch.version.hip) and knob_on("EXL3_QDEC_HIP")
+
+
+@on_change
+def _refresh_knobs():
+    global ENABLED
+    ENABLED = bool(torch.version.hip) and knob_on("EXL3_QDEC_HIP")
+
 _kernels = {}
 _bufs = {}
 _lib = None
@@ -33,11 +42,11 @@ def _hip():
 
 def pick_dw(hd, nt, nw):
     """waves per stream splitting the head dim: the smallest count that keeps the O accumulators (NT * HD/16 * 8 / DW floats) in budget"""
-    if os.environ.get("EXL3_QDEC_HIP_DW"):
-        dw = int(os.environ["EXL3_QDEC_HIP_DW"])
+    if knob("EXL3_QDEC_HIP_DW"):
+        dw = int(knob("EXL3_QDEC_HIP_DW"))
         return dw if dw in (1, 2, 4) and nw % dw == 0 and hd // 16 // dw >= 4 else None
     for dw in (1, 2, 4):
-        if nw % dw == 0 and hd // 16 // dw >= 4 and nt * (hd // 16) * 8 // dw <= int(os.environ.get("EXL3_QDEC_HIP_MAXO", "96")):
+        if nw % dw == 0 and hd // 16 // dw >= 4 and nt * (hd // 16) * 8 // dw <= knob_int("EXL3_QDEC_HIP_MAXO", 96):
             return dw
     return None
 
@@ -63,7 +72,7 @@ def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, 
         return None
     if head_dim not in (128, 256) or n_q_heads % n_kv_heads != 0 or page_size % 16 != 0:
         return None
-    nw = int(os.environ.get("EXL3_QDEC_HIP_NW", "0")) or 4
+    nw = knob_int("EXL3_QDEC_HIP_NW", 0) or 4
     nt = (q_len * (n_q_heads // n_kv_heads) + 15) // 16
     dw = pick_dw(head_dim, nt, nw)
     if dw is None:
@@ -72,14 +81,16 @@ def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, 
     if shared > 64 * 1024:
         return None
     return dict(hd=head_dim, kb=k_bits, vb=v_bits, nkv=n_kv_heads, nqh=n_q_heads, qlen=q_len, page=page_size, nw=nw, dw=dw,
-                causal=bool(causal), scale=float(sm_scale), sinks=bool(has_sinks), key_lo=int(key_lo), tq=bool(tq))
+                causal=bool(causal), scale=float(sm_scale), sinks=bool(has_sinks), key_lo=int(key_lo), tq=bool(tq),
+                vpf=bool(knob_int("EXL3_QDEC_HIP_VPF", 1)))
 
 
 def _compile(cfg, arch):
     from exllamav3.util import hip_compiler
     defs = dict(HD=cfg["hd"], KB=cfg["kb"], VB=cfg["vb"], NKV=cfg["nkv"], NQH=cfg["nqh"], QLEN=cfg["qlen"], PAGE=cfg["page"],
-                NW=cfg["nw"], DW=cfg["dw"], CAUSAL=int(cfg["causal"]), HAS_SINKS=int(cfg["sinks"]), KEY_LO=cfg["key_lo"], TQ=int(cfg.get("tq", False)), SCALE=repr(float(cfg["scale"])) + "f")
-    extra = [f"-D{k}={v}" for k, v in defs.items()] + os.environ.get("EXL3_QDEC_HIP_FLAGS", "").split()
+                NW=cfg["nw"], DW=cfg["dw"], CAUSAL=int(cfg["causal"]), HAS_SINKS=int(cfg["sinks"]), KEY_LO=cfg["key_lo"], TQ=int(cfg.get("tq", False)),
+                VPF=int(cfg.get("vpf", False)), SCALE=repr(float(cfg["scale"])) + "f")
+    extra = [f"-D{k}={v}" for k, v in defs.items()] + knob("EXL3_QDEC_HIP_FLAGS", "").split()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"] + extra
     gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
     if os.path.isdir(gcc):
@@ -123,7 +134,7 @@ class _Kernel:
 
 
 def get_kernel(cfg, device):
-    key = (device.index, tuple(sorted(cfg.items())))
+    key = (device.index, tuple(sorted(cfg.items())), knob("EXL3_QDEC_HIP_FLAGS", ""))
     k = _kernels.get(key)
     if k is None:
         k = _kernels[key] = _Kernel(cfg, device)
@@ -146,9 +157,9 @@ def cu_count(device):
 
 
 def num_splits(cfg, device, programs, max_k_len):
-    if os.environ.get("EXL3_QDEC_HIP_SPL"):
-        return int(os.environ["EXL3_QDEC_HIP_SPL"])
-    waves = int(os.environ.get("EXL3_QDEC_HIP_WAVES", "0")) or cu_count(device) * (16 if cfg.get("tq") and cfg["qlen"] * (cfg["nqh"] // cfg["nkv"]) <= 16 else 12)   # tq, one q tile: 4 waves per SIMD (its V loads stay in flight)
+    if knob("EXL3_QDEC_HIP_SPL"):
+        return int(knob("EXL3_QDEC_HIP_SPL"))
+    waves = knob_int("EXL3_QDEC_HIP_WAVES", 0) or cu_count(device) * (16 if cfg.get("tq") and cfg["qlen"] * (cfg["nqh"] // cfg["nkv"]) <= 16 else 12)   # tq, one q tile: 4 waves per SIMD (its V loads stay in flight)
     return max(1, min(-(-waves // (programs * cfg["nw"])), -(-max_k_len // 16 // cfg["nw"]), 128))
 
 
