@@ -128,9 +128,16 @@ qdec_split(
 {
     __shared__ __align__(16) u32 cbk_s[TQ ? (1 << (2 * KB)) : 1];
     __shared__ __align__(16) u32 cbv_s[TQ ? (1 << (2 * VB)) : 1];
+    __shared__ __align__(16) u16 hraw[TQ ? 8 : 1024];      // H32 rotation matrix of the q prologue (fp16 bits, staged by cp.async)
     extern __shared__ __align__(16) unsigned char smem[];
     u16* Qs = (u16*)smem;
-    unsigned char* ring = smem + ((NT * 8 * QSTR * 2 + 15) / 16) * 16;
+#if TQ
+    constexpr int QRAW_B = 0;
+#else
+    constexpr int QRAW_B = ((NT * 8 * HD * 2 + 15) / 16) * 16;     // the q rows as loaded (fp16), rotated into Qs by the prologue
+#endif
+    u16* qraw = (u16*)(smem + ((NT * 8 * QSTR * 2 + 15) / 16) * 16);
+    unsigned char* ring = smem + ((NT * 8 * QSTR * 2 + 15) / 16) * 16 + QRAW_B;
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int g = lane >> 2, t = lane & 3;
@@ -142,40 +149,23 @@ qdec_split(
     const int n_start = split * split_len;
     const int n_end = min(n_start + split_len, total_k);
 
-    // ---- q rows -> rotated (h32) fp16 in smem
-    if (TQ) {                                            // q arrives already rotated: plain copy (K dim order permuted like below)
-        for (int i = tid; i < (1 << (2 * KB)); i += NTHREADS) cbk_s[i] = (u32)cbk[i & ((1 << KB) - 1)] | ((u32)cbk[i >> KB] << 16);
-        for (int i = tid; i < (1 << (2 * VB)); i += NTHREADS) cbv_s[i] = (u32)cbv[i & ((1 << VB) - 1)] | ((u32)cbv[i >> VB] << 16);
-        for (int idx = tid; idx < NT * 8 * HD; idx += NTHREADS) {
-            int r = idx / HD, d = idx % HD;
-            u16 x = 0;
-            if (r < ROWS) x = q[((size_t)((batch * QLEN + r % QLEN) * NQH + kvh * GROUP + r / QLEN)) * HD + d];
-            Qs[r * QSTR + ((d & ~15) | (d & 8) | ((d & 3) << 1) | ((d >> 2) & 1))] = x;
+#if !TQ
+    // The q rows and the H32 matrix are requested first (one group), then the first K/V slabs: the prologue below waits for the
+    // q group only, and its latency-bound rotation overlaps the K/V fetch.
+    for (int c = tid; c < 1024 / 8; c += NTHREADS) cp16(hraw + c * 8, h32 + c * 8, true);
+    if ((((size_t)q) & 15) == 0) {
+        for (int c = tid; c < ROWS * (HD / 8); c += NTHREADS) {
+            int r = c / (HD / 8), d8 = c % (HD / 8);
+            cp16(qraw + r * HD + d8 * 8, q + ((size_t)((batch * QLEN + r % QLEN) * NQH + kvh * GROUP + r / QLEN)) * HD + d8 * 8, true);
         }
-        __syncthreads();
-    } else {
-        float* hs = (float*)(ring);                      // 32x32 fp32 scratch, ring is idle until the loop
-        for (int i = tid; i < 1024; i += NTHREADS) hs[i] = h2f(h32[i]);
-        __syncthreads();
-        for (int idx = tid; idx < NT * 8 * HD; idx += NTHREADS) {
-            int r = idx / HD, d = idx % HD, gi = d >> 5, c = d & 31;
-            float acc = 0.f;
-            if (r < ROWS) {
-                int row_q = r % QLEN, hl = r / QLEN;
-                const u16* qp = q + ((size_t)((batch * QLEN + row_q) * NQH + kvh * GROUP + hl)) * HD + gi * 32;
-                #pragma unroll
-                for (int k = 0; k < 32; k++) acc += h2f(qp[k]) * hs[k * 32 + c];
-            }
-            u32 hh = pack_h2(acc, 0.f) & 0xFFFFu;
-#if FASTDQ
-            Qs[r * QSTR + ((d & ~15) | (d & 8) | ((d & 3) << 1) | ((d >> 2) & 1))] = (u16)hh;
-#else
-            Qs[r * QSTR + d] = (u16)hh;
-#endif
+    } else {                                  // q is a view at an odd offset: plain loads
+        for (int c = tid; c < ROWS * HD; c += NTHREADS) {
+            int r = c / HD, d = c % HD;
+            qraw[c] = q[((size_t)((batch * QLEN + r % QLEN) * NQH + kvh * GROUP + r / QLEN)) * HD + d];
         }
-        __syncthreads();
     }
-
+    asm volatile("cp.async.commit_group;");
+#endif
     float m[NT][2], l[NT][2], qabs[NT][2];
     bool rvalid[NT][2];
     #pragma unroll
@@ -248,6 +238,59 @@ qdec_split(
     #pragma unroll
     for (int s = 0; s < ST - 1; s++) fill(s, ld_phys(s));
     int ph_cur = ld_phys(ST - 1);
+
+    // ---- q rows -> rotated (h32) fp16 in smem
+    if (TQ) {                                            // q arrives already rotated: plain copy (K dim order permuted like below)
+        for (int i = tid; i < (1 << (2 * KB)); i += NTHREADS) cbk_s[i] = (u32)cbk[i & ((1 << KB) - 1)] | ((u32)cbk[i >> KB] << 16);
+        for (int i = tid; i < (1 << (2 * VB)); i += NTHREADS) cbv_s[i] = (u32)cbv[i & ((1 << VB) - 1)] | ((u32)cbv[i >> VB] << 16);
+        for (int idx = tid; idx < NT * 8 * HD; idx += NTHREADS) {
+            int r = idx / HD, d = idx % HD;
+            u16 x = 0;
+            if (r < ROWS) x = q[((size_t)((batch * QLEN + r % QLEN) * NQH + kvh * GROUP + r / QLEN)) * HD + d];
+            Qs[r * QSTR + ((d & ~15) | (d & 8) | ((d & 3) << 1) | ((d >> 2) & 1))] = x;
+        }
+        __syncthreads();
+    } else {
+        asm volatile("cp.async.wait_group %0;" :: "n"(ST - 1));
+        __syncthreads();
+        // QU independent outputs per thread (NTHREADS is a multiple of 32, so they share the column c): the 32-term sums keep
+        // their order, the QU dependent chains run side by side
+        constexpr int QU = 4;
+        for (int base = tid; base < NT * 8 * HD; base += QU * NTHREADS) {
+            const u16* qp[QU];
+            float acc[QU];
+            #pragma unroll
+            for (int u = 0; u < QU; u++) {
+                int idx = base + u * NTHREADS;
+                int r = idx / HD, d = idx % HD;
+                acc[u] = 0.f;
+                qp[u] = (idx < NT * 8 * HD && r < ROWS) ? qraw + r * HD + (d >> 5) * 32 : nullptr;
+            }
+            const int c = base & 31;
+            #pragma unroll
+            for (int k = 0; k < 32; k++) {
+                const float hv = h2f(hraw[k * 32 + c]);
+                #pragma unroll
+                for (int u = 0; u < QU; u++)
+                    if (qp[u]) acc[u] += h2f(qp[u][k]) * hv;
+            }
+            #pragma unroll
+            for (int u = 0; u < QU; u++) {
+                int idx = base + u * NTHREADS;
+                if (idx < NT * 8 * HD) {
+                    int r = idx / HD, d = idx % HD;
+                    u32 hh = pack_h2(acc[u], 0.f) & 0xFFFFu;
+#if FASTDQ
+                    Qs[r * QSTR + ((d & ~15) | (d & 8) | ((d & 3) << 1) | ((d >> 2) & 1))] = (u16)hh;
+#else
+                    Qs[r * QSTR + d] = (u16)hh;
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+
 
 #if FASTDQ
     const DqK dk = make_dqk<KB>(t);
