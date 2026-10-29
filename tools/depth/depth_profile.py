@@ -60,6 +60,7 @@ def _main():
     ap.add_argument("--ndt-list", default="", help="draft depths to scan in ONE load, interleaved per --reps visit (e.g. 3,4,5,6 = verify rows 4..7); overrides --ndt")
     ap.add_argument("--arm", action="append", default=[], help="NAME:K=V,K2=V2 (repeatable): A/B arms of exllamav3.util.knobs switched in this ONE load")
     ap.add_argument("--order", default="", help="visit order of the arms, e.g. ABBAAB (default: each arm once, in the order given)")
+    ap.add_argument("--arm-eq", action="store_true", help="prefill arms: after each visit run one decode step and md5 its logits (end-to-end bit-identity of that arm's prefill)")
     args = ap.parse_args()
     arms = {}
     for spec in args.arm:
@@ -266,6 +267,10 @@ def _main():
                 fwd(chunk_ids, d, prefill=True)
                 torch.cuda.synchronize(); pacc[(a, d)].append(time.perf_counter() - t)
                 print(f"[pf] visit {n} arm {a} depth {d}: {1e3 * pacc[(a, d)][-1]:.0f} ms/chunk", flush=True)
+                if args.arm_eq:      # prefill output is None; the follow-up token reads what the prefill wrote
+                    eqh = hashlib.md5(fwd(one, d + args.chunk)[0, -1].float().cpu().numpy().tobytes()).hexdigest()[:12]
+                    RES["points"][str(d)].setdefault("prefill_eq_" + a, {}).setdefault("md5", []).append(eqh)
+                    print(f"[pfeq] visit {n} arm {a} depth {d}: {eqh}", flush=True)
                 if args.kernels and n < len(arms):                               # one traced chunk per arm per depth
                     fresh(d)
                     RES["points"][str(d)].setdefault("prefill_" + a, {})["window"] = window(lambda: fwd(chunk_ids, d, prefill=True), 1)
