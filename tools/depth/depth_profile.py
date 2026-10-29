@@ -61,6 +61,12 @@ def _main():
     ap.add_argument("--arm", action="append", default=[], help="NAME:K=V,K2=V2 (repeatable): A/B arms of exllamav3.util.knobs switched in this ONE load")
     ap.add_argument("--order", default="", help="visit order of the arms, e.g. ABBAAB (default: each arm once, in the order given)")
     args = ap.parse_args()
+    arms = {}
+    for spec in args.arm:
+        name, _, kv = spec.partition(":")
+        arms[name] = {k: (None if v in ("", "default") else v) for k, _, v in (i.partition("=") for i in kv.split(",") if i)}
+    order = args.order or "".join(arms)
+    arm_names = {k for a in arms.values() for k in a}
     if args.serve != "none":
         for k, v in served_env(args.serve).items():
             os.environ.setdefault(k, v)
@@ -208,12 +214,7 @@ def _main():
             guard(f"decode@{d}"); save()
     if not args.no_decode and args.arm:
         from exllamav3.util import knobs
-        arms = {}
-        for spec in args.arm:
-            name, _, kv = spec.partition(":")
-            arms[name] = {k: (None if v in ("", "default") else v) for k, _, v in (i.partition("=") for i in kv.split(",") if i)}
-        order = args.order or "".join(arms)
-        names = {k for a in arms.values() for k in a}
+        names = arm_names
         RES["arms"] = {a: {"knobs": arms[a], "visits": []} for a in arms}
         for n, a in enumerate(order):
             knobs.set_knobs({k: arms[a].get(k) for k in sorted(names)})        # one load: graphs and caches are dropped when a value changes
@@ -252,7 +253,33 @@ def _main():
                       f"(min {min(v['verify']['ms_min'] for v in vs)}, max {max(v['verify']['ms'] for v in vs)}), "
                       f"decode med {med([v['decode']['ms'] for v in vs])} ms over {len(vs)} visits", flush=True)
         save()
-    if not args.no_prefill:
+    if not args.no_prefill and arms:
+        from exllamav3.util import knobs
+        fresh(depths[0])
+        fwd(chunk_ids, depths[0], prefill=True); torch.cuda.synchronize()        # warm
+        pacc = {(a, d): [] for a in arms for d in depths}
+        for n, a in enumerate(order):
+            knobs.set_knobs({k: arms[a].get(k) for k in sorted(arm_names)})
+            for d in depths:
+                fresh(d)
+                torch.cuda.synchronize(); t = time.perf_counter()
+                fwd(chunk_ids, d, prefill=True)
+                torch.cuda.synchronize(); pacc[(a, d)].append(time.perf_counter() - t)
+                print(f"[pf] visit {n} arm {a} depth {d}: {1e3 * pacc[(a, d)][-1]:.0f} ms/chunk", flush=True)
+                if args.kernels and n < len(arms):                               # one traced chunk per arm per depth
+                    fresh(d)
+                    RES["points"][str(d)].setdefault("prefill_" + a, {})["window"] = window(lambda: fwd(chunk_ids, d, prefill=True), 1)
+                guard(f"prefill@{d}"); save()
+        knobs.set_knobs({k: None for k in arm_names})
+        for a in arms:
+            for d in depths:
+                ms = med(pacc[(a, d)])
+                e = RES["points"][str(d)].setdefault("prefill_" + a, {})
+                e.update({"ms": round(1e3 * ms, 2), "all_ms": [round(1e3 * x, 2) for x in pacc[(a, d)]], "chunk": args.chunk,
+                          "tok_s": round(args.chunk / ms, 1)})
+                print(f"[pf arm {a}] depth {d}: {1e3 * ms:.0f} ms/chunk = {args.chunk / ms:.1f} tok/s ({len(pacc[(a, d)])} visits)", flush=True)
+        save()
+    elif not args.no_prefill:
         fresh(depths[0])
         for _ in range(1):
             fwd(chunk_ids, depths[0], prefill=True); torch.cuda.synchronize()     # warm
