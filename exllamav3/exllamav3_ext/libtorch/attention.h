@@ -147,6 +147,14 @@ struct BC_Attention
     at::Tensor qsa_raw_plane;    // flat (pages * page_size, D_i) fp16
     at::Tensor qsa_pool_plane;   // flat (pages * page_size / P, D_i) fp16
 
+    // KVWIN (cache/kvwin.py): fp16 sink+window ring next to the quantized pool. The ring writer
+    // (also derives the pool pass's sequence lengths, cache_seqlens - W) runs after the cache
+    // append, the ring pass is one more flash-decoding partial after the pool splits, and the
+    // combine reduces num_splits + 1 partials. The per-job ring slot ids are patched per call
+    bool kvwin = false;
+    at::Tensor kw_ov_k, kw_ov_v;
+    int kw_S = 0, kw_W = 0, kw_Rc = 0, kw_R = 0;
+
     struct Slot
     {
         bool configured = false;
@@ -166,6 +174,7 @@ struct BC_Attention
         at::Tensor q2, q4, k4, v4, o2, o4, qg2, g2;
         at::Tensor qkv_c_ptrs;   // sliced bundle: per-slice output pointers into the statics
 
+        bool qkv_tri = false;    // q/k/v ran as one int8 GEMV launch (m == 1): the graph patches its activation pointer as a gemm A
         std::shared_ptr<TritonKernel> k_split;
         std::shared_ptr<TritonKernel> k_combine;   // null when num_splits == 1
         std::shared_ptr<TritonKernel> k_update;    // null when quant_cache
@@ -186,6 +195,12 @@ struct BC_Attention
         int qsa_splits = 0;
         int qsa_split_len = 0;
         int qsa_programs = 0;
+
+        // KVWIN statics/kernels (kvwin == true): pool pass sequence lengths (bsz) and the ring
+        // writer / ring partial kernels
+        at::Tensor kw_pool_len;
+        std::shared_ptr<TritonKernel> k_ovw, k_ring;
+        int kw_ovw_gy = 0;
 
         std::unique_ptr<Graph> graph;
     };
@@ -266,6 +281,28 @@ struct BC_Attention
         at::Tensor pool_plane
     );
 
+    void set_kvwin
+    (
+        at::Tensor ov_k,
+        at::Tensor ov_v,
+        int sinks,
+        int window,
+        int cyclic_rows,
+        int ring_rows
+    );
+
+    // Attaches the KVWIN statics/kernels to an already-configured slot (regime 0)
+    void configure_slot_kvwin
+    (
+        int bsz,
+        int q_len,
+        int regime,
+        at::Tensor pool_len,
+        std::shared_ptr<TritonKernel> k_ovw,
+        std::shared_ptr<TritonKernel> k_ring,
+        int ovw_gy
+    );
+
     bool needs_configure(int bsz, int q_len, int regime);
 
     void configure_slot
@@ -331,7 +368,8 @@ struct BC_Attention
         const c10::optional<at::Tensor>& position_ids,
         const c10::optional<at::Tensor>& inv_freq_override,
         int regime,
-        int64_t t_total
+        int64_t t_total,
+        const c10::optional<at::Tensor>& kvwin_slots = c10::nullopt
     );
 
     void run_gr
@@ -349,6 +387,7 @@ struct BC_Attention
         const c10::optional<at::Tensor>& inv_freq_override,
         int regime,
         int64_t t_total,
+        const c10::optional<at::Tensor>& kvwin_slots,
         Graph* graph
     );
 

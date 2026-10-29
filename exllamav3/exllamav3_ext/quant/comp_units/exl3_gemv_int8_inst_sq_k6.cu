@@ -19,3 +19,8 @@ void* exl3_gemv_int8_sq_sel_k6(int M, bool c_fp32, bool residual, bool dual)
     #undef SELM_
     return nullptr;
 }
+
+void* exl3_gemv_int8_sq_tri_sel_k6(bool c_fp32)
+{
+    return c_fp32 ? nullptr : (void*) exl3_gemv_int8_sq_kernel<6, 1, false, false, false, true>;
+}

@@ -7,11 +7,12 @@ from ...cache.kvwin import KVWinCtx
 
 @triton.jit
 def _ov_write_kernel(
-    k, v, ov_k, ov_v, slots, seqlens,
-    q_len, S, Rc, R,
+    k, v, ov_k, ov_v, slots, seqlens, pool_len,
+    q_len, S, Rc, R, W,
     n_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     HD_PAD: tl.constexpr,
+    WRITE_POOL_LEN: tl.constexpr = False,
 ):
     """One program per (batch, row j, kv head). j < S handles the sink row of position j (if it lies in this call),
     j >= S the (j - S)-th of the last min(q_len, Rc) rows. A row that is both a sink and in the tail is written
@@ -21,6 +22,10 @@ def _ov_write_kernel(
     h = tl.program_id(2)
     L = tl.load(seqlens + b)
     slot = tl.load(slots + b)
+    if WRITE_POOL_LEN:
+        # BC_Attention: the pool pass attends [S, q-W], its sequence length is the cache's shifted by W
+        if (j == 0) & (h == 0):
+            tl.store(pool_len + b, L - W)
     t = tl.where(j < S, j, tl.maximum(q_len - Rc, 0) + (j - S))
     p = L + t
     ok = (t < q_len) & (slot >= 0) & ((j >= S) | (p < S))
@@ -45,8 +50,8 @@ def ov_write(ctx: KVWinCtx, k: torch.Tensor, v: torch.Tensor, cache_seqlens: tor
     n_rows = cfg.S + min(q_len, cfg.Rc)
     with torch.cuda.device(k.device):
         _ov_write_kernel[(bsz, n_rows, n_kv_heads)](
-            k, v, st.ov_k, st.ov_v, slots, cache_seqlens,
-            q_len, cfg.S, cfg.Rc, cfg.R,
+            k, v, st.ov_k, st.ov_v, slots, cache_seqlens, cache_seqlens,
+            q_len, cfg.S, cfg.Rc, cfg.R, cfg.W,
             n_kv_heads, head_dim, triton.next_power_of_2(head_dim),
             num_warps = 1,
         )
