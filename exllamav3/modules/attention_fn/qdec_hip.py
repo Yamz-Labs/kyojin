@@ -169,6 +169,20 @@ def cu_count(device):
     return _cus[idx]
 
 
+def lds_per_mp(device):
+    """LDS bytes per multiprocessor as torch counts multiprocessors: a gfx11.5 WGP is 2 CUs of 64 KiB, so 128 KiB per MP.
+    Matches the measured residency steps (3 CTAs of 36 KiB at 3/MP = the one-wave 60-CTA config in the qdsmm cells)."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    p = torch.cuda.get_device_properties(idx)
+    return 2 * int(getattr(p, "shared_memory_per_multiprocessor", 65536))
+
+
+def resident_ctas(kern, device):
+    """CTAs of this kernel resident per multiprocessor (dynamic LDS only: the per-CTA static part is ~5 KiB and the
+    2 CTAs of a 49 KiB kernel, i.e. the 4/5 q tile tier, are what the split probe measured)."""
+    return max(1, lds_per_mp(device) // max(kern.shared, 1))
+
+
 def num_splits(cfg, device, programs, max_k_len):
     if knob("EXL3_QDEC_HIP_SPL"):
         return int(knob("EXL3_QDEC_HIP_SPL"))
@@ -184,6 +198,12 @@ def decode(cfg, q, k_cache, v_cache, block_table, cache_seqlens, k_scales, v_sca
     kern = get_kernel(cfg, q.device)
     programs = bsz * cfg["nkv"]
     splits = num_splits(cfg, q.device, programs, max_k_len)
+    # never launch more CTAs than one full residency wave: the surplus CTAs queue behind the resident ones and each
+    # CTA then walks fewer, shorter splits (measured at 4/5 q tiles: 60 CTAs = 1.5 waves -> 40 CTAs -21 % / -13 %;
+    # 1-3 q tiles resolve to 25/15/15, i.e. today's count, so those shapes are untouched). tq keeps its own count:
+    # there the extra splits keep V loads in flight rather than trading waves (see num_splits).
+    if not cfg.get("tq"):
+        splits = max(1, min(splits, resident_ctas(kern, q.device) * cu_count(q.device) // programs))
     split_len = -(-(-(-max_k_len // splits)) // 16) * 16
     rows = cfg["qlen"] * (cfg["nqh"] // cfg["nkv"])
     ns_total = splits + (1 if ring is not None else 0)
