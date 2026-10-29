@@ -2129,10 +2129,12 @@ def main() -> None:
     if args.sessions > 1:
         # chunked prefill beside decoding users (EXL3_SCHED_CHUNK_IL, generator/chunk_il.py): a big prefill runs one
         # short chunk per step and shares the step with the decode round of every running session. Default on for
-        # multi-session serving; EXL3_SCHED_CHUNK_IL=0 restores FIFO prefills.
-        os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
-        os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
-        os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
+        # multi-session ROCm serving (measured on gfx1151); EXL3_SCHED_CHUNK_IL=0 restores FIFO prefills.
+        import torch as _torch
+        if _torch.version.hip:
+            os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
+            os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
+            os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
         print(f"serve: --sessions {args.sessions}: up to {args.sessions} requests share the KV pool of -c {args.max_ctx} "
               f"(per-session window = -c / sessions when all are busy); greedy output is not guaranteed equal to the same "
               f"request run alone; slot save/restore waits for every running request and acts on the last prompt noted",
