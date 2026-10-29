@@ -51,7 +51,7 @@ def pick_dw(hd, nt, nw):
     return None
 
 
-def geometry(hd, nqh, nkv, qlen, nw, dw):
+def geometry(hd, nqh, nkv, qlen, nw, dw, smm = 0, sxmul = 0):
     """(NT, RP, shared bytes): q tile + max(32x32 fp32 q-rotation matrix, S exchange, cross-stream merge buffer), mirrors qdec.hip"""
     rows = qlen * (nqh // nkv)
     nt = (rows + 15) // 16
@@ -60,7 +60,7 @@ def geometry(hd, nqh, nkv, qlen, nw, dw):
     nsw = nw // dw
     no = nt * (hd // 16 // dw) * 8
     merge = ((nsw - 1) * dw * no * 32 + 2 * (nsw - 1) * nt * 32) * 4
-    sx = 2 * nw * nt * 8 * 32 * 4 if dw > 1 else 0
+    sx = (sxmul or (1 if smm else 2)) * nw * nt * 8 * 32 * 4 if dw > 1 else 0
     return nt, rp, qs + max(4096, merge, sx)
 
 
@@ -77,19 +77,22 @@ def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, 
     dw = pick_dw(head_dim, nt, nw)
     if dw is None:
         return None
-    _, _, shared = geometry(head_dim, n_q_heads, n_kv_heads, q_len, nw, dw)
+    smmv = int(knob_int("EXL3_QDEC_HIP_SMM", 0))
+    smm = int(smmv != 0 and dw > 1 and nt >= 3)   # measured: nt3 -39 %, nt2 +1 %, nt1 flat
+    sxmul = 2 if smmv == 2 else 0                 # SMM=2: same kernel as SMM=1 but the old (double) allocation, a footprint probe
+    _, _, shared = geometry(head_dim, n_q_heads, n_kv_heads, q_len, nw, dw, smm, sxmul)
     if shared > 64 * 1024:
         return None
     return dict(hd=head_dim, kb=k_bits, vb=v_bits, nkv=n_kv_heads, nqh=n_q_heads, qlen=q_len, page=page_size, nw=nw, dw=dw,
                 causal=bool(causal), scale=float(sm_scale), sinks=bool(has_sinks), key_lo=int(key_lo), tq=bool(tq),
-                vpf=bool(knob_int("EXL3_QDEC_HIP_VPF", 1)))
+                vpf=bool(knob_int("EXL3_QDEC_HIP_VPF", 1)), smm=smm, sxmul=sxmul)
 
 
 def _compile(cfg, arch):
     from exllamav3.util import hip_compiler
     defs = dict(HD=cfg["hd"], KB=cfg["kb"], VB=cfg["vb"], NKV=cfg["nkv"], NQH=cfg["nqh"], QLEN=cfg["qlen"], PAGE=cfg["page"],
                 NW=cfg["nw"], DW=cfg["dw"], CAUSAL=int(cfg["causal"]), HAS_SINKS=int(cfg["sinks"]), KEY_LO=cfg["key_lo"], TQ=int(cfg.get("tq", False)),
-                VPF=int(cfg.get("vpf", False)), SCALE=repr(float(cfg["scale"])) + "f")
+                VPF=int(cfg.get("vpf", False)), SMM1=int(cfg.get("smm", 0)), SCALE=repr(float(cfg["scale"])) + "f")
     extra = [f"-D{k}={v}" for k, v in defs.items()] + knob("EXL3_QDEC_HIP_FLAGS", "").split()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"] + extra
     gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
@@ -115,7 +118,8 @@ class _Kernel:
         arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
         self.cfg = cfg
         self.path = _compile(cfg, arch)
-        _, self.rp, self.shared = geometry(cfg["hd"], cfg["nqh"], cfg["nkv"], cfg["qlen"], cfg["nw"], cfg["dw"])
+        _, self.rp, self.shared = geometry(cfg["hd"], cfg["nqh"], cfg["nkv"], cfg["qlen"], cfg["nw"], cfg["dw"],
+                                           cfg.get("smm", 0), cfg.get("sxmul", 0))
         self.mod = ctypes.c_void_p()
         if lib.hipModuleLoad(ctypes.byref(self.mod), self.path.encode()) != 0:
             raise RuntimeError("qdec_hip: hipModuleLoad failed")
