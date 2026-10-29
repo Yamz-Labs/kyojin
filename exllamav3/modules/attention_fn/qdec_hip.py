@@ -201,8 +201,9 @@ def decode(cfg, q, k_cache, v_cache, block_table, cache_seqlens, k_scales, v_sca
     # never launch more CTAs than one full residency wave: the surplus CTAs queue behind the resident ones and each
     # CTA then walks fewer, shorter splits (measured at 4/5 q tiles: 60 CTAs = 1.5 waves -> 40 CTAs -21 % / -13 %;
     # 1-3 q tiles resolve to 25/15/15, i.e. today's count, so those shapes are untouched). tq keeps its own count:
-    # there the extra splits keep V loads in flight rather than trading waves (see num_splits).
-    if not cfg.get("tq"):
+    # there the extra splits keep V loads in flight rather than trading waves (see num_splits), and an explicit
+    # EXL3_QDEC_HIP_SPL still wins over this cap.
+    if not cfg.get("tq") and not knob("EXL3_QDEC_HIP_SPL"):
         splits = max(1, min(splits, resident_ctas(kern, q.device) * cu_count(q.device) // programs))
     split_len = -(-(-(-max_k_len // splits)) // 16) * 16
     rows = cfg["qlen"] * (cfg["nqh"] // cfg["nkv"])
