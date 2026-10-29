@@ -109,7 +109,7 @@ def visit(port, model, prompts, users, max_tokens, extra, salt = None):
         gaps += mid
         chunks += len(ts)
     return {"md5": md5s, "gap_ms": statistics.median(gaps) * 1000 if gaps else float("nan"), "chunks": chunks, "wall": wall,
-            "ttft_ms": statistics.median(ttft) * 1000}
+            "ttft_ms": statistics.median(ttft) * 1000, "ttft_all_ms": [round(x * 1000) for x in ttft]}
 
 
 def main():
@@ -146,7 +146,7 @@ def main():
         v = visit(args.port, model, prompts, args.users, args.max_tokens, extra, salt)
         v.update(arm=a, n=n)
         visits.append(v)
-        print(f"visit {n} arm {a} gap {v['gap_ms']:.2f} ms  ttft {v['ttft_ms']:.0f} ms  md5 {','.join(v['md5'])}  ({time.time() - t0:.0f} s)", flush=True)
+        print(f"visit {n} arm {a} gap {v['gap_ms']:.2f} ms  ttft {v['ttft_ms']:.0f} ms  ttft per prompt {'/'.join(str(x) for x in v['ttft_all_ms'])} ms  md5 {','.join(v['md5'])}  ({time.time() - t0:.0f} s)", flush=True)
     http(args.port, "/admin/knobs", {k: None for k in arm_values(arms, args.order[0])})          # leave the server on its defaults
     print("\narm  visits  median-gap-ms  ttft-ms  agg tok/s  md5 stable  md5 per prompt")
     summary = {}
