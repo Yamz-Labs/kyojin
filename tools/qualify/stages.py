@@ -265,7 +265,8 @@ def job_kv(c: Ctx) -> dict:
 
 def job_kvmode(c: Ctx, docs) -> dict:
     """KV format auto-select, ONCE per model: decode-faithful 32K KL vs k8v8 of k6v6 (quant), kw6 (k6v6 + sink/window ring), tq6, tq5 (TurboQuant + ring).
-    Q6 rule (rules.choose_kv_mode): kw6 when its KL <= 0.9 x k6v6's; tq6 is a default candidate (tq5: QUALIFY_KV_TQ=1, tq off: QUALIFY_KV_TQ=0); the fewest bytes per value among the qualifying formats wins, else k6v6."""
+    Q6 rule (rules.choose_kv_mode): kw6 when its KL <= 0.9 x k6v6's; the tq formats are measured and reported, opt-in only (QUALIFY_KV_TQ=1 lets them win
+    under the same margin); the fewest bytes per value among the qualifying formats wins, else k6v6."""
     for f in (c.out / "kvmode_raw.json", c.out / "kvmode_raw.json.k8v8.pt"):
         f.unlink(missing_ok=True)
     for fmt in ("k8v8", "k6v6", "kw6", "tq6", "tq5"):       # one lock take per format (each is a model load + a 32K pass)
@@ -276,7 +277,7 @@ def job_kvmode(c: Ctx, docs) -> dict:
     kl = {n: v["kl_vs_k8"] for n, v in raw.items()}
     bpv = {n: v["bits_per_val"] for n, v in raw.items()}
     dec = {n: v.get("decode_s_per_tok") for n, v in raw.items()}
-    win = rules.choose_kv_mode(kl, bpv, dec_s=dec, allowed=rules.kv_allowed_formats(os.environ.get("QUALIFY_KV_TQ")))
+    win = rules.choose_kv_mode(kl, bpv, dec_s=dec, allowed=rules.KV_DEFAULT_FORMATS + (("tq6", "tq5") if os.environ.get("QUALIFY_KV_TQ") == "1" else ()))
     if win == "k6v6":
         return dict(modes=raw, mode="quant")
     if win == "kw6":

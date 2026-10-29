@@ -2284,7 +2284,7 @@ def load_all(args: argparse.Namespace):
             print(f"qserve: KV cache from {kvp.name}: {args.kv_mode} k{args.k_bits}v{args.v_bits}" + (f" ring {args.kvwin}" if args.kvwin else ""), flush=True)
         except (ValueError, KeyError, OSError) as e:
             print(f"qserve: ignoring {kvp}: {e}", flush=True)
-    args.kv_mode = args.kv_mode or "tq"
+    args.kv_mode = args.kv_mode or "quant"
     if args.kv_mode == "fp16":
         args.k_bits = args.v_bits = args.cache_bits = 0
     elif args.kv_mode == "tq" and not (args.k_bits or args.v_bits or args.cache_bits):
@@ -2343,9 +2343,10 @@ def main() -> None:
                         help="bits per K/V element of the attention cache pages (0 = fp16, the default; 8 = packed int8, about 40 %% smaller pages, saves 2.6 GiB at 256K, greedy output differs from the 16-bit cache; with EXL3_ROW_INV_GROUPS=1 four parallel sessions matched solo runs, 16 of 16)")
     parser.add_argument("--k-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="K bits of the quantized attention cache (with --v-bits; overrides --cache-bits)")
     parser.add_argument("--v-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="V bits of the quantized attention cache")
-    parser.add_argument("--kv-mode", choices=("tq", "quant", "fp16"), default=None,
-                        help="KV cache format. tq (default): TurboQuant pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector) with the fp16 sink-4 + window-128 ring, "
-                             "6 bits when no --k-bits / --v-bits / --cache-bits / lane preset says otherwise; quant = per-32 scale pages (--k-bits / --v-bits); fp16 = unquantized pages")
+    parser.add_argument("--kv-mode", choices=("quant", "tq", "fp16"), default=None,
+                        help="KV cache format. quant (default): per-32 scale pages (--k-bits / --v-bits), fp16 pages when no bits are given; "
+                             "tq: TurboQuant pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector) with the fp16 sink-4 + window-128 ring, "
+                             "6 bits when no --k-bits / --v-bits / --cache-bits / lane preset says otherwise; fp16 = unquantized pages")
     parser.add_argument("--kvwin", default=None, metavar="SINK:WINDOW",
                         help="fp16 sink + window ring of the quantized cache (EXL3_KVWIN, e.g. 4:128; an EXL3_KVWIN already set wins); written by tools/qualify as the kw6 choice")
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")

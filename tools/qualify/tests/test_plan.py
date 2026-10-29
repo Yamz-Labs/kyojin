@@ -292,35 +292,26 @@ class CliTests(unittest.TestCase):
 class KvModeRule(unittest.TestCase):
     BPV = {"k6v6": 6.5, "kw6": 6.5, "tq6": 6.0625, "tq5": 5.0625}
     TQ = ("k6v6", "kw6", "tq6", "tq5")
-    NOTQ = ("k6v6", "kw6")
 
     def test_kv_mode_refuses_a_format_with_a_slower_decode_step(self):
         bpv = {"k6v6": 6.5, "kw6": 6.5, "tq6": 6.06, "tq5": 5.06}
         kl = {"k6v6": 0.0007, "kw6": 0.00035, "tq6": 0.0004, "tq5": 0.0009}
-        self.assertEqual(rules.choose_kv_mode(kl, bpv, allowed=self.NOTQ), "kw6")
-        self.assertEqual(rules.choose_kv_mode(kl, bpv, allowed=self.NOTQ, dec_s={"k6v6": 0.0068, "kw6": 0.0090, "tq6": 0.0118, "tq5": 0.0070}), "k6v6")      # ROCm 0.8B: ring +32 %
-        self.assertEqual(rules.choose_kv_mode(kl, bpv, allowed=self.NOTQ, dec_s={"k6v6": 0.0068, "kw6": 0.0071}), "kw6")
-        self.assertEqual(rules.choose_kv_mode(kl, bpv, dec_s={"k6v6": 0.0068, "kw6": 0.0090, "tq6": 0.0071}), "tq6")      # default: tq6 is a candidate
+        self.assertEqual(rules.choose_kv_mode(kl, bpv), "kw6")
+        self.assertEqual(rules.choose_kv_mode(kl, bpv, dec_s={"k6v6": 0.0068, "kw6": 0.0090, "tq6": 0.0118, "tq5": 0.0070}), "k6v6")      # ROCm 0.8B: ring +32 %
+        self.assertEqual(rules.choose_kv_mode(kl, bpv, dec_s={"k6v6": 0.0068, "kw6": 0.0071}), "kw6")
         self.assertEqual(rules.choose_kv_mode(kl, bpv, allowed=self.TQ, dec_s={"k6v6": 0.0068, "kw6": 0.0090, "tq6": 0.0118, "tq5": 0.0070}), "k6v6")
 
     def test_choose_kv_mode(self):
         bpv = self.BPV
-        # tq off (QUALIFY_KV_TQ=0): tq6 / tq5 never win, kw6 does when it beats k6v6 by the margin
-        no = dict(allowed=rules.kv_allowed_formats("0"))
-        self.assertEqual(no["allowed"], self.NOTQ)
-        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.0536, "kw6": 0.0216, "tq6": 0.0319, "tq5": 0.0544}, bpv, **no), "kw6")      # Nanbeige 32K p1
-        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.0095, "tq6": 0.004, "tq5": 0.009}, bpv, **no), "k6v6")       # kw6 inside the noise
+        # tq opt-in (default): tq6 / tq5 never win, kw6 does when it beats k6v6 by the margin
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.0536, "kw6": 0.0216, "tq6": 0.0319, "tq5": 0.0544}, bpv), "kw6")      # Nanbeige 32K p1
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.0095, "tq6": 0.004, "tq5": 0.009}, bpv), "k6v6")       # kw6 inside the noise
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002}, {"k6v6": 6.5}), "k6v6")                                         # nothing else measured (tq unsupported by the model)
-        # default (tq6 is a candidate, floor = no worse than k6v6, fewest bytes wins; tq5 needs QUALIFY_KV_TQ=1)
-        self.assertEqual(rules.kv_allowed_formats(None), ("k6v6", "kw6", "tq6"))
-        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.0536, "kw6": 0.0216, "tq6": 0.0319, "tq5": 0.0544}, bpv), "tq6")
-        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.0095, "tq6": 0.0099, "tq5": 0.009}, bpv), "tq6")       # tq6 slightly under k6v6 is enough
-        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.0095, "tq6": 0.0105, "tq5": 0.009}, bpv), "k6v6")      # tq6 worse than k6v6: never
-        # QUALIFY_KV_TQ=1 also allows tq5: fewest bytes among the qualifying formats
+        # with tq allowed (QUALIFY_KV_TQ=1): fewest bytes among the qualifying formats, a tq format needs the same 0.9 margin
         kw = dict(allowed=self.TQ)
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.005, "tq6": 0.004, "tq5": 0.009}, bpv, **kw), "tq5")
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.005, "tq6": 0.008, "tq5": 0.020}, bpv, **kw), "tq6")
-        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.005, "tq6": 0.0105, "tq5": 0.020}, bpv, **kw), "kw6")  # tq6 worse than k6v6
+        self.assertEqual(rules.choose_kv_mode({"k6v6": 0.010, "kw6": 0.005, "tq6": 0.0095, "tq5": 0.020}, bpv, **kw), "kw6")  # tq6 inside the noise
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.005, "kw6": 0.006, "tq6": 0.0125, "tq5": 0.0048}, bpv, **kw), "k6v6")
         self.assertEqual(rules.choose_kv_mode({"k6v6": 0.002, "kw6": 0.0021, "tq6": 0.004, "tq5": 0.010}, bpv, **kw), "k6v6")
 
@@ -339,12 +330,8 @@ class KvModeRule(unittest.TestCase):
             c = SimpleNamespace(out=out, args=dict(kvmode_steps=64), meta=dict(path=str(t / "pack"), index_sha="x", serve_entry="tools/qwen/serve.py", vision=False,
                                 template=None, mtp_layers=0), py=py, locks=contextlib.nullcontext, repo=t, data={})
             stages._git = lambda repo: "deadbeef"
-            # QUALIFY_KV_TQ=0 (opt-out): kw6 wins (6 <= 0.9 x 10)
-            os.environ["QUALIFY_KV_TQ"] = "0"
-            try:
-                kv = stages.job_kvmode(c, out / "docs.pt")
-            finally:
-                del os.environ["QUALIFY_KV_TQ"]
+            # default: tq stays opt-in, kw6 wins (6 <= 0.9 x 10)
+            kv = stages.job_kvmode(c, out / "docs.pt")
             self.assertEqual((kv["mode"], kv["chosen"], kv["kvwin"]), ("quant", [6, 6], "4:128"))
             stages.write_kv_choice(c, kv)
             j = json.loads((t / "pack" / "kv_cache.json").read_text())
@@ -354,8 +341,12 @@ class KvModeRule(unittest.TestCase):
             f = packmod.serve_flags(c.meta, port=1, ctx=4096, sessions=1, k_bits=6, v_bits=6, kvwin=stages.chosen_kvwin(c))
             self.assertEqual(f[f.index("--kv-mode") + 1], "quant")
             self.assertEqual(f[f.index("--kvwin") + 1], "4:128")
-            # default: tq6 wins the same table (fewer bytes than kw6; tq5 is not a default candidate)
-            kv = stages.job_kvmode(c, out / "docs.pt")
+            # QUALIFY_KV_TQ=1: tq6 wins the same table (fewer bytes than kw6; tq5 fails the margin)
+            os.environ["QUALIFY_KV_TQ"] = "1"
+            try:
+                kv = stages.job_kvmode(c, out / "docs.pt")
+            finally:
+                del os.environ["QUALIFY_KV_TQ"]
             self.assertEqual((kv["mode"], kv["chosen"]), ("tq", [6, 6]))
             stages.write_kv_choice(c, kv)
             self.assertEqual(json.loads((t / "pack" / "kv_cache.json").read_text())["kv_mode"], "tq")

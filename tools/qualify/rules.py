@@ -19,16 +19,9 @@ def choose_kv(kl_vs_k8: dict[int, float], kl_max: float = KV_KL_MAX) -> tuple[in
 KV_MODE_MARGIN = 0.9    # one 256-step doc is noisy (two docs of one model scatter by 10-30 %): a candidate has to beat k6v6 by this factor
 
 
-KV_TQ_MARGIN = 1.0      # owner floor (28/10): TurboQuant is the default, so a tq format only has to be no worse than k6v6
-KV_DEFAULT_FORMATS = ("k6v6", "kw6", "tq6")    # tq6 is a default candidate (28/10 flip); tq5 is measured and reported, opt-in with QUALIFY_KV_TQ=1; QUALIFY_KV_TQ=0 drops tq6 too
+KV_TQ_MARGIN = 0.9      # same margin as kw6: a 256-step doc scatters 10-30 %, a tie is a coin flip, so a tq format must clearly beat k6v6 to be chosen
+KV_DEFAULT_FORMATS = ("k6v6", "kw6")    # tq6 / tq5 are measured and reported but stay opt-in (QUALIFY_KV_TQ=1): the gate "tq6 >= default on every model" is not met yet
 KV_WIN_SPEC = "4:128"                   # kw6 = k6v6 + the fp16 sink-4 / window-128 ring
-
-
-def kv_allowed_formats(tq_env: str | None) -> tuple:
-    """Formats the KV auto-select may choose. QUALIFY_KV_TQ: unset = defaults (k6v6, kw6, tq6), "1" = also tq5, "0" = no TurboQuant (opt-out)."""
-    if tq_env == "0":
-        return tuple(f for f in KV_DEFAULT_FORMATS if not f.startswith("tq"))
-    return KV_DEFAULT_FORMATS + (("tq5",) if tq_env == "1" else ())
 
 
 KV_MODE_MAX_SLOWDOWN = 1.10    # a format whose decode step is > 10 % slower than k6v6's is not a free quality win (Qwen3.5-0.8B on ROCm: kw6 0.0090 vs 0.0068 s/tok)
@@ -43,8 +36,8 @@ def choose_kv_mode(kl: dict[str, float], bits_per_val: dict[str, float], base: s
     (e.g. the model's attention cannot hold a TurboQuant cache). The wider-must-qualify check looks at every measured format, `allowed` or not."""
     lim = lambda n: (tq_margin if n.startswith("tq") else margin) * kl[base]
     ok = [n for n in kl if n != base and n in bits_per_val and kl[n] <= lim(n)]
-    # sanity: more bits can only help, so a format with fewer bits that beats the baseline while a wider format of the same family (tq5 vs tq6) does not is measurement noise
-    ok = [n for n in ok if all(m in ok for m in kl if m != base and m[:2] == n[:2] and bits_per_val.get(m, 0) > bits_per_val[n])]      # within one family (tq5 vs tq6)
+    # sanity: more bits can only help, so a format with fewer bits that beats the baseline while a wider tq format does not is measurement noise
+    ok = [n for n in ok if all(m in ok for m in kl if m != base and bits_per_val.get(m, 0) > bits_per_val[n])]
     ok = [n for n in ok if n in allowed]
     if dec_s and dec_s.get(base):
         ok = [n for n in ok if not dec_s.get(n) or dec_s[n] <= max_slowdown * dec_s[base]]

@@ -15,7 +15,7 @@ No QJL stage, no boundary-layer exceptions.
 serve.py --k-bits 5 --v-bits 5 --kv-mode tq        # tq5 (5.06 b/value); 4..6 bits, head_dim 64 / 128 / 256 / 512
 ```
 
-TurboQuant is the default (28/10): no flag = `--kv-mode tq` (6 bits on ROCm, K4V4 on the NVIDIA preset). Opt-outs: `--kv-mode quant` (per-32 scale pages with `--k-bits/--v-bits`), `--kv-mode fp16` (unquantized pages). A pack that went through `tools/qualify` has `kv_cache.json` (`kv_mode`, `k_bits`,
+TurboQuant is opt-in: no flag = `--kv-mode quant` (per-32 scale pages with `--k-bits/--v-bits`, fp16 pages with no bits); `--kv-mode tq` selects TurboQuant (6 bits on ROCm, K4V4 on the NVIDIA preset), `--kv-mode fp16` forces unquantized pages. A pack that went through `tools/qualify` has `kv_cache.json` (`kv_mode`, `k_bits`,
 `v_bits`); `serve.py` uses it when no KV flag is given.
 
 ## How it fits the engine
@@ -37,8 +37,8 @@ TurboQuant is the default (28/10): no flag = `--kv-mode tq` (6 bits on ROCm, K4V
 * `tools/qualify` (kv stage) measures the decode-faithful 32K KL against k8v8 of k6v6, kw6 (k6v6 + the fp16 sink-4 / window-128 ring) and
   tq6 / tq5 once per model. The default format is kw6 when its KL is <= 0.9 x k6v6's (a 256-step doc scatters 10-30 %: a tie stays on
   k6v6), written to `kv_cache.json` as `kvwin: "4:128"` (`serve.py --kvwin`, sets `EXL3_KVWIN` before the model is built). tq6 / tq5 are
-  a default candidate (28/10): it wins when its KL is <= k6v6's (fewest bytes among the qualifying formats); tq5 needs `QUALIFY_KV_TQ=1`, `QUALIFY_KV_TQ=0` removes TurboQuant from the choice
-  (a narrower tq format wins only if every wider tq format qualifies). A model whose attention cannot hold a TurboQuant cache (QSA sparse attention, see below)
+  measured and reported but opt-in (`--kv-mode tq`); `QUALIFY_KV_TQ=1` lets them win (fewest bytes among the formats within the
+  margin, a narrower one only if every wider one qualifies). A model whose attention cannot hold a TurboQuant cache (QSA sparse attention, see below)
   records tq6 / tq5 as `unsupported` and never picks them. The log-probs of the stage are kept in fp32 so close formats stay apart. `--no-kv-modes` skips the stage. The report also lists decode s/token per format.
 
 Qualify cells, RTX 3090, one 256-step 32K doc, KL vs k8v8 (decode s/tok): Nanbeige k6v6 .00495 (.0356) | kw6 .00267 (.0361) | tq6 .00251 | tq5 .00456
@@ -64,9 +64,9 @@ Served A/B, same session (decode tok/s, median of 3): 4K / 32K / 120K k6v6 46.29
 (tq6 vs kw6: -1.0 / -1.0 / -2.1 %). One 32K decode step is 27.2 ms of GPU time; tq6 adds ~0.32 ms over the same ring (q/k/v rotation 0.14, writer 0.10
 more than the quant writer, qdec 0.08), the ring itself ~0.30 ms in both kw6 and tq6.
 
-## Default status (28/10, branch feature/tq-default): FLIPPED
+## Default status (29/10): opt-in
 
-tq6 is the default in `tools/qwen/serve.py`, `tools/glm/serve.py` and the qualify kv stage (opt-outs above). Qualify always passes `--kv-mode` explicitly.
+Rule for a TurboQuant default: KL no worse than k6v6 (top-1 within noise) AND decode / TTFT at least the 1.8.2 default at 4K / 32K / 128K. Qwen3.8-Flash-Next fails both on the 12-cut long-prompt probe (tq6 KL 1.14e-2 vs k6v6 8.98e-3, decode .92-.97 of the fp16 default), Qwen3.8-27B tq4 pays +5 % TTFT at 32K, so the 1.8.2 defaults stay everywhere on the Qwen path and the qualify choice stays k6v6 / kw6 (`QUALIFY_KV_TQ=1` lets tq6 / tq5 win). Qualify always passes `--kv-mode` explicitly.
 GLM-5.3 MLA latent (`CacheLayer_MLA_tq`, 28/10, real pack, 32K prefix, 32 teacher-forced decode steps, KL vs the fp16 cache): tq6 .00403, k6 .00525;
 decode 48.4 vs 49.9 ms/token (fp16 cache 44.7). The 512-wide gamma-free latent is rotated once after kv_a_layernorm (R diag(1/gamma) is one matrix), the
 rotation and gamma live in W_UK / W_UV (so q, the kernels and the output never rotate per token), DSA indexer planes stay fp16. The decode kernels read codes
