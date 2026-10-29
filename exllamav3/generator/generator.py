@@ -4,6 +4,7 @@ import logging
 import os
 import time
 import torch
+from ..model import cuda_graph as _cuda_graph
 try:
     from ..modules.moe_fused import check_barrier as _moe_fused_check   # fused MoE half-layer grid barrier: raise if it ever timed out
 except Exception:                                                    # noqa: BLE001
@@ -1709,13 +1710,15 @@ class Generator:
         return True
 
     def _lag1_ready(self) -> bool:
-        if self.draft_model or self.ngram_match_min or self.recurrent_cache is not None or self.visualizer:
+        if self.draft_model or self.ngram_match_min or self.visualizer or _TAIL_REPLY_GEN or "mrope" in self.model.caps:
             return False
         if self.num_draft_tokens or ROW_GROUPS["on"] and ROW_INV["on"] and self.model.caps.get("row_inv_groups"):
             return False
-        runner = self.model.__dict__.get("_cuda_graph_runner")
-        g = getattr(runner, "_gemb", None) if runner is not None else None
-        return g is not None and g is not False
+        if _cuda_graph.CUDA_GRAPH_ENABLED and not torch.version.hip:
+            runner = self.model.__dict__.get("_cuda_graph_runner")
+            g = getattr(runner, "_gemb", None) if runner is not None else None
+            return g is not None and g is not False
+        return self.model.lag_table() is not None
 
     def _lag1_params(self, jobs, rows_ids_shape, nxt: int):
         """Inputs of the step `nxt` positions after the current host state (0 = now, 1 = the step after the token in flight)."""
@@ -1736,7 +1739,7 @@ class Generator:
             "block_table": block_index,
             "cache": self.cache,
             "cache_seqlens": cache_seqlens,
-            "recurrent_states": [job.recurrent_state for job in jobs] if self.ring_states else None,
+            "recurrent_states": [job.recurrent_state for job in jobs] if (self.ring_states or self.recurrent_cache is not None) else None,
             "indexed_embeddings": [],
             "positions": None,
             "recurrent_history": False,
@@ -1808,13 +1811,17 @@ class Generator:
                 lim = job.max_new_tokens
                 if (lim is not None and job.new_tokens + 2 > lim) or job.new_tokens + 2 > job.max_rq_tokens:
                     ahead = False; break
+                # a recurrent state with a token in flight is one position ahead of the host: keep checkpoint / stash positions
+                # (page boundaries) out of the window where the next iterate would read it
+                if self.recurrent_cache is not None and not 3 <= seq.kv_position % PAGE_SIZE <= PAGE_SIZE - 4:
+                    ahead = False; break
                 if (seq.kv_position + 1) // PAGE_SIZE >= len(seq.allocated_pages) or \
                         seq.allocated_pages[(seq.kv_position + 1) // PAGE_SIZE].ref_count != 1:
                     ahead = False; break
         if ahead:
             ids_dev = torch.cat(dev_tokens, dim = 0).to(torch.long)
             params = self._lag1_params(live_jobs, ids_dev.shape, 1)
-            nlogits = self.model.forward_graph_only(ids_dev, params)
+            nlogits = self.model.forward_dev(ids_dev, params)
             if nlogits is not None:
                 nxt = {"jobs": live_jobs, "logits": nlogits}
         ev.synchronize()
