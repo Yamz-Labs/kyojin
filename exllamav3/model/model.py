@@ -275,6 +275,21 @@ class Model(Model_TPMixin, Model_LSMixin):
             return y
 
 
+    @torch.inference_mode
+    def forward_graph_only(self, input_ids: torch.Tensor, params: dict):
+        """forward() for decode steps whose ids are a device tensor (lag-1 pipeline): only the whole-forward CUDA graph can take
+        them (its GPU embedding table), so a decline returns None instead of running the eager path."""
+        if self.loaded_tp or not _cuda_graph.CUDA_GRAPH_ENABLED or torch.version.hip or not torch.cuda.is_available():
+            return None
+        x = self.prepare_inputs(input_ids, params)
+        if params.get("recurrent_states") is not None and "recurrent_slots" not in params:
+            prepare_for_recurrence(input_ids, params, self)
+        y = _cuda_graph.maybe_forward(self, x, params)
+        if y is not None:
+            advance_recurrent_states(input_ids, params, self)
+        return y
+
+
     def unload(self):
         _cuda_graph.purge(self)
         for module in self.modules:
