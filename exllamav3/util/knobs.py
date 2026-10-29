@@ -24,6 +24,7 @@ KNOBS = {
     "EXL3_PF_WAVES_PER_EU": "2",
     "EXL3_PF_CK_GQA": "0",
     "EXL3_VERIFY_ATTN_LOOP": "0",
+    "EXL3_GDN_VSPLIT_GDN": "1",
     "EXL3_QDEC": "1",
     "EXL3_QDEC_HIP": "1",
     "EXL3_QDEC_GRAPH": "1",
