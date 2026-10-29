@@ -42,21 +42,19 @@ def avail_gb():
 
 
 def _page_md5(cache, p0, p1, pages, torch):
-    """md5 of the cache bytes a prefill chunk wrote: page-indexed tensors (dim0 == page count) are sliced to
-    [p0, p1); other tensors are hashed whole when small. Returns (hex, tensors hashed, tensors skipped)."""
+    """md5 of the KV bytes a prefill chunk wrote: only tensors indexed by page along dim 0 are sliced to
+    [p0, p1). Whole-tensor hashing is deliberately not used: the sparse-index pools carry entries from earlier
+    visits, so hashing them makes the digest depend on visit history instead of on this chunk. Returns
+    (hex, tensors hashed, tensors skipped)."""
     hh, n, skipped = hashlib.md5(), 0, 0
     for layer in cache.layers.values():
         for v in layer.get_tensors():
             if v is None:
                 continue
-            if v.dim() >= 2 and v.shape[0] == pages:
-                t = v[p0:p1]
-            elif v.numel() <= (1 << 27):
-                t = v
-            else:
+            if not (v.dim() >= 2 and v.shape[0] == pages):
                 skipped += 1
                 continue
-            hh.update(t.float().contiguous().cpu().numpy().tobytes())
+            hh.update(v[p0:p1].float().contiguous().cpu().numpy().tobytes())
             n += 1
     return hh.hexdigest()[:12], n, skipped
 
