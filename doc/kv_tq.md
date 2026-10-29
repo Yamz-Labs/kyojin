@@ -66,14 +66,14 @@ more than the quant writer, qdec 0.08), the ring itself ~0.30 ms in both kw6 and
 
 ## Default status (28/10, branch feature/tq-default): NOT flipped
 
-tq stays opt-in (`--kv-mode tq`). The gate "tq6 >= the per-32 cache on speed and quality for every box model" is not met: the Qwen3.8 QSA lane
-cannot hold a TurboQuant cache at all, GLM (MLA) and MiMo (head dim 192) have no TQ path, no box model has a tq KL measurement, and tq6 still
-trails k6v6 at T1 (launch work; hd128 at 128K: about 0.85-1.0 vs 0.63 ms per layer). Qualify always passes `--kv-mode` explicitly.
+tq stays opt-in (`--kv-mode tq`). The gate "tq6 >= the per-32 cache on speed and quality for every box model" is not yet met: GLM (MLA) and MiMo (head dim 192) have no TQ path, and tq6 trails k6v6 at T1 by launch gaps. Qwen3.8 QSA now holds a TQ cache (see below).
+Qualify always passes `--kv-mode` explicitly.
 
 Known limits:
-* QSA models (Qwen3.8-Flash-Next family): `Attention.cache_layer_type` maps every quant layer to `CacheLayer_qsa_quant`, so `--kv-mode tq`
-  there is the plain quant cache (identical KL to k6v6 in the qualify run). Serve and qualify now say so (`tq.cache_is_tq`). A real fix needs
-  a `CacheLayer_qsa_tq` plus codebook loads in the QSA sparse split kernel.
+* QSA models (Qwen3.8-Flash-Next family): `Attention.cache_layer_type` maps a TQ layer to `CacheLayer_qsa_tq` (TQ pool + fp16 indexer planes). The dense
+  regime goes through the normal dispatch; the sparse regime rotates q and K/V itself and reads the codes through the codebook in the QSA split kernel
+  (BC graphs stay off for tq). Measured 28/10 on qwen38-yamz-v2-bal, 256 teacher-forced decode steps after a long doc, KL vs k8v8: k6v6 .00229,
+  tq6 .00177 (top-1 .977 vs .980), tq5 .00281; decode 41.8 vs 41.9 ms/token. CUDA must re-check the sparse split kernel with codebook loads.
 * MLA/DSA (GLM) keeps the fp16 latent cache, and head dim 192 (MiMo) has no codebook.
 
 HIP decode kernel (box, Strix Halo, per layer at 128K, hd 256, 2 KV heads, 24 q heads): verify steps of 5..8 rows now run as row chunks on
@@ -81,3 +81,8 @@ HIP decode kernel (box, Strix Halo, per layer at 128K, hd 256, 2 KV heads, 24 q 
 72-79 VGPRs: tq6 3.5 -> 1.7 ms). tq6 split-kernel time is now at or below k6v6's at every row count; what is left at T1 is launch work (rotate
 q, unrotate o, ring launch): +0.06 ms vs k6v6 at 128K, +0.08 ms at 8K per layer. `tools/bench_kv_attn.py` reproduces the table. CUDA must
 re-check the same >4-row verify fallback and the TQ spills in `qdec.cu` / `qdec_rows.cu`.
+
+Prefill rotation (28/10): rotations of more than 1024 rows (prefill chunks) run as one library GEMM instead of the Triton kernel (hd 256, 2048-row
+chunk, 24 q heads 2.51 -> 0.40 ms, 2 kv heads 0.26 -> 0.02 ms; hd 128 24 heads 0.19 -> 0.06 ms); the KV write of a 2048-row chunk drops 0.73 -> 0.12 ms.
+T1 gap: GPU time per T1 call is the same as k6v6 (split 535-584 vs 543 us); the rest is host launch gaps of the 6 small eager launches (rotate x2,
+write x2, ring, ov write), which a captured graph removes.
