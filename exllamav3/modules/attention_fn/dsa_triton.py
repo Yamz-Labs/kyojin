@@ -30,6 +30,7 @@ The lightning-indexer scoring kernel is shared as-is between raw-token (V3.2) an
 import os
 import torch
 from ...util.tensor import g_tensor_cache
+from ...util.knobs import knob, knob_int
 
 # EXL3_DSA_DEBUG_BOUNDS=1: compile the JIT DSA kernels with device-side bounds asserts on
 # every block-table page read and gathered pool index (names the kernel and traps at the
@@ -1610,13 +1611,13 @@ def dsa_attn(
         bh, bn, nw, dc, *ext = (int(x) for x in _lat.split(":")) if ":" in _lat else (32, 16, 4, 64)
         kv1, pf, ns = (list(ext) + [0, 0, 1][len(ext):])[:3]
         # EXL3_DSA_LAT_OSPLIT (read per call, opt-in): split the D_c output accumulator across n programs
-        osplit = int(os.environ.get("EXL3_DSA_LAT_OSPLIT", "1"))
+        osplit = knob_int("EXL3_DSA_LAT_OSPLIT", 1)
         assert osplit == 1 or not kv1, "EXL3_DSA_LAT_OSPLIT > 1 needs KV1 = 0"
         # EXL3_DSA_LAT_2P (read per call): "BN1:NW1:BN2:NW2[:STORE]" = two-pass latent kernel (pass 1 QK ->
         # exact row max/sum, pass 2 PV without rescale; STORE=1 keeps pass-1 scores in fp32, row-sliced
         # <= 512 MB, and pass 2 skips QK). Default 64:4:16:4:1 since mla-prefill step 4 (-36 % kernel,
         # PPL 10x4096 +0.054 %, KL 3.5e-3); "0" = the one-pass kernel above.
-        _2p = os.environ.get("EXL3_DSA_LAT_2P", "64:4:16:4:1")
+        _2p = knob("EXL3_DSA_LAT_2P", "64:4:16:4:1")
         with torch.cuda.device(q.device):
             if _2p != "0":
                 bn1, nw1, bn2, nw2, *st = (int(x) for x in _2p.split(":"))

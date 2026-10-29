@@ -56,6 +56,8 @@ from collections import Counter, OrderedDict
 
 import torch
 
+from ..util.knobs import knob_on
+
 _env_int = lambda name, default: int(os.environ.get(name, default) or default)
 
 # Module global: a harness may flip it between arms (then call purge()).
@@ -290,7 +292,7 @@ class CudaGraphRunner:
         # KVWIN ring-only models (plain attention + fp16 sink/window rings riding the recurrent state slots): the ring ids are
         # static slot data exactly like a GDN model's, the ring writer/reader run inside the capture (bc_attn.py)
         from ..cache import kvwin
-        self.has_ring = bool(kvwin.ANY_ACTIVE) and os.environ.get("EXL3_CUDA_GRAPH_RING", "1") != "0" and not (self.has_gdn or self.has_conv or self.has_mamba or self.has_swa)
+        self.has_ring = bool(kvwin.ANY_ACTIVE) and knob_on("EXL3_CUDA_GRAPH_RING") and not (self.has_gdn or self.has_conv or self.has_mamba or self.has_swa)
         if len(devs) != 1 or (self.has_gdn and self.has_conv):
             return False   # GDN graphs pass device slot ids, ShortConv reads them on the host: no mixed model
         dev = devs.pop()
