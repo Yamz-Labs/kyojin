@@ -421,10 +421,14 @@ void BC_MLAttention::run_gr
     // sequence and reads them back from the cache)
     if (quant_cache)
     {
-        quant_cache_cont_gr(s.ckv, s.qtmp, s.stmp, 0.0f, graph);
+        // TurboQuant pages (h32 carries the fp32 codebook): no CUDA quantizer; the append kernel rotates and encodes the staged
+        // latent itself, its constants (rotation, codebook, midpoints) live in the stmp slot
+        const bool tq = h32.scalar_type() == at::kFloat;
+        if (!tq)
+            quant_cache_cont_gr(s.ckv, s.qtmp, s.stmp, 0.0f, graph);
         std::vector<void*> args =
         {
-            (void*) s.qtmp.data_ptr(),
+            tq ? (void*) s.ckv.data_ptr() : (void*) s.qtmp.data_ptr(),
             (void*) s.stmp.data_ptr(),
             (void*) s.kpe.data_ptr(),
             (void*) cache_ckv.data_ptr(),

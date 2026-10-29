@@ -74,6 +74,52 @@ def tq_dequant_window(words, scales, cb, out, cache_seqlens, block_table, page_s
 
 
 @triton.jit
+def _tq_dequant_rows_kernel(
+    words, scales, cb, out, n_rows,
+    BITS: tl.constexpr,
+    D: tl.constexpr,
+    TB: tl.constexpr,
+):
+    """Contiguous rows (one fp16 scale per row, the MLA latent layout): out[row] = codebook[codes] * scale, rotated domain."""
+    row = tl.program_id(0) * TB + tl.arange(0, TB)
+    rmask = row < n_rows
+    d = tl.arange(0, D)
+    g = d // 32
+    r = d - g * 32
+    G: tl.constexpr = D // 32
+    base = row[:, None].to(tl.int64) * (G * BITS) + g[None, :] * BITS
+    m2 = rmask[:, None]
+    raw = tl.zeros((TB, D), tl.int32)
+    pbase = 0
+    if BITS & 8:
+        w = tl.load(words + base + pbase + (r // 4)[None, :], mask = m2, other = 0)
+        raw = (raw << 8) | ((w >> ((r % 4) * 8)[None, :]) & 255)
+        pbase += 8
+    if BITS & 4:
+        w = tl.load(words + base + pbase + (r // 8)[None, :], mask = m2, other = 0)
+        raw = (raw << 4) | ((w >> ((r % 8) * 4)[None, :]) & 15)
+        pbase += 4
+    if BITS & 2:
+        w = tl.load(words + base + pbase + (r // 16)[None, :], mask = m2, other = 0)
+        raw = (raw << 2) | ((w >> ((r % 16) * 2)[None, :]) & 3)
+        pbase += 2
+    if BITS & 1:
+        w = tl.load(words + base + pbase + (r // 32)[None, :], mask = m2, other = 0)
+        raw = (raw << 1) | ((w >> (r % 32)[None, :]) & 1)
+    sc = tl.load(scales + row, mask = rmask, other = 0.0).to(tl.float32)
+    val = (tl.load(cb + raw) * sc[:, None]).to(tl.float16)
+    tl.store(out + row[:, None].to(tl.int64) * D + d[None, :], val, mask = m2)
+
+
+def tq_dequant_rows(words, scales, cb, out, bits, dim):
+    """words [N, dim/32*bits] int32, scales [N] fp16 -> out [N, dim] fp16 (rotated domain)."""
+    n = words.shape[0]
+    tb = 8
+    with torch.cuda.device(words.device):
+        _tq_dequant_rows_kernel[(triton.cdiv(n, tb),)](words, scales, cb, out, n, bits, dim, tb, num_warps = 4, num_stages = 1)
+
+
+@triton.jit
 def _tq_write_kernel(
     x, words, scales, cb, mid, block_table, cache_seqlens,
     length, npps,

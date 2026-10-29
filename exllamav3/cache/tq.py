@@ -23,6 +23,7 @@ from .quant import CacheLayer_quant
 
 TQ_SEED = 20240611
 _REF_ROT = os.environ.get("EXL3_TQ_REF_ROT") == "1"           # torch GEMM rotation (A/B and debugging)
+_MM_ROWS = int(os.environ.get("EXL3_TQ_ROT_MM_ROWS", "1024"))   # rotations of more rows than this run as one library GEMM (prefill chunks); fewer rows use the one-launch Triton kernel (decode / verify)
 _REF_WRITE = os.environ.get("EXL3_TQ_REF_WRITE") == "1"     # torch reference writer (A/B and debugging)
 
 
@@ -32,6 +33,14 @@ def codebook(dim: int, bits: int) -> torch.Tensor:
     from .tq_codebooks import CODEBOOKS
     assert (dim, bits) in CODEBOOKS, f"no TurboQuant codebook for head_dim {dim}, {bits} bits (have {sorted(CODEBOOKS)})"
     return torch.tensor(CODEBOOKS[dim, bits], dtype = torch.float32)
+
+
+def cache_is_tq(cache) -> bool:
+    """True when every attention layer of `cache` is a TurboQuant layer. A model whose attention maps the requested layer type to its own
+    variant (QSA sparse attention: CacheLayer_qsa_quant) keeps the plain quant layer, so `--kv-mode tq` there is the quant cache."""
+    from .mla import CacheLayer_MLA_quant
+    layers = [l for l in cache.layers.values() if isinstance(l, (CacheLayer_quant, CacheLayer_MLA_quant))]
+    return bool(layers) and all(getattr(l, "tq", False) for l in layers)
 
 
 def supported(dim: int, bits: int) -> bool:
@@ -79,14 +88,14 @@ class TQState:
 
     def rotate(self, *xs: torch.Tensor):
         """fp16 tensors [..., dim] -> R x, same shapes (one Triton launch for all of them on a GPU)."""
-        if xs[0].is_cuda and not _REF_ROT:
+        if xs[0].is_cuda and not _REF_ROT and sum(x.numel() for x in xs) // self.dim <= _MM_ROWS:
             from ..modules.attention_fn.tq_triton import tq_rotate
             return tq_rotate(self.rot_t, *xs) if len(xs) > 1 else tq_rotate(self.rot_t, *xs)[0]
         out = [(x.reshape(-1, self.dim) @ self.rot_t).view(x.shape) for x in xs]
         return out if len(xs) > 1 else out[0]
 
     def unrotate(self, y: torch.Tensor) -> torch.Tensor:
-        if y.is_cuda and not _REF_ROT:
+        if y.is_cuda and not _REF_ROT and y.numel() // self.dim <= _MM_ROWS:
             from ..modules.attention_fn.tq_triton import tq_rotate
             return tq_rotate(self.rot, y)[0]
         return (y.reshape(-1, self.dim) @ self.rot).view(y.shape)

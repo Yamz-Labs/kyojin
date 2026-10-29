@@ -265,18 +265,18 @@ def job_kv(c: Ctx) -> dict:
 
 def job_kvmode(c: Ctx, docs) -> dict:
     """KV format auto-select, ONCE per model: decode-faithful 32K KL vs k8v8 of k6v6 (quant), kw6 (k6v6 + sink/window ring), tq6, tq5 (TurboQuant + ring).
-    Q6 rule (rules.choose_kv_mode): kw6 when its KL <= 0.9 x k6v6's, else k6v6; the tq formats are measured and reported, opt-in only
-    (QUALIFY_KV_TQ=1 lets them win: any tq format with KL <= 0.9 x k6v6's, then the fewest bytes per value)."""
+    Q6 rule (rules.choose_kv_mode): kw6 when its KL <= 0.9 x k6v6's; tq6 is a default candidate (tq5: QUALIFY_KV_TQ=1, tq off: QUALIFY_KV_TQ=0); the fewest bytes per value among the qualifying formats wins, else k6v6."""
     for f in (c.out / "kvmode_raw.json", c.out / "kvmode_raw.json.k8v8.pt"):
         f.unlink(missing_ok=True)
     for fmt in ("k8v8", "k6v6", "kw6", "tq6", "tq5"):       # one lock take per format (each is a model load + a 32K pass)
         with c.locks(f"kvmode {fmt}"):
             c.py("gpu_eval.py", "kvmode", c.meta["path"], docs, c.out / "kvmode_raw.json", c.args.get("kvmode_steps", 256), fmt, timeout=14400)
     raw = json.loads((c.out / "kvmode_raw.json").read_text())
+    raw = {n: v for n, v in raw.items() if "kl_vs_k8" in v}       # a format the model's attention cannot hold (tq on QSA layers) is recorded as unsupported, not measured
     kl = {n: v["kl_vs_k8"] for n, v in raw.items()}
     bpv = {n: v["bits_per_val"] for n, v in raw.items()}
     dec = {n: v.get("decode_s_per_tok") for n, v in raw.items()}
-    win = rules.choose_kv_mode(kl, bpv, dec_s=dec, allowed=rules.KV_DEFAULT_FORMATS + (("tq6", "tq5") if os.environ.get("QUALIFY_KV_TQ") == "1" else ()))
+    win = rules.choose_kv_mode(kl, bpv, dec_s=dec, allowed=rules.kv_allowed_formats(os.environ.get("QUALIFY_KV_TQ")))
     if win == "k6v6":
         return dict(modes=raw, mode="quant")
     if win == "kw6":

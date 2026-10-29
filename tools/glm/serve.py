@@ -642,7 +642,7 @@ class ResidentEngine:
     row_budget = 0
 
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
-                 vision: bool = True, sessions: int = 1, cache_bits: int = 0,
+                 vision: bool = True, sessions: int = 1, cache_bits: int = 0, kv_mode: str = "quant",
                  image_cache_bytes: int | None = None, image_cache_items: int = 0,
                  image_cache_format: str = "fp32",
                  image_cache_dir: str | None = IMAGE_CACHE_DIR_DEFAULT,
@@ -689,6 +689,13 @@ class ResidentEngine:
         # indexer and k-pool planes and the rope key stay fp16, so the saving is smaller than the latent-only ratio.
         from exllamav3 import CacheLayer_quant
         qkw = dict(layer_type=CacheLayer_quant, k_bits=cache_bits, v_bits=cache_bits) if cache_bits else {}
+        if kv_mode == "tq" and cache_bits:
+            # TurboQuant latent (rotated, gamma-folded; see cache/mla.py CacheLayer_MLA_tq): k{bits} over the 512-wide latent
+            from exllamav3.cache.tq import CacheLayer_tq, supported as tq_supported
+            if tq_supported(512, cache_bits):
+                qkw["layer_type"] = CacheLayer_tq
+            else:
+                print(f"serve: kv-mode tq: no TurboQuant codebook for the {cache_bits}-bit latent, keeping the quant cache", flush=True)
         slots = max(sessions, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
         # GLM_NGRAM = "gram,K,match[,cmin]": n-gram lookup of tools/qwen/spec_policy.install_lookup. When the
         # last `match` tokens occurred before, the round verifies the K tokens that followed them instead of the drafter's
@@ -2082,9 +2089,12 @@ def main() -> None:
     parser.add_argument("--sessions", type=int, default=1,
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
+    parser.add_argument("--kv-mode", choices=("tq", "quant", "fp16"), default="tq",
+                        help="latent cache format. tq (default): TurboQuant, rotated Lloyd-Max codes + one scale per token, 6 bits unless --cache-bits says otherwise "
+                             "(KL below the quant cache, same decode speed); quant: packed per-32 group scales (--cache-bits 4/5/6/8, 8 if none given); fp16: the unpacked 16-bit pages")
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
-    parser.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
-                        help="bits per element of the MLA latent cache pages (0 = fp16, the default; 8 = packed int8; the DSA "
+    parser.add_argument("--cache-bits", type=int, default=None, choices=(0, 4, 5, 6, 8),
+                        help="bits per element of the MLA latent cache pages (default: 6 with --kv-mode tq, else 0; 0 = fp16; 8 = packed int8; the DSA "
                              "indexer and k-pool planes and the rope key stay fp16; output differs token-wise from fp16; slot "
                              "files do not cross cache modes, and a cross-mode restore is rejected)")
     parser.add_argument("--image-cache-mb", type=int, default=IMAGE_CACHE_MB_DEFAULT,
@@ -2124,6 +2134,10 @@ def main() -> None:
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
+    if args.kv_mode == "fp16":
+        args.cache_bits = 0
+    elif args.cache_bits is None:
+        args.cache_bits = 6 if args.kv_mode == "tq" else 8       # default cache: TurboQuant 6-bit latent; --kv-mode quant alone = the packed int8 pages
     if not 1 <= args.sessions <= MAX_SESSIONS:
         parser.error(f"--sessions must be 1..{MAX_SESSIONS}")
     if args.sessions > 1:
@@ -2131,7 +2145,7 @@ def main() -> None:
               f"(per-session window = -c / sessions when all are busy); greedy output is not guaranteed equal to the same "
               f"request run alone; slot save/restore waits for every running request and acts on the last prompt noted",
               file=sys.stderr, flush=True)
-    if args.cache_bits and args.sessions > 1:
+    if args.cache_bits and args.sessions > 1 and args.kv_mode != "tq":
         print(f"serve: --cache-bits {args.cache_bits} with --sessions {args.sessions}: the packed int8 MLA pages are not "
               f"row-invariant, so batched decode changes greedy output versus a single session (the rows still agree with "
               f"each other). Slot files also do not cross cache modes.", file=sys.stderr, flush=True)
@@ -2167,7 +2181,7 @@ def main() -> None:
         image_cache_size = (f"{args.image_cache_mb} MiB of host memory (--image-cache-mb)" if image_cache_bytes
                             else "no byte limit (--image-cache-mb 0)")
         engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
-                              vision=not args.no_vision, sessions=args.sessions, cache_bits=args.cache_bits,
+                              vision=not args.no_vision, sessions=args.sessions, cache_bits=args.cache_bits, kv_mode=args.kv_mode,
                               image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items,
                               image_cache_format=args.image_cache_format,
                               image_cache_dir=args.image_cache_dir, image_cache_dir_max_gb=args.image_cache_dir_max_gb,
@@ -2176,7 +2190,7 @@ def main() -> None:
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
-        print(f"serve: cache={'int' + str(args.cache_bits) + ' (slot files do not cross cache modes)' if args.cache_bits else 'fp16'}", flush=True)
+        print(f"serve: cache={args.kv_mode + str(args.cache_bits) + ' (slot files do not cross cache modes)' if args.cache_bits else 'fp16'}", flush=True)
         print(f"serve: image cache {image_cache_size}, {'no count cap' if not engine.emb_cache.max_items else str(engine.emb_cache.max_items) + ' pictures max'}, "
               f"{args.image_cache_format} rows, {engine.emb_cache.policy} policy, shared by {args.sessions} session(s)", flush=True)
         if engine.emb_disk is not None:

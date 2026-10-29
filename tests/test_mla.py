@@ -68,7 +68,7 @@ class FakeConfig:
 
 
 def build(H = 8, hidden = 1024, kv_lora = 512, nope = 128, rope_dim = 64, v_head = 128,
-          q_lora = None, nope_only = False, seed = 0, wscale = 0.085):
+          q_lora = None, nope_only = False, seed = 0, wscale = 0.085, pre_load = None):
     """Random-weight MLAttention plus the raw weights, for the reference forward.
 
     wscale is chosen so pre-softmax scores land around unit standard deviation. The q and k paths
@@ -105,6 +105,7 @@ def build(H = 8, hidden = 1024, kv_lora = 512, nope = 128, rope_dim = 64, v_head
         qk_rope_head_dim = rope_dim, v_head_dim = v_head, rope_settings = rope_settings,
         q_lora_rank = q_lora, rms_norm_eps = 1e-6,
     )
+    if pre_load: pre_load(module)
     module.load(torch.device(device))
     return module, {k: v.to(device) for k, v in t.items()}, key
 
@@ -585,7 +586,7 @@ def test_mla_gather_tile(bits):
     out_r = torch.empty((e - a, D_r), dtype = torch.half, device = dev)
     _mla_gather_tile_kernel[(triton.cdiv(e - a, 64),)](
         ck, kp, sk, h32, bt, out_c, out_r, a, e - a, npages, 0,
-        qbits, PS, D_c, D_r, 64, num_warps = 4, num_stages = 2,
+        qbits, 0, PS, D_c, D_r, 64, num_warps = 4, num_stages = 2,
     )
     err_c = (out_c.float() - want[a:e].float()).abs().max().item()
     err_r = (out_r.float() - kpe_rows[0, a:e].float()).abs().max().item()
@@ -602,3 +603,30 @@ def test_mla_kv_b_export_roundtrip():
     want = t[f"{key}.kv_b_proj.weight"]
     assert got.shape == want.shape
     assert torch.equal(got.cpu().half(), want.cpu().half()), "kv_b reconstruction differs"
+
+
+# ---- TurboQuant latent cache ---------------------------------------------------------------
+
+def _tq_pair(bits, **kw):
+    from exllamav3.cache import CacheLayer_MLA_tq
+    holder = {}
+    def pre(m):
+        holder["l"] = CacheLayer_MLA_tq(None, m, 0, 4 * PAGE_SIZE * 2, k_bits = bits)
+    module, t, key = build(pre_load = pre, **kw)
+    holder["l"].alloc(torch.device(device))
+    return module, t, key, holder["l"]
+
+
+@pytest.mark.parametrize("nope_only,geom", [(True, {}), (False, {}), (True, dict(rope_dim = 0, nope = 256, v_head = 256))])
+@pytest.mark.parametrize("bits", [6, 5])
+def test_mla_tq_cache_vs_reference(bits, nope_only, geom):
+    """TurboQuant latent cache (rotation + gamma folded into the weights) tracks the exact reference."""
+    module, t, key, layer = _tq_pair(bits, H = 8, q_lora = 256, seed = 31, nope_only = nope_only, **geom)
+    bsz, S = 2, 300
+    x = (torch.randn((bsz, S, module.hidden_size), device = device) * 0.5).half()
+    bt = torch.arange(4 * bsz, dtype = torch.int32, device = device).view(bsz, 4)
+    ref = ref_forward(module, t, key, x, torch.zeros((bsz,), dtype = torch.int32, device = device))
+    out = run_module(module, x, layer, bt)
+    outd = run_module(module, x, _tq_pair(bits, H = 8, q_lora = 256, seed = 31, nope_only = nope_only, **geom)[3], bt, chunk = 1)
+    print(f"  tq{bits} vs reference: prefill {rel_err(out, ref):.3e} decode {rel_err(outd, ref):.3e}")
+    assert rel_err(out, ref) < 1e-1 and rel_err(outd, ref) < 1e-1

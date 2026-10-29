@@ -1,7 +1,7 @@
 from .cache import Cache, CacheLayer
 from .fp16 import CacheLayer_fp16
 from .quant import CacheLayer_quant
-from .mla import CacheLayer_MLA_fp16, CacheLayer_MLA_quant
+from .mla import CacheLayer_MLA_fp16, CacheLayer_MLA_quant, CacheLayer_MLA_tq
 from .dsa import CacheLayer_dsa
 from .recurrent import RecurrentCache
 from .tq import CacheLayer_tq
