@@ -6,6 +6,7 @@
 #include "../util.h"
 #include "../util.cuh"
 #include "../quant/exl3_gemm.cuh"
+#include "../quant/exl3_gemv_int8.cuh"
 #include "../hgemm.cuh"
 #include "../rope.cuh"
 #include "../cache/q_cache.cuh"
@@ -477,7 +478,23 @@ void BC_Attention::run_gr
     at::Tensor xh_q = xh_flat.narrow(0, 0, (int64_t) R * hs).view({R, hs});
     bool use_qg_mgemm = gate_mode == 2 && qg_ptrs_trellis.has_value() && R <= 32;
     bool use_qkv = qkv_ptrs_trellis.has_value() && R <= 32;
-    if (use_qkv)
+    // m == 1, no gate/bias: q, k and v as ONE int8 sq-GEMV launch over the stacked 256-column groups (the sliced mgemm
+    // streams the 33 MB bundle at ~565 GB/s, the sq kernel at ~715 GB/s). Falls back to the bundle when it declines
+    s.qkv_tri = false;
+    if (use_qkv && R == 1 && gate_mode == 0 && hs == hidden_size && !g_weight && k_proj && v_proj && !use_k_as_v &&
+        !q_proj->bias && !k_proj->bias && !v_proj->bias && q_proj->mul1 && k_proj->mul1 && v_proj->mul1 && x2.dtype() == at::kHalf)
+    {
+        at::Tensor kvt = s.kv.view({2, R, num_kv_heads * head_dim});
+        at::Tensor k_out = kvt.select(0, 0), v_out = kvt.select(0, 1);
+        s.qkv_tri = exl3_gemv_int8_tri(x2, q_proj->trellis, s.q2, q_proj->suh, q_proj->svh,
+                                       k_proj->trellis, k_out, k_proj->suh, k_proj->svh,
+                                       v_proj->trellis, v_out, v_proj->suh, v_proj->svh, stream, graph);
+    }
+    if (s.qkv_tri)
+    {
+        // Q, K, V written by the triple launch
+    }
+    else if (use_qkv)
     {
         // Q, K, V (and a quantized full gate) as one sliced mgemm; the K/V section below is
         // skipped. The carrier only supplies the dtype and slice width
@@ -1006,7 +1023,9 @@ void BC_Attention::run
     bool use_qkv = qkv_ptrs_trellis.has_value() && R <= 32;
 
     // Q / gate projections (an fp16 gate is a cublas node with no patchable sites)
-    if (use_qkv)
+    if (s.qkv_tri)
+        params.emplace_back(GP_gemm_A, xptr);    // one int8 GEMV launch covers q, k, v
+    else if (use_qkv)
         params.emplace_back(GP_mgemm_A, xptr);   // one sliced mgemm covers q, k, v (and a quantized gate)
     else if (use_qg_mgemm)
         params.emplace_back(GP_mgemm_A, xptr);

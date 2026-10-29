@@ -47,3 +47,21 @@ bool exl3_gemv_int8_pair_eager
     const at::Tensor& B1, at::Tensor& C1, const c10::optional<at::Tensor>& suh1, const c10::optional<at::Tensor>& svh1,
     const at::Tensor& B2, at::Tensor& C2, const c10::optional<at::Tensor>& suh2, const c10::optional<at::Tensor>& svh2
 );
+
+bool exl3_gemv_int8_tri
+(
+    const at::Tensor& A,
+    const at::Tensor& B1, at::Tensor& C1, const c10::optional<at::Tensor>& suh1, const c10::optional<at::Tensor>& svh1,
+    const at::Tensor& B2, at::Tensor& C2, const c10::optional<at::Tensor>& suh2, const c10::optional<at::Tensor>& svh2,
+    const at::Tensor& B3, at::Tensor& C3, const c10::optional<at::Tensor>& suh3, const c10::optional<at::Tensor>& svh3,
+    cudaStream_t stream,
+    Graph* graph
+);
+
+bool exl3_gemv_int8_tri_eager
+(
+    const at::Tensor& A,
+    const at::Tensor& B1, at::Tensor& C1, const c10::optional<at::Tensor>& suh1, const c10::optional<at::Tensor>& svh1,
+    const at::Tensor& B2, at::Tensor& C2, const c10::optional<at::Tensor>& suh2, const c10::optional<at::Tensor>& svh2,
+    const at::Tensor& B3, at::Tensor& C3, const c10::optional<at::Tensor>& suh3, const c10::optional<at::Tensor>& svh3
+);
