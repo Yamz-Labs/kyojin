@@ -65,8 +65,9 @@ def geometry(hd, nqh, nkv, qlen, nw, dw, smm = 0, sxmul = 0):
 
 
 def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, causal, sm_scale,
-             window_left, window_right, softcap, kv_append_len, has_sinks, key_lo = 0, tq = False):
-    """Kernel config for a call, or None when the Triton kernels must run it. key_lo: KVWIN, positions below it are not attended"""
+             window_left, window_right, softcap, kv_append_len, has_sinks, key_lo = 0, tq = False, bsz = 1):
+    """Kernel config for a call, or None when the Triton kernels must run it. key_lo: KVWIN, positions below it are not attended
+    bsz: sequences in the call; it only feeds the EXL3_QDEC_HIP_SMM default (auto: on for one sequence, see below)"""
     if (not ENABLED or window_left >= 0 or window_right >= 0 or softcap or kv_append_len != q_len
             or not (2 <= k_bits <= 8) or not (2 <= v_bits <= 8)):
         return None
@@ -77,8 +78,11 @@ def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, 
     dw = pick_dw(head_dim, nt, nw)
     if dw is None:
         return None
-    smmv = int(knob_int("EXL3_QDEC_HIP_SMM", 0))
-    smm = int(smmv != 0 and dw > 1 and nt >= 3)   # measured: nt3 -39 %, nt2 +1 %, nt1 flat
+    smmk = knob("EXL3_QDEC_HIP_SMM", "auto")
+    smmv = (1 if bsz == 1 else 0) if smmk == "auto" else int(smmk)
+    # measured (131K, 36/48 rows, 3 q tiles): single buffer -37 % with one sequence, +1 % with 2 or 4
+    # sequences batched (fewer, longer splits hide the extra per-slab barrier); nt2 +1 %, nt1 flat
+    smm = int(smmv != 0 and dw > 1 and nt >= 3)
     sxmul = 2 if smmv == 2 else 0                 # SMM=2: same kernel as SMM=1 but the old (double) allocation, a footprint probe
     _, _, shared = geometry(head_dim, n_q_heads, n_kv_heads, q_len, nw, dw, smm, sxmul)
     if shared > 64 * 1024:
