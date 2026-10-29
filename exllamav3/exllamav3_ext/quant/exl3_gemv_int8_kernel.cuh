@@ -343,6 +343,21 @@ __device__ __forceinline__ void gemv_int8_row_sums
 #define SQ_COUNTERS_CAP 4096                                    // fixed counter region: size_n up to 1M
 #define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 4)    // sq-private region at workspace start (counters + per-slice-per-row scales, m <= 4)
 
+// Weight-stream load: read-only, no L1 allocation, L2 evict-first (the trellis rows are read exactly once per
+// launch). Measured on 3090 (bit-identical): M = 1 -0.5..-1.9 us per launch, M = 2 flat-to-worse, so M = 1 only.
+template <bool hint>
+__device__ __forceinline__ uint2 ldg_stream_u2(const uint32_t* p)
+{
+#if defined(USE_ROCM)
+    return *(const uint2*) p;
+#else
+    if constexpr (!hint) return *(const uint2*) p;
+    uint2 r;
+    asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
+    return r;
+#endif
+}
+
 // Wide unit (4 bpw): one (256-column x k-slice) unit, warp per adjacent block pair, uint2 loads.
 // M activation rows share the decoded weights: extraction and the B stream are amortized, each row
 // only adds its dp4a chains against its own splat region (sh_as + r * slice_stride; residual splats
@@ -372,14 +387,14 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     int shfl_src = (lane & 16) | ((lane + 15) & 15);
 
     int iacc0[M] = {}, iacc1[M] = {}, jacc0[M] = {}, jacc1[M] = {};
-    uint2 r0 = *(const uint2*) bp;
+    uint2 r0 = ldg_stream_u2<(M == 1)>(bp);
     uint2 r1 = {};
-    if (nrows > 1) r1 = *(const uint2*) (bp + row_stride);
+    if (nrows > 1) r1 = ldg_stream_u2<(M == 1)>(bp + row_stride);
 
     for (int kb = 0; kb < nrows; ++kb)
     {
         uint2 r2 = {};
-        if (kb + 2 < nrows) r2 = *(const uint2*) (bp + (size_t) (kb + 2) * row_stride);
+        if (kb + 2 < nrows) r2 = ldg_stream_u2<(M == 1)>(bp + (size_t) (kb + 2) * row_stride);
         uint32_t prev = __shfl_sync(0xffffffff, r0.y, shfl_src);
 
         uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
@@ -1018,6 +1033,27 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
 
+// L2 prefetch of the head of a unit's weight stream (first EXL3_SQ_PF block rows of its 256-column stripe), issued BEFORE the (not K=3: the extra registers drop its occupancy 5 -> 4 blocks/SM)
+// serial slice staging so the DRAM is busy during the staging instead of idle (no registers held across the staging, unlike a
+// register pre-issue). Layout: row stride 2 * bits * size_n bytes, stripe 512 * bits bytes = 4 * bits 128-byte lines.
+#ifndef EXL3_SQ_PF
+#define EXL3_SQ_PF 8
+#endif
+template <int bits>
+__device__ __forceinline__ void gemv_int8_prefetch_unit(const uint16_t* __restrict__ B, int nb256, int kb0, int nrows, int size_n)
+{
+#if !defined(USE_ROCM)
+    constexpr int lines = 4 * bits;
+    int rows_pf = nrows < EXL3_SQ_PF ? nrows : EXL3_SQ_PF;
+    int i = threadIdx.x;
+    if (i < lines * rows_pf)
+    {
+        const char* base = (const char*) B + (size_t) kb0 * size_n * 2 * bits + (size_t) nb256 * 512 * bits;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(base + (size_t) (i / lines) * size_n * 2 * bits + (i % lines) * 128));
+    }
+#endif
+}
+
 // dual: a second matrix (B2, ...) is computed by the same launch; a separate instantiation so the single-matrix
 // kernels keep their register budget (and so their occupancy)
 template <int bits, int M, bool c_fp32, bool residual, bool dual = false>
@@ -1102,6 +1138,9 @@ void exl3_gemv_int8_sq_kernel
         int kb0 = slice * rows_per;
         int nrows = MIN(rows_per, rows_total - kb0);
         int key = slice * 2 + smat;
+#if EXL3_SQ_PF > 0
+        if constexpr (M == 1 && bits != 3) gemv_int8_prefetch_unit<bits>(B_m, nb256, kb0, nrows, size_n);
+#endif
         if (key != prev_key)
         {
             gemv_int8_stage_slice<M, residual>(A_m, size_m, size_k, suh_m, qsums_m + 4 * slice * M,
