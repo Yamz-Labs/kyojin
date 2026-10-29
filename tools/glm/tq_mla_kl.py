@@ -80,7 +80,7 @@ def main(pack, docs, out, n_prefix=16384, n_dec=64, fmts=None):
     bt = torch.arange((T + 256) // 256, dtype=torch.int32)[None]
     lps, res = {}, {}
     import os
-    refp = os.path.expanduser(f"~/hermes-work/tqdef/glm/ref_fp16_{n_prefix}_{n_dec}.pt")
+    refp = os.path.join(os.path.expanduser(os.environ.get("TQ_MLA_KL_REF_DIR", "~/.cache/kyojin/tq_mla_kl")), f"ref_fp16_{n_prefix}_{n_dec}.pt")   # fp16 reference logprobs (written by a run that includes the fp16 format)
     prof = os.environ.get("PROF") == "1"       # PROF=1: kernel time table of 4 decode steps, no KL
     if "fp16" not in fmts and not prof:
         lps["fp16"] = torch.load(refp)
@@ -132,6 +132,7 @@ def main(pack, docs, out, n_prefix=16384, n_dec=64, fmts=None):
                 st.free()
         lps[f] = torch.stack(rows)
         if f == "fp16":
+            os.makedirs(os.path.dirname(refp), exist_ok=True)
             torch.save(lps[f], refp)
         if f != "fp16":
             r = lps["fp16"]
