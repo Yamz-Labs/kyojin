@@ -11,6 +11,7 @@ from typing import Callable, Optional
 
 # name -> default (str). The call sites pass the same default to knob(); tests/test_knobs.py checks the two agree.
 KNOBS = {
+    "KYOJIN_HIP_GLUE": "0",
     "EXL3_DEQ_WINDOW_TRITON": "1",
     "EXL3_GEMV_TRI": "1",
     "EXL3_GEMV_R_ARR1": "1",
