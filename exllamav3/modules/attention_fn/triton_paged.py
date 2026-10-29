@@ -800,9 +800,15 @@ def _prefill_ck_contig(q, kd, vd, past, n_kvh, head_dim, scale, out):
     # one 24-head call 405 ms (29.0 TF, 231 GB/s = the stream roof) -> 4 calls of 6 heads 4x86 = 343 ms (34.2 TF),
     # i.e. the op is DRAM-bound on the q-tile re-reads, not ALU-bound. Costs one contiguous copy of the group's q/k/v
     # (a per-group head slice is not row-contiguous): 194 ms of the 114K chunk, paid against 1000 ms of attention.
+    # Default -1 = AUTO: on from EXL3_PF_CK_GQA_MINPAST cached tokens, off below it (the copies are a fixed cost that
+    # short chunks cannot pay for). Measured in ONE load, arms ABABAB x3, 4096-row chunk, whole chunk / CK kernel:
+    # past 32K -1.9 % / -7.0 %, 114K -5.6 % / -13.4 %, 262K -10.6 % / -17.5 % (the saving grows with depth because the
+    # group's window stops fitting in L2); 0 forces the single call everywhere, 1 forces the split everywhere.
     # head_dim >= 256 only: at hd128 32q/4kv the same split is +14 % (one call 185.8 ms = 42.2 TF, 335 GB/s of K/V,
     # i.e. that shape still rides in L2), so the narrow-head class keeps the single call.
-    if knob_int("EXL3_PF_CK_GQA", 0) and head_dim >= 256 and n_kvh > 1 and n_qh % n_kvh == 0:
+    gqa = knob_int("EXL3_PF_CK_GQA", -1)
+    if (gqa > 0 or (gqa < 0 and past >= knob_int("EXL3_PF_CK_GQA_MINPAST", 65536))) \
+            and head_dim >= 256 and n_kvh > 1 and n_qh % n_kvh == 0:
         ratio = n_qh // n_kvh
         for g in range(n_kvh):
             qg = q[:, :, g * ratio:(g + 1) * ratio, :].contiguous()
