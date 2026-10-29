@@ -275,6 +275,73 @@ class Model(Model_TPMixin, Model_LSMixin):
             return y
 
 
+    def lag_table(self):
+        """Device copy of the token embedding table for the lag-1 pipeline's eager path (None: not possible for this model)."""
+        t = self.__dict__.get("_lag_tbl", 0)
+        if t != 0:
+            return t
+        self._lag_tbl = None
+        try:
+            from ..modules import Embedding, NGramEmbedding
+            if self.loaded_tp or not torch.cuda.is_available() or self._get_prefetch_layers or getattr(self.config, "moe_cpu_hosts", None):
+                return None
+            if any(type(m).__name__ in ("PLE", "PerLayerEmbedding") or isinstance(m, NGramEmbedding) for m in self.modules):
+                return None
+            emb, inst0, _ = self.fwd_modules[0]
+            if not isinstance(emb, Embedding) or emb.embedding is None or emb.normalize or emb.multiplier != 1.0:
+                return None
+            w = emb.embedding.weight
+            if w.dtype not in (torch.half, torch.bfloat16):
+                return None
+            dev = self.fwd_modules[1][0].device
+            if dev is None or torch.device(dev).type != "cuda":
+                return None
+            need = w.numel() * w.element_size() if w.device.type == "cpu" else 0
+            free, _ = torch.cuda.mem_get_info(dev)
+            if free < need + (int(os.environ.get("EXL3_GPU_EMB_MARGIN_MB", "1536")) << 20):
+                return None
+            probe = torch.arange(0, 8, dtype = torch.long).reshape(1, -1)
+            ref = emb.forward(probe, {"layer_instance": inst0})
+            wg = w.detach() if w.device.type == "cuda" else w.detach().to(dev)
+            got = wg.index_select(0, probe.to(wg.device).reshape(-1)).view(1, -1, wg.shape[1]).to(ref.dtype)
+            if got.shape != ref.shape or not torch.equal(got.cpu(), ref.cpu()):
+                return None
+            self._lag_tbl = (wg, ref.dtype)
+        except Exception as ex:
+            print(f"[lag1] no device embedding table: {ex}", flush = True)
+            self._lag_tbl = None
+        return self._lag_tbl
+
+
+    @torch.inference_mode
+    def forward_dev(self, input_ids: torch.Tensor, params: dict):
+        """forward() for a decode step whose ids are a device tensor (lag-1 pipeline). CUDA with the whole-forward graph: only the
+        graph can take them (its GPU embedding table), a decline returns None. Otherwise the eager layers run from a device-side
+        embedding gather (lag_table). Same arithmetic as forward(): the table rows are the rows Embedding.forward reads."""
+        if _cuda_graph.CUDA_GRAPH_ENABLED and not torch.version.hip:
+            if self.loaded_tp or not torch.cuda.is_available():
+                return None
+            x = self.prepare_inputs(input_ids, params)
+            if params.get("recurrent_states") is not None and "recurrent_slots" not in params:
+                prepare_for_recurrence(input_ids, params, self)
+            y = _cuda_graph.maybe_forward(self, x, params)
+            if y is not None:
+                advance_recurrent_states(input_ids, params, self)
+            return y
+        tbl = self.lag_table()
+        if tbl is None:
+            return None
+        x = self.prepare_inputs(input_ids, params)
+        if params.get("recurrent_states") is not None and "recurrent_slots" not in params:
+            prepare_for_recurrence(input_ids, params, self)
+        wg, dt = tbl
+        params["input_ids"] = input_ids
+        x = wg.index_select(0, input_ids.reshape(-1)).view(*input_ids.shape, wg.shape[1]).to(dt)
+        y = self.forward_ls(x, params, skip_first = True)
+        advance_recurrent_states(input_ids, params, self)
+        return y
+
+
     def unload(self):
         _cuda_graph.purge(self)
         for module in self.modules:

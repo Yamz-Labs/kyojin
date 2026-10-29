@@ -335,12 +335,13 @@ class Model_LSMixin(ABC):
         self,
         x: torch.Tensor,
         params: dict,
+        skip_first: bool = False,
     ):
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
         self._name_embedding_target(x, params)
         span = _FWD_SPAN and x.dim() >= 3 and x.shape[1] <= 8   # (batch, rows, ..): decode/verify only, not prefill chunks
-        for module, instance, idx in self.fwd_modules:
+        for module, instance, idx in (self.fwd_modules[1:] if skip_first else self.fwd_modules):
             params["layer_instance"] = instance
             if module.caps.get("logits_output"):
                 # EXL3_PF_SKIP: skip_logits -- the caller discards the logits (the MTP prompt
