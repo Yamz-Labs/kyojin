@@ -84,12 +84,26 @@ def test_triton_write_and_window_dequant_exact(D, bits):
     tok = cs.long().unsqueeze(1) + torch.arange(length, device = DEV).unsqueeze(0)
     rows = (bt.long().gather(1, tok // PAGE) * PAGE + tok % PAGE).reshape(-1)
     wr, sr = tq.encode_ref(x.reshape(-1, D), st.cbk, st.midk, bits)
-    assert torch.equal(words.view(-1, words.shape[-1])[rows], wr.view(rows.numel(), -1))
-    assert torch.equal(sc.view(-1, HKV)[rows], sr.view(rows.numel(), -1))
+    wk = words.view(-1, words.shape[-1])[rows].reshape(-1, D // 32 * bits)
+    sk = sc.view(-1, HKV)[rows].reshape(-1)
+    # The kernel sums the squared norms in its own order, the reference in torch's: the fp32 norms differ in the last bit. A
+    # coordinate whose unit value sits within ~1e-6 of a midpoint may then take the neighbouring code, and the fp16 scale may land
+    # one step apart (together about 1 in 100 draws). Everything else must be exact.
+    from exllamav3.ext_fallbacks import _unpack_cache_codes
+    ck, cr = [_unpack_cache_codes(w.view(-1, D // 32, bits).to(torch.int64) & 0xffffffff, bits).reshape(-1, D) for w in (wk, wr)]
+    bad = ck != cr
+    if bad.any():
+        assert (ck - cr).abs().max() == 1
+        u = x.reshape(-1, D).float() / x.reshape(-1, D).float().norm(dim = -1, keepdim = True)
+        lo = torch.minimum(ck, cr).clamp_max(st.midk.numel() - 1)
+        assert (u[bad] - st.midk[lo[bad]]).abs().max() < 1e-6
+    nrm = x.reshape(-1, D).float().norm(dim = -1)
+    sc_k = (nrm / st.cbk[ck].norm(dim = -1)).to(torch.float16)      # scale the kernel's own codes call for
+    assert (sk.view(torch.int16).int() - sc_k.view(torch.int16).int()).abs().max() <= 1
     npps = bt.shape[1]
     out = torch.zeros(bsz * npps, PAGE, HKV, D, dtype = torch.half, device = DEV)
     T._tq_dequant_window_kernel[(bsz * npps * (PAGE // 16), HKV)](words, sc, st.cbk, out, bt, cs, length, npps, bits, PAGE, HKV, D, 16)
-    ref = tq.decode_ref(wr, sr, st.cbk, bits, D)
+    ref = tq.decode_ref(wk, sk, st.cbk, bits, D)      # the dequant is exact given the stored codes and scales
     got = torch.stack([out[b * npps + int(tok[b, t]) // PAGE, int(tok[b, t]) % PAGE] for b in range(bsz) for t in range(length)]).reshape(ref.shape)
     assert torch.equal(got, ref)
 
