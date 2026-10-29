@@ -158,6 +158,18 @@ def test_dispatch_matches_dequantized_reference(hd, bits):
 
 
 @needs_gpu
+@pytest.mark.parametrize("bits", [5, 6])
+def test_verify_rows_beyond_one_pass_match_reference(bits):
+    """GQA 12 at head_dim 256: a verify step of more than 4 tokens does not fit one qdec_hip pass and runs as row chunks (ring included)"""
+    rig = Rig(bits, hd = 256, kvh = 2, qh = 24, pages = 8)
+    for n in (700, 1, 6, 8, 5, 3, 7):
+        q, o, L = rig.step(n)
+        r = rig.ref(q, L)
+        err = ((o.float() - r).norm() / r.norm()).item()
+        assert err < 6e-3, (bits, n, L, err)
+
+
+@needs_gpu
 @pytest.mark.parametrize("D", [128, 256])
 def test_fused_rotation_matches_gemm(D):
     from exllamav3.modules.attention_fn.tq_triton import _tq_rotate_kernel
