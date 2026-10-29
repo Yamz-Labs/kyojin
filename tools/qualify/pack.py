@@ -133,8 +133,7 @@ def serve_flags(meta: dict, *, port: int, ctx: int, sessions: int, k_bits: int, 
          "--draft-policy", draft or draft_policy(meta)]
     if dflash_dir and (draft or "") == "dflash":
         f += ["--dflash-dir", dflash_dir]
-    if kv_mode != "quant":
-        f += ["--kv-mode", kv_mode]
+    f += ["--kv-mode", kv_mode]            # always explicit: the server's own default is tq where the backend has it
     if kvwin:
         f += ["--kvwin", kvwin]
     if not meta["vision"]:

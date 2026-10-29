@@ -34,6 +34,13 @@ def codebook(dim: int, bits: int) -> torch.Tensor:
     return torch.tensor(CODEBOOKS[dim, bits], dtype = torch.float32)
 
 
+def cache_is_tq(cache) -> bool:
+    """True when every attention layer of `cache` is a TurboQuant layer. A model whose attention maps the requested layer type to its own
+    variant (QSA sparse attention: CacheLayer_qsa_quant) keeps the plain quant layer, so `--kv-mode tq` there is the quant cache."""
+    layers = [l for l in cache.layers.values() if isinstance(l, CacheLayer_quant)]
+    return bool(layers) and all(getattr(l, "tq", False) for l in layers)
+
+
 def supported(dim: int, bits: int) -> bool:
     from .tq_codebooks import CODEBOOKS
     return (dim, bits) in CODEBOOKS
