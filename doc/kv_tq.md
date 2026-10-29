@@ -15,7 +15,7 @@ No QJL stage, no boundary-layer exceptions.
 serve.py --k-bits 5 --v-bits 5 --kv-mode tq        # tq5 (5.06 b/value); 4..6 bits, head_dim 64 / 128 / 256 / 512
 ```
 
-The default (`--kv-mode quant` or nothing) is unchanged. A pack that went through `tools/qualify` has `kv_cache.json` (`kv_mode`, `k_bits`,
+TurboQuant is the default (28/10): no flag = `--kv-mode tq` (6 bits on ROCm, K4V4 on the NVIDIA preset). Opt-outs: `--kv-mode quant` (per-32 scale pages with `--k-bits/--v-bits`), `--kv-mode fp16` (unquantized pages). A pack that went through `tools/qualify` has `kv_cache.json` (`kv_mode`, `k_bits`,
 `v_bits`); `serve.py` uses it when no KV flag is given.
 
 ## How it fits the engine
@@ -37,8 +37,8 @@ The default (`--kv-mode quant` or nothing) is unchanged. A pack that went throug
 * `tools/qualify` (kv stage) measures the decode-faithful 32K KL against k8v8 of k6v6, kw6 (k6v6 + the fp16 sink-4 / window-128 ring) and
   tq6 / tq5 once per model. The default format is kw6 when its KL is <= 0.9 x k6v6's (a 256-step doc scatters 10-30 %: a tie stays on
   k6v6), written to `kv_cache.json` as `kvwin: "4:128"` (`serve.py --kvwin`, sets `EXL3_KVWIN` before the model is built). tq6 / tq5 are
-  measured and reported but stay opt-in (`--kv-mode tq`); `QUALIFY_KV_TQ=1` lets them win (fewest bytes among the formats within the
-  margin, a narrower one only if every wider one qualifies). A model whose attention cannot hold a TurboQuant cache (QSA sparse attention, see below)
+  a default candidate (28/10): it wins when its KL is <= k6v6's (fewest bytes among the qualifying formats); tq5 needs `QUALIFY_KV_TQ=1`, `QUALIFY_KV_TQ=0` removes TurboQuant from the choice
+  (a narrower tq format wins only if every wider tq format qualifies). A model whose attention cannot hold a TurboQuant cache (QSA sparse attention, see below)
   records tq6 / tq5 as `unsupported` and never picks them. The log-probs of the stage are kept in fp32 so close formats stay apart. `--no-kv-modes` skips the stage. The report also lists decode s/token per format.
 
 Qualify cells, RTX 3090, one 256-step 32K doc, KL vs k8v8 (decode s/tok): Nanbeige k6v6 .00495 (.0356) | kw6 .00267 (.0361) | tq6 .00251 | tq5 .00456
@@ -64,17 +64,21 @@ Served A/B, same session (decode tok/s, median of 3): 4K / 32K / 120K k6v6 46.29
 (tq6 vs kw6: -1.0 / -1.0 / -2.1 %). One 32K decode step is 27.2 ms of GPU time; tq6 adds ~0.32 ms over the same ring (q/k/v rotation 0.14, writer 0.10
 more than the quant writer, qdec 0.08), the ring itself ~0.30 ms in both kw6 and tq6.
 
-## Default status (28/10, branch feature/tq-default): NOT flipped
+## Default status (28/10, branch feature/tq-default): FLIPPED
 
-tq stays opt-in (`--kv-mode tq`). The gate "tq6 >= the per-32 cache on speed and quality for every box model" is not yet met: GLM (MLA) and MiMo (head dim 192) have no TQ path, and tq6 trails k6v6 at T1 by launch gaps. Qwen3.8 QSA now holds a TQ cache (see below).
-Qualify always passes `--kv-mode` explicitly.
+tq6 is the default in `tools/qwen/serve.py`, `tools/glm/serve.py` and the qualify kv stage (opt-outs above). Qualify always passes `--kv-mode` explicitly.
+GLM-5.3 MLA latent (`CacheLayer_MLA_tq`, 28/10, real pack, 32K prefix, 32 teacher-forced decode steps, KL vs the fp16 cache): tq6 .00403, k6 .00525;
+decode 48.4 vs 49.9 ms/token (fp16 cache 44.7). The 512-wide gamma-free latent is rotated once after kv_a_layernorm (R diag(1/gamma) is one matrix), the
+rotation and gamma live in W_UK / W_UV (so q, the kernels and the output never rotate per token), DSA indexer planes stay fp16. The decode kernels read codes
+through an fp16 codebook with 32 heads per program (the expansion is paid once per head block). The first version read a zeroed norm weight (deferred
+tensor read at fold time) and gave NaN latents (KL .85): the fold now reads the weight with `no_defer`.
 
 Known limits:
 * QSA models (Qwen3.8-Flash-Next family): `Attention.cache_layer_type` maps a TQ layer to `CacheLayer_qsa_tq` (TQ pool + fp16 indexer planes). The dense
   regime goes through the normal dispatch; the sparse regime rotates q and K/V itself and reads the codes through the codebook in the QSA split kernel
   (BC graphs stay off for tq). Measured 28/10 on qwen38-yamz-v2-bal, 256 teacher-forced decode steps after a long doc, KL vs k8v8: k6v6 .00229,
   tq6 .00177 (top-1 .977 vs .980), tq5 .00281; decode 41.8 vs 41.9 ms/token. CUDA must re-check the sparse split kernel with codebook loads.
-* MLA/DSA (GLM) keeps the fp16 latent cache, and head dim 192 (MiMo) has no codebook.
+* MLA/DSA (GLM) holds `CacheLayer_MLA_tq` (eager path; the BC graph path for tq is not validated, the box runs with BC off). Head dim 192 (MiMo) has no codebook and keeps the quant cache.
 
 HIP decode kernel (box, Strix Halo, per layer at 128K, hd 256, 2 KV heads, 24 q heads): verify steps of 5..8 rows now run as row chunks on
 `qdec_hip` (before: the Triton split kernels, 32 ms; after 2.2 ms at T5, 3.3 ms at T8), and the TQ V prefetch is limited to 2 q tiles (T3 / T4 spilled
