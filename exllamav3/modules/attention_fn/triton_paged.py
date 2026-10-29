@@ -1263,7 +1263,8 @@ def _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, so
     window_left, window_right = _normalize_window(window_size)
     sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
     cfg = _qh.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, k_cache.shape[1], causal, softmax_scale,
-                       window_left, window_right, softcap, kv_append_len, has_sinks, ring.cfg.S if ring is not None else 0, tq is not None)
+                       window_left, window_right, softcap, kv_append_len, has_sinks, ring.cfg.S if ring is not None else 0, tq is not None,
+                       bsz = bsz)
     if cfg is None:
         # A verify step with more rows than one pass of the kernel holds (accumulator budget: 4 tokens at GQA 12, hd 256) runs as
         # row chunks, each one a smaller verify at the shifted position: the Triton split kernels cost 15-20x more at 128K

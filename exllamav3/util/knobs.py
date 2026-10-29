@@ -46,9 +46,11 @@ KNOBS = {
     "EXL3_QDEC_HIP_NW": "0",
     "EXL3_QDEC_HIP_DW": "",
     "EXL3_QDEC_HIP_MAXO": "96",
+    "EXL3_QDEC_HIP_MAXO2": "160",
     "EXL3_QDEC_HIP_SPL": "",
     "EXL3_QDEC_HIP_WAVES": "0",
     "EXL3_QDEC_HIP_VPF": "1",
+    "EXL3_QDEC_HIP_SMM": "auto",
     "EXL3_QDEC_HIP_FLAGS": "",
 }
 

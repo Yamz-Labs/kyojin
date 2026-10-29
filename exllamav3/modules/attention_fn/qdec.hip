@@ -58,6 +58,12 @@ typedef u32 v8u __attribute__((ext_vector_type(8)));
 #ifndef VPF
 #define VPF 1                         // this slab's V runs are issued before its S stage, so their DRAM latency overlaps
 #endif                                // the S dequant/WMMA and the softmax (bit-identical, scheduling only; 0 = pre-lever order)
+#ifndef SMM1
+#define SMM1 0                        // DW > 1: single-buffer the cross-wave S exchange (half the LDS, one extra barrier per slab)
+#endif
+#ifndef SMMB
+#define SMMB 0                        // DW > 1: keep the double buffer but re-align the waves on every slab (extra barrier only)
+#endif
 
 __device__ __forceinline__ u32 hsub2(u32 a, u32 b) { return __builtin_bit_cast(u32, __builtin_bit_cast(v2h, a) - __builtin_bit_cast(v2h, b)); }
 __device__ __forceinline__ u32 hmul2(u32 a, u32 b) { return __builtin_bit_cast(u32, __builtin_bit_cast(v2h, a) * __builtin_bit_cast(v2h, b)); }
@@ -272,7 +278,7 @@ qdec_split(
     const float sl = SCALE * LOG2E;
     const float qmin = (float)(total_k - QLEN);
 
-    float* Ssm = (float*) scratch;                       // DW > 1: [2][NSW*DW][NT][8][32] partial S, double buffered
+    float* Ssm = (float*) scratch;                       // DW > 1: [NSW*DW][NT][8][32] partial S (double buffered unless SMM1)
     u32 kw[KWW];             // this lane's token row of K (kvh slice of this wave's groups)
     u16 ksc[GWV];            // its scales
     int row0 = 0, lim = 0;
@@ -394,7 +400,7 @@ qdec_split(
         }
         if (DW > 1) {
             // sum the partial S of the DW waves of this stream in a fixed order (every wave gets the same bits)
-            float* sb = Ssm + (size_t)(it & 1) * NSW * DW * NT * 8 * 32;
+            float* sb = Ssm + (SMM1 ? 0 : (size_t)(it & 1) * NSW * DW * NT * 8 * 32);
             if (active) {
                 #pragma unroll
                 for (int j = 0; j < NT; j++)
@@ -414,6 +420,7 @@ qdec_split(
                     }
             }
         }
+        if ((SMM1 || SMMB) && DW > 1) __syncthreads();   // SMM1: the single buffer is overwritten next iteration; SMMB: phase-align only
         if (!active) continue;
 #if TQF
         const bool more = it + 1 < iters && (sw + (it + 1) * NSW) < nslabs;
