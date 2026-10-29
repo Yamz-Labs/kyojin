@@ -55,6 +55,9 @@ typedef u32 v8u __attribute__((ext_vector_type(8)));
 #ifndef KEY_LO
 #define KEY_LO 0                      // KVWIN: tokens below KEY_LO are not attended (the fp16 ring serves the sinks)
 #endif
+#ifndef VPF
+#define VPF 1                         // this slab's V runs are issued before its S stage, so their DRAM latency overlaps
+#endif                                // the S dequant/WMMA and the softmax (bit-identical, scheduling only; 0 = pre-lever order)
 
 __device__ __forceinline__ u32 hsub2(u32 a, u32 b) { return __builtin_bit_cast(u32, __builtin_bit_cast(v2h, a) - __builtin_bit_cast(v2h, b)); }
 __device__ __forceinline__ u32 hmul2(u32 a, u32 b) { return __builtin_bit_cast(u32, __builtin_bit_cast(v2h, a) * __builtin_bit_cast(v2h, b)); }
@@ -325,8 +328,24 @@ qdec_split(
         v8f S[NT];
         #pragma unroll
         for (int j = 0; j < NT; j++) S[j] = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
+#if VPF && !TQF
+        u32 vr[16][NRW > 0 ? NRW : 1];                   // this slab's V runs, loaded up front (see VPF)
+        u32 vsc[16];
+#endif
 
         if (active) {
+#if VPF && !TQF
+            {
+                const int dcol = dw * HDW + DTW * n;
+                const int gi_v = dcol >> 5, p0 = dcol & 31;
+                #pragma unroll
+                for (int e = 0; e < 16; e++) {
+                    size_t row = (size_t) row0 + min(e, lim);
+                    load_run(vr[e], v_cache + row * (GPT * VB) + kvh * VCHW + gi_v * VB, p0);
+                    vsc[e] = TQ ? ((u32) v_scales[row * NKV + kvh] * 0x10001u) : scale2<VB>(v_scales[row * GPT + kvh * G + gi_v]);
+                }
+            }
+#endif
             // ---- S (partial over this wave's k-steps) = Kdeq x q^T
             #pragma unroll
             for (int gl = 0; gl < GWV; gl++) {
@@ -476,6 +495,7 @@ qdec_split(
             }
         }
 #else
+#if !VPF
         const int cur_row0 = row0, cur_lim = lim;
         const int dcol = dw * HDW + DTW * n;
         const int gi_v = dcol >> 5, p0 = dcol & 31;
@@ -487,6 +507,7 @@ qdec_split(
             load_run(vr[e], v_cache + row * (GPT * VB) + kvh * VCHW + gi_v * VB, p0);
             vsc[e] = TQ ? ((u32) v_scales[row * NKV + kvh] * 0x10001u) : scale2<VB>(v_scales[row * GPT + kvh * G + gi_v]);
         }
+#endif
         // next slab's K (kw is dead now)
         if (it + 1 < iters && (sw + (it + 1) * NSW) < nslabs) { slab_rows(it + 1); load_k(); }
         #pragma unroll

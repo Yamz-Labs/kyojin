@@ -81,13 +81,15 @@ def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, 
     if shared > 64 * 1024:
         return None
     return dict(hd=head_dim, kb=k_bits, vb=v_bits, nkv=n_kv_heads, nqh=n_q_heads, qlen=q_len, page=page_size, nw=nw, dw=dw,
-                causal=bool(causal), scale=float(sm_scale), sinks=bool(has_sinks), key_lo=int(key_lo), tq=bool(tq))
+                causal=bool(causal), scale=float(sm_scale), sinks=bool(has_sinks), key_lo=int(key_lo), tq=bool(tq),
+                vpf=bool(knob_int("EXL3_QDEC_HIP_VPF", 1)))
 
 
 def _compile(cfg, arch):
     from exllamav3.util import hip_compiler
     defs = dict(HD=cfg["hd"], KB=cfg["kb"], VB=cfg["vb"], NKV=cfg["nkv"], NQH=cfg["nqh"], QLEN=cfg["qlen"], PAGE=cfg["page"],
-                NW=cfg["nw"], DW=cfg["dw"], CAUSAL=int(cfg["causal"]), HAS_SINKS=int(cfg["sinks"]), KEY_LO=cfg["key_lo"], TQ=int(cfg.get("tq", False)), SCALE=repr(float(cfg["scale"])) + "f")
+                NW=cfg["nw"], DW=cfg["dw"], CAUSAL=int(cfg["causal"]), HAS_SINKS=int(cfg["sinks"]), KEY_LO=cfg["key_lo"], TQ=int(cfg.get("tq", False)),
+                VPF=int(cfg.get("vpf", False)), SCALE=repr(float(cfg["scale"])) + "f")
     extra = [f"-D{k}={v}" for k, v in defs.items()] + knob("EXL3_QDEC_HIP_FLAGS", "").split()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"] + extra
     gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
