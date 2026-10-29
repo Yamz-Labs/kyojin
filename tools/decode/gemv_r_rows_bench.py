@@ -37,8 +37,12 @@ ARMS = {
  # shipped verify env for 5..8 rows (tools/qwen/serve.py SERVE_ENV): RM6 + WIDE8 + DEC1
  "S1": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RM6": "1", "EXL3_GEMV_R_WIDE8": "1"},
  "S1a0": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RM6": "1", "EXL3_GEMV_R_WIDE8": "1", "EXL3_GEMV_R_ARR1": "0"},
+ # the served 5..6-row env as row_split MODE 2 sets it (RPB 4 + CHUNK_FAST 1) with wide8 pinned to 7 rows (the
+ # pre-lever-20 default), and the same with the wide8 one-pass form allowed from 5 rows (the shipped default)
+ "S2": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RM6": "1", "EXL3_GEMV_R_WIDE8": "1", "EXL3_GEMV_R_RPB": "4", "EXL3_GEMV_R_CHUNK_FAST": "1", "EXL3_GEMV_R_WIDE8_MINR": "7"},
+ "S2w5": {"EXL3_GEMV_R_DEC1": "1", "EXL3_GEMV_R_RM6": "1", "EXL3_GEMV_R_WIDE8": "1", "EXL3_GEMV_R_RPB": "4", "EXL3_GEMV_R_CHUNK_FAST": "1", "EXL3_GEMV_R_WIDE8_MINR": "5"},
 }
-KEYS = ["EXL3_GEMV_R_DEC1", "EXL3_GEMV_R_RPB", "EXL3_GEMV_R_CHUNK_FAST", "EXL3_GEMV_R_RPB78", "EXL3_GEMV_R_RM6", "EXL3_GEMV_R_RPB9", "EXL3_GEMV_R_SWAP9", "EXL3_GEMV_R_WIDE8", "EXL3_GEMV_R_ARR1"]
+KEYS = ["EXL3_GEMV_R_DEC1", "EXL3_GEMV_R_RPB", "EXL3_GEMV_R_CHUNK_FAST", "EXL3_GEMV_R_RPB78", "EXL3_GEMV_R_RM6", "EXL3_GEMV_R_RPB9", "EXL3_GEMV_R_SWAP9", "EXL3_GEMV_R_WIDE8", "EXL3_GEMV_R_ARR1", "EXL3_GEMV_R_WIDE8_MINR"]
 def setarm(name):
     for k in KEYS: os.environ.pop(k, None)
     os.environ.update(ARMS[name])

@@ -15,6 +15,7 @@ KNOBS = {
     "EXL3_GEMV_TRI": "1",
     "EXL3_GEMV_R_ARR1": "1",
     "EXL3_GEMV_R_WIDE8": "1",
+    "EXL3_GEMV_R_WIDE8_MINR": "5",
     "EXL3_GEMV_R_RPB78": "4",
     "EXL3_BC_KVWIN": "1",
     "EXL3_CUDA_GRAPH_RING": "1",

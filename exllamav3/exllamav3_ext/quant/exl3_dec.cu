@@ -2666,10 +2666,13 @@ static void dec_gemv_r_impl
                      env_int("EXL3_GEMV_R_DEC1", 0) == 1 && GEMV_R_ROW_BUDGET / ktw >= R;
     if (rm6) rpb = R;
 
-    // EXL3_GEMV_R_WIDE8=1 (needs EXL3_GEMV_R_DEC1=1): 7..8 rows run in ONE launch of the 8-row instantiation with the x words in SGPRs
-    // (lane_gemv_r2) instead of two 4-row chunks that each decode every tile (ktw > 16: the input is staged in 16-tile phases). Grids under
-    // EXL3_GEMV_R_WIDE8_MINBLK (32) blocks keep the two chunks. Same per-row arithmetic, bit-identical output.
-    const bool wide8 = R >= 7 && R <= MOE_R_MAX && env_int("EXL3_GEMV_R_WIDE8", 0) != 0 &&
+    // EXL3_GEMV_R_WIDE8=1 (needs EXL3_GEMV_R_DEC1=1): rows from EXL3_GEMV_R_WIDE8_MINR (default 5) up run in ONE launch of the
+    // 8-row instantiation with the x words in SGPRs (lane_gemv_r2) instead of two 4-row chunks that each decode every tile
+    // (ktw > 16: the input is staged in 16-tile phases). Grids under EXL3_GEMV_R_WIDE8_MINBLK (32) blocks keep the two chunks.
+    // Same per-row arithmetic, bit-identical output. MINR 5 is the ktw > 16 classes at the 5..6-row verify (rbp 4 chunks them
+    // into 2 passes that each stream the weights: 33 calls, 266.5 us vs 149.3 at 1 row; one pass: 101.0 -> 74.2 us in the
+    // kernel, -2.9/-3.9 ms on the 5-row verify at 4K/131K in situ); rm6 covers kb2 8 / 10 and still wins there.
+    const bool wide8 = R >= env_int("EXL3_GEMV_R_WIDE8_MINR", 5) && R <= MOE_R_MAX && env_int("EXL3_GEMV_R_WIDE8", 0) != 0 &&
                        env_int("EXL3_GEMV_R_DEC1", 0) == 1 &&
                        (GEMV_R_ROW_BUDGET / ktw >= R || (ktw % 16 == 0 && ktw <= 64)) &&      // ktw 32 / 48 / 64: staged in 16-tile phases
                        strips_total * kbs >= env_int("EXL3_GEMV_R_WIDE8_MINBLK", 32);          // one pass runs half the blocks of the two 4-row chunks: it loses when the grid gets sparse
