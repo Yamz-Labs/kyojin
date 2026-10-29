@@ -149,7 +149,7 @@ class KVWinLayerState:
         self.cache_layer = cache_layer
         global ANY_ACTIVE
         ANY_ACTIVE = True
-        cache_layer.kvwin = self        # BC_Attention (per-layer graph decode) declines such layers: they run the Python path
+        cache_layer.kvwin = self        # BC_Attention (per-layer graph decode) runs the ring in-graph on CUDA (bc_attn.py); on ROCm it declines such layers
 
     @property
     def active(self) -> bool:

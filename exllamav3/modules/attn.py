@@ -1187,7 +1187,7 @@ class Attention(Module):
         return o
 
 
-    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens, host_seqlens = None):
+    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens, host_seqlens = None, kvwin_ctx = None):
         """
         Graph-captured decode attention block (projections through o_proj as one C++ call,
         replayed as one CUDA graph after warmup). Returns the block output, or None when the
@@ -1213,7 +1213,7 @@ class Attention(Module):
             return None
         return bca.step(
             x, cache_seqlens, block_table, position, positions, position_ids, inv_freq,
-            causal = params.get("causal", True), host_seqlens = host_seqlens
+            causal = params.get("causal", True), host_seqlens = host_seqlens, kvwin_ctx = kvwin_ctx
         )
 
 
@@ -1341,7 +1341,7 @@ class Attention(Module):
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
-                                  host_seqlens = qsa_seqlens_cpu)
+                                  host_seqlens = qsa_seqlens_cpu, kvwin_ctx = ov)
             if o is not None:
                 return o
 
