@@ -68,6 +68,8 @@ def _main():
     ap.add_argument("--arm-attr", default="", help="module:ATTR to flip instead of --knob (arm on = True, off = False)")
     ap.add_argument("--purge", default="", help="module:function called between arms (e.g. a graph cache purge)")
     ap.add_argument("--gen", type=int, default=64)
+    ap.add_argument("--gen-reps", type=int, default=2, help="generation passes per arm, interleaved (ABAB)")
+    ap.add_argument("--gen-only", action="store_true", help="skip the timed phases: greedy exactness only (generator uses the cache it was created with)")
     ap.add_argument("--cache-bits", type=int, default=16)
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--min-avail-gb", type=float, default=5.0)
@@ -98,6 +100,10 @@ def _main():
     model = Model.from_config(config)
     qkw = dict(layer_type=CacheLayer_quant, k_bits=a.cache_bits, v_bits=a.cache_bits) if a.cache_bits < 16 else {}
     cache = Cache(model, max_num_tokens=cap, max_history=4, max_batch_size=1, **qkw)
+    # a generator needs its own page table (the timed phases map one by hand), and caches must be
+    # constructed before model.load
+    gcap = 2048 if a.gen else 0
+    gcache = Cache(model, max_num_tokens=gcap, max_history=2, max_batch_size=1, **qkw) if gcap else None
     model.load(device="cuda:0", progressbar=False)
     av = avail_gb()
     R["load_s"] = round(time.time() - t0, 1); R["avail_after_load_gb"] = round(av, 1)
@@ -162,7 +168,7 @@ def _main():
             h.update(lg.float().cpu().numpy().tobytes())
         return ts, h.hexdigest()
 
-    for d in depths:
+    for d in ([] if a.gen_only else depths):
         pt = R["points"][str(d)] = {arm: [] for arm in arms}
         R["md5"][str(d)] = {arm: None for arm in arms}
         for v in range(a.reps):
@@ -183,31 +189,33 @@ def _main():
         tok = Tokenizer.from_config(config)
         prompt = "Write one paragraph about the speed of light in a vacuum, then a short list of its consequences."
         ids = tok.encode(prompt, add_bos=True, encode_special_tokens=True)
-        out = {}
-        for arm in arms:
-            set_arm(arm)
-            # a generator needs its own page table: the timed phases above used a manually mapped one
-            gcache = Cache(model, max_num_tokens=cap, max_history=4, max_batch_size=1, **qkw)
-            gen = Generator(model=model, cache=gcache, tokenizer=tok)
-            gen.enqueue(Job(input_ids=ids, max_new_tokens=a.gen, sampler=GreedySampler()))
-            toks = []
-            while gen.num_remaining_jobs():
-                for r in gen.iterate():
-                    for t in (r.get("token_ids") or []):
-                        toks.append(int(t))
-            out[arm] = dict(md5=hashlib.md5(",".join(map(str, toks)).encode()).hexdigest(), n=len(toks), ids=toks[:8])
-            print(f"  gen arm={arm} {out[arm]['md5']} n={out[arm]['n']} head={out[arm]['ids']}", flush=True)
+        out = {arm: [] for arm in arms}
+        for rep in range(a.gen_reps):
+            for arm in (arms if rep % 2 == 0 else arms[::-1]):
+                set_arm(arm)
+                gen = Generator(model=model, cache=gcache, tokenizer=tok)
+                gen.enqueue(Job(input_ids=ids, max_new_tokens=a.gen, sampler=GreedySampler()))
+                toks = []
+                while gen.num_remaining_jobs():
+                    for r in gen.iterate():
+                        for t in (r.get("token_ids") or []):
+                            toks.append(int(t))
+                out[arm].append(dict(md5=hashlib.md5(",".join(map(str, toks)).encode()).hexdigest(), n=len(toks), ids=toks[:8]))
+                print(f"  gen rep={rep} arm={arm} {out[arm][-1]['md5']} n={out[arm][-1]['n']} head={out[arm][-1]['ids']}", flush=True)
         R["gen"] = out
+        same_arm = all(len({d["md5"] for d in v}) == 1 for v in out.values())
+        cross = len({v[0]["md5"] for v in out.values()}) == 1
+        print(f"gen: within-arm stable {same_arm}, off==on {cross}", flush=True)
         save()
 
-    for d in depths:
+    for d in ([] if a.gen_only else depths):
         o, n = R["points"][str(d)]["off"], R["points"][str(d)]["on"]
         mo, mn = statistics.mean(o), statistics.mean(n)
         se = statistics.stdev([x - y for x, y in zip(o, n)]) / max(1, len(o)) ** 0.5 if len(o) > 1 else 0.0
         print(f"depth {d}: off {mo:.3f} ms ({1000/mo:.2f} tok/s)  on {mn:.3f} ({1000/mn:.2f})  "
               f"delta {100*(mn-mo)/mo:+.2f} % +- {100*se/mo:.2f}  md5 {'EQUAL' if R['md5'][str(d)]['off']==R['md5'][str(d)]['on'] else 'DIFFER'}")
     if R["gen"]:
-        print("greedy md5", "EQUAL" if R["gen"]["off"]["md5"] == R["gen"]["on"]["md5"] else "DIFFER")
+        print("greedy md5", "EQUAL" if R["gen"]["off"][0]["md5"] == R["gen"]["on"][0]["md5"] else "DIFFER")
     save()
 
 
