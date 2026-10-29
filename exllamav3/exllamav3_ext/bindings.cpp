@@ -465,6 +465,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fused_silu_mul", &fused_silu_mul, "fused_silu_mul");
     m.def("silu_mul_pitched", &silu_mul_pitched, "silu_mul_pitched");
     m.def("skinny_set_onepass", &skinny_set_onepass, "skinny_set_onepass");
+    m.def("skinny_set_w2", &skinny_set_w2, "skinny_set_w2");
     m.def("kda_gate", &kda_gate, "kda_gate");
     m.def("kda_fb_gate", &kda_fb_gate, "kda_fb_gate");
 #if defined(USE_ROCM)
