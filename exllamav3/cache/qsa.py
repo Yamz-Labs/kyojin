@@ -5,6 +5,7 @@ import torch
 from .cache import CacheLayer
 from .fp16 import CacheLayer_fp16
 from .quant import CacheLayer_quant
+from .tq import CacheLayer_tq
 from ..constants import PAGE_SIZE
 
 
@@ -41,6 +42,10 @@ class QSAPlanes:
         super().free()
         self.raw_k = None
         self.pooled = None
+
+    def update_kv_sparse(self, cache_seqlens, block_table, k, v, length: int):
+        """Write new K/V from the sparse-attention call sites (natural-domain k, v, no dispatch in front)."""
+        self.update_kv_direct(cache_seqlens, block_table, k, v, length)
 
     @override
     def copy_page(self, source, from_page: int, to_page: int, num_tokens: int):
@@ -104,6 +109,33 @@ class CacheLayer_qsa_quant(QSAPlanes, CacheLayer_quant):
     def tp_export(self, plan):
         return {
             "cls": CacheLayer_qsa_quant,
+            "args": {
+                "cache_id": self.cache_id,
+                "max_num_tokens": self.max_num_tokens,
+                "k_bits": self.k_bits,
+                "v_bits": self.v_bits,
+            }
+        }
+
+
+class CacheLayer_qsa_tq(QSAPlanes, CacheLayer_tq):
+    """TurboQuant KV pool (rotated domain, Lloyd-Max codes, one fp16 norm per head vector) with the fp16 QSA indexer
+    planes. The planes are the indexer's own keys and stay outside the rotation. The dense regime goes through the
+    normal dispatch (which rotates); the sparse regime rotates q and K/V itself (attn.py, QSAIndexer.sparse_attend)."""
+
+    def __init__(self, config, attention, cache_id: int, max_num_tokens: int, k_bits: int, v_bits: int, compand_a: float = 0.0):
+        super().__init__(config, attention, cache_id, max_num_tokens, k_bits, v_bits, compand_a)
+        self._init_planes(attention, max_num_tokens)
+
+    @override
+    def update_kv_sparse(self, cache_seqlens, block_table, k, v, length: int):
+        k, v = self.get_tq().rotate(k, v)
+        self.update_kv_direct(cache_seqlens, block_table, k, v, length)
+
+    @override
+    def tp_export(self, plan):
+        return {
+            "cls": CacheLayer_qsa_tq,
             "args": {
                 "cache_id": self.cache_id,
                 "max_num_tokens": self.max_num_tokens,

@@ -1224,7 +1224,10 @@ class Attention(Module):
             return default, kwargs
         from ..cache.fp16 import CacheLayer_fp16
         from ..cache.quant import CacheLayer_quant
-        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant
+        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant, CacheLayer_qsa_tq
+        from ..cache.tq import CacheLayer_tq
+        if issubclass(default, CacheLayer_tq):
+            return CacheLayer_qsa_tq, kwargs
         if issubclass(default, CacheLayer_quant):
             return CacheLayer_qsa_quant, kwargs
         assert issubclass(default, CacheLayer_fp16), \
@@ -1379,7 +1382,7 @@ class Attention(Module):
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
         if qsa_sparse:
-            qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
+            qsa_layer.update_kv_sparse(cache_seqlens, block_table, k, v, seqlen)
             if params.get("kv_only") and _kv_only_skip:
                 # EXL3_PF_SKIP kv_only (the MTP draft prompt prefill): K/V and the indexer planes are written, the block's
                 # output is discarded by the caller, so the selection, the sparse attention and everything after it are skipped.
@@ -1520,7 +1523,7 @@ class Attention(Module):
             thr = self.qsa_indexer.sparse_threshold()
             if all(int(qsa_cpu[b]) + seqlen > thr for b in range(bsz)):
                 q_idx = self.qsa_indexer.update_planes(qsa_layer, x, self.rope, block_table, qsa_cpu, params)
-                qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
+                qsa_layer.update_kv_sparse(cache_seqlens, block_table, k, v, seqlen)
                 outs.append(self.qsa_indexer.sparse_attend(qsa_layer, self, q, q_idx, block_table, qsa_cpu))
                 bsz_loop = 0
         for b in range(bsz_loop):
@@ -1533,7 +1536,7 @@ class Attention(Module):
             else:
                 cpu_b, sparse = None, False
             if sparse:
-                qsa_layer.update_kv_direct(cs_b, bt_b, k[sl], v[sl], seqlen)
+                qsa_layer.update_kv_sparse(cs_b, bt_b, k[sl], v[sl], seqlen)
                 outs.append(self.qsa_indexer.sparse_attend_verify(qsa_layer, self, q[sl], q_idx, bt_b, cpu_b))
             else:
                 max_kv_len = int(cpu_b.max().item()) if cpu_b is not None else None
