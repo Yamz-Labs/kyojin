@@ -41,6 +41,26 @@ def avail_gb():
     return -1.0
 
 
+def _page_md5(cache, p0, p1, pages, torch):
+    """md5 of the cache bytes a prefill chunk wrote: page-indexed tensors (dim0 == page count) are sliced to
+    [p0, p1); other tensors are hashed whole when small. Returns (hex, tensors hashed, tensors skipped)."""
+    hh, n, skipped = hashlib.md5(), 0, 0
+    for layer in cache.layers.values():
+        for v in layer.get_tensors():
+            if v is None:
+                continue
+            if v.dim() >= 2 and v.shape[0] == pages:
+                t = v[p0:p1]
+            elif v.numel() <= (1 << 27):
+                t = v
+            else:
+                skipped += 1
+                continue
+            hh.update(t.float().contiguous().cpu().numpy().tobytes())
+            n += 1
+    return hh.hexdigest()[:12], n, skipped
+
+
 def _main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
@@ -267,21 +287,10 @@ def _main():
                 fwd(chunk_ids, d, prefill=True)
                 torch.cuda.synchronize(); pacc[(a, d)].append(time.perf_counter() - t)
                 print(f"[pf] visit {n} arm {a} depth {d}: {1e3 * pacc[(a, d)][-1]:.0f} ms/chunk", flush=True)
-                if args.arm_eq:      # model.prefill returns None: its only output is the cache pages it wrote
-                    p0, p1 = d // PAGE, (d + args.chunk) // PAGE
-                    hh = hashlib.md5()
-                    for layer in cache.layers.values():
-                        shp = getattr(layer, "shape", None)
-                        if not shp:
-                            continue
-                        for name, v in vars(layer).items():
-                            if name.startswith("_") or not (isinstance(v, torch.Tensor) and v.is_cuda and
-                                                           v.dim() >= 2 and v.shape[0] == shp[0]):
-                                continue
-                            hh.update(v[p0:p1].float().contiguous().cpu().numpy().tobytes())
-                    eqh = hh.hexdigest()[:12]
-                    RES["points"][str(d)].setdefault("prefill_eq_" + a, {}).setdefault("md5", []).append(eqh)
-                    print(f"[pfeq] visit {n} arm {a} depth {d}: {eqh}", flush=True)
+                if args.arm_eq:      # model.prefill returns None: its only output is the cache it wrote
+                    eqh = _page_md5(cache, d // PAGE, (d + args.chunk) // PAGE, cap // PAGE, torch)
+                    RES["points"][str(d)].setdefault("prefill_eq_" + a, {}).setdefault("md5", []).append(eqh[0])
+                    print(f"[pfeq] visit {n} arm {a} depth {d}: {eqh[0]} (tensors {eqh[1]}, skipped {eqh[2]})", flush=True)
                 if args.kernels and n < len(arms):                               # one traced chunk per arm per depth
                     fresh(d)
                     RES["points"][str(d)].setdefault("prefill_" + a, {})["window"] = window(lambda: fwd(chunk_ids, d, prefill=True), 1)
