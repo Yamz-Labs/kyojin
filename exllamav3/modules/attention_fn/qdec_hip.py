@@ -41,13 +41,18 @@ def _hip():
 
 
 def pick_dw(hd, nt, nw):
-    """waves per stream splitting the head dim: the smallest count that keeps the O accumulators (NT * HD/16 * 8 / DW floats) in budget"""
+    """waves per stream splitting the head dim: the smallest count that keeps the O accumulators (NT * HD/16 * 8 / DW floats) in budget.
+    Shapes past that budget (4 and 5 q tiles at hd 256) still take DW=4, with the accumulators spilling, when they fit the second budget:
+    the alternative there is the Triton fallback, measured 6.6x / 4.8x slower per call at 131K (same rows, same cache bytes)."""
     if knob("EXL3_QDEC_HIP_DW"):
         dw = int(knob("EXL3_QDEC_HIP_DW"))
         return dw if dw in (1, 2, 4) and nw % dw == 0 and hd // 16 // dw >= 4 else None
     for dw in (1, 2, 4):
         if nw % dw == 0 and hd // 16 // dw >= 4 and nt * (hd // 16) * 8 // dw <= knob_int("EXL3_QDEC_HIP_MAXO", 96):
             return dw
+    dw = 4
+    if nw % dw == 0 and hd // 16 // dw >= 4 and nt * (hd // 16) * 8 // dw <= knob_int("EXL3_QDEC_HIP_MAXO2", 160):
+        return dw
     return None
 
 
