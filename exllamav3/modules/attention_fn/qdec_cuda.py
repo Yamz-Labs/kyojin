@@ -17,6 +17,7 @@ _SRC_ROWS = os.path.join(os.path.dirname(__file__), "cu", "qdec_rows.cu")      #
 _COMMON = os.path.join(os.path.dirname(__file__), "cu", "qdec_common.cuh")
 ROWS_MODE = os.environ.get("EXL3_QDEC_ROWS", "1")          # 0: no many-row kernel, 1: only where qdec.cu cannot, 2: always
 _CACHE = os.path.expanduser(os.environ.get("EXL3_QDEC_CACHE", "~/.cache/exl3_qdec"))
+TQ_QDEC_MAX_NTHD = int(os.environ.get("EXL3_QDEC_TQ_NTHD", "384"))      # TurboQuant: largest row tiles x head dim qdec.cu takes without spilling
 _kernels = {}
 
 
@@ -50,7 +51,7 @@ def geometry(cfg):
     sc_b = (16 * g * 2 + 15) // 16 * 16
     stage_b = 16 * kstr * 4 + 16 * vstr * 4 + 2 * sc_b
     ring = cfg["nw"] * cfg["st"] * stage_b
-    qs = (nt * 8 * (hd + 8) * 2 + 15) // 16 * 16
+    qs = (nt * 8 * (hd + 8) * 2 + 15) // 16 * 16 + (nt * 8 * hd * 2 + 15) // 16 * 16     # rotated q rows + the raw rows staged by cp.async
     merge = (cfg["nw"] * nt * 8 * hd + 2 * cfg["nw"] * nt * 8) * 4
     return dict(nt=nt, rows=rows, stage_b=stage_b, shared=qs + max(ring, merge, 4096))
 
@@ -161,8 +162,11 @@ def rows_nw(hd):
 
 
 def static_smem(cfg) -> int:
-    """static shared memory of qdec.cu: the TurboQuant pair tables (codebook entry pairs as 32-bit words, K and V)"""
-    return 4 * ((1 << 2 * cfg["kb"]) + (1 << 2 * cfg["vb"])) if cfg.get("tq") and not cfg.get("rows_kernel") else 0
+    """static shared memory of qdec.cu: the TurboQuant pair tables (codebook entry pairs as 32-bit words, K and V), else the 32x32 fp32
+    H32 matrix of the q prologue (the many-row kernel keeps it in its ring)"""
+    if cfg.get("rows_kernel") and not cfg.get("tq"):
+        return 0
+    return 4 * ((1 << 2 * cfg["kb"]) + (1 << 2 * cfg["vb"])) if cfg.get("tq") else 2048
 
 
 def pick_nw_st(cfg):
@@ -173,7 +177,7 @@ def pick_nw_st(cfg):
         c.update(nw=rows_nw(cfg["hd"]))
         for st in ((int(os.environ["EXL3_QDEC_RST"]),) if os.environ.get("EXL3_QDEC_RST") else (3, 2, 1)):
             c.update(st=st)
-            if geometry(c)["shared"] <= 99 * 1024:
+            if geometry(c)["shared"] <= 99 * 1024 - static_smem(c):
                 return c["nw"], st
         raise QdecUnsupported("no ring configuration fits")
     narrow = cfg["hd"] == 128 and cfg["kb"] + cfg["vb"] <= 8
@@ -201,11 +205,19 @@ def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, 
     if key_lo:
         cfg["key_lo"] = int(key_lo)
     if tq:
-        # TurboQuant: qdec.cu only (no many-row kernel); the per-head scale is fetched as a 4-byte word, so the kv head count is even
+        # TurboQuant: the per-head scale is fetched as a 4-byte word, so the kv head count is even
         if n_kv_heads % 2 or cfg["hd"] % 64 != 0:
             return None
         cfg["tq"] = True
-        if not (supported(cfg) and geometry(cfg)["nt"] * 8 <= block_rows):
+        # qdec.cu keeps the whole O (hd x rows fp32) in registers and spills past ~384 accumulator columns (ptxas sm_86: hd128 nt4,
+        # hd256 nt2); the many-row kernel splits the head dim across the warps and serves everything above
+        old_ok = supported(cfg) and geometry(cfg)["nt"] * 8 <= block_rows and geometry(cfg)["nt"] * cfg["hd"] <= TQ_QDEC_MAX_NTHD
+        if ROWS_MODE == "2" or not old_ok:
+            rc = dict(cfg, rows_kernel=True, nw=rows_nw(cfg["hd"]), block_rows=max(16, triton.next_power_of_2(geometry(cfg)["rows"])))
+            if supported(rc):
+                cfg = rc
+                old_ok = True
+        if not old_ok:
             return None
         try:
             cfg["nw"], cfg["st"] = pick_nw_st(cfg)

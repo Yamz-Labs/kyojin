@@ -34,6 +34,11 @@ and gathered split kernels live in qsa_triton.py. A module with an indexer that 
 declines the BC path outright: an unarmed graph would let the planes go stale under dense decode
 and poison later sparse selection.
 
+KVWIN (cache/kvwin.py, CUDA): a layer with a fp16 sink+window ring runs it in the graph too -- the ring writer (which also derives the
+pool pass's sequence lengths, cache_seqlens - W) after the cache append, the pool splits over [S, q-W] (KEY_LO = S), the ring pass as
+one more flash-decoding partial and the combine over one partial more. The per-job ring slots are patched like the other pointers.
+EXL3_BC_KVWIN=0 sends such layers back to the Python path; ROCm keeps declining them.
+
 Enabled by default; EXL3_BC_ATTN=0 disables the path. Unsupported module/cache configurations
 fall back to the dispatch path by design (build_bc_attn returns None); unexpected failures
 while building the path raise.
@@ -55,6 +60,11 @@ MAX_R = MAX_BSZ * MAX_QLEN
 
 _kernel_cache = {}
 _sm_count = {}
+MAX_BSZ_KW = 8      # BC_Attention.MAX_BSZ
+_RING_BN = int(os.environ.get("EXL3_BC_RING_BN", "256"))
+_RING_WARPS = int(os.environ.get("EXL3_BC_RING_WARPS", "8"))
+_RING_STAGES = int(os.environ.get("EXL3_BC_RING_STAGES", "1"))
+_kvwin_bc = os.environ.get("EXL3_BC_KVWIN", "1") != "0"     # KVWIN ring inside the BC_Attention graph
 
 
 def _is_pow2(n: int) -> bool:
@@ -118,7 +128,7 @@ class BCAttn:
         return w
 
     def __init__(self, module, cache_k, cache_v, k_scales = None, v_scales = None,
-                 k_bits = 0, v_bits = 0, qsa_layer = None):
+                 k_bits = 0, v_bits = 0, qsa_layer = None, kvwin_state = None):
         self.module = module
         self.device = torch.device(module.device)
         self.head_dim = module.head_dim
@@ -258,7 +268,14 @@ class BCAttn:
                 raw_plane = qsa_layer.raw_k.view(-1, idx.head_dim),
                 pool_plane = qsa_layer.pooled.view(-1, idx.head_dim),
             )
+        # KVWIN (cache/kvwin.py): the ring writer and the ring partial run inside the graph; the pool pass attends [S, q-W].
+        # Only the plain causal quantized decode shape (the one the ring serves) takes this path, see step()
+        self.kw = kvwin_state
+        if self.kw is not None:
+            c = self.kw.cfg
+            self.bc.set_kvwin(self.kw.ov_k, self.kw.ov_v, c.S, c.W, c.Rc, c.R)
         self.slot_widths = {}
+        self.kw_bad = set()
 
     def _configure(self, bsz: int, q_len: int, causal: bool, regime: int):
         import triton
@@ -286,6 +303,11 @@ class BCAttn:
                 combine_subtiles,
                 decode_row_layout,
             )
+
+        kw = self.kw
+        if kw is not None and not (ATTN16 and causal and regime == 0 and self.k_bits > 0 and self.v_bits > 0):
+            return False        # the ring serves causal quantized decode on the 1.6 kernels only: the Python path runs it
+        key_lo = kw.cfg.S if kw is not None else 0
 
         dev = self.device
         hd = self.head_dim
@@ -331,7 +353,7 @@ class BCAttn:
             page_size = PAGE_SIZE, head_dim = hd, HD_PAD = hd_pad, scale = float(self.sm_scale),
             CAUSAL = bool(causal), WINDOW_LEFT = window_left, WINDOW_RIGHT = window_right,
             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
-            BLOCK_ROWS = block_rows, BLOCK_N = block_n, KEY_LO = 0,
+            BLOCK_ROWS = block_rows, BLOCK_N = block_n, KEY_LO = key_lo,
         )
         if not ATTN16:
             consts |= dict(BLOCK_M = block_m, BLOCK_H = block_h)
@@ -339,7 +361,7 @@ class BCAttn:
         if ATTN16 and self.quant and self.k_bits > 0 and self.v_bits > 0:
             from . import qdec_cuda
             qcfg = None if not qdec_cuda.GRAPH_ENABLED else qdec_cuda.make_cfg(q_len, qh, kvh, hd, self.k_bits, self.v_bits, PAGE_SIZE, causal, self.sm_scale,
-                                      block_rows, window_left, window_right, self.softcap or 0.0, q_len)
+                                      block_rows, window_left, window_right, self.softcap or 0.0, q_len, key_lo)
         if qcfg is not None and h_blocks != 1 and not qcfg.get("rows_kernel"):
             qcfg = None
         if qcfg is not None and qcfg.get("rows_kernel"):
@@ -410,8 +432,9 @@ class BCAttn:
         o = g_tensor_cache.get(dev, (bsz, q_len, qh, hd), torch.half, "bca_o")
         # Regime-1 slots never launch the dense split/combine; their partials are sized by the
         # sparse kernels in _configure_qsa (same bucketed tags, so the footprint is the max)
-        pn_o = programs * splits_cap * block_rows * hd_pad
-        pn_ml = programs * splits_cap * block_rows * 2
+        ns_cap = splits_cap + (1 if kw is not None else 0)      # KVWIN: the ring partial follows the pool splits
+        pn_o = programs * ns_cap * block_rows * hd_pad
+        pn_ml = programs * ns_cap * block_rows * 2
         if regime == 1:
             pn_o, pn_ml = self._qsa_partial_sizes(bsz * q_len)
         partial_o = g_tensor_cache.get_bucketed(dev, pn_o, torch.float, "bca_po")
@@ -437,8 +460,42 @@ class BCAttn:
             xp, yp,
         )
 
+        if kw is not None:
+            from .kvwin_triton import _ov_write_kernel, _ring_split_kernel
+            cfg = kw.cfg
+            sig_w = {
+                "k": "*fp16", "v": "*fp16", "ov_k": "*fp16", "ov_v": "*fp16", "slots": "*i32", "seqlens": "*i32",
+                "pool_len": "*i32", "q_len": "i32", "S": "i32", "Rc": "i32", "R": "i32", "W": "i32",
+            } | {n: "constexpr" for n in ("n_kv_heads", "head_dim", "HD_PAD", "WRITE_POOL_LEN")}
+            consts_w = dict(n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad, WRITE_POOL_LEN = True)
+            k_ovw = _compile_kernel(dev, _ov_write_kernel, sig_w, consts_w, 1, 1)
+            # the JIT path specializes pointers and ints divisible by 16 (vectorized ring loads): the AOT kernel declares them too,
+            # every one is a whole allocation (statics, the ring tensors) or a configured constant
+            d16 = lambda n: ":16" if n % 16 == 0 else ""
+            sig_r = {
+                "q": "*fp16:16", "ov_k": "*fp16:16", "ov_v": "*fp16:16", "slots": "*i32", "cache_seqlens": "*i32",
+                "h32": "*fp16:16", "partial_o": "*fp32:16", "partial_ml": "*fp32:16",
+                "ns_total": "i32", "sinks_n": "i32" + d16(cfg.S), "win": "i32" + d16(cfg.W), "Rc": "i32" + d16(cfg.Rc),
+                "R": "i32" + d16(cfg.R),
+            } | {n: "constexpr" for n in (
+                "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD", "scale", "ROT_V", "LAYOUT", "BLOCK_M", "BLOCK_H",
+                "BLOCK_ROWS", "BLOCK_N", "RPP")}
+            consts_r = dict(q_len = q_len, n_q_heads = qh, n_kv_heads = kvh, head_dim = hd, HD_PAD = hd_pad,
+                            scale = float(self.sm_scale), ROT_V = self.v_bits > 0, LAYOUT = 0, BLOCK_M = 1, BLOCK_H = 1,
+                            BLOCK_ROWS = block_rows, BLOCK_N = _RING_BN, RPP = 0)
+            # one-tile ring pass with 8 warps when the K tile (BLOCK_N x head_dim fp16) fits comfortably in shared memory; wide heads
+            # (hd 256) or a device that refuses the tile fall back to the 64-key / 4-warp pass
+            bn = min(_RING_BN, max(16, 32768 // hd_pad))
+            try:
+                k_ring = _compile_kernel(dev, _ring_split_kernel, sig_r, consts_r | dict(BLOCK_N = bn), _RING_WARPS, _RING_STAGES)
+            except RuntimeError:
+                k_ring = _compile_kernel(dev, _ring_split_kernel, sig_r, consts_r | dict(BLOCK_N = 64), 4, 1)
+            pool_len = g_tensor_cache.get(dev, (MAX_BSZ_KW,), torch.int32, "bca_poollen")
+            self.bc.configure_slot_kvwin(bsz, q_len, regime, pool_len, k_ovw, k_ring, cfg.S + min(q_len, cfg.Rc))
+
         if self.qsa:
             self._configure_qsa(bsz, q_len, regime)
+        return True
 
     # ---- QSA -----------------------------------------------------------------------------------
 
@@ -609,8 +666,13 @@ class BCAttn:
         inv_freq: torch.Tensor | None,
         causal: bool = True,
         host_seqlens: torch.Tensor | None = None,
+        kvwin_ctx = None,
     ) -> torch.Tensor | None:
         bsz, q_len, _ = x.shape
+
+        # KVWIN: a call without job states (no ring context) writes the pool alone, as the Python path does
+        if self.kw is not None and (kvwin_ctx is None or kvwin_ctx.state is not self.kw or not causal):
+            return None
 
         # QSA regime: dense below the sparse threshold (top-k cannot exclude anything there, so
         # dense attention is exact), gathered sparse above it. Sparse slots are decode-only;
@@ -635,12 +697,16 @@ class BCAttn:
         # position source, block-table pointer/width, split configuration -- is a runtime
         # argument patched into the graph
         skey = (tuple(inv_freq.shape) if inv_freq is not None else None, causal)
+        if (bsz, q_len, regime) in self.kw_bad:
+            return None
         if self.slot_widths.get((bsz, q_len, regime), ...) != skey:
-            self._configure(bsz, q_len, causal, regime)
+            if self._configure(bsz, q_len, causal, regime) is False:
+                self.kw_bad.add((bsz, q_len, regime))
+                return None
             self.slot_widths[(bsz, q_len, regime)] = skey
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
         self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
-                    position_ids, inv_freq, regime, t_total)
+                    position_ids, inv_freq, regime, t_total, kvwin_ctx.slots if self.kw is not None else None)
         return y
 
 
@@ -753,8 +819,11 @@ def build_bc_attn(module, layer):
     from ...cache.qsa import QSAPlanes
 
     m = module
-    if getattr(layer, "kvwin", None) is not None:
-        # KVWIN: the graph writes the pool inside the captured block and would leave the fp16 ring stale
+    kw = getattr(layer, "kvwin", None)
+    if kw is not None and not (kw.active and _kvwin_bc and not torch.version.hip and isinstance(layer, CacheLayer_quant) and
+                               getattr(m, "qsa_indexer", None) is None):
+        # KVWIN without the in-graph ring (EXL3_BC_KVWIN=0, or an inactive ring): the graph would write the pool and leave
+        # the fp16 ring stale
         _trace_build(m, None, "attn")
         return None
     if getattr(layer, "tq", False):
@@ -794,7 +863,7 @@ def build_bc_attn(module, layer):
         return None
     if isinstance(layer, CacheLayer_quant):
         bca = BCAttn(m, layer.qk, layer.qv, layer.sk, layer.sv, layer.k_bits, layer.v_bits,
-                     qsa_layer = layer if qsa_idx is not None else None)
+                     qsa_layer = layer if qsa_idx is not None else None, kvwin_state = kw)
     else:
         bca = BCAttn(m, layer.k, layer.v,
                      qsa_layer = layer if qsa_idx is not None else None)

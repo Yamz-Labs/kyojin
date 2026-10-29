@@ -6,6 +6,7 @@
 #include "../util.h"
 #include "../util.cuh"
 #include "../quant/exl3_gemm.cuh"
+#include "../quant/exl3_gemv_int8.cuh"
 #include "../hgemm.cuh"
 #include "../rope.cuh"
 #include "../cache/q_cache.cuh"
@@ -382,6 +383,47 @@ void BC_Attention::configure_slot_qsa
     }
 }
 
+void BC_Attention::set_kvwin
+(
+    at::Tensor ov_k,
+    at::Tensor ov_v,
+    int sinks,
+    int window,
+    int cyclic_rows,
+    int ring_rows
+)
+{
+    TORCH_CHECK(quant_cache && !qsa, "BC_Attention: KVWIN requires a quantized cache and no QSA indexer");
+    kvwin = true;
+    kw_ov_k = std::move(ov_k);
+    kw_ov_v = std::move(ov_v);
+    kw_S = sinks;
+    kw_W = window;
+    kw_Rc = cyclic_rows;
+    kw_R = ring_rows;
+}
+
+void BC_Attention::configure_slot_kvwin
+(
+    int bsz,
+    int q_len,
+    int regime,
+    at::Tensor pool_len,
+    std::shared_ptr<TritonKernel> k_ovw,
+    std::shared_ptr<TritonKernel> k_ring,
+    int ovw_gy
+)
+{
+    TORCH_CHECK(kvwin && regime == 0, "BC_Attention: KVWIN slot without set_kvwin / in the sparse regime");
+    Slot& s = slot(bsz, q_len, regime);
+    TORCH_CHECK(s.configured, "BC_Attention: KVWIN attached to an unconfigured slot");
+    TORCH_CHECK(pool_len.is_contiguous() && pool_len.numel() >= bsz, "BC_Attention: bad pool_len static");
+    s.kw_pool_len = std::move(pool_len);
+    s.k_ovw = k_ovw;
+    s.k_ring = k_ring;
+    s.kw_ovw_gy = ovw_gy;
+}
+
 // Live split configuration from the current block-table bound (same formula as the python
 // dispatch path, so the two produce identical numerics)
 // key blocks per split (was 4): short contexts get more CTAs (upstream exllamav3 1.6.0, MIT)
@@ -409,6 +451,7 @@ void BC_Attention::run_gr
     const c10::optional<at::Tensor>& inv_freq_override,
     int regime,
     int64_t t_total,
+    const c10::optional<at::Tensor>& kvwin_slots,
     Graph* graph
 )
 {
@@ -435,7 +478,23 @@ void BC_Attention::run_gr
     at::Tensor xh_q = xh_flat.narrow(0, 0, (int64_t) R * hs).view({R, hs});
     bool use_qg_mgemm = gate_mode == 2 && qg_ptrs_trellis.has_value() && R <= 32;
     bool use_qkv = qkv_ptrs_trellis.has_value() && R <= 32;
-    if (use_qkv)
+    // m == 1, no gate/bias: q, k and v as ONE int8 sq-GEMV launch over the stacked 256-column groups (the sliced mgemm
+    // streams the 33 MB bundle at ~565 GB/s, the sq kernel at ~715 GB/s). Falls back to the bundle when it declines
+    s.qkv_tri = false;
+    if (use_qkv && R == 1 && gate_mode == 0 && hs == hidden_size && !g_weight && k_proj && v_proj && !use_k_as_v &&
+        !q_proj->bias && !k_proj->bias && !v_proj->bias && q_proj->mul1 && k_proj->mul1 && v_proj->mul1 && x2.dtype() == at::kHalf)
+    {
+        at::Tensor kvt = s.kv.view({2, R, num_kv_heads * head_dim});
+        at::Tensor k_out = kvt.select(0, 0), v_out = kvt.select(0, 1);
+        s.qkv_tri = exl3_gemv_int8_tri(x2, q_proj->trellis, s.q2, q_proj->suh, q_proj->svh,
+                                       k_proj->trellis, k_out, k_proj->suh, k_proj->svh,
+                                       v_proj->trellis, v_out, v_proj->suh, v_proj->svh, stream, graph);
+    }
+    if (s.qkv_tri)
+    {
+        // Q, K, V written by the triple launch
+    }
+    else if (use_qkv)
     {
         // Q, K, V (and a quantized full gate) as one sliced mgemm; the K/V section below is
         // skipped. The carrier only supplies the dtype and slice width
@@ -588,6 +647,34 @@ void BC_Attention::run_gr
             graph->record_param(s.k_update->handle(), GP_attn_seqlens, 5);
             graph->record_param(s.k_update->handle(), GP_attn_num_pages, 6, 4);
             graph->record_param(s.k_update->handle(), GP_end, 0);
+        }
+    }
+
+    // KVWIN: the new rows enter the ring (the ring pass includes the row's own key) and the pool
+    // pass gets its shortened sequence lengths (cache_seqlens - W)
+    if (kvwin)
+    {
+        std::vector<void*> args =
+        {
+            (void*) s.k4.data_ptr(),
+            (void*) s.v4.data_ptr(),
+            (void*) kw_ov_k.data_ptr(),
+            (void*) kw_ov_v.data_ptr(),
+            (void*) kvwin_slots.value().data_ptr(),
+            (void*) cache_seqlens.data_ptr(),
+            (void*) s.kw_pool_len.data_ptr(),
+            (void*) (intptr_t) q_len,
+            (void*) (intptr_t) kw_S,
+            (void*) (intptr_t) kw_Rc,
+            (void*) (intptr_t) kw_R,
+            (void*) (intptr_t) kw_W,
+        };
+        s.k_ovw->launch(bsz, s.kw_ovw_gy, num_kv_heads, args, stream);
+        if (graph)
+        {
+            graph->record_param(s.k_ovw->handle(), GP_attn_seqlens, 5);
+            graph->record_param(s.k_ovw->handle(), GP_kvwin_slots, 4);
+            graph->record_param(s.k_ovw->handle(), GP_end, 0);
         }
     }
 
@@ -766,7 +853,7 @@ void BC_Attention::run_gr
             (void*) cache_k.data_ptr(),
             (void*) cache_v.data_ptr(),
             (void*) block_table.data_ptr(),
-            (void*) cache_seqlens.data_ptr(),
+            kvwin ? (void*) s.kw_pool_len.data_ptr() : (void*) cache_seqlens.data_ptr(),
             (void*) s.o.data_ptr(),
             (void*) s.partial_o.data_ptr(),
             (void*) s.partial_ml.data_ptr(),
@@ -775,7 +862,7 @@ void BC_Attention::run_gr
             (void*) h32.data_ptr(),
             (void*) (intptr_t) split_len,
             (void*) (intptr_t) (int) block_table.size(1),
-            (void*) (intptr_t) num_splits,
+            (void*) (intptr_t) (num_splits + (kvwin ? 1 : 0)),   // KVWIN: partial stride, the ring partial is the last
             (void*) s.q.data_ptr(),  // sinks: dead arg, slots compile with HAS_SINKS = false
         };
         // Launched at the split cap so the captured grid never changes; splits at or above the
@@ -784,11 +871,40 @@ void BC_Attention::run_gr
         if (graph)
         {
             graph->record_param(s.k_split->handle(), GP_attn_block_table, 3);
-            graph->record_param(s.k_split->handle(), GP_attn_seqlens, 4);
+            if (!kvwin)
+                graph->record_param(s.k_split->handle(), GP_attn_seqlens, 4);
             graph->record_param(s.k_split->handle(), GP_attn_split_len, 11, 4);
             graph->record_param(s.k_split->handle(), GP_attn_num_pages, 12, 4);
             graph->record_param(s.k_split->handle(), GP_attn_num_splits, 13, 4);
             graph->record_param(s.k_split->handle(), GP_end, 0);
+        }
+    }
+    if (kvwin)
+    {
+        // fp16 ring pass: one more partial after the pool splits
+        std::vector<void*> args =
+        {
+            (void*) s.q.data_ptr(),
+            (void*) kw_ov_k.data_ptr(),
+            (void*) kw_ov_v.data_ptr(),
+            (void*) kvwin_slots.value().data_ptr(),
+            (void*) cache_seqlens.data_ptr(),
+            (void*) h32.data_ptr(),
+            (void*) s.partial_o.data_ptr(),
+            (void*) s.partial_ml.data_ptr(),
+            (void*) (intptr_t) (num_splits + 1),
+            (void*) (intptr_t) kw_S,
+            (void*) (intptr_t) kw_W,
+            (void*) (intptr_t) kw_Rc,
+            (void*) (intptr_t) kw_R,
+        };
+        s.k_ring->launch(s.programs, 1, 1, args, stream);
+        if (graph)
+        {
+            graph->record_param(s.k_ring->handle(), GP_kvwin_slots, 3);
+            graph->record_param(s.k_ring->handle(), GP_attn_seqlens, 4);
+            graph->record_param(s.k_ring->handle(), GP_attn_num_splits, 8, 4);
+            graph->record_param(s.k_ring->handle(), GP_end, 0);
         }
     }
     {
@@ -798,7 +914,7 @@ void BC_Attention::run_gr
             (void*) s.partial_ml.data_ptr(),
             (void*) s.o.data_ptr(),
             (void*) h32.data_ptr(),
-            (void*) (intptr_t) num_splits,
+            (void*) (intptr_t) (num_splits + (kvwin ? 1 : 0)),
             // Static sink pointer when the module has learned sinks (combine compiled with
             // HAS_SINKS), dead arg otherwise
             sinks ? (void*) sinks.value().data_ptr() : (void*) s.q.data_ptr(),
@@ -853,10 +969,12 @@ void BC_Attention::run
     const c10::optional<at::Tensor>& position_ids,
     const c10::optional<at::Tensor>& inv_freq_override,
     int regime,
-    int64_t t_total
+    int64_t t_total,
+    const c10::optional<at::Tensor>& kvwin_slots
 )
 {
     py::gil_scoped_release release;
+    TORCH_CHECK(!kvwin || kvwin_slots, "BC_Attention: KVWIN module run without ring slots");
     c10::cuda::CUDAGuard device_guard(x.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -869,12 +987,12 @@ void BC_Attention::run
     // captured, then launched below like every later run, with only the I/O pointers patched
     if (graph_outer_capture(stream))
     {
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, kvwin_slots, nullptr);
         return;
     }
     if (s.runs == 0)
     {
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, kvwin_slots, nullptr);
         s.runs = 1;
         return;
     }
@@ -882,7 +1000,7 @@ void BC_Attention::run
     if (!s.graph->ready)
     {
         s.graph->capture_begin();
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, s.graph.get());
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, kvwin_slots, s.graph.get());
         s.graph->capture_end();
         s.runs = 2;
     }
@@ -905,7 +1023,9 @@ void BC_Attention::run
     bool use_qkv = qkv_ptrs_trellis.has_value() && R <= 32;
 
     // Q / gate projections (an fp16 gate is a cublas node with no patchable sites)
-    if (use_qkv)
+    if (s.qkv_tri)
+        params.emplace_back(GP_gemm_A, xptr);    // one int8 GEMV launch covers q, k, v
+    else if (use_qkv)
         params.emplace_back(GP_mgemm_A, xptr);   // one sliced mgemm covers q, k, v (and a quantized gate)
     else if (use_qg_mgemm)
         params.emplace_back(GP_mgemm_A, xptr);
@@ -956,6 +1076,11 @@ void BC_Attention::run
         params.emplace_back(GP_qcache_seqlens, (void*) cache_seqlens.data_ptr());
         params.emplace_back(GP_qcache_block_table, (void*) block_table.data_ptr());
         params.emplace_back(GP_qcache_blocks_per_seq, (void*) (uintptr_t) bt_width);
+        if (kvwin)
+        {
+            params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+            params.emplace_back(GP_kvwin_slots, (void*) kvwin_slots.value().data_ptr());
+        }
     }
     else
     {
@@ -1003,12 +1128,20 @@ void BC_Attention::run
     {
         int num_splits, split_len;
         split_config(bt_width, page_size, q_len, s.block_n, s.splits_cap, &num_splits, &split_len);
+        int ns_total = num_splits + (kvwin ? 1 : 0);
         params.emplace_back(GP_attn_block_table, (void*) block_table.data_ptr());
-        params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+        if (!kvwin)
+            params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
         params.emplace_back(GP_attn_split_len, (void*) (uintptr_t) split_len);
         params.emplace_back(GP_attn_num_pages, (void*) (uintptr_t) bt_width);
-        params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);
-        params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) num_splits);   // combine kernel
+        params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) ns_total);
+        if (kvwin)
+        {
+            params.emplace_back(GP_kvwin_slots, (void*) kvwin_slots.value().data_ptr());   // ring partial
+            params.emplace_back(GP_attn_seqlens, (void*) cache_seqlens.data_ptr());
+            params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) ns_total);
+        }
+        params.emplace_back(GP_attn_num_splits, (void*) (uintptr_t) ns_total);   // combine kernel
     }
     void* yptr = padded ? s.yp.data_ptr() : (void*) y.data_ptr();
     params.emplace_back(GP_gemm_C, yptr);

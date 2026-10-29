@@ -68,6 +68,7 @@ import triton
 import triton.language as tl
 
 from .triton_paged import _qc_load_kt, _qc_load_v, _rot_h32
+from .tq_triton import _tq_pack_plane
 
 @triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
 def _mla_kv_quant_scatter_kernel(
@@ -105,6 +106,68 @@ def _mla_kv_quant_scatter_kernel(
     tl.store(qk + tok * W_TOT + w, tl.load(tmp_q + row * W_TOT + w, mask = mask_w), mask = mask_w)
     g = tl.arange(0, N_G)
     tl.store(sk + tok * N_G + g, tl.load(tmp_s + row * N_G + g))
+    if D_r > 0:
+        r = tl.arange(0, D_r)
+        tl.store(kpe_cache + tok * D_r + r, tl.load(kpe_new + row * D_r + r))
+
+
+@triton.jit(do_not_specialize = ["append_len", "num_pages_per_seq"])
+def _mla_tq_scatter_kernel(
+    ckv_new,             # (rows, D_c) fp16, NORMALIZED latent in the natural domain (graph path) -- rotated here
+    consts,              # fp32: rot_t (D_c * D_c, y = x @ rot_t), then the 2^BITS codebook, then the 2^BITS - 1 midpoints
+    kpe_new,             # (rows, D_r) fp16
+    qk,                  # (pages, page_size, D_c // 32 * BITS) int32
+    sk,                  # (pages, page_size, 1) fp16, norm / ||centroids||
+    kpe_cache,           # (pages, page_size, 1, D_r) fp16
+    block_table,
+    cache_seqlens,
+    num_pages_per_seq,
+    append_len,
+    page_size: tl.constexpr,
+    BITS: tl.constexpr,
+    D_c: tl.constexpr,
+    D_r: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """TurboQuant append for the graph-captured decode block: one program per new row. y = R x (dense matvec in fp32, BK rows of the
+    rotation per step), unit-normalize, nearest Lloyd-Max centroid per coordinate, bit planes, one fp16 scale, rope key copy."""
+    row = tl.program_id(0)
+    batch = row // append_len
+    pos = row - batch * append_len
+    abs_pos = tl.load(cache_seqlens + batch) + pos
+    page = abs_pos // page_size
+    phys = tl.load(block_table + batch * num_pages_per_seq + page)
+    tok = phys.to(tl.int64) * page_size + (abs_pos - page * page_size)
+
+    cols = tl.arange(0, D_c)
+    y = tl.zeros((D_c,), tl.float32)
+    for k0 in range(0, D_c, BK):
+        ks = k0 + tl.arange(0, BK)
+        xk = tl.load(ckv_new + row.to(tl.int64) * D_c + ks).to(tl.float32)
+        wt = tl.load(consts + ks[:, None] * D_c + cols[None, :])
+        y += tl.sum(xk[:, None] * wt, axis = 0)
+    # the dispatch path rotates in fp16 (tq_rotate); round the same way so both paths store the same codes
+    y = y.to(tl.float16).to(tl.float32)
+    cb_off = D_c * D_c
+    mid_off = cb_off + (1 << BITS)
+    nrm = tl.maximum(tl.sqrt(tl.sum(y * y, axis = 0)), 1e-12)
+    u = y / nrm
+    code = tl.zeros((D_c,), tl.int32)
+    for i in range((1 << BITS) - 1):
+        code += (u > tl.load(consts + mid_off + i)).to(tl.int32)
+    c = tl.load(consts + cb_off + code)
+    cn = tl.maximum(tl.sqrt(tl.sum(c * c, axis = 0)), 1e-12)
+    tl.store(sk + tok, (nrm / cn).to(tl.float16))
+    G: tl.constexpr = D_c // 32
+    wbase = qk + tok * (G * BITS)
+    if BITS & 8:
+        _tq_pack_plane(wbase, code, 8, BITS, 0, BITS - 8, G, D_c)
+    if BITS & 4:
+        _tq_pack_plane(wbase, code, 4, BITS, (BITS & 8), BITS - (BITS & 8) - 4, G, D_c)
+    if BITS & 2:
+        _tq_pack_plane(wbase, code, 2, BITS, (BITS & 12), BITS - (BITS & 12) - 2, G, D_c)
+    if BITS & 1:
+        _tq_pack_plane(wbase, code, 1, BITS, (BITS & 14), 0, G, D_c)
     if D_r > 0:
         r = tl.arange(0, D_r)
         tl.store(kpe_cache + tok * D_r + r, tl.load(kpe_new + row * D_r + r))
@@ -219,6 +282,7 @@ def _mla_decode_split_kernel(
     num_pages_per_seq,   # runtime: block-table width can grow without recompiling
     num_splits,          # runtime: the grid may be launched wider; extra splits idle
     QC: tl.constexpr,    # latent cache bits (2-8), 0 = fp16
+    TQ: tl.constexpr,    # 1: TurboQuant pages (h32 slot = fp32 codebook, scales (pages, page, 1)), rotation lives in the weights
     QC_TRANS: tl.constexpr,  # 0: expand both orientations; 1: expand V once, trans for K^T
     Q_PE_TM: tl.constexpr,   # q_pe layout: 0 = head-major (H, R, D_r), 1 = token-major
                              # (R, H, D_r) as staged by the BC graph (no permute stage)
@@ -266,7 +330,7 @@ def _mla_decode_split_kernel(
     if D_r > 0:
         q_r = tl.load(q_pe + qpe_row[:, None] * D_r + offs_r[None, :],
                       mask = valid_row[:, None], other = 0.0)
-    if QC > 0:
+    if QC > 0 and TQ == 0:
         # Packed values live in the rotated domain; rotating q here keeps the score dot exact
         # (H32 is orthogonal and block-diagonal per 32, so dot(Hq, Hk) == dot(q, k))
         q_c = _rot_h32(q_c, h32, BLOCK_ROWS, D_c)
@@ -295,11 +359,11 @@ def _mla_decode_split_kernel(
             # the dequantized fp16 tile for the score dot (QC_TRANS 1) -- the transpose is of
             # a plain fp16 value, not of loader interleave output (the miscompiling shape)
             if QC_TRANS:
-                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c, h32, TQ)
                 kt = tl.trans(v_tile)
             else:
-                kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c, h32, TQ)
+                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c, h32, TQ)
         else:
             # V is K: load the latent tile once, transpose it for the score dot
             v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
@@ -328,7 +392,7 @@ def _mla_decode_split_kernel(
 
     if FINAL:
         out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
-        if QC > 0:
+        if QC > 0 and TQ == 0:
             # The accumulator is in the rotated domain (rotated V); one inverse rotation at
             # the end recovers the latent (H32 is symmetric, so the same helper serves)
             out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, D_c)
@@ -351,6 +415,7 @@ def _mla_decode_combine_kernel(
     h32,
     num_splits,
     QC: tl.constexpr,
+    TQ: tl.constexpr,
     bsz: tl.constexpr,
     q_len: tl.constexpr,
     n_q_heads: tl.constexpr,
@@ -389,7 +454,7 @@ def _mla_decode_combine_kernel(
         l_sum += l_s * w
 
     out_tile = acc / tl.where(l_sum[:, None] == 0.0, 1.0, l_sum[:, None])
-    if QC > 0:
+    if QC > 0 and TQ == 0:
         # Split partials stay in the rotated domain; the single inverse rotation happens here
         out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, D_c)
     q_row = row_h * (bsz * q_len) + batch * q_len + row_q
@@ -411,6 +476,7 @@ def _mla_prefill_kernel(
     q_len,
     n_rows,
     QC: tl.constexpr,
+    TQ: tl.constexpr,
     QC_TRANS: tl.constexpr,
     pre_appended_len: tl.constexpr,
     n_q_heads: tl.constexpr,
@@ -441,7 +507,7 @@ def _mla_prefill_kernel(
     if D_r > 0:
         q_r = tl.load(q_pe + q_row[:, None] * D_r + offs_r[None, :],
                       mask = valid_row[:, None], other = 0.0)
-    if QC > 0:
+    if QC > 0 and TQ == 0:
         q_c = _rot_h32(q_c, h32, BLOCK_M, D_c)
 
     past = tl.load(cache_seqlens + batch) + pre_appended_len - q_len
@@ -467,11 +533,11 @@ def _mla_prefill_kernel(
 
         if QC > 0:
             if QC_TRANS:
-                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c, h32, TQ)
                 kt = tl.trans(v_tile)
             else:
-                kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
+                kt = _qc_load_kt(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c, h32, TQ)
+                v_tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c, h32, TQ)
         else:
             v_tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
                              mask = in_range[:, None], other = 0.0)
@@ -498,7 +564,7 @@ def _mla_prefill_kernel(
         m = m_new
 
     out_tile = acc / tl.where(l[:, None] == 0.0, 1.0, l[:, None])
-    if QC > 0:
+    if QC > 0 and TQ == 0:
         out_tile = _rot_h32(out_tile, h32, BLOCK_M, D_c)
     tl.store(out + q_row[:, None] * D_c + offs_c[None, :], out_tile, mask = valid_row[:, None])
 
@@ -517,6 +583,7 @@ def _mla_gather_tile_kernel(
     num_pages_per_seq,   # runtime
     batch,               # runtime
     QC: tl.constexpr,
+    TQ: tl.constexpr,
     page_size: tl.constexpr,
     D_c: tl.constexpr,
     D_r: tl.constexpr,
@@ -537,9 +604,11 @@ def _mla_gather_tile_kernel(
 
     offs_c = tl.arange(0, D_c)
     if QC > 0:
-        tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c)
-        # h32 is symmetric orthonormal, so the same multiply that rotates also unrotates
-        tile = _rot_h32(tile, h32, BLOCK_R, D_c)
+        tile = _qc_load_v(ckv_cache, ckv_scales, tok, 0, offs_c, in_range, QC, 1, D_c, D_c, h32, TQ)
+        # h32 is symmetric orthonormal, so the same multiply that rotates also unrotates; TQ keeps the rotated domain (the module's
+        # up-projection weights are rotated with it)
+        if TQ == 0:
+            tile = _rot_h32(tile, h32, BLOCK_R, D_c)
     else:
         tile = tl.load(ckv_cache + tok[:, None] * D_c + offs_c[None, :],
                        mask = in_range[:, None], other = 0.0)
@@ -1102,13 +1171,14 @@ def mla_attn_triton_decode(
 
     if qc is not None:
         from .triton_paged import _get_h32
-        ckv_scales, qc_bits = qc
+        ckv_scales, qc_bits, tq = (*qc, None)[:3]        # tq: cache.tq.TQState for TurboQuant pages (codebook in the h32 slot), else None
         assert ckv_cache.shape[-1] == D_c // 32 * qc_bits
-        h32 = _get_h32(q_lat.device)
+        h32 = _get_h32(q_lat.device) if tq is None else tq.cbk16
+        tqf = int(tq is not None)
         if _qc_trans_override is not None:
             qc_trans = _qc_trans_override != "0"
     else:
-        ckv_scales, qc_bits, h32 = q_lat, 0, q_lat
+        ckv_scales, qc_bits, h32, tqf = q_lat, 0, q_lat, 0
 
     if out is None:
         out = torch.empty_like(q_lat)
@@ -1119,14 +1189,14 @@ def mla_attn_triton_decode(
     if block_h is None:
         # 16 rows fills the tl.dot M axis; more heads per program means fewer redundant passes
         # over the latent cache, which is what keeps large-head-count models compute-bound
-        block_h = max(16 // block_m, 1)
+        block_h = max((32 if tqf else 16) // block_m, 1)   # TurboQuant: the codebook expansion is the cost of a program, 32 rows halve the passes (GLM H64 at 4K: 0.91 -> 0.26 ms, rounding-level equal)
     block_h = min(block_h, max(1, triton.next_power_of_2(n_q_heads)))
     block_rows = block_m * block_h
     if block_n is None:
         # qc: one big expanded tile per iteration, no pipelining (the expansion is ALU work the
         # scheduler overlaps anyway); swept best on Ampere/Ada/Blackwell at 512-wide latents.
         # fp16: smaller tiles, deeper pipeline
-        block_n = (32 if D_c <= 512 else 16) if qc is None else (_qc_bn_override or 64)
+        block_n = (32 if D_c <= 512 else 16) if qc is None else (_qc_bn_override or (32 if tqf else 64))
     if num_stages is None:
         num_stages = 3 if qc is None else 1
     if num_warps is None:
@@ -1178,7 +1248,7 @@ def mla_attn_triton_decode(
             q_lat, q_pe, ckv_cache, kpe_cache, ckv_scales, h32, block_table, cache_seqlens, out,
             partial_o, partial_ml,
             split_len, num_pages_per_seq, num_splits,
-            qc_bits, bool(qc_trans), False, bsz, q_len, pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
+            qc_bits, tqf, bool(qc_trans), False, bsz, q_len, pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
             bool(causal), num_splits == 1,
             block_m, block_h, block_rows, block_n,
             num_warps = num_warps, num_stages = num_stages,
@@ -1211,7 +1281,7 @@ def mla_attn_triton_decode(
         if num_splits > 1:
             _mla_decode_combine_kernel[(programs,)](
                 partial_o, partial_ml, out, h32, num_splits,
-                qc_bits, bsz, q_len, n_q_heads, D_c, block_m, block_h, block_rows,
+                qc_bits, tqf, bsz, q_len, n_q_heads, D_c, block_m, block_h, block_rows,
                 num_warps = 4, num_stages = 1,
             )
             _dbg_sync("mla_decode_combine", q_lat.device)
@@ -1445,10 +1515,11 @@ def mla_attn_triton_prefill_mha(
 
     if qc is not None:
         from .triton_paged import _get_h32
-        ckv_scales, qc_bits = qc
-        h32 = _get_h32(dev)
+        ckv_scales, qc_bits, tq = (*qc, None)[:3]        # tq: cache.tq.TQState for TurboQuant pages (codebook in the h32 slot), else None
+        h32 = _get_h32(dev) if tq is None else tq.cbk16
+        tqf = int(tq is not None)
     else:
-        ckv_scales, qc_bits, h32 = q, 0, q
+        ckv_scales, qc_bits, h32, tqf = q, 0, q, 0
 
     # Workspace is bounded by (tile_size, chunk length), NOT by context length, and only ONE tile
     # of up-projected K/V ever exists at a time. These are prefill-sized (128 MiB per buffer at a
@@ -1486,7 +1557,7 @@ def mla_attn_triton_prefill_mha(
                 _mla_gather_tile_kernel[(triton.cdiv(tl_len, 64),)](
                     ckv_cache, kpe_cache, ckv_scales, h32, block_table,
                     ckv_t, kpe_t, a, tl_len, npps, b,
-                    qc_bits, page_size, D_c, D_r, 64,
+                    qc_bits, tqf, page_size, D_c, D_r, 64,
                     num_warps = 4, num_stages = 2,
                 )
                 # Up-projection as two plain contiguous GEMMs (never the strided-batched form)
@@ -1555,11 +1626,12 @@ def mla_attn_triton_prefill(
 
     if qc is not None:
         from .triton_paged import _get_h32
-        ckv_scales, qc_bits = qc
+        ckv_scales, qc_bits, tq = (*qc, None)[:3]        # tq: cache.tq.TQState for TurboQuant pages (codebook in the h32 slot), else None
         assert ckv_cache.shape[-1] == D_c // 32 * qc_bits
-        h32 = _get_h32(q_lat.device)
+        h32 = _get_h32(q_lat.device) if tq is None else tq.cbk16
+        tqf = int(tq is not None)
     else:
-        ckv_scales, qc_bits, h32 = q_lat, 0, q_lat
+        ckv_scales, qc_bits, h32, tqf = q_lat, 0, q_lat, 0
 
     if block_m is None:
         block_m = 32 if qc is None else 16
@@ -1577,7 +1649,7 @@ def mla_attn_triton_prefill(
         _mla_prefill_kernel[(triton.cdiv(q_len, block_m), bsz * n_q_heads)](
             q_lat, q_pe, ckv_cache, kpe_cache, ckv_scales, h32, block_table, cache_seqlens, out,
             block_table.shape[1], q_len, n_rows,
-            qc_bits, bool(qc_trans), pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
+            qc_bits, tqf, bool(qc_trans), pre_appended_len, n_q_heads, page_size, D_c, D_r, float(softmax_scale),
             bool(causal), block_m, block_n,
             num_warps = num_warps, num_stages = num_stages,
         )

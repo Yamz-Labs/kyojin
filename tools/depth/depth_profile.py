@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """In-process depth profiler: per-step cost vs context depth in minutes, no real prefill.
 
-  tools/depth/depth_profile.py MODEL_DIR --serve glm|qwen -o out.json [--depths 8192,...] [--cache-bits 16|8]
+  tools/depth/depth_profile.py MODEL_DIR --serve glm|qwen -o out.json [--depths 8192,...] [--cache-bits 16|8] [--kv-mode quant|tq]
         [--ndt 2] [--chunk 4096] [--reps 3] [--kernels] [--no-prefill] [--no-decode]
 
 Loads the model once with the SERVED environment (the SERVE_ENV / SPEED_ENV tables of tools/{qwen,glm}/serve.py,
@@ -48,6 +48,7 @@ def _main():
     ap.add_argument("-o", "--out", required=True)
     ap.add_argument("--depths", default="8192,32768,65536,131072,262144,500000")
     ap.add_argument("--cache-bits", type=int, default=16)
+    ap.add_argument("--kv-mode", choices=["quant", "tq"], default="quant", help="tq: TurboQuant pages (the served default) at --cache-bits 4..6")
     ap.add_argument("--ndt", type=int, default=2, help="drafted tokens: verify step = ndt + 1 rows")
     ap.add_argument("--chunk", type=int, default=int(os.environ.get("EXL3_PREFILL_CHUNK", "4096")))
     ap.add_argument("--steps", type=int, default=12)
@@ -91,6 +92,9 @@ def _main():
     config = Config.from_directory(args.model)
     model = Model.from_config(config)
     qkw = dict(layer_type=CacheLayer_quant, k_bits=args.cache_bits, v_bits=args.cache_bits) if args.cache_bits < 16 else {}
+    if args.kv_mode == "tq" and args.cache_bits < 16:
+        from exllamav3.cache.tq import CacheLayer_tq
+        qkw["layer_type"] = CacheLayer_tq
     cache = Cache(model, max_num_tokens=cap, max_history=max(3, R), max_batch_size=1, **qkw)
     model.load(device="cuda:0", progressbar=False)
     RES["load_s"] = round(time.time() - t0, 1)

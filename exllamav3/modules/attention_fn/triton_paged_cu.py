@@ -800,7 +800,7 @@ def paged_attn_triton_decode_cu(
         from . import qdec_cuda
         qcfg = qdec_cuda.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, page_size, causal, softmax_scale,
                                   block_rows, window_left, window_right, softcap, kv_append_len, key_lo, tq is not None)
-        if tq is not None and (qcfg is None or h_blocks != 1):
+        if tq is not None and (qcfg is None or (h_blocks != 1 and not qcfg.get("rows_kernel"))):
             raise NoFittingConfig("TurboQuant: qdec.cu shapes only")
         if qcfg is not None and (h_blocks == 1 or qcfg.get("rows_kernel")):
             if qcfg.get("rows_kernel"):

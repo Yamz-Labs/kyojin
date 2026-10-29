@@ -74,6 +74,114 @@ def tq_dequant_window(words, scales, cb, out, cache_seqlens, block_table, page_s
 
 
 @triton.jit
+def _tq_dequant_rows_kernel(
+    words, scales, cb, out, n_rows,
+    BITS: tl.constexpr,
+    D: tl.constexpr,
+    TB: tl.constexpr,
+):
+    """Contiguous rows (one fp16 scale per row, the MLA latent layout): out[row] = codebook[codes] * scale, rotated domain."""
+    row = tl.program_id(0) * TB + tl.arange(0, TB)
+    rmask = row < n_rows
+    d = tl.arange(0, D)
+    g = d // 32
+    r = d - g * 32
+    G: tl.constexpr = D // 32
+    base = row[:, None].to(tl.int64) * (G * BITS) + g[None, :] * BITS
+    m2 = rmask[:, None]
+    raw = tl.zeros((TB, D), tl.int32)
+    pbase = 0
+    if BITS & 8:
+        w = tl.load(words + base + pbase + (r // 4)[None, :], mask = m2, other = 0)
+        raw = (raw << 8) | ((w >> ((r % 4) * 8)[None, :]) & 255)
+        pbase += 8
+    if BITS & 4:
+        w = tl.load(words + base + pbase + (r // 8)[None, :], mask = m2, other = 0)
+        raw = (raw << 4) | ((w >> ((r % 8) * 4)[None, :]) & 15)
+        pbase += 4
+    if BITS & 2:
+        w = tl.load(words + base + pbase + (r // 16)[None, :], mask = m2, other = 0)
+        raw = (raw << 2) | ((w >> ((r % 16) * 2)[None, :]) & 3)
+        pbase += 2
+    if BITS & 1:
+        w = tl.load(words + base + pbase + (r // 32)[None, :], mask = m2, other = 0)
+        raw = (raw << 1) | ((w >> (r % 32)[None, :]) & 1)
+    sc = tl.load(scales + row, mask = rmask, other = 0.0).to(tl.float32)
+    val = (tl.load(cb + raw) * sc[:, None]).to(tl.float16)
+    tl.store(out + row[:, None].to(tl.int64) * D + d[None, :], val, mask = m2)
+
+
+def tq_dequant_rows(words, scales, cb, out, bits, dim):
+    """words [N, dim/32*bits] int32, scales [N] fp16 -> out [N, dim] fp16 (rotated domain)."""
+    n = words.shape[0]
+    tb = 8
+    with torch.cuda.device(words.device):
+        _tq_dequant_rows_kernel[(triton.cdiv(n, tb),)](words, scales, cb, out, n, bits, dim, tb, num_warps = 4, num_stages = 1)
+
+
+@triton.jit
+def _tq_gather_dequant_kernel(
+    words, scales, cb, indices, block_table, out, idx_out, npr,
+    K_pad: tl.constexpr,
+    PAGE: tl.constexpr,
+    BITS: tl.constexpr,
+    D: tl.constexpr,
+    TB: tl.constexpr,
+):
+    """Decode-time staging of the gathered rows of a TurboQuant latent pool: program (query row, TB-entry tile) dequantizes the
+    rows its indices select into out[row * K_pad + n] (fp16, rotated domain, MLA layout: one fp16 scale per entry) and writes the
+    compact index idx_out[row, n] = row * K_pad + n (-1 where the selection is padded), so the fp16 decode kernels run on `out`
+    with a one-page identity block table. Padded entries cost no loads or stores."""
+    row = tl.program_id(0)
+    n = tl.program_id(1) * TB + tl.arange(0, TB)
+    idx = tl.load(indices + row * K_pad + n, mask = n < K_pad, other = -1)
+    ok = idx >= 0
+    ids = tl.where(ok, idx, 0)
+    phys = tl.load(block_table + row * npr + ids // PAGE, mask = ok, other = 0)
+    tok = (phys * PAGE + ids % PAGE).to(tl.int64)
+    slot = row * K_pad + n
+    tl.store(idx_out + slot, tl.where(ok, slot, -1), mask = n < K_pad)
+    d = tl.arange(0, D)
+    g = d // 32
+    r = d - g * 32
+    G: tl.constexpr = D // 32
+    base = tok[:, None] * (G * BITS) + g[None, :] * BITS
+    m2 = ok[:, None]
+    raw = tl.zeros((TB, D), tl.int32)
+    pbase = 0
+    if BITS & 8:
+        w = tl.load(words + base + pbase + (r // 4)[None, :], mask = m2, other = 0)
+        raw = (raw << 8) | ((w >> ((r % 4) * 8)[None, :]) & 255)
+        pbase += 8
+    if BITS & 4:
+        w = tl.load(words + base + pbase + (r // 8)[None, :], mask = m2, other = 0)
+        raw = (raw << 4) | ((w >> ((r % 8) * 4)[None, :]) & 15)
+        pbase += 4
+    if BITS & 2:
+        w = tl.load(words + base + pbase + (r // 16)[None, :], mask = m2, other = 0)
+        raw = (raw << 2) | ((w >> ((r % 16) * 2)[None, :]) & 3)
+        pbase += 2
+    if BITS & 1:
+        w = tl.load(words + base + pbase + (r // 32)[None, :], mask = m2, other = 0)
+        raw = (raw << 1) | ((w >> (r % 32)[None, :]) & 1)
+    sc = tl.load(scales + tok, mask = ok, other = 0.0).to(tl.float32)
+    val = (tl.load(cb + raw) * sc[:, None]).to(tl.float16)
+    tl.store(out + slot[:, None].to(tl.int64) * D + d[None, :], val, mask = m2)
+
+
+def tq_gather_dequant(words, scales, cb, indices, block_table, out, idx_out, page_size, bits, dim, tb = 8, num_warps = 4):
+    """indices [R, K_pad] int32 (-1 padded) -> out [R * K_pad, dim] fp16 + idx_out [R, K_pad] int32 compact indices.
+    block_table has one row per query row, or a single row shared by all (stride 0). Graph-capturable (no host reads)."""
+    R, K_pad = indices.shape
+    npr = block_table.shape[1] if block_table.shape[0] > 1 else 0
+    with torch.cuda.device(words.device):
+        _tq_gather_dequant_kernel[(R, triton.cdiv(K_pad, tb))](
+            words, scales, cb, indices, block_table, out, idx_out, npr,
+            K_pad, page_size, bits, dim, tb, num_warps = num_warps, num_stages = 1,
+        )
+
+
+@triton.jit
 def _tq_write_kernel(
     x, words, scales, cb, mid, block_table, cache_seqlens,
     length, npps,

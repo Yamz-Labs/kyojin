@@ -742,6 +742,16 @@ class QwenEngine:
         if sessions > 1 and not on_cuda:   # speculative rounds of N requests verify N * (depth + 1) rows: cap the depth so they stay in one 8-row forward
             # (NVIDIA keeps the spec_policy default: a 16-row budget for a dense model, no cap for a MoE model)
             os.environ.setdefault("QWSPEC_LOAD_ROWS", os.environ.get("EXL3_ROW_INV_GROUP_ROWS") or "8")
+            # chunked prefill beside decoding users, ROCm only (gfx1151, 4 streams + one 32K prompt, EXL3_ROW_INV_GROUPS=1):
+            # without it every running stream waits one full 4096-row chunk (0.4 tok/s each); with the decode-priority
+            # chunk the streams decode in the same step as the leader's chunk, 4.2 tok/s each (+10x) for a 2.1x TTFT
+            # of the new prompt (19.8 s -> 40.9 s). Pure chunk steps (EXL3_CIL_SLICE_S=0) only reached 2.2 tok/s.
+            # Opt out with EXL3_SCHED_CHUNK_IL=0. CUDA sets the same three above; the other non-CUDA backends
+            # (Apple) are left on the FIFO prefill until measured there.
+            if torch.version.hip:
+                os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
+                os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
+                os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
@@ -769,17 +779,20 @@ class QwenEngine:
         from exllamav3 import CacheLayer_quant
         qkw = dict(layer_type=CacheLayer_quant, k_bits=k_bits, v_bits=v_bits) if (k_bits and v_bits) else {}
         assert bool(k_bits) == bool(v_bits), "set both --k-bits and --v-bits (or --cache-bits)"
-        if kv_mode == "tq":
-            # TurboQuant KV pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector) with the fp16 sink + window ring
+        if kv_mode == "tq" and k_bits and v_bits:
+            # TurboQuant KV pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector) with the fp16 sink + window ring. Widths outside 4..6 and head dims without a codebook keep the per-32 quant pages
             from exllamav3.cache.tq import CacheLayer_tq, supported as tq_supported
             hd = getattr(self.config, "head_dim", None)
-            assert k_bits in (4, 5, 6) and v_bits in (4, 5, 6), "--kv-mode tq needs --k-bits and --v-bits in 4..6"
-            if hd and tq_supported(hd, k_bits) and tq_supported(hd, v_bits):
+            if k_bits in (4, 5, 6) and v_bits in (4, 5, 6) and hd and tq_supported(hd, k_bits) and tq_supported(hd, v_bits):
                 qkw["layer_type"] = CacheLayer_tq
             else:
-                print(f"qserve: --kv-mode tq: head_dim {hd} is not supported, keeping the quant cache", flush=True)
+                print(f"qserve: kv-mode tq: k{k_bits}v{v_bits} at head_dim {hd} has no TurboQuant codebook, keeping the quant cache", flush=True)
         # one recurrent (GDN) slot per session; the Generator caps its batch at the slot count
         self.cache = Cache(self.model, max_num_tokens=ctx, max_history=max(3, ndt), max_batch_size=sessions, **qkw)
+        if qkw.get("layer_type") is not None and getattr(qkw["layer_type"], "tq", False):
+            from exllamav3.cache.tq import cache_is_tq
+            if not cache_is_tq(self.cache):
+                print("qserve: kv-mode tq: this model's attention cache layers (QSA sparse attention) keep the quant cache", flush=True)
         if os.environ.get("EXL3_WARM_DENSE", "1") != "0":
             from exllamav3.model.dense_warmup import seed_dense_tune
             seed_dense_tune()
@@ -2272,6 +2285,10 @@ def load_all(args: argparse.Namespace):
         except (ValueError, KeyError, OSError) as e:
             print(f"qserve: ignoring {kvp}: {e}", flush=True)
     args.kv_mode = args.kv_mode or "quant"
+    if args.kv_mode == "fp16":
+        args.k_bits = args.v_bits = args.cache_bits = 0
+    elif args.kv_mode == "tq" and not (args.k_bits or args.v_bits or args.cache_bits):
+        args.k_bits = args.v_bits = 4 if (torch.version.cuda and not torch.version.hip) else 6      # TurboQuant default width: 6 bits; the NVIDIA lanes keep their K4V4 preset
     if args.kvwin:
         os.environ.setdefault("EXL3_KVWIN", args.kvwin)     # before the model is built: the attention modules declare the ring state from it
     t0 = time.time()
@@ -2299,6 +2316,13 @@ def load_all(args: argparse.Namespace):
         kv = sum(l.storage_size() for c in (engine.cache, engine.draft_cache) if c is not None for l in c.layers.values()) / 2**20 / args.ctx
         lazy = getattr(engine.draft_model, "lazy_vram_bytes", lambda: 0)() / 2**20 if engine.draft_model is not None else 0.0
         print(f"qserve: VRAM left after load: {free_mib:.0f} MiB, {lazy:.0f} MiB of it taken later by the draft-head subset (ctx={args.ctx}, sessions={args.sessions})", flush=True)
+        # KV format actually in use (CacheLayer_tq / CacheLayer_quant) + per-token cost: the two numbers a KV-mode A/B and the
+        # max-context gate are decided on, read straight from the allocated pages instead of guessed from the flags
+        _lay = next(iter(engine.cache.layers.values()), None)
+        _kv_max = int((free_mib - lazy) / kv + args.ctx) // 256 * 256 if kv > 0 else 0
+        print(f"qserve: KV {type(_lay).__name__} k{args.k_bits}v{args.v_bits}"
+              f" {kv:.4f} MiB/token/session = {kv * args.ctx:.0f} MiB at ctx {args.ctx}; "
+              f"~{_kv_max} tokens would fit with {free_mib - lazy:.0f} MiB free", flush=True)
         min_free = float(os.environ.get("EXL3_MIN_FREE_MIB") or MIN_FREE_MIB)
         warm_peak = getattr(engine, "warm_peak_mib", None)
         if warm_peak is not None:
@@ -2326,8 +2350,10 @@ def main() -> None:
                         help="bits per K/V element of the attention cache pages (0 = fp16, the default; 8 = packed int8, about 40 %% smaller pages, saves 2.6 GiB at 256K, greedy output differs from the 16-bit cache; with EXL3_ROW_INV_GROUPS=1 four parallel sessions matched solo runs, 16 of 16)")
     parser.add_argument("--k-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="K bits of the quantized attention cache (with --v-bits; overrides --cache-bits)")
     parser.add_argument("--v-bits", type=int, default=0, choices=(0, 2, 3, 4, 5, 6, 7, 8), help="V bits of the quantized attention cache")
-    parser.add_argument("--kv-mode", choices=("quant", "tq"), default=None,
-                        help="KV cache format with --k-bits / --v-bits: quant = per-32 scale pages (default); tq = TurboQuant pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector, 4..6 bits) with the fp16 sink-4 + window-128 ring")
+    parser.add_argument("--kv-mode", choices=("quant", "tq", "fp16"), default=None,
+                        help="KV cache format. quant (default): per-32 scale pages (--k-bits / --v-bits), fp16 pages when no bits are given; "
+                             "tq: TurboQuant pages (rotation + Lloyd-Max codebook + one fp16 norm per head vector) with the fp16 sink-4 + window-128 ring, "
+                             "6 bits when no --k-bits / --v-bits / --cache-bits / lane preset says otherwise; fp16 = unquantized pages")
     parser.add_argument("--kvwin", default=None, metavar="SINK:WINDOW",
                         help="fp16 sink + window ring of the quantized cache (EXL3_KVWIN, e.g. 4:128; an EXL3_KVWIN already set wins); written by tools/qualify as the kw6 choice")
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")

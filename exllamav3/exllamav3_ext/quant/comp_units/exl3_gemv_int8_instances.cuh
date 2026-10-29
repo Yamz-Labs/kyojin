@@ -8,6 +8,12 @@ void* exl3_gemv_int8_sq_sel_k3(int M, bool c_fp32, bool residual, bool dual);
 void* exl3_gemv_int8_sq_sel_k4(int M, bool c_fp32, bool residual, bool dual);
 void* exl3_gemv_int8_sq_sel_k5(int M, bool c_fp32, bool residual, bool dual);
 void* exl3_gemv_int8_sq_sel_k6(int M, bool c_fp32, bool residual, bool dual);
+void* exl3_gemv_int8_sq_tri_sel_k1(bool c_fp32);
+void* exl3_gemv_int8_sq_tri_sel_k2(bool c_fp32);
+void* exl3_gemv_int8_sq_tri_sel_k3(bool c_fp32);
+void* exl3_gemv_int8_sq_tri_sel_k4(bool c_fp32);
+void* exl3_gemv_int8_sq_tri_sel_k5(bool c_fp32);
+void* exl3_gemv_int8_sq_tri_sel_k6(bool c_fp32);
 
 void* exl3_gemv_int8_coop_sel_k1(bool c_fp32, bool residual);
 void* exl3_gemv_int8_coop_sel_k2(bool c_fp32, bool residual);

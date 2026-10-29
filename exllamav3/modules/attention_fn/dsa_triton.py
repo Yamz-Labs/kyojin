@@ -106,6 +106,7 @@ def _dsa_attn_kernel(
     OUT_LATENT: tl.constexpr = 0,  # store only the latent half, head-major (H, R, D_c),
                                    # the exact mla_unfold input; the rope half of the
                                    # weighted sum is never accumulated
+    TQ: tl.constexpr = 0,          # 1: TurboQuant pool (h32 slot = fp32 codebook, pool_s one fp16 scale per entry, rotation lives in the weights)
     QC: tl.constexpr = 0,          # pool_c is the packed quantized pool (QC bits per
                                    # value, 32-value groups, H32-rotated domain)
 ):
@@ -137,7 +138,7 @@ def _dsa_attn_kernel(
         if D_r > 0:
             qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
 
-    if QC > 0:
+    if QC > 0 and TQ == 0:
         # Packed pool values live in the H32-rotated domain (orthonormal, block-diagonal
         # per 32 values): rotate q once so every score dot is exact, rotate the fp16
         # window tiles into the same domain, and rotate the accumulated output back in
@@ -184,7 +185,7 @@ def _dsa_attn_kernel(
                          mask = mc[:, None] & valid_c[None, :], other = 0.0) \
                + tl.load(ring + idx_r[:, None] * D + offs_c[None, :],
                          mask = mr[:, None] & valid_c[None, :], other = 0.0)
-            if QC > 0:
+            if QC > 0 and TQ == 0:
                 vc = _rot_h32(vc, h32, BLOCK_W, D_c_pad)
             scores = tl.dot(qc, tl.trans(vc))
             if D_r > 0:
@@ -228,7 +229,7 @@ def _dsa_attn_kernel(
             tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_attn: pool page OOB")
         tok = phys * page_size + idx_s % page_size
         if QC > 0:
-            vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad)
+            vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad, h32, TQ)
         else:
             vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                          mask = in_range[:, None] & valid_c[None, :], other = 0.0)
@@ -253,7 +254,7 @@ def _dsa_attn_kernel(
 
     denom = tl.where(l == 0.0, 1.0, l)
     oc = acc_c / denom[:, None]
-    if QC > 0:
+    if QC > 0 and TQ == 0:
         # Accumulated in the rotated domain: one inverse rotation (H32 is involutory)
         oc = _rot_h32(oc, h32, BLOCK_H, D_c_pad).to(tl.float32)
 
@@ -558,6 +559,7 @@ def _dsa_attn_split_kernel(
                                    # MULTIROW keeps the per-job state args scalar)
     OUT_LATENT: tl.constexpr = 0,  # accumulate/store only the latent half; ws_acc rows
                                    # are D_c wide and the combine emits (H, R, D_c)
+    TQ: tl.constexpr = 0,
     QC: tl.constexpr = 0,          # packed quantized pool (see _dsa_attn_kernel); the
                                    # partials stay in the rotated domain
 ):
@@ -614,7 +616,7 @@ def _dsa_attn_split_kernel(
         if D_r > 0:
             qr = tl.load(q_base + D_c + offs_r[None, :], mask = valid_h[:, None], other = 0.0)
 
-    if QC > 0:
+    if QC > 0 and TQ == 0:
         # Packed pool values live in the H32-rotated domain (orthonormal, block-diagonal
         # per 32 values): rotate q once so every score dot is exact, rotate the fp16
         # window tiles into the same domain, and rotate the accumulated output back in
@@ -652,7 +654,7 @@ def _dsa_attn_split_kernel(
                          mask = mc[:, None] & valid_c[None, :], other = 0.0) \
                + tl.load(ring + idx_r[:, None] * D + offs_c[None, :],
                          mask = mr[:, None] & valid_c[None, :], other = 0.0)
-            if QC > 0:
+            if QC > 0 and TQ == 0:
                 vc = _rot_h32(vc, h32, BLOCK_W, D_c_pad)
             scores = tl.dot(qc, tl.trans(vc))
             if D_r > 0:
@@ -692,7 +694,7 @@ def _dsa_attn_split_kernel(
             tl.device_assert(tl.where(in_range, (phys >= 0) & (phys < DEBUG_PAGES), True), "dsa_split: pool page OOB")
         tok = phys * page_size + idx_s % page_size
         if QC > 0:
-            vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad)
+            vc = _qc_load_v(pool_c, pool_s, tok, 0, offs_c, in_range, QC, 1, D_c, D_c_pad, h32, TQ)
         else:
             vc = tl.load(pool_c + tok[:, None] * D_c + offs_c[None, :],
                          mask = in_range[:, None] & valid_c[None, :], other = 0.0)
@@ -969,6 +971,7 @@ def _dsa_attn_combine_kernel(
     SEQ: tl.constexpr = 1,
     MULTIROW: tl.constexpr = 0,  # q_pos0 is a per-job i32 array when set
     OUT_LATENT: tl.constexpr = 0,  # ws rows are D_c wide; emit head-major (H, R, D_c)
+    TQ: tl.constexpr = 0,
     QC: tl.constexpr = 0,          # split partials came from a packed pool (rotated)
 ):
     """Combine phase: merge the split partials (sink folded in as one more partial),
@@ -1010,7 +1013,7 @@ def _dsa_attn_combine_kernel(
     denom = tl.where(l_run == 0.0, 1.0, l_run)
     o = acc / denom[:, None]
 
-    if QC > 0:
+    if QC > 0 and TQ == 0:
         # Partials from a packed pool are in the rotated domain: one inverse rotation per
         # 32-group of the latent columns (the rope columns are fp16 pages, never rotated;
         # D_c is a multiple of 32, so no group straddles the boundary)
@@ -1286,6 +1289,8 @@ def _dsa_pool_expand_kernel(
 # the online path; _MAX_ENTRIES bounds the transient (1M entries * 576 dims ~ 1.2 GB)
 _dsa_qc_stage = os.environ.get("EXL3_DSA_QC_STAGE", "1") != "0"
 _dsa_qc_stage_min_r = int(os.environ.get("EXL3_DSA_QC_STAGE_MIN_R", "64"))
+_dsa_tq_gather = os.environ.get("EXL3_DSA_TQ_GATHER", "1") != "0"
+_dsa_tq_gather_max_r = int(os.environ.get("EXL3_DSA_TQ_GATHER_MAX_R", "8"))
 _dsa_qc_stage_max_entries = int(os.environ.get("EXL3_DSA_QC_STAGE_MAX_ENTRIES", str(1 << 20)))
 
 
@@ -1294,16 +1299,21 @@ def _stage_packed_pool(pool_c, qc, pool_r, block_table, page_size, pool_len, D_c
     a contiguous fp16 pool with an identity block table. Returns (pool_c, pool_r, block_table)
     for the fp16 kernel path."""
     from ...ext import exllamav3_ext as ext
-    pool_s, bits = qc
+    pool_s, bits, tq = (*qc, None)[:3]
     G = D_c // 32
     npw = -(-pool_len // page_size)
     pages = block_table[0, :npw].long()
     pc = pool_c.reshape(-1, page_size, G * bits)[pages]
-    ps = pool_s.reshape(-1, page_size, G)[pages]
     n_rows = npw * page_size
     rows_alloc = max(page_size, 1 << (n_rows - 1).bit_length())      # pow2: few distinct sizes
     out = torch.empty((rows_alloc, D_c), dtype = torch.half, device = pool_c.device)
-    ext.dequant_cache_cont(pc.view(-1, G * bits), ps.view(-1, G), out[:n_rows], 0.0)
+    if tq is not None:
+        # TurboQuant: codebook gather x one scale per entry, left in the rotated domain (the module's weights are rotated with it)
+        from .tq_triton import tq_dequant_rows
+        tq_dequant_rows(pc.view(-1, G * bits), pool_s.reshape(-1, page_size)[pages].reshape(-1), tq.cbk, out[:n_rows], bits, D_c)
+    else:
+        ps = pool_s.reshape(-1, page_size, G)[pages]
+        ext.dequant_cache_cont(pc.view(-1, G * bits), ps.view(-1, G), out[:n_rows], 0.0)
     pr = pool_r.reshape(-1, page_size, D_r)[pages].contiguous() if D_r > 0 else pool_r
     bt = torch.arange(npw, dtype = torch.int32, device = pool_c.device).unsqueeze(0)
     return out[:n_rows].view(npw, page_size, D_c), pr, bt
@@ -1409,13 +1419,32 @@ def dsa_attn(
             pool_c, qc, pool_r, block_table, page_size, pool_len, D_c, D_r)
         qc = None
         dummy_i = block_table
+    if (qc is not None and _dsa_tq_gather and len(qc) > 2 and qc[2] is not None and q_split and out_latent
+            and D_r == 0 and indices is not None and multirow is None and not nc_block and not nc_chunk
+            and not (win_len > 0 and kv_chunk is not None) and not dsa_debug_bounds
+            and R <= _dsa_tq_gather_max_r and pool_c.dtype == torch.int32):
+        # TurboQuant decode: dequantize only the gathered rows (one launch, ~K_pad x D_c fp16 per row) and run the fp16 decode
+        # split (dt / fast kernels) on them; the generic in-kernel plane loader costs ~6x the fp16 kernel per call (served GLM
+        # decode -10 %). Same fp16 values as the in-kernel loader, rotated domain, so the combine is the plain fp16 one.
+        from .tq_triton import tq_gather_dequant
+        pool_s_, bits_, tq_ = qc[0], qc[1], qc[2]
+        K_g = indices.shape[1]
+        st_out = g_tensor_cache.get(q.device, (R * K_g, D_c), torch.half, "dsa_tqg_rows")
+        st_idx = g_tensor_cache.get(q.device, (R, K_g), torch.int32, "dsa_tqg_idx")
+        tq_gather_dequant(pool_c, pool_s_.reshape(-1), tq_.cbk, indices, block_table, st_out, st_idx, page_size, bits_, D_c)
+        bt0 = g_tensor_cache.get(q.device, (1, 1), torch.int32, "dsa_tqg_bt")
+        bt0.zero_()
+        pool_c, block_table, indices, qc = st_out, bt0, st_idx, None
+        page_size = 1 << max(R * K_g - 1, 1).bit_length()
+        dummy_i = block_table
     if qc is not None:
-        pool_s, qc_bits = qc
+        pool_s, qc_bits, tq = (*qc, None)[:3]
         assert D_c % 32 == 0 and pool_c.dtype == torch.int32 and pool_s.dtype == torch.half
-        h32_t = _get_h32(q.device)
+        h32_t = _get_h32(q.device) if tq is None else tq.cbk16
+        tqf = int(tq is not None)
         pc_arg = pool_c
     else:
-        pool_s, qc_bits, h32_t = q, 0, q   # any valid fp16 pointers for the unused args
+        pool_s, qc_bits, h32_t, tqf = q, 0, q, 0   # any valid fp16 pointers for the unused args
         pc_arg = pool_c.reshape(-1, D_c)
     has_window = win_len > 0 and kv_chunk is not None
     if q_split:
@@ -1449,7 +1478,7 @@ def dsa_attn(
         num_stages = min(num_stages, 2)
         block_h = min(block_h, 16)
     if dsa_debug_bounds:
-        pool_rows = pool_s.numel() // (D_c // 32) if qc is not None else pool_c.numel() // max(D_c, 1)
+        pool_rows = pool_s.numel() // (1 if tqf else D_c // 32) if qc is not None else pool_c.numel() // max(D_c, 1)
         dbg_pages = -(-pool_rows // max(page_size, 1))
     else:
         dbg_pages = 0
@@ -1478,7 +1507,7 @@ def dsa_attn(
             n_splits = 1
 
     if n_splits > 1:
-        block_h = min(block_h, 16)   # more head-blocks: the split path wants parallelism
+        block_h = min(block_h, int(os.environ.get("EXL3_DSA_TQ_BH", "32")) if tqf else 16)   # more head-blocks: the split path wants parallelism (tq: the codebook expansion is per head-block, so fewer blocks)
         # Flash-decoding split: the monolithic kernel at R = 1 is 2 blocks walking the key
         # tiles serially (pure latency); the split phase spreads the keys over
         # R * h_blocks * n_splits programs and the combine folds sinks/derot/store
@@ -1553,8 +1582,8 @@ def dsa_attn(
                     SEQ = a_seq, MULTIROW = multirow is not None,
                     DEBUG_BOUNDS = dbg, DEBUG_PAGES = dbg_pages,
                     Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
-                    QC = qc_bits,
-                    num_warps = num_warps, num_stages = 2,
+                    QC = qc_bits, TQ = tqf,
+                    num_warps = num_warps, num_stages = 1 if tqf else 2,
                 )
             _dsa_attn_combine_kernel[(R * hb, triton.cdiv(D_out, 128))](
                 ws_ml, ws_acc, sinks_t, derot_t, out,
@@ -1564,7 +1593,7 @@ def dsa_attn(
                 BLOCK_H = block_h, BLOCK_D = 128,
                 SEQ = a_seq, MULTIROW = multirow is not None,
                 OUT_LATENT = 1 if out_latent else 0,
-                QC = qc_bits,
+                QC = qc_bits, TQ = tqf,
                 num_warps = 4, num_stages = 2,
             )
         return out
@@ -1638,7 +1667,7 @@ def dsa_attn(
             NC_BLOCK = 1 if nc_block else 0,
             NC_CHUNK = 1 if nc_chunk else 0, NC_HIST = nc_hist,
             Q_SPLIT = 1 if q_split else 0, OUT_LATENT = 1 if out_latent else 0,
-            QC = qc_bits,
+            QC = qc_bits, TQ = tqf,
             num_warps = num_warps, num_stages = num_stages,
         )
     return out

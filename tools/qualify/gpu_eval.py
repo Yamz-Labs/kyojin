@@ -94,6 +94,8 @@ def kvmode(pack, docs, out, n=256, only=None):
     e = T - n
     cfg = Config.from_directory(pack)
     hd = cfg.head_dim
+    if hd <= 0 or getattr(cfg, 'kv_lora_rank', 0):
+        hd = getattr(cfg, 'kv_lora_rank', hd)       # MLA: the cached vector is the latent
     fmts = [("k8v8", "quant", 8), ("k6v6", "quant", 6), ("kw6", "quant", 6)] + [(f"tq{b}", "tq", b) for b in (6, 5) if hd > 0 and tq.supported(hd, b)]
     x = torch.tensor([ids])
     npg = (T + 256) // 256
@@ -114,6 +116,11 @@ def kvmode(pack, docs, out, n=256, only=None):
             os.environ["EXL3_KVWIN"] = "4:128" if name == "kw6" else "0"     # the production formats at >= 6 bits run without the window; kw6 = the same cache with the ring
             cache = Cache(m, max_num_tokens=T + 256, max_batch_size=2, max_history=3, layer_type=CacheLayer_quant, k_bits=b, v_bits=b)
             os.environ.pop("EXL3_KVWIN")
+        if kind == "tq" and not tq.cache_is_tq(cache):
+            res[name] = dict(unsupported="the attention cache layers of this model do not take a TurboQuant cache (no TurboQuant layer for this attention type)")
+            print(name, res[name], flush=True)
+            del cache, m; gc.collect()
+            continue
         m.load(progressbar=False)
         with torch.inference_mode():
             st = cache.get_new_state() if cache.recurrent_state_cls is not None else None
@@ -126,15 +133,17 @@ def kvmode(pack, docs, out, n=256, only=None):
                 m.prefill(x[:, a: min(a + 2048, e)], par(a, min(a + 2048, e) - a))
             rows = []
             t_dec = time.time()
-            for j in range(n):
-                lg = m.forward(x[:, e + j: e + j + 1], par(e + j, 1))
-                rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-1], -1).half().cpu())
+            qs = int(os.environ.get("KVMODE_QS", "1"))        # rows per decode step: >1 exercises the verify path (spec / MTP / parallel users)
+            for j in range(0, n, qs):
+                k = min(qs, n - j)
+                lg = m.forward(x[:, e + j: e + j + k], par(e + j, k))
+                rows.append(torch.log_softmax(lg.float().reshape(-1, lg.shape[-1])[-k:], -1).half().cpu())
             t_dec = (time.time() - t_dec) / n
             if st is not None:
                 st.free()
-        lps[name] = torch.stack(rows).float()
+        lps[name] = torch.cat(rows).float()
         if name == "k8v8":
-            torch.save(lps[name].half(), out + ".k8v8.pt")
+            torch.save(lps[name], out + ".k8v8.pt")
         free(m, cache)
         if name != "k8v8":
             r8 = lps["k8v8"]

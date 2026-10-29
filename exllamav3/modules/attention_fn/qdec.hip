@@ -125,6 +125,11 @@ template<int B> __device__ __forceinline__ u32 dequant2_tq(u32 raw_m, u32 s2, co
 #define TQF_OFF 0
 #endif
 #define TQF (TQ && !TQF_OFF && (KB == 5 || KB == 6) && (VB == 5 || VB == 6) && (DTW == 8 || DTW == 4))
+// TQVP: the V runs of the next slab are fetched during the current slab's S / softmax (they stay live in vr / vsc, 48 VGPRs at 6 bits). With
+// 3+ q tiles (O accumulators 96+ VGPRs) that spills (72-79 VGPRs at 36-48 rows), so those fetch the V runs of a slab right before its lookups instead.
+#ifndef TQVP
+#define TQVP (NT <= 2)
+#endif
 template<int B, int K> __device__ __forceinline__ void zbuild(u32 w, u32 y, u32& ze, u32& zo)
 {
     if (B == 6) {
@@ -306,15 +311,15 @@ qdec_split(
     const int gi_v = dcol >> 5, p0 = dcol & 31;
     u32 vr[16][NRW > 0 ? NRW : 1];
     u32 vsc[16];
-    auto load_v = [&]() {
+    auto load_v = [&](int r0, int lm) {
         #pragma unroll
         for (int e = 0; e < 16; e++) {
-            size_t row = (size_t) row0 + min(e, lim);
+            size_t row = (size_t) r0 + min(e, lm);
             load_run(vr[e], v_cache + row * (GPT * VB) + kvh * VCHW + gi_v * VB, p0);
             vsc[e] = (u32) v_scales[row * NKV + kvh] * 0x10001u;
         }
     };
-    if (nslabs > sw) { slab_rows(0); load_k(); load_v(); }
+    if (nslabs > sw) { slab_rows(0); load_k(); if (TQVP) load_v(row0, lim); }
 #else
     if (nslabs > sw) { slab_rows(0); load_k(); }
 #endif
@@ -393,6 +398,7 @@ qdec_split(
         if (!active) continue;
 #if TQF
         const bool more = it + 1 < iters && (sw + (it + 1) * NSW) < nslabs;
+        const int cur_row0 = row0, cur_lim = lim;
         if (more) { slab_rows(it + 1); load_k(); }       // kw is dead once S is formed
 #endif
 
@@ -451,11 +457,12 @@ qdec_split(
 #if TQF
         {
             u32 ze[16], zo[16], vsp[8];
+            if (!TQVP) load_v(cur_row0, cur_lim);
             #pragma unroll
             for (int e = 0; e < 16; e++) zbuild<VB, 0>(vr[e][0], vr[e][1], ze[e], zo[e]);
             #pragma unroll
             for (int i = 0; i < 8; i++) vsp[i] = perm(vsc[2 * i + 1], vsc[2 * i], 0x05040100u);   // scales of tokens 2i, 2i + 1
-            if (more) load_v();                              // vr is dead: the next slab's V runs fly during the lookups below
+            if (TQVP && more) load_v(row0, lim);             // vr is dead: the next slab's V runs fly during the lookups below
             #pragma unroll
             for (int u = 0; u < DTW / 2; u++) {
                 v8u b0, b1;

@@ -4,6 +4,7 @@ import logging
 import os
 import time
 import torch
+from ..model import cuda_graph as _cuda_graph
 try:
     from ..modules.moe_fused import check_barrier as _moe_fused_check   # fused MoE half-layer grid barrier: raise if it ever timed out
 except Exception:                                                    # noqa: BLE001
@@ -44,6 +45,8 @@ from .job import Job, _ttrace_begin, _ttrace_end, _TAIL_REPLY as _TAIL_REPLY_GEN
 # once the results are handed out; every iterate / cancel / clear_queue runs it first, so later work sees the same cache state in
 # the same order (exact by construction). Pays where the stash is a blocking copy (HIP .cpu(), CUDA EXL3_TAIL_PIN=0).
 _REPLY_FIRST = os.environ.get("EXL3_REPLY_FIRST", "0") == "1"
+_LAG1_DEBUG = os.environ.get("EXL3_LAG1_DEBUG", "0") == "1"
+_LAG1 = os.environ.get("EXL3_LAG1", "0") == "1"   # lag-1 decode pipeline (see Generator._gen_lag1)
 from . import spec_sample
 from .filter import Filter
 from .row_groups import plan_groups, group_rows_cap, plain_rows_verify, GROUPS as ROW_GROUPS
@@ -624,9 +627,35 @@ class Generator:
         self.flush_deferred()
         if _TORCH_PROF is not None:
             return self._iterate_profiled()
+        if _CPROF is not None and not _CPROF["done"] and any(j.is_prefill_done() for j in self.active_jobs):
+            return self._iterate_cprofiled()
         results = self._iterate_inner()
         if _moe_fused_check is not None:
             _moe_fused_check(self.model)
+        return results
+
+    def _iterate_cprofiled(self) -> list[dict]:
+        """EXL3_CPROF=SKIP:STEPS:PATH (diagnostic): cProfile of STEPS decode iterations after SKIP of them (host time per function; cuda syncs show where the host waits for the GPU)."""
+        import cProfile, pstats
+        st = _CPROF
+        st["seen"] += 1
+        if st["seen"] <= st["skip"]:
+            return self._iterate_inner()
+        if st["prof"] is None:
+            st["prof"] = cProfile.Profile(); st["t0"] = time.perf_counter()
+        st["prof"].enable()
+        try:
+            results = self._iterate_inner()
+        finally:
+            st["prof"].disable()
+        st["n"] += 1
+        if st["n"] == st["steps"]:
+            wall = time.perf_counter() - st["t0"]
+            with open(st["path"], "w") as f:
+                f.write(f"{st['steps']} iterations, wall {wall / st['steps'] * 1000:.2f} ms/iter (profiled-region wall incl. unprofiled gaps)\n")
+                for key in ("tottime", "cumtime"):
+                    ps = pstats.Stats(st["prof"], stream = f); ps.sort_stats(key).print_stats(45)
+            st["done"] = True
         return results
 
     def _iterate_profiled(self) -> list[dict]:
@@ -948,7 +977,8 @@ class Generator:
 
         # Regular generation
         else:
-            self.iterate_gen(results)
+            if not (_LAG1 and self._gen_lag1(results)):
+                self.iterate_gen(results)
 
         _ttrace_end("generation round", _t0)
         # Visualization
@@ -1655,6 +1685,177 @@ class Generator:
         if exports:
             params["export_states"] = [torch.cat(parts, dim = 0) for parts in zip(*exports)]
         return torch.cat(logits, dim = 0)
+
+
+    # ---------------------------------------------------------------------------------------------------------------------
+    # Lag-1 decode pipeline (EXL3_LAG1=1). Plain decode (no draft, no recurrent cache) normally pays one host round trip
+    # per step: sample on the device -> read the token -> host bookkeeping -> build the next step's inputs -> launch. Here the
+    # next step is launched from the DEVICE token right after the sampler, before the host reads token k, so the GPU runs
+    # step k+1 while the host processes token k (one step of lag). The step in flight is adopted by the next call.
+    # A job that ends at token k leaves a wasted row in the step already in flight (its KV write lands in its own pages, in
+    # stream order ahead of any later reuse); that row is simply never sampled. Whatever the pipeline cannot do (filters,
+    # penalties, forced tokens, healing, banned strings, probs, drafts, recurrent caches, a job about to hit a token
+    # limit, waiting/prefilling jobs, a page boundary, no GPU embedding table) takes the regular loop.
+    # Needs the whole-forward CUDA graph with the GPU embedding table (cuda_graph.py, EXL3_GPU_EMB).
+    _lag = None
+    _lag_par = 0
+
+    def _lag1_job_ok(self, job) -> bool:
+        if len(job.sequences) != 1 or job.filters or job.embeddings or job.forced_ids is not None:
+            return False
+        if job.new_tokens < 0 or job.checkpoint is not None or job.banned_strings:
+            return False
+        if job.return_probs or job.return_top_tokens > 0 or job.sampler.reqs_past_ids:
+            return False
+        return True
+
+    def _lag1_ready(self) -> bool:
+        if self.draft_model or self.ngram_match_min or self.visualizer or _TAIL_REPLY_GEN or "mrope" in self.model.caps:
+            return False
+        if self.num_draft_tokens or ROW_GROUPS["on"] and ROW_INV["on"] and self.model.caps.get("row_inv_groups"):
+            return False
+        if _cuda_graph.CUDA_GRAPH_ENABLED and not torch.version.hip:
+            runner = self.model.__dict__.get("_cuda_graph_runner")
+            g = getattr(runner, "_gemb", None) if runner is not None else None
+            return g is not None and g is not False
+        return self.model.lag_table() is not None
+
+    def _lag1_params(self, jobs, rows_ids_shape, nxt: int):
+        """Inputs of the step `nxt` positions after the current host state (0 = now, 1 = the step after the token in flight)."""
+        par = self._lag_par = self._lag_par ^ 1
+        n = len(jobs)
+        max_seq_len = max(job.get_max_seq_len() for job in jobs) + nxt
+        max_pages_batch = block_table_pages(max_seq_len)
+        block_index = self._staging(f"block_index_l{par}", n, max_pages_batch)
+        block_index.zero_()
+        cache_seqlens = self._staging(f"cache_seqlens_l{par}", n)
+        for b, job in enumerate(jobs):
+            seq = job.sequences[0]
+            bi = seq.block_index_tensor[:, :max_pages_batch]
+            block_index[b:b + 1, :bi.shape[-1]].copy_(bi)
+            cache_seqlens[b] = seq.kv_position + nxt
+        params = {
+            "attn_mode": "flash_attn",
+            "block_table": block_index,
+            "cache": self.cache,
+            "cache_seqlens": cache_seqlens,
+            "recurrent_states": [job.recurrent_state for job in jobs] if (self.ring_states or self.recurrent_cache is not None) else None,
+            "indexed_embeddings": [],
+            "positions": None,
+            "recurrent_history": False,
+            "pinned_staging": True,
+            "dflash_verify": plain_rows_verify(n, False),
+        }
+        return params
+
+    def _gen_lag1(self, results: list) -> bool:
+        """One pipelined decode round. Returns False (nothing done) when the regular loop must run this round."""
+        st = self._lag
+        if st is None:
+            if not self._lag1_ready():
+                return False
+            jobs = [j for j in self.active_jobs if j.is_prefill_done()]
+            if not jobs or len(jobs) != len(self.active_jobs) or self.pending_jobs or not all(self._lag1_job_ok(j) for j in jobs):
+                return False
+            # step k from host ids (regular forward; the cuda graph runner takes the ids through its GPU table)
+            _first = [j for j in jobs if j.time_first_token is None]
+            if _first:
+                cuda_sync_active()
+                for j in _first: j.time_first_token = time.time()
+            ids_list = []
+            for job in jobs:
+                ids_list += job.get_input_ids_list(None, len(ids_list), add_to_cache = True)
+            batch_ids = torch.cat(ids_list, dim = 0)
+            if batch_ids.shape[-1] != 1:
+                return False
+            params = self._lag1_params(jobs, batch_ids.shape, 0)
+            logits = self.model.forward(input_ids = batch_ids, params = params)
+        else:
+            self._lag = None
+            jobs, logits = st["jobs"], st["logits"]
+            for job in jobs:
+                if job in self.active_jobs:
+                    job.get_input_ids_list(None, 0, add_to_cache = True)   # the token that was fed from the device is on the host now
+
+        live = [(i, job) for i, job in enumerate(jobs) if job in self.active_jobs]
+        if not live:
+            return True
+        n_live = len(live)
+        pinned = self.sample_pinned
+        if pinned is None or pinned.shape[0] < n_live:
+            self.sample_pinned = pinned = torch.empty((max(n_live, 32), 1), dtype = torch.long, pin_memory = True)
+        launched = []
+        dev_tokens = []
+        for k, (i, job) in enumerate(live):
+            job.prepare_logit_mask()
+            job.prepare_sampling_past_ids()
+            tl = logits[i:i + 1, :, :]
+            sampled = job.receive_logits(tl)
+            nt = sampled[0]
+            dev_tokens.append(nt.view(1, 1))
+            pinned[k:k + 1].copy_(nt.view(1, 1), non_blocking = True)
+            launched.append((job, tl, (pinned[k:k + 1],) + sampled[1:]))
+        ev = torch.cuda.Event()
+        ev.record()
+
+        # launch the next step from the device tokens, unless something needs the host first
+        nxt = None
+        live_jobs = [job for _, job in live]
+        ahead = (
+            self._lag1_ready() and not self.pending_jobs and len(live_jobs) == len(self.active_jobs) and
+            all(self._lag1_job_ok(j) for j in live_jobs)
+        )
+        if ahead:
+            for job in live_jobs:
+                seq = job.sequences[0]
+                lim = job.max_new_tokens
+                if (lim is not None and job.new_tokens + 2 > lim) or job.new_tokens + 2 > job.max_rq_tokens:
+                    ahead = False; break
+                # a recurrent state with a token in flight is one position ahead of the host: keep checkpoint / stash positions
+                # (page boundaries) out of the window where the next iterate would read it
+                if self.recurrent_cache is not None and not 3 <= seq.kv_position % PAGE_SIZE <= PAGE_SIZE - 4:
+                    ahead = False; break
+                if (seq.kv_position + 1) // PAGE_SIZE >= len(seq.allocated_pages) or \
+                        seq.allocated_pages[(seq.kv_position + 1) // PAGE_SIZE].ref_count != 1:
+                    ahead = False; break
+        if ahead:
+            ids_dev = torch.cat(dev_tokens, dim = 0).to(torch.long)
+            params = self._lag1_params(live_jobs, ids_dev.shape, 1)
+            nlogits = self.model.forward_dev(ids_dev, params)
+            if nlogits is not None:
+                nxt = {"jobs": live_jobs, "logits": nlogits}
+        ev.synchronize()
+
+        completed_jobs = []
+        requeuing_jobs = []
+        for job, token_logits, (next_token, next_k_tokens, next_k_probs, next_prob) in launched:
+            eos, sampled_token, rq = job.receive_sample(token_logits, next_token, next_k_tokens, next_k_probs, next_prob, results)
+            if job.checkpoint_rewound:
+                job.checkpoint_rewound = False
+            if len(job.sequences) == 1 and rq:
+                requeuing_jobs.append(job)
+            elif eos:
+                completed_jobs.append(job)
+
+        num_jobs = self.num_remaining_jobs()
+        for job in completed_jobs + requeuing_jobs:
+            if _REPLY_FIRST and job not in requeuing_jobs:
+                self.deferred_jobs.append(job)
+            else:
+                job.deallocate_pages()
+            self.active_jobs.remove(job)
+        for job in requeuing_jobs:
+            rq_job = job.prepare_for_requeue()
+            self.pending_jobs.insert(0, rq_job)
+        if num_jobs and not self.num_remaining_jobs() and not self.deferred_jobs:
+            self.on_queue_drained()
+        self._lag = nxt if self.active_jobs else None
+        if _LAG1_DEBUG:
+            c = self._lag_stats = getattr(self, "_lag_stats", [0, 0, 0])
+            c[0] += 1; c[1] += int(nxt is not None); c[2] += int(st is not None)
+            if c[0] % 100 == 0:
+                print(f"[lag1] rounds {c[0]} launched-ahead {c[1]} adopted {c[2]}", flush = True)
+        return True
 
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
         _HP0[0] = time.perf_counter()
@@ -2510,6 +2711,10 @@ _PF_PROF = None
 if os.environ.get("EXL3_PF_PROF"):
     _pa = os.environ["EXL3_PF_PROF"].rsplit(":", 1)
     _PF_PROF = dict(path = _pa[0], call = int(_pa[1]), seen = 0, done = False)
+_CPROF = None
+if os.environ.get("EXL3_CPROF"):
+    _cp = os.environ["EXL3_CPROF"].split(":", 2)
+    _CPROF = dict(skip = int(_cp[0]), steps = int(_cp[1]), path = _cp[2], seen = 0, n = 0, prof = None, done = False)
 _TORCH_PROF = None
 if os.environ.get("EXL3_TORCH_PROF"):
     _a = os.environ["EXL3_TORCH_PROF"].split(":", 3)

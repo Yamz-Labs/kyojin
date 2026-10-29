@@ -1247,6 +1247,8 @@ latch the value at import.
 | `EXL3_HC_FN_HALF_PF` | `1` | Reads the hyper-connection weights in fp16 at any row count, not only small ones, which halves the dominant traffic of that kernel. |
 | `EXL3_HC_1PASS_PF` | `1` | The one-pass prefill kernel for the hyper-connection mix and norm, above the decode row cap. |
 | `EXL3_DEC_DSA_FAST` | `1` | A tuned tile and split preset for the DSA decode kernel, for 2 or more rows. A list of numbers overrides the pieces. |
+| `EXL3_DSA_TQ_GATHER` | `1` | On a TurboQuant latent cache, decode first dequantizes only the gathered rows, then runs the fp16 DSA decode kernels. `0` = read the packed pages inside the kernel. |
+| `EXL3_DSA_TQ_GATHER_MAX_R` | `8` | Largest row count that takes the gathered dequantize path. |
 | `EXL3_MIDCHUNK_CKPT` | `2` | A prefill chunk that crosses a recurrent checkpoint boundary also saves the recurrent state there, so the follow-up turn can resume from it. |
 | `EXL3_PREFILL_BIG_TAIL` | `1` | Allows the big-chunk tail path. Honored only with `EXL3_MIDCHUNK_CKPT=2`. |
 | `EXL3_BIG_TAIL_DENSE` | `1` | On a sparse single-session decode pass longer than the query-length cap, lets the tail attend densely instead of sparsely. |
