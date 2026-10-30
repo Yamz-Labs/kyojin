@@ -1494,5 +1494,27 @@ class DraftDepthTests(unittest.TestCase):
         self.assertEqual(c.depth, 0)
 
 
+class HeartbeatStallDumpTests(unittest.TestCase):
+    def _run(self, dump_s, wait):
+        import time
+        out = io.StringIO()   # no file descriptor: the dump takes its traceback fallback
+        with unittest.mock.patch.object(sys, "stdout", out):
+            with serve.Heartbeat("phase", every=0.05, dump_s=dump_s):
+                time.sleep(wait)
+            time.sleep(0.1)   # the heartbeat thread sees the stop
+        return out.getvalue()
+
+    def test_a_long_phase_prints_every_thread_stack_once_per_doubling(self):
+        out = self._run(0.1, 1.0)
+        self.assertIn(out.count("still running after"), (3, 4))      # 0.1, 0.2, 0.4, 0.8 s: not one per 0.05 s tick
+        self.assertIn("test_serve.py", out)                            # the stack of the waiting main thread
+        self.assertIn("Triton compiles in flight", out)
+
+    def test_zero_turns_the_dump_off(self):
+        out = self._run(0, 0.2)
+        self.assertNotIn("still running after", out)
+        self.assertIn("phase done in", out)
+
+
 if __name__ == "__main__":
     unittest.main()

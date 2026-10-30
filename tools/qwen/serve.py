@@ -444,10 +444,13 @@ def load_defaults(model_dir: str, args: argparse.Namespace | None = None) -> dic
 
 
 class Heartbeat:
-    """Prints one progress line every `every` seconds while a long start-up phase runs."""
+    """Prints one progress line every `every` seconds while a long start-up phase runs. A phase still running after
+    EXL3_STALL_DUMP_S seconds (default 600, 0 = off) also prints the Python stack of every thread, again at 2x, 4x ... that
+    time, so a stall shows where it waits (GPU sync, Triton compile, disk read) and whether it moves."""
 
-    def __init__(self, label: str, every: float = 15.0):
+    def __init__(self, label: str, every: float = 15.0, dump_s: float | None = None):
         self.label, self.every, self.stop = label, every, threading.Event()
+        self.dump_s = float(os.environ.get("EXL3_STALL_DUMP_S", "600")) if dump_s is None else dump_s
 
     def __enter__(self):
         self.t0 = time.time()
@@ -456,8 +459,30 @@ class Heartbeat:
         return self
 
     def _run(self):
+        next_dump = self.dump_s
         while not self.stop.wait(self.every):
-            print(f"qserve: {self.label} ... {time.time() - self.t0:.0f} s", flush=True)
+            dt = time.time() - self.t0
+            print(f"qserve: {self.label} ... {dt:.0f} s", flush=True)
+            if 0 < next_dump <= dt:
+                next_dump *= 2
+                self.dump(dt)
+
+    def dump(self, dt: float):
+        import faulthandler
+        try:
+            from exllamav3.util import jit_log
+            jit = jit_log.pending()
+        except ImportError:
+            jit = None
+        busy = "not logged (EXL3_LOG_JIT=1 logs them)" if jit is None else ", ".join(f"{n} {a:.0f} s" for n, a in jit) or "none"
+        print(f"qserve: {self.label} still running after {dt:.0f} s, stack of every thread below (EXL3_STALL_DUMP_S=0 = off); "
+              f"Triton compiles in flight: {busy}", flush=True)
+        try:
+            faulthandler.dump_traceback(file=sys.stdout, all_threads=True)
+        except (ValueError, OSError, io.UnsupportedOperation):   # stdout without a file descriptor (captured)
+            import traceback
+            for tid, frame in sys._current_frames().items():
+                print(f"Thread {tid:#x}:\n" + "".join(traceback.format_stack(frame)), flush=True)
 
     def __exit__(self, *exc):
         self.stop.set()
