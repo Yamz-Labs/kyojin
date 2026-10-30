@@ -5,6 +5,7 @@ from __future__ import annotations
 import os, sys, time
 
 _t0: dict = {}
+_on = False
 
 
 def install(log=None) -> bool:
@@ -14,16 +15,18 @@ def install(log=None) -> bool:
         from triton import knobs
     except Exception:   # noqa: BLE001  older triton: no hooks
         return False
+    global _on
+    _on = True
     out = log or (lambda s: print(s, file=sys.stderr, flush=True))
     started = time.perf_counter()
 
     def pre(*, key, repr, fn, compile, is_manual_warmup, already_compiled):
         if not already_compiled:
-            _t0[key] = time.perf_counter()
+            _t0[key] = (time.perf_counter(), str(repr).split("[", 1)[0])
         return False
 
     def post(*, key, repr, fn, compile, is_manual_warmup, already_compiled):
-        t = _t0.pop(key, None)
+        t = _t0.pop(key, (None,))[0]
         if t is None or already_compiled:
             return
         now = time.perf_counter()
@@ -38,3 +41,11 @@ def install(log=None) -> bool:
     knobs.runtime.jit_cache_hook = pre
     knobs.runtime.jit_post_compile_hook = post
     return True
+
+
+def pending():
+    """[(kernel name, seconds)] of the compiles started and not finished yet; None when the log is off (no hooks)."""
+    if not _on:
+        return None
+    now = time.perf_counter()
+    return [(name, now - t) for t, name in list(_t0.values())]
