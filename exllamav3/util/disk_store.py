@@ -84,8 +84,9 @@ class DiskStore:
         except Exception:                                                        # noqa: BLE001 torn / foreign
             return None
 
-    def read(self, name: str):
-        d = torch.load(self._p(name, ".pt"), map_location="cpu", weights_only=False)
+    def read(self, name: str, mmap: bool = False):
+        """mmap: tensors stay backed by the file (page cache), so a reader that copies only part of them pays only that part"""
+        d = torch.load(self._p(name, ".pt"), map_location="cpu", weights_only=False, mmap=mmap)
         self.touch(name)
         self.stats["hits"] += 1
         return d
