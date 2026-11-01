@@ -37,8 +37,8 @@ _BULK_OFF_FILE = os.environ.get("EXL3_PD_BULK_OFF_FILE", "")      # bench switch
 
 
 def bulk_on() -> bool:
-    """pinned bulk restore (default); EXL3_PD_BULK=0 = the per-page copies"""
-    return os.environ.get("EXL3_PD_BULK", "1") != "0" and not (_BULK_OFF_FILE and os.path.exists(_BULK_OFF_FILE))
+    """pinned bulk restore (default on CUDA: 390 -> 295 ms; on ROCm unified memory it costs 329 -> 617 ms); EXL3_PD_BULK=0|1 forces it"""
+    return os.environ.get("EXL3_PD_BULK", "0" if torch.version.hip else "1") != "0" and not (_BULK_OFF_FILE and os.path.exists(_BULK_OFF_FILE))
 
 
 def weights_identity(model_dir: str) -> str:
