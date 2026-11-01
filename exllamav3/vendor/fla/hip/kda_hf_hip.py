@@ -6,6 +6,7 @@ import ctypes, hashlib, os, subprocess
 import torch
 import triton
 from exllamav3.util import hip_compiler
+from exllamav3.util.knobs import knob
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kda_hf.hip")
@@ -46,7 +47,7 @@ def _load(defs=""):
 def kda_hf_ok(q, k, v, g, beta, initial_state, chunk_size):
     """q, k [1, T, H, 128] bf16 (l2-normalized), v [1, T, HV, 128] bf16, g [1, T, HV, 128] fp32 = 64-row-local log2 cumsum,
     beta [1, T, HV] bf16, all contiguous."""
-    if os.environ.get("EXL3_KDA_HF", "0") != "1" or _state.get("fail"):
+    if knob("EXL3_KDA_HF", "0") != "1" or _state.get("fail"):
         return False
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
@@ -63,7 +64,7 @@ def chunk_kda_hf(q, k, v, g, beta, scale, initial_state, output_final_state, ckp
     if defs is None:
         # diagonal 16x16 blocks: from fla's token_parallel kernel (exact fp32 pairwise decay) by default; EXL3_KDA_HF_DIAG=1 (read
         # per call) computes them in the kernel with bf16 WMMA (faster, but heavier per-token error tails on real GLM inputs)
-        defs = "" if os.environ.get("EXL3_KDA_HF_DIAG", "0") == "1" else "KHF_TP=1"
+        defs = "" if knob("EXL3_KDA_HF_DIAG", "0") == "1" else "KHF_TP=1"
     try:
         fn = _load(defs)
     except Exception:

@@ -55,6 +55,15 @@ typedef u32 v8u __attribute__((ext_vector_type(8)));
 #ifndef KEY_LO
 #define KEY_LO 0                      // KVWIN: tokens below KEY_LO are not attended (the fp16 ring serves the sinks)
 #endif
+#ifndef VPF
+#define VPF 1                         // this slab's V runs are issued before its S stage, so their DRAM latency overlaps
+#endif                                // the S dequant/WMMA and the softmax (bit-identical, scheduling only; 0 = pre-lever order)
+#ifndef SMM1
+#define SMM1 0                        // DW > 1: single-buffer the cross-wave S exchange (half the LDS, one extra barrier per slab)
+#endif
+#ifndef SMMB
+#define SMMB 0                        // DW > 1: keep the double buffer but re-align the waves on every slab (extra barrier only)
+#endif
 
 __device__ __forceinline__ u32 hsub2(u32 a, u32 b) { return __builtin_bit_cast(u32, __builtin_bit_cast(v2h, a) - __builtin_bit_cast(v2h, b)); }
 __device__ __forceinline__ u32 hmul2(u32 a, u32 b) { return __builtin_bit_cast(u32, __builtin_bit_cast(v2h, a) * __builtin_bit_cast(v2h, b)); }
@@ -269,7 +278,7 @@ qdec_split(
     const float sl = SCALE * LOG2E;
     const float qmin = (float)(total_k - QLEN);
 
-    float* Ssm = (float*) scratch;                       // DW > 1: [2][NSW*DW][NT][8][32] partial S, double buffered
+    float* Ssm = (float*) scratch;                       // DW > 1: [NSW*DW][NT][8][32] partial S (double buffered unless SMM1)
     u32 kw[KWW];             // this lane's token row of K (kvh slice of this wave's groups)
     u16 ksc[GWV];            // its scales
     int row0 = 0, lim = 0;
@@ -330,8 +339,24 @@ qdec_split(
         v8f S[NT];
         #pragma unroll
         for (int j = 0; j < NT; j++) S[j] = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
+#if VPF && !TQF
+        u32 vr[16][NRW > 0 ? NRW : 1];                   // this slab's V runs, loaded up front (see VPF)
+        u32 vsc[16];
+#endif
 
         if (active) {
+#if VPF && !TQF
+            {
+                const int dcol = dw * HDW + DTW * n;
+                const int gi_v = dcol >> 5, p0 = dcol & 31;
+                #pragma unroll
+                for (int e = 0; e < 16; e++) {
+                    size_t row = (size_t) row0 + min(e, lim);
+                    load_run(vr[e], v_cache + row * (GPT * VB) + kvh * VCHW + gi_v * VB, p0);
+                    vsc[e] = TQ ? ((u32) v_scales[row * NKV + kvh] * 0x10001u) : scale2<VB>(v_scales[row * GPT + kvh * G + gi_v]);
+                }
+            }
+#endif
             // ---- S (partial over this wave's k-steps) = Kdeq x q^T
             #pragma unroll
             for (int gl = 0; gl < GWV; gl++) {
@@ -375,7 +400,7 @@ qdec_split(
         }
         if (DW > 1) {
             // sum the partial S of the DW waves of this stream in a fixed order (every wave gets the same bits)
-            float* sb = Ssm + (size_t)(it & 1) * NSW * DW * NT * 8 * 32;
+            float* sb = Ssm + (SMM1 ? 0 : (size_t)(it & 1) * NSW * DW * NT * 8 * 32);
             if (active) {
                 #pragma unroll
                 for (int j = 0; j < NT; j++)
@@ -395,6 +420,7 @@ qdec_split(
                     }
             }
         }
+        if ((SMM1 || SMMB) && DW > 1) __syncthreads();   // SMM1: the single buffer is overwritten next iteration; SMMB: phase-align only
         if (!active) continue;
 #if TQF
         const bool more = it + 1 < iters && (sw + (it + 1) * NSW) < nslabs;
@@ -483,6 +509,7 @@ qdec_split(
             }
         }
 #else
+#if !VPF
         const int cur_row0 = row0, cur_lim = lim;
         const int dcol = dw * HDW + DTW * n;
         const int gi_v = dcol >> 5, p0 = dcol & 31;
@@ -494,6 +521,7 @@ qdec_split(
             load_run(vr[e], v_cache + row * (GPT * VB) + kvh * VCHW + gi_v * VB, p0);
             vsc[e] = TQ ? ((u32) v_scales[row * NKV + kvh] * 0x10001u) : scale2<VB>(v_scales[row * GPT + kvh * G + gi_v]);
         }
+#endif
         // next slab's K (kw is dead now)
         if (it + 1 < iters && (sw + (it + 1) * NSW) < nslabs) { slab_rows(it + 1); load_k(); }
         #pragma unroll

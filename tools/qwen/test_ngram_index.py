@@ -153,10 +153,43 @@ def recorded(dd, rounds=300, seed=3):
         print(f"recorded {L:>6}: ctx {len(ctx)} {rounds} rounds equal ({n_hits} with L>=5); cold build {cold:.2f}s, turn2 resync {turn2*1e3:.1f} ms, "
               f"new sync+match median {1e6*sorted(times)[len(times)//2]:.0f} us (max {1e6*max(times):.0f}), old tolist+scan median {1e3*sorted(t_old)[10]:.2f} ms; fallbacks {fol.idx.fallbacks}")
 
+def pool(rounds=40):
+    """FollowerPool: sessions taking turns on a shared system prompt give the same match as ngram_match, hold at most `cap` followers,
+    and a returning session resyncs by its new tokens only (no rebuild)."""
+    rnd = random.Random(7); nmin, K = 2, 6
+    sysp = [rnd.randrange(50) for _ in range(300)]
+    for cap in (1, 3):
+        fp = sp.FollowerPool(nmin, cap); ctxs = [sysp + [rnd.randrange(50) for _ in range(500 + 100 * u)] for u in range(5)]
+        sids = [SeqTensor((1, 1), torch.long, -1, init_cap=64) for _ in ctxs]
+        for u, c in enumerate(ctxs): sids[u].append(torch.tensor([c]))
+        rebuilds = 0
+        for r in range(rounds):
+            u = rnd.randrange(len(ctxs)); new = [rnd.randrange(50) for _ in range(rnd.randrange(1, 40))]
+            ctxs[u] = ctxs[u] + new; sids[u].append(torch.tensor([new]))
+            n0 = len(fp.cur.idx.toks) if fp.cur.sid is not sids[u] else 0
+            idx = fp.sync(sids[u])
+            assert idx is fp.idx and len(fp.fs) <= cap
+            assert np.array_equal(np.frombuffer(idx.toks, dtype=np.int32), np.array(ctxs[u], dtype=np.int32)), f"pool index != ctx (cap {cap}, round {r})"
+            assert idx.match(K) == sp.ngram_match(ctxs[u], nmin, K), f"pool match != ngram_match (cap {cap}, round {r})"
+        hit(f"pool_cap{cap}")
+    # alternating two sessions: once both are known, a return costs the new tokens only
+    fp = sp.FollowerPool(nmin, 2); a = [rnd.randrange(50) for _ in range(3000)]; b = [rnd.randrange(50) for _ in range(3000)]
+    sa = SeqTensor((1, 1), torch.long, -1, init_cap=64); sa.append(torch.tensor([sysp + a]))
+    sb = SeqTensor((1, 1), torch.long, -1, init_cap=64); sb.append(torch.tensor([sysp + b]))
+    fp.sync(sa); fp.sync(sb)
+    fa, fb = [f for f in fp.fs if f.sid is sa][0], [f for f in fp.fs if f.sid is sb][0]
+    assert fa is not fb
+    for sid in (sa, sb, sa, sb):
+        sid.append(torch.tensor([[1, 2, 3]])); before = len(fp.cur.idx.toks) if fp.cur.sid is sid else None
+        fp.sync(sid)
+        assert fp.cur.sid is sid and (fp.cur is fa) == (sid is sa)
+    hit("pool_alternate")
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("--fuzz", type=int, default=10000); ap.add_argument("--docs", default=os.path.expanduser("$WORK_DIR"))
     ap.add_argument("--skip-recorded", action="store_true"); a = ap.parse_args()
     fuzz(a.fuzz)
+    pool()
     print("branches:", json.dumps(BR, sort_keys=True))
-    if not a.skip_recorded: recorded(a.docs)
+    if not a.skip_recorded and os.path.exists(a.docs): recorded(a.docs)
     print("ALL OK")

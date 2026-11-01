@@ -18,7 +18,7 @@ except top-k selection (random keys give the realistic score spread of a long do
 The speculative drafter is NOT loaded: spec-off and verify are the target model's cost; MTP acceptance is content.
 Run inside:  flock ~/ds41_work/gpu.lock ~/ds41_work/cur1510/quiet.sh ...  (needs ~110 GiB free for GLM).
 """
-import argparse, ast, collections, json, os, sys, time
+import argparse, ast, collections, hashlib, json, os, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PAGE = 256
@@ -41,6 +41,24 @@ def avail_gb():
     return -1.0
 
 
+def _page_md5(cache, p0, p1, pages, torch):
+    """md5 of the KV bytes a prefill chunk wrote: only tensors indexed by page along dim 0 are sliced to
+    [p0, p1). Whole-tensor hashing is deliberately not used: the sparse-index pools carry entries from earlier
+    visits, so hashing them makes the digest depend on visit history instead of on this chunk. Returns
+    (hex, tensors hashed, tensors skipped)."""
+    hh, n, skipped = hashlib.md5(), 0, 0
+    for layer in cache.layers.values():
+        for v in layer.get_tensors():
+            if v is None:
+                continue
+            if not (v.dim() >= 2 and v.shape[0] == pages):
+                skipped += 1
+                continue
+            hh.update(v[p0:p1].float().contiguous().cpu().numpy().tobytes())
+            n += 1
+    return hh.hexdigest()[:12], n, skipped
+
+
 def _main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
@@ -58,7 +76,17 @@ def _main():
     ap.add_argument("--no-decode", action="store_true")
     ap.add_argument("--min-avail-gb", type=float, default=10.0)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--ndt-list", default="", help="draft depths to scan in ONE load, interleaved per --reps visit (e.g. 3,4,5,6 = verify rows 4..7); overrides --ndt")
+    ap.add_argument("--arm", action="append", default=[], help="NAME:K=V,K2=V2 (repeatable): A/B arms of exllamav3.util.knobs switched in this ONE load")
+    ap.add_argument("--order", default="", help="visit order of the arms, e.g. ABBAAB (default: each arm once, in the order given)")
+    ap.add_argument("--arm-eq", action="store_true", help="prefill arms: after each visit md5 the cache pages the chunk wrote (bit-identity of that arm's prefill)")
     args = ap.parse_args()
+    arms = {}
+    for spec in args.arm:
+        name, _, kv = spec.partition(":")
+        arms[name] = {k: (None if v in ("", "default") else v) for k, _, v in (i.partition("=") for i in kv.split(",") if i)}
+    order = args.order or "".join(arms)
+    arm_names = {k for a in arms.values() for k in a}
     if args.serve != "none":
         for k, v in served_env(args.serve).items():
             os.environ.setdefault(k, v)
@@ -71,8 +99,10 @@ def _main():
     torch.set_grad_enabled(False)
 
     depths = [int(x) for x in args.depths.split(",")]
+    ndt_scan = [int(x) for x in args.ndt_list.split(",")] if args.ndt_list else []
     R = args.ndt + 1
-    top = max(depths) + args.chunk + args.steps + R + 64
+    Rmax = max([R] + [n + 1 for n in ndt_scan])
+    top = max(depths) + args.chunk + args.steps + Rmax + 64
     cap = ((top + PAGE - 1) // PAGE + 1) * PAGE
     RES = {"model": args.model, "args": vars(args), "env": {k: v for k, v in os.environ.items() if k.startswith(("EXL3_", "MPW"))},
            "points": {}}
@@ -95,7 +125,7 @@ def _main():
     if args.kv_mode == "tq" and args.cache_bits < 16:
         from exllamav3.cache.tq import CacheLayer_tq
         qkw["layer_type"] = CacheLayer_tq
-    cache = Cache(model, max_num_tokens=cap, max_history=max(3, R), max_batch_size=1, **qkw)
+    cache = Cache(model, max_num_tokens=cap, max_history=max(3, Rmax), max_batch_size=1, **qkw)
     model.load(device="cuda:0", progressbar=False)
     RES["load_s"] = round(time.time() - t0, 1)
     RES["avail_after_load_gb"] = round(avail_gb(), 1)
@@ -145,6 +175,15 @@ def _main():
     chunk_ids = torch.randint(1000, min(V, 100000), (1, args.chunk), generator=gen)
     one = torch.randint(1000, min(V, 100000), (1, 1), generator=gen)
     rows = torch.randint(1000, min(V, 100000), (1, R), generator=gen)
+    rows_of = {R: rows}
+
+    def rows_for(r):
+        if r not in rows_of:                       # one synthetic row set per row count, reused across visits
+            rows_of[r] = torch.randint(1000, min(V, 100000), (1, r), generator=gen)
+        return rows_of[r]
+
+    import hashlib
+    HASH = hashlib.md5()
 
     def timed_steps(ids, d, n, verify=False):
         ts = []
@@ -152,6 +191,8 @@ def _main():
             torch.cuda.synchronize(); a = time.perf_counter()
             lg = fwd(ids, d + k, verify=verify)
             _ = lg[0, -1].argmax().item()            # the served step ends with the token readback
+            if os.environ.get("DP_HASH") == "1":     # bit-identity probe: md5 of the logits of every step
+                HASH.update(lg.float().cpu().numpy().tobytes())
             ts.append(time.perf_counter() - a)
         return ts
 
@@ -168,23 +209,104 @@ def _main():
     med = lambda x: sorted(x)[len(x) // 2]
     for d in depths:
         RES["points"][str(d)] = {}
-    if not args.no_decode:
+    def decode_points(P, hashes=None, R_=None, ids_rows=None):
+        """decode and verify rows at depth d into P; hashes (arm runs) gets the md5 of the first step's last-row logits"""
+        R_ = R_ or R
+        ids_rows = rows if ids_rows is None else ids_rows
+        for label, ids, n_rows in (("decode", one, 1), ("verify", ids_rows, R_)):
+            ver = label == "verify"
+            fresh(d)
+            timed_steps(ids, d, 3, ver)                  # graph capture / JIT / allocator at this length
+            fresh(d)
+            if hashes is not None:
+                hashes[label] = hashlib.md5(fwd(ids, d, verify=ver)[0, -1].float().cpu().numpy().tobytes()).hexdigest()[:12]
+                fresh(d)
+            ts = timed_steps(ids, d, args.steps, ver)
+            P[label] = {"ms": round(1e3 * med(ts), 3), "ms_min": round(1e3 * min(ts), 3), "rows": n_rows,
+                        "tok_s_per_row": round(n_rows / med(ts), 2)}
+            if args.kernels:
+                fresh(d)
+                P[label]["window"] = window(lambda: [fwd(ids, d + k, verify=ver) for k in range(4)], 4)
+
+    if not args.no_decode and not args.arm and not ndt_scan:
         for d in depths:
             P = RES["points"][str(d)]
-            for label, ids, n_rows in (("decode", one, 1), ("verify", rows, R)):
-                ver = label == "verify"
-                fresh(d)
-                timed_steps(ids, d, 3, ver)                  # graph capture / JIT / allocator at this length
-                fresh(d)
-                ts = timed_steps(ids, d, args.steps, ver)
-                P[label] = {"ms": round(1e3 * med(ts), 3), "ms_min": round(1e3 * min(ts), 3), "rows": n_rows,
-                            "tok_s_per_row": round(n_rows / med(ts), 2)}
-                if args.kernels:
-                    fresh(d)
-                    P[label]["window"] = window(lambda: [fwd(ids, d + k, verify=ver) for k in range(4)], 4)
+            decode_points(P)
+            if os.environ.get("DP_HASH") == "1": print(f"[hash] depth {d} {HASH.hexdigest()}", flush=True)
             print(f"[dec] depth {d}: decode {P['decode']['ms']} ms, verify({R} rows) {P['verify']['ms']} ms", flush=True)
             guard(f"decode@{d}"); save()
-    if not args.no_prefill:
+    if not args.no_decode and args.arm:
+        from exllamav3.util import knobs
+        names = arm_names
+        RES["arms"] = {a: {"knobs": arms[a], "visits": []} for a in arms}
+        for n, a in enumerate(order):
+            knobs.set_knobs({k: arms[a].get(k) for k in sorted(names)})        # one load: graphs and caches are dropped when a value changes
+            visit = {"n": n, "points": {}}
+            for d in depths:
+                P, H = {}, {}
+                decode_points(P, H)
+                P["md5"] = H
+                visit["points"][str(d)] = P
+                print(f"[dec] visit {n} arm {a} depth {d}: decode {P['decode']['ms']} ms ({H['decode']}), verify({R} rows) {P['verify']['ms']} ms ({H['verify']})", flush=True)
+                guard(f"decode@{d}"); save()
+            RES["arms"][a]["visits"].append(visit)
+        knobs.set_knobs({k: None for k in names})
+        for a in arms:
+            for d in depths:
+                vs = [v["points"][str(d)] for v in RES["arms"][a]["visits"]]
+                print(f"[arm {a}] depth {d}: decode {med([v['decode']['ms'] for v in vs])} ms  verify {med([v['verify']['ms'] for v in vs])} ms  "
+                      f"md5 {'stable' if all(v['md5'] == vs[0]['md5'] for v in vs) else 'UNSTABLE'} {vs[0]['md5']}", flush=True)
+    if ndt_scan and not args.no_decode:
+        RES["rows_scan"] = {str(n + 1): {} for n in ndt_scan}
+        for rep in range(args.reps):                 # visits interleaved over row counts: one CPU window for all of them
+            for n in ndt_scan:
+                r = n + 1
+                for d in depths:
+                    P = {}
+                    decode_points(P, None, r, rows_for(r))
+                    RES["rows_scan"][str(r)].setdefault(str(d), []).append(P)
+                    print(f"[rows] rep {rep} rows {r} depth {d}: decode {P['decode']['ms']} ms, "
+                          f"verify {P['verify']['ms']} ms (min {P['verify']['ms_min']})", flush=True)
+                save(); guard(f"rows@{r}")
+        for n in ndt_scan:
+            r = n + 1
+            for d in depths:
+                vs = RES["rows_scan"][str(r)][str(d)]
+                print(f"[rows {r}] depth {d}: verify med {med([v['verify']['ms'] for v in vs])} ms "
+                      f"(min {min(v['verify']['ms_min'] for v in vs)}, max {max(v['verify']['ms'] for v in vs)}), "
+                      f"decode med {med([v['decode']['ms'] for v in vs])} ms over {len(vs)} visits", flush=True)
+        save()
+    if not args.no_prefill and arms:
+        from exllamav3.util import knobs
+        fresh(depths[0])
+        fwd(chunk_ids, depths[0], prefill=True); torch.cuda.synchronize()        # warm
+        pacc = {(a, d): [] for a in arms for d in depths}
+        for n, a in enumerate(order):
+            knobs.set_knobs({k: arms[a].get(k) for k in sorted(arm_names)})
+            for d in depths:
+                fresh(d)
+                torch.cuda.synchronize(); t = time.perf_counter()
+                fwd(chunk_ids, d, prefill=True)
+                torch.cuda.synchronize(); pacc[(a, d)].append(time.perf_counter() - t)
+                print(f"[pf] visit {n} arm {a} depth {d}: {1e3 * pacc[(a, d)][-1]:.0f} ms/chunk", flush=True)
+                if args.arm_eq:      # model.prefill returns None: its only output is the cache it wrote
+                    eqh = _page_md5(cache, d // PAGE, (d + args.chunk) // PAGE, cap // PAGE, torch)
+                    RES["points"][str(d)].setdefault("prefill_eq_" + a, {}).setdefault("md5", []).append(eqh[0])
+                    print(f"[pfeq] visit {n} arm {a} depth {d}: {eqh[0]} (tensors {eqh[1]}, skipped {eqh[2]})", flush=True)
+                if args.kernels and n < len(arms):                               # one traced chunk per arm per depth
+                    fresh(d)
+                    RES["points"][str(d)].setdefault("prefill_" + a, {})["window"] = window(lambda: fwd(chunk_ids, d, prefill=True), 1)
+                guard(f"prefill@{d}"); save()
+        knobs.set_knobs({k: None for k in arm_names})
+        for a in arms:
+            for d in depths:
+                ms = med(pacc[(a, d)])
+                e = RES["points"][str(d)].setdefault("prefill_" + a, {})
+                e.update({"ms": round(1e3 * ms, 2), "all_ms": [round(1e3 * x, 2) for x in pacc[(a, d)]], "chunk": args.chunk,
+                          "tok_s": round(args.chunk / ms, 1)})
+                print(f"[pf arm {a}] depth {d}: {1e3 * ms:.0f} ms/chunk = {args.chunk / ms:.1f} tok/s ({len(pacc[(a, d)])} visits)", flush=True)
+        save()
+    elif not args.no_prefill:
         fresh(depths[0])
         for _ in range(1):
             fwd(chunk_ids, depths[0], prefill=True); torch.cuda.synchronize()     # warm

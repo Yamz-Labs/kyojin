@@ -5,6 +5,7 @@ import torch
 from ...ext import exllamav3_ext as ext
 from ...constants import PAGE_SIZE
 from ...util.tensor import g_tensor_cache
+from ...util.knobs import knob_on, on_change
 
 """
 Graph-captured decode attention (BC_Attention): the whole attention block for a decode step --
@@ -64,7 +65,13 @@ MAX_BSZ_KW = 8      # BC_Attention.MAX_BSZ
 _RING_BN = int(os.environ.get("EXL3_BC_RING_BN", "256"))
 _RING_WARPS = int(os.environ.get("EXL3_BC_RING_WARPS", "8"))
 _RING_STAGES = int(os.environ.get("EXL3_BC_RING_STAGES", "1"))
-_kvwin_bc = os.environ.get("EXL3_BC_KVWIN", "1") != "0"     # KVWIN ring inside the BC_Attention graph
+_kvwin_bc = knob_on("EXL3_BC_KVWIN")     # KVWIN ring inside the BC_Attention graph
+
+
+@on_change
+def _refresh_kvwin_bc():
+    global _kvwin_bc
+    _kvwin_bc = knob_on("EXL3_BC_KVWIN")
 
 
 def _is_pow2(n: int) -> bool:

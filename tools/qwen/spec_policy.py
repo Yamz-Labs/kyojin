@@ -227,6 +227,50 @@ class SeqFollower:
         sid._ng_lw = n
         return idx
 
+class FollowerPool:
+    """SeqFollower for a server that alternates between sessions: one follower per conversation (at most `cap`, least recently used
+    goes first), so a returning session resyncs by its new tokens only. A single follower matched the next request by common prefix
+    with the LAST request: with users taking turns that prefix is the shared system prompt and every return rebuilt the whole index
+    (about 2.5 us per token: 0.42 s at 117K). A request goes to the follower sharing most of its prompt; with none sharing half of it,
+    it takes a new follower (the oldest one while the pool is full). One user: one follower, the same work as before.
+    Host RAM: about 2 MB per 1000 tokens per follower (QWSPEC_NG_POOL=1 gives the single follower back)."""
+    def __init__(self, nmin, cap=None):
+        self.nmin = nmin; self.cap = max(1, cap if cap is not None else int(os.environ.get("QWSPEC_NG_POOL", "4")))
+        self.fs = []; self.cur = SeqFollower(nmin); self.fs.append(self.cur)
+
+    @property
+    def idx(self):
+        return self.cur.idx
+
+    @staticmethod
+    def _common(f, ids):
+        have = np.frombuffer(f.idx.toks, dtype=np.int32)
+        m = min(len(ids), len(have))
+        neq = np.flatnonzero(ids[:m] != have[:m])
+        return int(neq[0]) if len(neq) else m
+
+    def sync(self, sid):
+        f = next((f for f in self.fs if f.sid is sid), None)
+        if f is None:
+            if len(self.fs) == 1 and self.cap == 1:
+                f = self.fs[0]
+            else:
+                ids = _as_np(sid.torch()) if len(sid) else np.zeros(0, dtype=np.int64)
+                best, bp = None, -1
+                for g in self.fs:
+                    p = self._common(g, ids)
+                    if p > bp: best, bp = g, p
+                if bp * 2 >= len(ids) or (best is not None and not len(best.idx.toks)):
+                    f = best
+                elif len(self.fs) < self.cap:
+                    f = SeqFollower(self.nmin); self.fs.append(f)
+                else:
+                    f = self.fs[0]
+        if f is not self.fs[-1]:
+            self.fs.remove(f); self.fs.append(f)
+        self.cur = f
+        return f.sync(sid)
+
 # ---------------------------------------------------------------------------------------------- depth rules
 # A rule decides, per drafted depth, from the drafter's max token probability p (the "reach" is the running product):
 #   step(i, p) -> (keep, more): keep = this depth's token goes to the verify; more = draft one more depth.
@@ -482,7 +526,7 @@ def install_lookup(g, ngram, stats=None):
     before, the round verifies its continuation (K tokens, cut by cmin as in install()) and runs ONE draft forward so the
     drafter cache has no hole; every other round is the Generator's own. Only with a single active request. The cache
     needs max_history >= K. Returns an uninstall function."""
-    fol = SeqFollower(ngram[0]); K, lmin = ngram[1], ngram[2]; cmin = ngram[3] if len(ngram) > 3 else 0
+    fol = FollowerPool(ngram[0]); K, lmin = ngram[1], ngram[2]; cmin = ngram[3] if len(ngram) > 3 else 0
     orig = type(g).iterate_draftmodel_mtp_gen.__get__(g)
     orig_enqueue = g.enqueue
     def enq(job):
@@ -659,7 +703,7 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
     orig_draft = type(g).iterate_draftmodel_mtp_gen.__get__(g)
     orig_sfs = dm.sample_from_state; orig_fwd = dm.forward; orig_lmf = lm.forward
     cap = {}
-    fol = SeqFollower(ngram[0]) if ngram is not None else None
+    fol = FollowerPool(ngram[0]) if ngram is not None else None
     # Lookup drafts while several requests decode together (QWSPEC_NG_MULTI_ROWS = verify-row budget of such a round, 0 = off,
     # default 32 = the multi-job graph's B x Q limit for a dense CUDA model, off elsewhere): one follower per request
     ngm_rows = int(os.environ.get("QWSPEC_NG_MULTI_ROWS", "") or (2 * dense_cuda_rows(model))) if ngram is not None else 0
@@ -683,7 +727,12 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
             for j in (job if isinstance(job, list) else [job]):
                 if len(getattr(j, "sequences", ())) == 1:
                     fol.sync(j.sequences[0].sequence_ids)
-                    if ngm_rows: mf.setdefault(j, SeqFollower(ngram[0])).sync(j.sequences[0].sequence_ids)
+            # the per-request followers serve rounds with several requests decoding together only: a lone request would pay a cold
+            # build of its whole prompt (about 2.5 us per token) for nothing, so they are primed when a second request is there
+            if ngm_rows and len(g.active_jobs) + len(g.pending_jobs) > 1:
+                for j in list(g.active_jobs) + list(g.pending_jobs):
+                    if len(getattr(j, "sequences", ())) == 1 and j not in mf:
+                        mf[j] = SeqFollower(ngram[0]); mf[j].sync(j.sequences[0].sequence_ids)
         return r
     if fol is not None: g.enqueue = enq
     def lmf(*a, **k):

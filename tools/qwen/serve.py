@@ -306,6 +306,9 @@ def resolve_template_kwargs(body: dict[str, Any], defaults: dict[str, Any]) -> d
         kw["reasoning_effort"] = EFFORT_ALIASES.get(effort, effort)
     if "enable_thinking" in kw and not isinstance(kw["enable_thinking"], bool):
         raise BadRequest("enable_thinking must be boolean")
+    if kw.get("enable_thinking") is False and not any(
+            src.get("reasoning_effort") is not None for src in (ctk, body)):
+        kw.pop("reasoning_effort", None)
     return kw
 
 
@@ -535,7 +538,18 @@ class Retract(int):
 # prefill at 4K/16K), and EXL3_PF_SKIP (the MTP draft prefill fills K/V only and skips the 1-row lm_head, +0.5 % to +2 %).
 # Set any of them to 0 to go back.
 SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verify readback + fewer host dispatches: +0.8 % speculative, ids identical
-             ("EXL3_MOE_FUSED", "1"), ("EXL3_MOE_VALU", "1"), ("EXL3_VERIFY_ATTN_LOOP", "1"),
+             # 28/10 gfx1151: the verify block's attention runs as ONE R-row launch (qdec.hip, the ROCm many-row
+             # kernel, counterpart of cu/qdec_rows.cu on the 3090), not as R batch-1 calls: those re-dequantize the same
+             # KV window per row (16 full-attn layers x 5 launches at 5 rows). Price, ONE load per cell,
+             # ABBA, shipped env, k4v4, 10 steps: verify(3 rows) 4K 89.2 -> 83.8 ms, 32K 99.3 -> 87.2,
+             # 131K 128.8 -> 104.4, 262K 169.0 -> 131.3 (-6/-12/-19/-22 %); verify(6 rows) 4K
+             # 108.4 -> 102.6, 131K 181.6 -> 140.7 (-5/-22 %). Numerics: a different reduction order, gated
+             # per row against the bitwise loop at 4K/32K/131K (3 and 6 rows): top-1 equal on every row,
+             # max|dlogit| <= 0.078, KL <= 9.3e-5 (4-bit KV cache noise level). Served, ONE server life,
+             # /admin/knobs ABBA, 12K prompt, 200 tokens: per-round t_verify R2 77.4 -> 74.8, R3 83.6 ->
+             # 79.5, R4 88.5 -> 82.0, R5 97.9 -> 89.2, R8 110.7 -> 100.6 ms (=-3/-5/-7/-9/-9 %), tokens/round
+             # 3.0/3.0. 1 goes back to the batch-1 loop (bitwise vs plain decode).
+             ("EXL3_MOE_FUSED", "1"), ("EXL3_MOE_VALU", "1"), ("EXL3_VERIFY_ATTN_LOOP", "0"),
              ("EXL3_VERIFY_GEMV_R", "1"), ("EXL3_GEMV_R_DEC1", "1"), ("EXL3_MTP_FUSE_CATCHUP", "0"),
              ("EXL3_PLE_HIP", "1"), ("EXL3_DQ_HIP", "1"), ("EXL3_GR_HIP", "1"), ("EXL3_GDN_FUSE", "1"), ("EXL3_PF_SKIP", "1"),
              # the attention / GDN blocks keep o_proj's fp16 output (the residual apply widens in-kernel) and the ablit projection
@@ -615,7 +629,13 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
              # Follow-up turns resume from the reply-end checkpoint (T2 prefill x0.90, quality gated).
              ("EXL3_TAIL_REPLY", "1"), ("EXL3_REPLY_FIRST", "1"),
              # 17/10: multi-block exact decode top-k (bitwise on 24+ cases, decode R<=1 T>=32768 only; saves 0.13/0.42/0.91 ms per token at 128K/256K/500K). 0 = one-block.
-             ("EXL3_TOPK_PAR", "1"))
+             ("EXL3_TOPK_PAR", "1"),
+             # 28/10 gfx1151: the 1-row draft step is 4.9 ms, 3.7 ms of it the shared 248K-row K5 head (at the DRAM roof, 0.80 GB);
+             # the MTP layer itself is 1.3 ms. Reading the head's own frequent 128-row blocks (adaptive subset, probe-guarded,
+             # target verifies every draft so the text cannot change) costs 0.8 ms: served cur rule 4K, 320 tokens, ABBA x2,
+             # prose 22.2 -> 22.9 t/s (+3.2 %), code 23.2 -> 25.0 (+7.4 %), tokens/round 3.08/3.33 unchanged (+-1 %), text identical.
+             # WARM 256 draft rows (~75 rounds) so a normal reply reaches the subset; after it the round's draft share is 15.6 -> 6.5 ms.
+             ("EXL3_DRAFT_VOCAB", "98304"), ("EXL3_DRAFT_WARM", "256"))
 
 # NVIDIA only (RTX 3090; the AMD values above stay as they are). The verify of 2..8 rows costs
 # 25-29 ms against 22 ms for one row, while a draft step costs ~1.5 ms, 0.93 ms of it the 248K-row K5 head: deeper drafts pay
@@ -1522,11 +1542,11 @@ def format_logprobs(entries: list, token_ids: list[int], token_str, chat: bool) 
 
 
 # Every route of create_app(), for the early /health listener (404 / 405 while loading); a test keeps it in step.
-ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",)}
+ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",), "/admin/knobs": ("GET", "POST")}
 
 
 def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, Any] | None = None,
-               default_max_tokens: int | None = None) -> web.Application:
+               default_max_tokens: int | None = None, admin_knobs: bool = False) -> web.Application:
     """HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     defaults = defaults or load_defaults("/nonexistent")
     queue: asyncio.Queue = asyncio.Queue()
@@ -2244,6 +2264,25 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         except (ValueError, FileNotFoundError, RuntimeError, json.JSONDecodeError) as exc:
             return err(400, f"{type(exc).__name__}: {exc}")
 
+    @contextlib.asynccontextmanager
+    async def exclusive():
+        """No request runs inside: every session permit is held (the slot-action drain)."""
+        async with lock:
+            held = 0
+            try:
+                for _ in range(sessions):
+                    await gate.acquire()
+                    held += 1
+                yield
+            finally:
+                for _ in range(held):
+                    gate.release()
+
+    if admin_knobs:
+        import admin_knobs as _admin
+        h = _admin.make_handler(engine, exclusive)
+        app.router.add_get("/admin/knobs", h)
+        app.router.add_post("/admin/knobs", h)
     app.router.add_get("/v1/models", models)
     app.router.add_get("/health", health)
     app.router.add_post("/v1/chat/completions", lifecycle.wrapped(completions))
@@ -2369,6 +2408,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model", default=DEFAULT_MODEL, help="pack directory")
+    parser.add_argument("--admin-knobs", action="store_true", help="opt in to POST /admin/knobs (loopback clients only): switch the A/B knobs of exllamav3.util.knobs without a reload")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="id shown by /v1/models and expected in requests")
     parser.add_argument("--ctx", "-c", type=int, default=65536, help="KV cache size in tokens (default 65536)")
     parser.add_argument("--cache-bits", type=int, default=0, choices=(0, 8),
@@ -2449,7 +2489,7 @@ def main() -> None:
     except BaseException as exc:                                  # noqa: BLE001
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
-    app = create_app(engine, args.model_id, template, defaults, args.default_max_tokens)
+    app = create_app(engine, args.model_id, template, defaults, args.default_max_tokens, admin_knobs=args.admin_knobs)
     print(f"qserve: {app['ping'].describe()}", flush=True)
     print(f"qserve: {app['reqlog'].describe()}", flush=True)
 

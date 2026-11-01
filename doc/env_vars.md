@@ -1204,6 +1204,9 @@ latch the value at import.
 | `EXL3_MOE_FUSED` | `1` | The fused MoE kernel. Ignored on a non-ROCm build. |
 | `EXL3_MOE_VALU` | `1` | The FDOT2 VALU decode matvec for K2/K4 experts instead of the WMMA body (bitwise-identical outputs). K=2 also defaults on without it; `0` forces the WMMA body everywhere. |
 | `EXL3_VERIFY_ATTN_LOOP` | `1` | Runs an R-row verify attention as the exact R single-row loop, which is what keeps a verify forward bit-identical. |
+| `EXL3_PD_BULK` | `1` on CUDA, `0` on ROCm | Prefix disk restore with one pinned bulk copy instead of per-page copies. Bulk is faster on CUDA and slower on ROCm unified memory. |
+| `EXL3_RC_ANCHOR_MAX` | `16384` | Recurrent checkpoint cache: power-of-two positions up to this value are evicted last, so a compaction turn can resume from them. `0` gives plain LRU. |
+| `QWSPEC_NG_POOL` | `4` | N-gram followers kept per server, one per conversation. `1` gives the single follower back. |
 | `EXL3_VERIFY_GEMV_R` | `1` | Runs the decode projections of an R-row verify as one multi-row GEMV instead of R single-row calls. |
 | `EXL3_GEMV_R_DEC1` | `1` | Decodes each weight pair once per verify forward and shares it across rows, instead of decoding it again per row. Bit-identical, and it needs `EXL3_GEMV_R_RM6`. |
 | `EXL3_MTP_FUSE_CATCHUP` | `0` | `0` runs a catch-up draft prefill after each accepted round, `1` folds those rows into the next draft forward, `2` does that on the union MoE path. Unset means auto. |
