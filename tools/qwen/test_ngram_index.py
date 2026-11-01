@@ -191,5 +191,5 @@ if __name__ == "__main__":
     fuzz(a.fuzz)
     pool()
     print("branches:", json.dumps(BR, sort_keys=True))
-    if not a.skip_recorded: recorded(a.docs)
+    if not a.skip_recorded and os.path.exists(a.docs): recorded(a.docs)
     print("ALL OK")
