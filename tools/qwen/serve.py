@@ -306,6 +306,9 @@ def resolve_template_kwargs(body: dict[str, Any], defaults: dict[str, Any]) -> d
         kw["reasoning_effort"] = EFFORT_ALIASES.get(effort, effort)
     if "enable_thinking" in kw and not isinstance(kw["enable_thinking"], bool):
         raise BadRequest("enable_thinking must be boolean")
+    if kw.get("enable_thinking") is False and not any(
+            src.get("reasoning_effort") is not None for src in (ctk, body)):
+        kw.pop("reasoning_effort", None)
     return kw
 
 

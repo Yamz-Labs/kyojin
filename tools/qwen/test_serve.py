@@ -201,7 +201,9 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(serve.resolve_template_kwargs({}, d), {"reasoning_effort": "low"})
         self.assertEqual(serve.resolve_template_kwargs({"reasoning_effort": "high"}, d), {"reasoning_effort": "xhigh"})
         self.assertEqual(serve.resolve_template_kwargs({"chat_template_kwargs": {"enable_thinking": False}}, d),
-                         {"enable_thinking": False, "reasoning_effort": "low"})
+                         {"enable_thinking": False})
+        self.assertEqual(serve.resolve_template_kwargs({"enable_thinking": False, "reasoning_effort": "medium"}, d),
+                         {"enable_thinking": False, "reasoning_effort": "medium"})
         self.assertEqual(serve.resolve_template_kwargs({"reasoning_effort": "none"}, d), {"enable_thinking": False})
         with self.assertRaises(serve.BadRequest):
             serve.resolve_template_kwargs({"enable_thinking": "no"}, d)
