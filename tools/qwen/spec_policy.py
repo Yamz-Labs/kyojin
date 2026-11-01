@@ -683,7 +683,12 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
             for j in (job if isinstance(job, list) else [job]):
                 if len(getattr(j, "sequences", ())) == 1:
                     fol.sync(j.sequences[0].sequence_ids)
-                    if ngm_rows: mf.setdefault(j, SeqFollower(ngram[0])).sync(j.sequences[0].sequence_ids)
+            # the per-request followers serve rounds with several requests decoding together only: a lone request would pay a cold
+            # build of its whole prompt (about 2.5 us per token) for nothing, so they are primed when a second request is there
+            if ngm_rows and len(g.active_jobs) + len(g.pending_jobs) > 1:
+                for j in list(g.active_jobs) + list(g.pending_jobs):
+                    if len(getattr(j, "sequences", ())) == 1 and j not in mf:
+                        mf[j] = SeqFollower(ngram[0]); mf[j].sync(j.sequences[0].sequence_ids)
         return r
     if fol is not None: g.enqueue = enq
     def lmf(*a, **k):
