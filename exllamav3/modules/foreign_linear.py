@@ -24,6 +24,7 @@ import torch
 from .module import Module
 from ..ext import exllamav3_ext as ext
 from ..foreign_quant.gap_formats import dequant as gap_dequant
+from ..foreign_quant import triton_gap
 
 FUSED_ROWS_MAX = 16
 _FUSED = os.environ.get("BOLT_FQ_FUSED", "1") != "0"
@@ -43,6 +44,8 @@ _PAIR = os.environ.get("BOLT_FQ_PAIR", "1") != "0"
 _FORMATS = ("q8_0", "iq2_xxs", "nvfp4", "q4_k", "q5_k", "q6_k", "iq4_xs",
             "q4_0", "q5_0", "iq4_nl", "iq3_xxs", "iq3_s", "mxfp4", "nvfp4_gguf")
 # GGUF blocks without a fused kernel yet: torch dequant (foreign_quant/gap_formats.py) + matmul at every width.
+# BOLT_FQ_GAP_FUSED=0 turns the fused Triton decode kernel off (A/B).
+_GAP_FUSED = os.environ.get("BOLT_FQ_GAP_FUSED", "1") != "0"
 _GAP_FORMATS = ("q4_0", "q5_0", "iq4_nl", "iq3_xxs", "iq3_s", "mxfp4", "nvfp4_gguf")
 # GGUF K-quant formats: decode (rows < 16) via the q8_1-
 # activation row kernels; prefill (rows >= 16) via the unfused fp16 dequant
@@ -210,7 +213,14 @@ class ForeignLinear(Module):
         if not flat.is_contiguous():
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
-        if self.format in _KQ_FORMATS:
+        if (
+            _GAP_FUSED and self.format in _GAP_FORMATS and flat.dtype == torch.half
+            and triton_gap.supported(self.format, R, K, self.out_features)
+        ):
+            out = triton_gap.gemv(self.format, flat, self.packed)
+            if out.dtype != dtype:
+                out = out.to(dtype)
+        elif self.format in _KQ_FORMATS:
             # KQ path: quantize once to the cached q8 scratch, one
             # row-per-block launch. Decode widths (R < 16) always run here;
             # prefill widths (R >= 16) use the unfused fp16 GEMM below (one
