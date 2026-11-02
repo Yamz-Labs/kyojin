@@ -23,6 +23,7 @@ import torch
 
 from .module import Module
 from ..ext import exllamav3_ext as ext
+from ..foreign_quant.gap_formats import dequant as gap_dequant
 
 FUSED_ROWS_MAX = 16
 _FUSED = os.environ.get("BOLT_FQ_FUSED", "1") != "0"
@@ -39,7 +40,10 @@ _UNFUSED_ROWS = int(os.environ.get("BOLT_FQ_UNFUSED_ROWS", "8192"))
 # restores the direct dot for A/B.
 _PAIR = os.environ.get("BOLT_FQ_PAIR", "1") != "0"
 
-_FORMATS = ("q8_0", "iq2_xxs", "nvfp4", "q4_k", "q5_k", "q6_k", "iq4_xs")
+_FORMATS = ("q8_0", "iq2_xxs", "nvfp4", "q4_k", "q5_k", "q6_k", "iq4_xs",
+            "q4_0", "q5_0", "iq4_nl", "iq3_xxs", "iq3_s", "mxfp4", "nvfp4_gguf")
+# GGUF blocks without a fused kernel yet: torch dequant (foreign_quant/gap_formats.py) + matmul at every width.
+_GAP_FORMATS = ("q4_0", "q5_0", "iq4_nl", "iq3_xxs", "iq3_s", "mxfp4", "nvfp4_gguf")
 # GGUF K-quant formats: decode (rows < 16) via the q8_1-
 # activation row kernels; prefill (rows >= 16) via the unfused fp16 dequant
 # + cuBLAS GEMM path, one GEMM per call -- i.e. one GEMM per
@@ -132,7 +136,7 @@ class ForeignLinear(Module):
     def load(self, device: torch.device, **kwargs):
         self.device = device
         stc = self.config.stc
-        if self.format in ("q8_0", "iq2_xxs") or self.format in _KQ_FORMATS:
+        if self.format in ("q8_0", "iq2_xxs") or self.format in _KQ_FORMATS or self.format in _GAP_FORMATS:
             # Single raw payload (KQ GGUF bytes / Q8_0 / IQ2_XXS blocks).
             self.packed = stc.get_tensor(self.key + ".weight", device, no_defer=True)
             assert self.packed.dtype == torch.uint8, f"{self.key}: expected U8 payload, got {self.packed.dtype}"
@@ -161,6 +165,8 @@ class ForeignLinear(Module):
         N = self.out_features
         assert 0 <= first and first + count <= N
         dev = self.packed.device
+        if self.format in _GAP_FORMATS:
+            return gap_dequant(self.format, self.packed[first:first + count])
         if self.format in _KQ_FORMATS:
             Kb = self.in_features // 256
             bb = _KQ_BLOCK_BYTES[self.format]
@@ -247,6 +253,7 @@ class ForeignLinear(Module):
                     ext_fn(qb, self.packed, out[_s:_e])
         elif (
             _FUSED and R >= 1 and R <= FUSED_ROWS_MAX and flat.is_contiguous()
+            and self.format not in _GAP_FORMATS
             and flat.dtype in (torch.half, torch.float)
             and hasattr(ext, "fq_gemv_q8_0")
             and _GEMV
@@ -262,6 +269,7 @@ class ForeignLinear(Module):
                                   self.scales.reshape(N, K // 16), self.global_scale, out, _PAIR)
         elif (
             _FUSED and R >= 1 and R <= FUSED_ROWS_MAX and flat.dtype == torch.half and flat.is_contiguous()
+            and self.format not in _GAP_FORMATS
             and hasattr(ext, "fq_gemm_q8_0")
         ):
             N = self.out_features

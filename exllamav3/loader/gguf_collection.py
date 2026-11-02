@@ -26,7 +26,11 @@ GGML_BBS = {
     14: 210,  # Q6_K
     23: 136,  # IQ4_XS
 }
-GGML_QUANT = set(GGML_BBS.keys())
+# (elements, bytes) per block of the formats served by gap_formats / fq_gemv_q8_0 (32- and 64-element blocks)
+GGML_BLK = {t: (256, bb) for t, bb in GGML_BBS.items()}
+GGML_BLK.update({2: (32, 18), 6: (32, 22), 8: (32, 34), 20: (32, 18), 18: (256, 98), 21: (256, 110),
+                 39: (32, 17), 40: (64, 36)})
+GGML_QUANT = set(GGML_BLK.keys())
 
 _META_SZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
@@ -203,10 +207,10 @@ class GGUFCollection:
         ty, dims, off = info
         dev = device if device is not None else torch.device("cpu")
         if ty in GGML_QUANT:
-            bb = GGML_BBS[ty]
+            qk, bb = GGML_BLK[ty]
             K, N = dims[0], dims[1]
-            assert K % 256 == 0
-            nb = K // 256
+            assert K % qk == 0
+            nb = K // qk
             if exp_idx is not None:
                 assert len(dims) == 3
                 E = dims[2]
