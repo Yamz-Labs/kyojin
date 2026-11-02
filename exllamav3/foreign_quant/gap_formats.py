@@ -11,8 +11,11 @@ import torch
 from .gguf_tables import IQ3_S_GRID, IQ3_XXS_GRID, IQ4_NL_VALUES, KSIGNS
 
 # name -> (elements per block, bytes per block)
-BLOCKS = {"q4_0": (32, 18), "q5_0": (32, 22), "iq4_nl": (32, 18), "iq3_xxs": (256, 98), "iq3_s": (256, 110)}
-GGML_TYPE_IDS = {"q4_0": 2, "q5_0": 6, "iq3_xxs": 18, "iq4_nl": 20, "iq3_s": 21}
+BLOCKS = {"q4_0": (32, 18), "q5_0": (32, 22), "iq4_nl": (32, 18), "iq3_xxs": (256, 98), "iq3_s": (256, 110),
+          "mxfp4": (32, 17), "nvfp4_gguf": (64, 36)}
+GGML_TYPE_IDS = {"q4_0": 2, "q5_0": 6, "iq3_xxs": 18, "iq4_nl": 20, "iq3_s": 21, "mxfp4": 39, "nvfp4_gguf": 40}
+# MXFP4 / NVFP4 nibble -> value in half units (the scale carries the other factor 0.5)
+_FP4_HALF = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
 _TABLES: dict = {}
 
@@ -22,6 +25,8 @@ def _table(name: str, device) -> torch.Tensor:
     if key not in _TABLES:
         if name == "iq4_nl":
             t = torch.tensor(IQ4_NL_VALUES, dtype=torch.float32)
+        elif name == "fp4":
+            t = torch.tensor(_FP4_HALF, dtype=torch.float32)
         elif name == "iq3_xxs":
             t = torch.frombuffer(bytearray(IQ3_XXS_GRID), dtype=torch.uint8).reshape(256, 4).float()
         elif name == "iq3_s":
@@ -55,6 +60,21 @@ def dequant(fmt: str, raw: torch.Tensor) -> torch.Tensor:
     n = raw.shape[0]
     b = _blocks(raw, fmt)
     nb = b.shape[0]
+    if fmt == "mxfp4":      # [e8m0 scale][16 bytes: elements 0..15 low nibbles, 16..31 high nibbles]
+        e = b[:, 0:1].float()
+        d = torch.exp2(e - 128.0)                                # ggml_e8m0_to_fp32_half
+        qs = b[:, 1:17]
+        v = _table("fp4", raw.device)[torch.cat([qs & 15, qs >> 4], dim=1).long()]
+        return (d * v).reshape(n, -1).half()
+    if fmt == "nvfp4_gguf":  # 64 values: [4 x UE4M3 scale (one per 16)][4 x 8 bytes: low nibbles = first 8, high = last 8]
+        x = b[:, 0:4].long()
+        ex = (x >> 3) & 15
+        mt = (x & 7).float()
+        sc = torch.where(ex == 0, mt * 2.0 ** -9, (1.0 + mt / 8.0) * torch.exp2(ex.float() - 7.0))
+        sc = torch.where((x == 0) | (x == 0x7F), torch.zeros_like(sc), sc * 0.5)          # [nb, 4]
+        qs = b[:, 4:36].reshape(nb, 4, 8)
+        v = _table("fp4", raw.device)[torch.cat([qs & 15, qs >> 4], dim=2).long()]         # [nb, 4, 16]
+        return (sc.unsqueeze(-1) * v).reshape(n, -1).half()
     d = _f16(b[:, 0:2])                                         # [nb, 1]
     if fmt in ("q4_0", "iq4_nl", "q5_0"):
         qs = b[:, 2:18] if fmt != "q5_0" else b[:, 6:22]

@@ -16,7 +16,8 @@ sys.modules["fq_gap"] = _mod
 _pkg.loader.exec_module(_mod)
 import fq_gap.gap_formats as gf
 
-NAMES = {"q4_0": T.Q4_0, "q5_0": T.Q5_0, "iq4_nl": T.IQ4_NL, "iq3_xxs": T.IQ3_XXS, "iq3_s": T.IQ3_S}
+NAMES = {"q4_0": T.Q4_0, "q5_0": T.Q5_0, "iq4_nl": T.IQ4_NL, "iq3_xxs": T.IQ3_XXS, "iq3_s": T.IQ3_S,
+         "mxfp4": T.MXFP4, "nvfp4_gguf": T.NVFP4}
 
 
 def _random_rows(fmt, n_rows, nb, seed):
@@ -24,7 +25,12 @@ def _random_rows(fmt, n_rows, nb, seed):
     rng = np.random.default_rng(seed)
     raw = rng.integers(0, 256, size=(n_rows, nb, bb), dtype=np.uint8)
     d = rng.uniform(0.001, 0.05, size=(n_rows, nb)).astype(np.float16)    # sane fp16 scale in the first 2 bytes
-    raw[:, :, 0:2] = d.view(np.uint8).reshape(n_rows, nb, 2)
+    if fmt not in ("mxfp4", "nvfp4_gguf"):
+        raw[:, :, 0:2] = d.view(np.uint8).reshape(n_rows, nb, 2)
+    elif fmt == "mxfp4":
+        raw[:, :, 0] = rng.integers(120, 135, size=(n_rows, nb), dtype=np.uint8)
+    else:
+        raw[:, :, 0:4] = rng.integers(40, 90, size=(n_rows, nb, 4), dtype=np.uint8)
     return raw.reshape(n_rows, nb * bb)
 
 
