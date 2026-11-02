@@ -77,12 +77,14 @@ def name_map(cfg: dict) -> dict:
 
 def write_config_dir(gguf_path: str, outdir: str) -> str:
     """Create outdir/{config.json, model.gguf -> gguf_path}; return outdir."""
+    from .gguf_tokenizer import write_tokenizer_files
     g = GGUFCollection(gguf_path)
+    os.makedirs(outdir, exist_ok=True)
     try:
         cfg = hf_config(g)
+        write_tokenizer_files(g, outdir)
     finally:
         g.close()
-    os.makedirs(outdir, exist_ok=True)
     with open(os.path.join(outdir, "config.json"), "w", encoding="utf8") as f:
         json.dump(cfg, f, indent=1)
     link = os.path.join(outdir, "model.gguf")

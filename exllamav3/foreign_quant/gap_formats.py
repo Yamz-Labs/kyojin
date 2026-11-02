@@ -11,9 +11,9 @@ import torch
 from .gguf_tables import IQ3_S_GRID, IQ3_XXS_GRID, IQ4_NL_VALUES, KSIGNS
 
 # name -> (elements per block, bytes per block)
-BLOCKS = {"q4_0": (32, 18), "q5_0": (32, 22), "iq4_nl": (32, 18), "iq3_xxs": (256, 98), "iq3_s": (256, 110),
+BLOCKS = {"q8_0": (32, 34), "q4_0": (32, 18), "q5_0": (32, 22), "iq4_nl": (32, 18), "iq3_xxs": (256, 98), "iq3_s": (256, 110),
           "mxfp4": (32, 17), "nvfp4_gguf": (64, 36)}
-GGML_TYPE_IDS = {"q4_0": 2, "q5_0": 6, "iq3_xxs": 18, "iq4_nl": 20, "iq3_s": 21, "mxfp4": 39, "nvfp4_gguf": 40}
+GGML_TYPE_IDS = {"q8_0": 8, "q4_0": 2, "q5_0": 6, "iq3_xxs": 18, "iq4_nl": 20, "iq3_s": 21, "mxfp4": 39, "nvfp4_gguf": 40}
 # MXFP4 / NVFP4 nibble -> value in half units (the scale carries the other factor 0.5)
 _FP4_HALF = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
@@ -60,6 +60,9 @@ def dequant(fmt: str, raw: torch.Tensor) -> torch.Tensor:
     n = raw.shape[0]
     b = _blocks(raw, fmt)
     nb = b.shape[0]
+    if fmt == "q8_0":       # [fp16 d][32 x int8]; torch fallback for builds without the fq_* extension kernels (ROCm)
+        d = b[:, 0:2].contiguous().view(torch.float16).float()
+        return (d * b[:, 2:34].contiguous().view(torch.int8).float()).reshape(n, -1).half()
     if fmt == "mxfp4":      # [e8m0 scale][16 bytes: elements 0..15 low nibbles, 16..31 high nibbles]
         e = b[:, 0:1].float()
         d = torch.exp2(e - 128.0)                                # ggml_e8m0_to_fp32_half

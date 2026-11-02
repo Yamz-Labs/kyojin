@@ -179,6 +179,8 @@ class ForeignLinear(Module):
             getattr(ext, f"fq_dequant_{self.format}")(
                 self.packed[first:first + count].contiguous(), out)
             return out
+        if self.format == "q8_0" and not hasattr(ext, "fq_dequant_q8_0"):
+            return gap_dequant("q8_0", self.packed[first:first + count])
         if self.format == "q8_0":
             Kb = self.in_features // 32
             out = torch.empty((count, self.in_features), dtype=torch.float16, device=dev)
