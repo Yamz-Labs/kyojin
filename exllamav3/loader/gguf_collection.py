@@ -69,26 +69,28 @@ class GGUFCollection:
 
             def rs():
                 n = struct.unpack("<Q", f.read(8))[0]
-                return f.read(n).decode()
+                return f.read(n).decode(errors="replace")
 
-            def sv():
-                t = struct.unpack("<I", f.read(4))[0]
-                if t in _META_SZ:
-                    f.read(_META_SZ[t])
-                elif t == 8:
-                    f.read(struct.unpack("<Q", f.read(8))[0])
-                elif t == 9:
+            _SC = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+
+            def sv(t=None):
+                if t is None:
+                    t = struct.unpack("<I", f.read(4))[0]
+                if t in _SC:
+                    return struct.unpack(_SC[t], f.read(struct.calcsize(_SC[t])))[0]
+                if t == 8:
+                    return rs()
+                if t == 9:
                     at = struct.unpack("<I", f.read(4))[0]
                     n = struct.unpack("<Q", f.read(8))[0]
-                    if at == 8:
-                        for _ in range(n):
-                            f.read(struct.unpack("<Q", f.read(8))[0])
-                    else:
-                        f.read(n * _META_SZ[at])
+                    return [sv(at) for _ in range(n)]
+                raise ValueError(f"gguf metadata type {t}")
 
+            # Metadata kept (config + tokenizer are derived from it, see loader/gguf_config.py)
+            self.meta = {}
             for _ in range(nm):
-                rs()
-                sv()
+                k = rs()
+                self.meta[k] = sv()
             self.infos = {}
             for _ in range(nt):
                 name = rs()
