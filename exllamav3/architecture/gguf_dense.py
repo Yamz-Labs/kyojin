@@ -76,8 +76,11 @@ class GGUFDenseConfig(Config):
         if fmt == "fp":
             return
         fl = ForeignLinear(self, "model.embed_tokens", K, N, fmt)
-        fl.load(torch.device("cpu"))
-        w = torch.cat([fl._dequant_rows(i, min(4096, N - i)) for i in range(0, N, 4096)])
+        # the K-quant / Q8_0 dequant kernels are device code: run them on the GPU, keep the table on the host
+        dev = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        fl.load(dev)
+        w = torch.cat([fl._dequant_rows(i, min(4096, N - i)).cpu() for i in range(0, N, 4096)])
+        fl.unload()
         self.gguf.new_tensors = {"model.embed_tokens.weight": w}
 
     def get_tensor_name_fixes(self):
