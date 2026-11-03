@@ -83,6 +83,8 @@ class Engine:
         import torch
         if torch.version.cuda and not torch.version.hip:
             os.environ.setdefault("EXL3_CUDA_GRAPH", "1")   # NVIDIA preset: whole-forward decode graph (read at import)
+            if max_batch > 1:
+                os.environ.setdefault("EXL3_CUDA_GRAPH_MULTI", "1")   # one graph per number of decoding jobs (B 1..4), not only for a lone job
         from exllamav3 import Config, Model, Cache, Tokenizer, Generator
         from exllamav3.cache import CacheLayer_quant
         self.config = Config.from_directory(model_dir)

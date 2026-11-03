@@ -26,6 +26,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from hardware import require
+require("ext")
 from exllamav3.modules.moe_mixedk import (
     MixedKStore, MixedKUnsupported, expert_bits_from_plan, parse_expert_bits, check_expert_bits, EXPERT_BITS_KEY,
     layer_is_mixed, expert_ks)

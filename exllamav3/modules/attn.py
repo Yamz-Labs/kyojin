@@ -10,13 +10,19 @@ from .multilinear import MultiLinear, SlicedMultiLinear
 from .quant.exl3 import MAX_BSZN_GEMV_R, row_pad_pitch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
-from ..util import profile_opt
+from ..util import profile_opt, knobs
 import os
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
 # EXL3_QKV_SLICE=0 falls back to the pairwise K/V and Q/G bundles
 _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
+_shared_proj = os.environ.get("EXL3_ATTN_SHARED_PROJ", "1") != "0"
+_shared_check = os.environ.get("EXL3_ATTN_SHARED_CHECK", "0") != "0"
+# EXL3_ATTN_BATCH_QSA (default on): in the row-invariant multi-job step, when every sequence takes the sparse (QSA) path the plane update, the KV append and
+# the gathered attention launch once over all sequences (their kernels give each row the bits of the one-sequence launch); the selection stays per sequence
+_batch_qsa = os.environ.get("EXL3_ATTN_BATCH_QSA", "1") != "0"
+_SHARED_STATS = [0, 0]
 _QKV_IG_MULTI = os.environ.get("EXL3_ATTN_QKV_IG_MULTI", "1") != "0"   # (q|gate, k, v one launch)
 
 
@@ -40,6 +46,7 @@ def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
 
 from ..util.tensor import g_tensor_cache
 from .attention_fn import attn_dispatch
+from ..cache.kvwin import env_capable as _kvwin_capable, make_ctx as _kvwin_ctx, ensure_filled as _kvwin_fill, KVWinLayerState
 
 """
                    
@@ -144,6 +151,12 @@ def split_params_by_sequence(params: dict, bsz: int) -> list[dict]:
         p.pop("dev_cache", None)
         p["block_table"] = params["block_table"][b:b + 1]
         p["cache_seqlens"] = params["cache_seqlens"][b:b + 1]
+        # the sequence's own recurrent state (and slot): the KVWIN ring of the attention layer lives in it
+        rs = params.get("recurrent_states")
+        if rs and len(rs) == bsz:
+            p["recurrent_states"] = rs[b:b + 1]
+            if torch.is_tensor(params.get("recurrent_slots")):
+                p["recurrent_slots"] = params["recurrent_slots"][b:b + 1]
         if positions is not None:
             p["positions"] = p["cache_seqlens"] if positions is params["cache_seqlens"] else positions[b:b + 1]
         out.append(p)
@@ -437,13 +450,21 @@ class Attention(Module):
             "kv_cache": True
         })
 
+        # KVWIN (EXL3_KVWIN=sink:window): the fp16 sink + window ring of a quantized cache is a per-job recurrent layer state
+        self.recurrent_layers = []
+        if _kvwin_capable() and self.num_kv_heads > 0:
+            self.caps["recurrent_cache"] = True
+            self.layer_state_cls = KVWinLayerState
+
         self.cache_layers = []
         self.tp_cache_lookup = {}
         self.multi_kv = None
         self.multi_qg = None
         self.tp_reduce = False
         self.dispatch_cache = {}
+        knobs.clear_on_change(self, "dispatch_cache")   # the kernel picked per call shape may depend on a knob
         self.bc_attn = {}
+        knobs.clear_on_change(self, "bc_attn")         # BCAttn objects bake knob values (EXL3_QDEC_GRAPH, EXL3_BC_KVWIN...)
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
@@ -484,6 +505,8 @@ class Attention(Module):
         # Cache
         for cl in self.cache_layers:
             cl.alloc(device)
+        for rl in self.recurrent_layers:
+            rl.alloc(device)
 
         if self.rope_settings:
             self.rope = RoPE(
@@ -627,9 +650,12 @@ class Attention(Module):
         super().unload()
 
         self.bc_attn = {}
+        knobs.clear_on_change(self, "bc_attn")         # BCAttn objects bake knob values (EXL3_QDEC_GRAPH, EXL3_BC_KVWIN...)
 
         for cl in self.cache_layers:
             cl.free()
+        for rl in self.recurrent_layers:
+            rl.free()
 
         self.rope = None
         self.sinks = None
@@ -681,7 +707,21 @@ class Attention(Module):
                         seq_params = params.get("row_inv_seq_params")
                         if seq_params is None:
                             seq_params = params["row_inv_seq_params"] = split_params_by_sequence(params, bsz)
-                        x = torch.cat([self.decode_flash_attn(x[b:b + 1], 1, seqlen, seq_params[b]) for b in range(bsz)], dim = 0)
+                        if self.shared_proj_ok(params):
+                            xs = self.decode_flash_attn_shared(x, bsz, seqlen, params, seq_params)
+                            if _shared_check:      # debug: the per-sequence blocks as reference, bitwise
+                                xr = torch.cat([self.decode_flash_attn(x[b:b + 1], 1, seqlen, seq_params[b]) for b in range(bsz)], dim = 0)
+                                _SHARED_STATS[0] += 1
+                                if _SHARED_STATS[0] == 1: print("shared-proj check: first call", flush=True)
+                                if not torch.equal(xs, xr):
+                                    _SHARED_STATS[1] += 1
+                                    if _SHARED_STATS[1] <= 5:
+                                        print(f"shared-proj MISMATCH layer {self.layer_idx} bsz {bsz} q_len {seqlen} maxdiff {(xs.float() - xr.float()).abs().max().item()}", flush=True)
+                                if _SHARED_STATS[0] % 500 == 0:
+                                    print(f"shared-proj check: {_SHARED_STATS[1]} mismatching of {_SHARED_STATS[0]} calls", flush=True)
+                            x = xs
+                        else:
+                            x = torch.cat([self.decode_flash_attn(x[b:b + 1], 1, seqlen, seq_params[b]) for b in range(bsz)], dim = 0)
                     else:
                         x = self.decode_flash_attn(x, bsz, seqlen, params)
                 case "flash_attn_nc":
@@ -1150,7 +1190,7 @@ class Attention(Module):
         return o
 
 
-    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens, host_seqlens = None):
+    def bc_attn_step(self, x, cache, params, block_table, cache_seqlens, host_seqlens = None, kvwin_ctx = None):
         """
         Graph-captured decode attention block (projections through o_proj as one C++ call,
         replayed as one CUDA graph after warmup). Returns the block output, or None when the
@@ -1176,7 +1216,7 @@ class Attention(Module):
             return None
         return bca.step(
             x, cache_seqlens, block_table, position, positions, position_ids, inv_freq,
-            causal = params.get("causal", True), host_seqlens = host_seqlens
+            causal = params.get("causal", True), host_seqlens = host_seqlens, kvwin_ctx = kvwin_ctx
         )
 
 
@@ -1187,7 +1227,10 @@ class Attention(Module):
             return default, kwargs
         from ..cache.fp16 import CacheLayer_fp16
         from ..cache.quant import CacheLayer_quant
-        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant
+        from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant, CacheLayer_qsa_tq
+        from ..cache.tq import CacheLayer_tq
+        if issubclass(default, CacheLayer_tq):
+            return CacheLayer_qsa_tq, kwargs
         if issubclass(default, CacheLayer_quant):
             return CacheLayer_qsa_quant, kwargs
         assert issubclass(default, CacheLayer_fp16), \
@@ -1247,6 +1290,18 @@ class Attention(Module):
         self.forward(x, p2)
 
 
+    def kvwin_ctx(self, cache, params: dict, bsz: int, block_table: torch.Tensor):
+        """KVWIN ring context of this attention call (None when off, inert or the call has no job states)."""
+        if not self.caps.get("recurrent_cache"):
+            return None
+        rl = getattr(cache, "recurrent_layers", None)
+        if not rl:
+            return None
+        ctx = _kvwin_ctx(rl.get((self.layer_idx, params.get("layer_instance") or 0)), params, self.device, bsz)
+        _kvwin_fill(ctx, params, block_table)
+        return ctx
+
+
     def decode_flash_attn(
         self,
         x: torch.Tensor,
@@ -1264,6 +1319,7 @@ class Attention(Module):
         position = params.get("position", 0)
         positions = get_for_device(params, "positions", self.device, None)
         position_ids = get_for_device(params, "position_ids", self.device, None)
+        ov = self.kvwin_ctx(cache, params, bsz, block_table)
         inv_freq = get_for_device(params, "inv_freq", self.device, None)
         causal = params.get("causal", True)
         non_causal_spans = params.get("non_causal_spans")
@@ -1291,7 +1347,7 @@ class Attention(Module):
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
-                                  host_seqlens = qsa_seqlens_cpu)
+                                  host_seqlens = qsa_seqlens_cpu, kvwin_ctx = ov)
             if o is not None:
                 return o
 
@@ -1329,7 +1385,7 @@ class Attention(Module):
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
         if qsa_sparse:
-            qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
+            qsa_layer.update_kv_sparse(cache_seqlens, block_table, k, v, seqlen)
             if params.get("kv_only") and _kv_only_skip:
                 # EXL3_PF_SKIP kv_only (the MTP draft prompt prefill): K/V and the indexer planes are written, the block's
                 # output is discarded by the caller, so the selection, the sparse attention and everything after it are skipped.
@@ -1347,9 +1403,19 @@ class Attention(Module):
                 cs_host = params.get("cache_seqlens")
                 if isinstance(cs_host, torch.Tensor) and cs_host.device.type == "cpu" and cs_host.numel():
                     max_kv_len = int(cs_host.max())
+            # TurboQuant cache: the many-row kernel (cu/qdec_rows.cu) serves every row count 1..32 as one program per kv
+            # head (verified against the dequantized reference, relerr 0.7-1.9e-3), so the R verify rows run as ONE batched
+            # call like the quantized cache does through the BC graph path. The per-row loop below is a bitwise
+            # row-invariance device and costs R x the attention time (128K MTP verify: 49.3 ms/step of 98.0 vs 12.0 of
+            # 59.0 for the quant cache). EXL3_TQ_VERIFY_LOOP=1 keeps the loop.
+            tq_batch = False
+            if 1 < seqlen <= MAX_BSZN_GEMV_R and ov is None and os.environ.get("EXL3_TQ_VERIFY_LOOP", "0") == "0":
+                from ..cache import CacheLayer as _CLv
+                _lyr = cache if isinstance(cache, _CLv) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+                tq_batch = bool(getattr(_lyr, "tq", False))
             if (
-                1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and
-                os.environ.get("EXL3_VERIFY_ATTN_LOOP", "0") != "0"
+                1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and not tq_batch and
+                knobs.knob_on("EXL3_VERIFY_ATTN_LOOP", "0")
             ):
                 # Row-invariant verify: the R-row paged decode tiles the KV span from the batch's single
                 # cache_seqlens/q_len, a different float order than R batch-1 calls. Run the exact
@@ -1373,6 +1439,7 @@ class Attention(Module):
                     dispatch_cache = self.dispatch_cache,
                     max_kv_len = max_kv_len,
                     v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                    ov = ov,
                 ) for i in range(seqlen)], dim = 1)
             else:
                 o = attn_dispatch(
@@ -1393,6 +1460,7 @@ class Attention(Module):
                     dispatch_cache = self.dispatch_cache,
                     max_kv_len = max_kv_len,
                     v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                    ov = ov,
                 )
 
         if self.headwise_gate:
@@ -1414,6 +1482,115 @@ class Attention(Module):
 
         o = self.project_o(o, bsz, seqlen, params)
         return o
+
+
+    def shared_proj_ok(self, params: dict) -> bool:
+        """EXL3_ATTN_SHARED_PROJ (default on, ROCm): the row-invariant multi-job step runs the q/k/v and o projections of all
+        sequences in one launch and only the cache update + attention per sequence (decode_flash_attn_shared). CUDA keeps the
+        graph-captured per-sequence block (BC_Attention)."""
+        return (
+            _shared_proj and torch.version.hip is not None and self.num_kv_heads > 0 and
+            params.get("non_causal_spans") is None and not params.get("sim_kvq") and not params.get("kv_only") and
+            params.get("position_ids") is None and not self.tp_reduce
+        )
+
+
+    def decode_flash_attn_shared(self, x: torch.Tensor, bsz: int, seqlen: int, params: dict, seq_params: list):
+        """decode_flash_attn for a row-invariant multi-job step (params["row_inv_per_seq"]) with the projections shared by the
+        sequences. The kernels of the projections, head norms, rope and gates give each row the bits of the one-row launch
+        whatever the row count (util/row_inv.py), so those run once over the bsz * seqlen rows; the parts whose plan follows
+        the batch (the QSA plane update and selection, the paged attention split plan) run once per sequence on one-row
+        slices, exactly as decode_flash_attn(x[b:b+1], ...) does."""
+        cache = params.get("cache")
+        block_table = get_for_device(params, "block_table", self.device)
+        cache_seqlens = get_for_device(params, "cache_seqlens", self.device)
+        position = params.get("position", 0)
+        positions = get_for_device(params, "positions", self.device, None)
+        inv_freq = get_for_device(params, "inv_freq", self.device, None)
+        causal = params.get("causal", True)
+        ov_all = self.kvwin_ctx(cache, params, bsz, block_table)
+        qsa_layer = qsa_cpu = None
+        if self.qsa_indexer is not None:
+            from ..cache import CacheLayer as _CL
+            qsa_layer = cache if isinstance(cache, _CL) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
+            qsa_cpu = get_for_device(params, "cache_seqlens", "cpu")
+
+        q, k, v, g = self.project_qkv(x, params)
+        if self.q_norm:
+            if self.tp_span_heads_norm:
+                q, k = self.apply_qk_norms_tp(q, k, params)
+            elif not self.rope or self.q_norm_tensor is None:
+                q = self.q_norm.forward(q, params, out_dtype = torch.half)
+                k = self.k_norm.forward(k, params, out_dtype = torch.half)
+        if self.rope:
+            q, k = self.rope.apply(
+                q, k, position, positions, None, True,
+                self.q_norm_tensor if not self.tp_span_heads_norm else None,
+                self.k_norm_tensor if not self.tp_span_heads_norm else None,
+                self.norm_eps, self.norm_constant_bias, inv_freq,
+            )
+
+        outs = []
+        bsz_loop = bsz
+        if _batch_qsa and qsa_cpu is not None and bsz > 1:
+            thr = self.qsa_indexer.sparse_threshold()
+            if all(int(qsa_cpu[b]) + seqlen > thr for b in range(bsz)):
+                q_idx = self.qsa_indexer.update_planes(qsa_layer, x, self.rope, block_table, qsa_cpu, params)
+                qsa_layer.update_kv_sparse(cache_seqlens, block_table, k, v, seqlen)
+                outs.append(self.qsa_indexer.sparse_attend(qsa_layer, self, q, q_idx, block_table, qsa_cpu))
+                bsz_loop = 0
+        for b in range(bsz_loop):
+            sl = slice(b, b + 1)
+            bt_b, cs_b = block_table[sl], cache_seqlens[sl]
+            if qsa_cpu is not None:
+                cpu_b = qsa_cpu[sl]
+                sparse = int(cpu_b.max().item()) + seqlen > self.qsa_indexer.sparse_threshold()
+                q_idx = self.qsa_indexer.update_planes(qsa_layer, x[sl], self.rope, bt_b, cpu_b, seq_params[b])
+            else:
+                cpu_b, sparse = None, False
+            if sparse:
+                qsa_layer.update_kv_sparse(cs_b, bt_b, k[sl], v[sl], seqlen)
+                outs.append(self.qsa_indexer.sparse_attend_verify(qsa_layer, self, q[sl], q_idx, bt_b, cpu_b))
+            else:
+                max_kv_len = int(cpu_b.max().item()) if cpu_b is not None else None
+                if max_kv_len is None and seqlen > 16 and not torch.version.hip:
+                    max_kv_len = int(params["cache_seqlens"][sl].max())
+                # EXL3_VERIFY_ATTN_LOOP: the R-row paged decode as R one-row calls, as decode_flash_attn does
+                rows = range(seqlen) if 1 < seqlen <= MAX_BSZN_GEMV_R and knobs.knob_on("EXL3_VERIFY_ATTN_LOOP", "0") else None
+                def call(qq, kk, vv, cs):
+                    return attn_dispatch(
+                        q = qq, k = kk, v = vv,
+                        cache = cache, cache_idx = self.layer_idx, cache_instance = params.get("layer_instance"),
+                        block_table = bt_b, cache_seqlens = cs, causal = causal, sm_scale = self.sm_scale,
+                        window_size = self.window_arg(), softcap = self.logit_softcapping, non_causal_spans = None,
+                        sinks = self.sinks, dispatch_cache = self.dispatch_cache, max_kv_len = max_kv_len,
+                        v_dim = self.v_head_dim if self.v_head_dim != self.head_dim else None,
+                        ov = ov_all._replace(slots = ov_all.slots[sl]) if ov_all is not None else None,
+                    )
+                if rows is None:
+                    outs.append(call(q[sl], k[sl], v[sl], cs_b))
+                else:
+                    outs.append(torch.cat([call(q[sl][:, i:i + 1].contiguous(), k[sl][:, i:i + 1].contiguous(),
+                                                v[sl][:, i:i + 1].contiguous(), cs_b + i) for i in rows], dim = 1))
+        o = torch.cat(outs, dim = 0)
+
+        if self.headwise_gate:
+            if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+            else: ext.mul_sigmoid_broadcast_(o, g)
+        o = o.reshape((bsz, seqlen, self.num_q_heads * self.head_dim))
+        pitch = 0
+        if (self.full_gate or self.interleaved_gate) and self.v_head_dim == self.head_dim and not self.headwise_gate and \
+                o.dtype == torch.half and g.dtype == torch.half and o.is_contiguous() and g.is_contiguous() and \
+                getattr(ext, "mul_sigmoid_pad", None) is not None:
+            pitch = row_pad_pitch(self.o_proj, o.shape[-1], o.numel() // o.shape[-1], params)
+        if pitch:
+            o2 = torch.empty((o.numel() // o.shape[-1], pitch), dtype = torch.half, device = o.device)[:, :o.shape[-1]].view(o.shape)
+            ext.mul_sigmoid_pad(o, g, o2, pitch)
+            o = o2
+        elif self.full_gate or self.interleaved_gate:
+            ext.mul_sigmoid_(o, g)
+
+        return self.project_o(o, bsz, seqlen, params)
 
 
     def window_arg(self):

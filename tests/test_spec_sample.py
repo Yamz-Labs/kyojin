@@ -7,6 +7,8 @@ import os, sys, math, random, unittest
 os.environ.setdefault("HIP_VISIBLE_DEVICES", ""); os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+from hardware import require
+require("ext")
 from exllamav3.generator import spec_sample as ss
 from exllamav3.generator.sampler import ComboSampler, ArgmaxSampler
 

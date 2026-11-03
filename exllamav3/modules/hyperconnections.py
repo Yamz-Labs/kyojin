@@ -329,7 +329,9 @@ class HyperConnection(Module):
         if post is None or comb is None:  # GatedResidual-style sites (Qwen) carry no post/comb
             return False
         b, s, H, D = x.shape
-        return (b * s > 256 and b * s <= 65536 and H == 4 and D % 4 == 0
+        # KYOJIN_HIP_GLUE: decode rows join the fused site pair (see modules/hip_glue.py)
+        from .hip_glue import hc_fuse_rows_ok
+        return (hc_fuse_rows_ok(b * s) and H == 4 and D % 4 == 0
                 and x.dtype == torch.float and x.is_contiguous()
                 and y.dtype in (torch.float, torch.half) and y.is_contiguous() and y.numel() == b * s * D
                 and post.dtype == torch.float and post.is_contiguous()
@@ -362,7 +364,8 @@ class HyperConnection(Module):
                 and D <= 8192 and streams.is_contiguous() and _hc_mix_supported(streams.device)):
             return None
         R = b * s
-        if R <= 256 or R > 65536:   # = HC_MAX_TICKETS (hc_mix.cu)
+        from .hip_glue import hc_fuse_rows_ok
+        if not hc_fuse_rows_ok(R):  # prefill rows, plus decode rows under KYOJIN_HIP_GLUE
             return None
         if ext.hc_mix_num_chunks(R, H * D) != 1:
             return None

@@ -9,6 +9,8 @@ import types
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.generator import row_groups as RG
 from exllamav3.generator.generator import Generator
 from exllamav3.util.row_inv import ROW_INV_MAX_ROWS
@@ -16,13 +18,13 @@ from exllamav3.util.row_inv import ROW_INV_MAX_ROWS
 
 def test_cap_default_and_override(monkeypatch):
     monkeypatch.delenv("EXL3_ROW_INV_GROUP_ROWS", raising=False)
-    assert RG.group_rows_cap() == ROW_INV_MAX_ROWS == 8
+    assert RG.group_rows_cap() == ROW_INV_MAX_ROWS == (32 if torch.version.hip else 8)
     monkeypatch.setenv("EXL3_ROW_INV_GROUP_ROWS", "1")
     assert RG.group_rows_cap() == 1
     monkeypatch.setenv("EXL3_ROW_INV_GROUP_ROWS", "0")
     assert RG.group_rows_cap() == 1
     monkeypatch.setenv("EXL3_ROW_INV_GROUP_ROWS", "")
-    assert RG.group_rows_cap() == 8
+    assert RG.group_rows_cap() == ROW_INV_MAX_ROWS
 
 
 @pytest.mark.parametrize("value,expect", [(None, False), ("", False), ("0", False), ("1", True)])

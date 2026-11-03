@@ -19,18 +19,41 @@ from unittest import mock
 import pytest
 import torch
 
-# CPU only: never JIT-build the native extension (it needs the build lock and a GPU toolchain)
-if os.environ.get("EXL3_REAL_EXT") != "1" and "exllamav3.ext" not in sys.modules:
+from hardware import require
+require("triton")
+
+# CPU only: never JIT-build the native extension (it needs the build lock and a GPU toolchain). The stub and every
+# exllamav3 module imported over it leave sys.modules after the imports, or the test files collected later would get
+# them, and come back while this file's tests run (_stubbed_exllamav3)
+_stubbed = os.environ.get("EXL3_REAL_EXT") != "1" and "exllamav3.ext" not in sys.modules
+_before = set(sys.modules)
+if _stubbed:
     _stub = types.ModuleType("exllamav3.ext")
     _stub.exllamav3_ext = mock.MagicMock()
     _stub.__getattr__ = lambda name: mock.MagicMock()
     sys.modules["exllamav3.ext"] = _stub
+try:
+    from ref import frac_reconstruct as FR
+    from exllamav3.modules.moe_mixedk import (MixedKStore, MixedKUnsupported, PrunedLinear, expert_ks, layer_is_mixed,
+                                              pruned_experts, check_expert_bits)
+    from exllamav3.modules.block_sparse_mlp import _scatter_expert_count
+    from test_moe_mixedk_cpu import (Pack, KernelEmu, DEV, H, I, TOPK, LIMIT, routing, acts, buffers, outs, ws_fn, close)
+finally:
+    _stub_modules = {_n: sys.modules.pop(_n) for _n in set(sys.modules) - _before
+                     if _stubbed and (_n == "exllamav3" or _n.startswith("exllamav3."))}
 
-from ref import frac_reconstruct as FR
-from exllamav3.modules.moe_mixedk import (MixedKStore, MixedKUnsupported, PrunedLinear, expert_ks, layer_is_mixed,
-                                          pruned_experts, check_expert_bits)
-from exllamav3.modules.block_sparse_mlp import _scatter_expert_count
-from test_moe_mixedk_cpu import (Pack, KernelEmu, DEV, H, I, TOPK, LIMIT, routing, acts, buffers, outs, ws_fn, close)
+
+@pytest.fixture(autouse = True, scope = "module")
+def _stubbed_exllamav3():
+    """The tests (and the modules they call) import exllamav3 modules too: the stubbed ones, as during the imports above."""
+    saved = {n: sys.modules.get(n) for n in _stub_modules}
+    sys.modules.update(_stub_modules)
+    yield
+    for n, m in saved.items():
+        if m is None:
+            sys.modules.pop(n, None)
+        else:
+            sys.modules[n] = m
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 QD = os.path.join(ROOT, "exllamav3", "exllamav3_ext", "quant")

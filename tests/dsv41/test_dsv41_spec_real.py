@@ -15,6 +15,8 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "tools", "ds41"))
+from hardware import require
+require("ext")
 from exllamav3.dsv41.config import DSV41Config
 from exllamav3.dsv41.safetensors_io import SafetensorsWeightSource
 from exllamav3.dsv41.experts import SourceExpertProvider

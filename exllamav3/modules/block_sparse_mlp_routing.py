@@ -400,7 +400,7 @@ def routing_ds3(bsz, cfg, y, params):
 
 
 DEC_ROUTER_ROWS_MAX = 4  # loop ~23 us/row vs torch fallback ~120 us flat: loses past R~5
-ROUTER_ROWS_KERNEL_MAX = 4  # exl3_dec_router_rows takes NR in 2..4 (exl3_dec.cu)
+ROUTER_ROWS_KERNEL_MAX = 8  # exl3_dec_router_rows takes NR in 2..8 (exl3_dec.cu)
 
 
 def _router_row_chunks(bsz: int) -> list:
@@ -466,8 +466,7 @@ def _dec_router_rows(cfg, y, bsz):
     # bitwise to the per-row loop below
     if (os.environ.get("EXL3_DEC_ROUTER_ROWS", "1") == "2" and hasattr(ext, "exl3_dec_router_rows") and
             cfg.num_experts <= 320):
-        # The kernel takes 2..4 rows: more rows go as balanced chunks of 2..4 (5 -> 3+2, 8 -> 4+4),
-        # every row is still the batch-1 arithmetic
+        # The kernel takes 2..8 rows: more rows go as balanced chunks of 2..8, every row is still the batch-1 arithmetic
         r0 = 0
         for k in _router_row_chunks(bsz):
             ext.exl3_dec_router_rows(y2[r0:r0 + k], cfg.gate_tensor, bias, selected_experts[r0:r0 + k],

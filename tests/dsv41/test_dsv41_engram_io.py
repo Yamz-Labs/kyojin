@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.dsv41.engram import DirectRowReader
 from exllamav3.modules.dsv41_fn.engram_io import ParallelRowReader, NativeRowReader
 

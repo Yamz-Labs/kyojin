@@ -8,6 +8,8 @@ match at a smaller index was found, so an already-present stop string could be o
 import os, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hardware import require
+require("ext")
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.generator.job import _strings_to_utf32
 

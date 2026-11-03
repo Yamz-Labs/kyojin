@@ -2,6 +2,8 @@
 worker: no spurious Cholesky failure, no silently wrong factor. Needs a GPU (take gpu-lease on shared boxes).
 Run: PYTHONPATH=$PWD python tests/test_block_ldl_threads.py"""
 import threading, torch
+from hardware import require
+require("ext")
 from exllamav3.modules.quant.exl3_lib import quantize as q
 
 N, B = 1024, 16

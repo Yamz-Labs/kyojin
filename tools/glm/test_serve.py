@@ -333,6 +333,34 @@ class ServeTests(unittest.TestCase):
         self.assertEqual([len(m) for m in msgs], [1, 1, 1])
         self.assertEqual([m[0]["index"] for m in msgs], [0, 1, 2])
 
+    def test_held_tail_is_only_a_possible_marker_prefix(self):
+        marks = ["</think>", "<think>", serve.TOOL_OPEN, "STOP"]
+        self.assertEqual(serve.held_tail("plain words", marks), 0)
+        self.assertEqual(serve.held_tail("abc <tool_ca", marks), len("<tool_ca"))
+        self.assertEqual(serve.held_tail("abc <", marks), 1)
+        self.assertEqual(serve.held_tail("abc ST", marks), 2)
+        self.assertEqual(serve.held_tail("abc </think", marks), len("</think"))
+        self.assertEqual(serve.held_tail("<", marks), 1)
+        self.assertEqual(serve.held_tail("", marks), 0)
+
+    def test_stream_first_text_is_not_held_back_by_a_marker_length(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        engine = FakeEngine('plan it</think>Sure.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>')
+        app = serve.create_app(engine, "m", self.template + "<think>")
+
+        async def check():
+            client = TestClient(TestServer(app))
+            await client.start_server()
+            response = await client.post("/v1/chat/completions", json={
+                "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+            raw = (await response.read()).decode()
+            await client.close()
+            return raw
+
+        chunks = [json.loads(l[6:]) for l in run(check()).split("\n") if l.startswith("data: {")]
+        reasoning = [c["choices"][0]["delta"]["reasoning_content"] for c in chunks if "reasoning_content" in c["choices"][0]["delta"]]
+        self.assertEqual(reasoning[0], "pla")   # the first 3-character engine chunk goes out at once
+
     def test_stream_open_think_and_tool_call(self):
         from aiohttp.test_utils import TestClient, TestServer
         engine = FakeEngine('plan it</think>Sure.<tool_call>get_weather<arg_key>city</arg_key>'

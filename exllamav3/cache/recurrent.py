@@ -20,6 +20,10 @@ def note_freed(nbytes: int):
         malloc_trim()
 
 
+ANCHOR_MIN_POS = 2048
+ANCHOR_MAX_POS = int(os.environ.get("EXL3_RC_ANCHOR_MAX", "16384"))     # 0 = plain LRU
+
+
 class RecurrentCache(OrderedDict):
     def __init__(
         self,
@@ -145,7 +149,8 @@ class RecurrentCache(OrderedDict):
                     popped = self.pop(popped_key)
                     self.metrics["stash_evictions_stranded"] += 1
                 else:
-                    popped_key, popped = self.popitem(last = False)
+                    popped_key = self._lru_victim()
+                    popped = self.pop(popped_key)
                     if pt is not None:
                         page = pt.referenced_pages.get(popped_key) or pt.unreferenced_pages.get(popped_key)
                         if page is not None and page.kv_position == PAGE_SIZE:
@@ -160,6 +165,26 @@ class RecurrentCache(OrderedDict):
             self[key] = stashed_state
             self.exact_meta.pop(key, None)    # a tag belongs to the stash it was made for (Job._stash_exact sets it after put)
             self.update_total_size()
+
+
+    def _lru_victim(self):
+        """
+        Oldest checkpoint, sparing the shared-prefix anchors (power-of-two positions up to ANCHOR_MAX_POS: 2K, 4K, 8K, 16K) while
+        other checkpoints exist and the anchors hold at most half of the cache: a long session churns through its own prompt-end
+        checkpoints and would otherwise push out the one at the end of the system prompt, so a compacted or new session sharing
+        that prompt resumed from zero although its K/V pages were still cached.
+        """
+        anchors = 0
+        victim = None
+        for k, v in OrderedDict.items(self):
+            pos = v.get("position", 0) if isinstance(v, dict) else 0
+            if ANCHOR_MIN_POS <= pos <= ANCHOR_MAX_POS and pos & (pos - 1) == 0:
+                anchors += v["checkpoint_size"]
+            elif victim is None:
+                victim = k
+        if victim is None or anchors > self.max_size // 2:
+            return next(iter(OrderedDict.keys(self)))
+        return victim
 
 
     def drop(self, key) -> None:

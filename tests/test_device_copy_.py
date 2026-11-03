@@ -7,6 +7,8 @@ Needs two CUDA devices; the P2P failure is simulated by patching the probe.
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
+from hardware import require
+require("ext")
 from exllamav3.util import device_copy as dc
 from exllamav3.util.device_copy import to_device
 

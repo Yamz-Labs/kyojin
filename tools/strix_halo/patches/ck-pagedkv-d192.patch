@@ -1,0 +1,34 @@
+diff --git a/example/ck_tile/01_fmha/CMakeLists.txt b/example/ck_tile/01_fmha/CMakeLists.txt
+index 062ef427ce68d2cd1f5f3c25f97f64ae384d401a..03c0a358a9d147d17ae2383d2712caec4337dea4 100644
+--- a/example/ck_tile/01_fmha/CMakeLists.txt
++++ b/example/ck_tile/01_fmha/CMakeLists.txt
+@@ -70,7 +70,7 @@ endif()
+ if(FMHA_FWD_HAS_GFX125)
+   set(FMHA_FWD_OPTDIM 32,64,96,128,160,192,256)
+ else()
+-  set(FMHA_FWD_OPTDIM 32,64,80,128,256)
++  set(FMHA_FWD_OPTDIM 32,64,80,128,192,256)
+ endif()
+
+ string(REPLACE ";" "," FMHA_FWD_APIS "${FMHA_FWD_ENABLE_APIS}")
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_pagedkv_prefill.py b/example/ck_tile/01_fmha/codegen/ops/fmha_pagedkv_prefill.py
+index 0044b23648a161ed32304ca4b863da50cf971808..09f1f5c7ca0f5d233bc5f5660c1125c970f945da 100644
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_pagedkv_prefill.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_pagedkv_prefill.py
+@@ -237,7 +237,7 @@ class FmhaFwdApiTrait:
+             else:
+                 assert False
+         elif self.pipeline_tag in ["qr_pagedkv", "qs"]:
+-            bk0submax = K0_MAX_SUBMAX_MAP[self.bk0max]
++            bk0submax = K0_MAX_SUBMAX_MAP[self.bn1]
+             if self.dvpad == "t":
+                 return f"true /*a.hdim_v % {bk0submax} != 0*/"  # TODO: order of get_pipelines() matters! (ugly)
+             else:
+@@ -613,6 +613,7 @@ class KernelComponentFactoryGfx11(KernelComponentFactoryBase):
+                 #                      bm0, bn0, bk0, bn1, bk1,
+               # "32":  FmhaFwdTileSize( 64,  64,  16,  32,  32,   32,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1),
+               # "64":  FmhaFwdTileSize( 64,  64,  32,  64,  32,   64,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1),
++                "192": FmhaFwdTileSize( 64,  64,  32, 128,  32, 192,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1),
+                 "128": FmhaFwdTileSize( 64,  64,  32, 128,  32,  128,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1),
+               # "192": FmhaFwdTileSize( 64,  64,  32, 128,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1),
+               # "256": FmhaFwdTileSize( 64,  64,  32, 256,  32,  256,  4, 1, 1,  4, 1, 1,  16, 16, 16,  16, 16, 16,  -1),

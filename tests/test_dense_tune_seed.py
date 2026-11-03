@@ -1,5 +1,7 @@
 import os, sys, tempfile, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from hardware import require
+require("ext")
 from exllamav3.model.dense_warmup import seed_dense_tune
 
 

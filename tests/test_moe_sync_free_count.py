@@ -1,5 +1,7 @@
 import pytest
 import torch
+from hardware import require
+require("ext")
 from exllamav3.modules.block_sparse_mlp import (
     _HIP_PREFILL_MAX_EXPERT_ROWS,
     _moe_sync_free_count,

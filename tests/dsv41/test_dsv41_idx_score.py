@@ -1,5 +1,7 @@
 """GPU check of the indexer scoring kernels against the torch reference (dense scan and candidate slots)."""
 import pytest, torch
+from hardware import require
+require("ext")
 from exllamav3.dsv41 import quant
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")

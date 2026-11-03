@@ -1,6 +1,8 @@
 """Job.split_plan / Job.exact_gate / Job._stash_exact: EXL3_PF_SPLIT exactness tags (CPU only)."""
 import os, sys, types
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from hardware import require
+require("ext")
 from exllamav3.generator.job import Job
 from exllamav3.generator.pagetable import PAGE_SIZE
 

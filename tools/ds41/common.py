@@ -1,5 +1,6 @@
 """Shared helpers for the DeepSeek-V4.1-Flash streaming converter: HTTP range reads, dtype tables."""
 
+import http.client
 import json
 import os
 import struct
@@ -76,7 +77,7 @@ def range_get(url: str, start: int, end: int, retries: int = 8, timeout: float =
             if len(data) != want:
                 raise IOError(f"short read: got {len(data)} of {want} bytes")
             return (data, total) if with_total else data
-        except (urllib.error.URLError, IOError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, IOError, TimeoutError, ConnectionError, http.client.HTTPException) as e:   # IncompleteRead
             if isinstance(e, urllib.error.HTTPError) and e.code in (401, 403, 404):
                 raise
             last = e

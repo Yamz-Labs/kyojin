@@ -64,12 +64,24 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 // (2x KLD at 120 rows) and are left out. The CUDA inner implements TILESIZE_M > 16; ROCm builds none of this
 #define EXL3_GEMM_SHAPE_5     32,     32,    256,     4,     3
 
-#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32
-#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32
-#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 256
-#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256, 512
+// Swapped-operand tile for 17..24 rows (CUDA): the weights are the m16 MMA operand and the activation rows the n8 one, so 24 rows
+// cost three MMAs per 16 columns and k16 where the 32-row tile of shape 5 pays four, on the warp-private pipeline of shape 4
+// (16-wide k, 256 threads, no block barrier in the main loop)
+#define EXL3_GEMM_SHAPE_6     24,     16,    256,     4,     3
 
-#define EXL3_GEMM_NUM_SHAPES 5
+#define EXL3_GEMM_TILESIZE_M  0, 16, 16, 16, 16, 32, 24
+#define EXL3_GEMM_TILESIZE_K  0, 16, 32, 32, 16, 32, 16
+#define EXL3_GEMM_TILESIZE_N  0, 128, 128, 256, 512, 256, 256
+#define EXL3_GEMM_BLOCKDIM  0, 256, 512, 512, 256, 512, 256
+
+#define EXL3_GEMM_NUM_SHAPES 6
+
+// The shape 6 pipeline is CUDA only (the ROCm inner has no warp-private pipeline): an empty slot is skipped by the autotuner
+#if defined(USE_ROCM)
+    #define EXL3_GEMM_INSTANCE_CUDA(kern, _bits, _c_fp32, cb, shape) nullptr
+#else
+    #define EXL3_GEMM_INSTANCE_CUDA(kern, _bits, _c_fp32, cb, shape) kern<_bits, _c_fp32, cb, shape>
+#endif
 
 // Shape 1 not currently used anywhere
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
@@ -78,7 +90,8 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>, \
-    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_5>
+    exl3_gemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_5>, \
+    EXL3_GEMM_INSTANCE_CUDA(exl3_gemm_kernel, _bits, _c_fp32, cb, EXL3_GEMM_SHAPE_6)
 
 #define EXL3_MGEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
@@ -86,7 +99,8 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_4>, \
-    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_5>
+    exl3_mgemm_kernel<_bits, _c_fp32, cb, EXL3_GEMM_SHAPE_5>, \
+    EXL3_GEMM_INSTANCE_CUDA(exl3_mgemm_kernel, _bits, _c_fp32, cb, EXL3_GEMM_SHAPE_6)
 
 #define EXL3_GEMM_BASE_THREADS 256
 

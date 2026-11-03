@@ -19,6 +19,8 @@ import os, sys, subprocess, tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
+from hardware import require
+require("ext")
 from exllamav3.ext import exllamav3_ext as _ext
 pytestmark = pytest.mark.skipif(
     not hasattr(_ext, "exl3_moe_cpu_has_avx2"),

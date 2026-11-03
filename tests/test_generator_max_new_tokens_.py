@@ -6,6 +6,8 @@ Set EXL3_TEST_DRAFT=mtp to also test with an MTP draft (model must have an MTP h
 """
 import os, sys, inspect
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hardware import require
+require("ext")
 from exllamav3 import model_init, Generator, Job, ArgmaxSampler
 
 DEFAULT_MODEL = "/mnt/str/models/qwen3.5-0.8b/exl3/2.00bpw/"

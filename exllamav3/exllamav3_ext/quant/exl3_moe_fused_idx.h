@@ -48,6 +48,9 @@ struct SmallK3S5 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK
 struct SmallK4S4 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 4, SB = 4; };
 struct QwenK6S6 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TOPK = 10, INTER = 640, RB = 6, SB = 6; };   // the MTP drafter layer of the public pack (routed K6, shared K6)
 struct SmallK6S6 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 6, SB = 6; };
+// Experimental six-bit routed / eight-bit shared experts; Python serving requires EXL3_MOE_FUSED_K6S8=1.
+struct QwenK6S8 : QwenK6S6 { static constexpr int SB = 8; };
+struct SmallK6S8 : SmallK6S6 { static constexpr int SB = 8; };
 struct SmallK4S5 { static constexpr int D = 256, H = 4, LR = 32, NEXP = 64, TOPK = 4, INTER = 128, RB = 4, SB = 5; };
 // 4 bpw and 5 bpw routed experts with a K6 shared expert (the layout of the public 4.05 bpw pack; K5S6 is its 5 bpw sibling), and small twins
 struct QwenK4S6 { static constexpr int D = 2560, H = 4, LR = 320, NEXP = 512, TOPK = 10, INTER = 640, RB = 4, SB = 6; };
@@ -86,7 +89,7 @@ struct Dm
     static_assert(TOPK >= 1 && TOPK <= 15, "combine uses wave <= TOPK, 16 waves");
     static_assert(MAXR * TOPK <= THREADS && MAXR * TOPK <= 40, "sort/group arrays");
     static_assert(TRows<S>::v >= MAXR && TRows<S>::v <= MAXRT && TRows<S>::v * TOPK <= THREADS, "wide instantiation: sort/group arrays (one thread per slot)");
-    static_assert((RB >= 2 && RB <= 6) && (SB >= 2 && SB <= 6), "K2, K3, K4, K5, K6");
+    static_assert((RB >= 2 && RB <= 6) && ((SB >= 2 && SB <= 6) || SB == 8), "routed K2..K6; shared K2..K6 or K8");
     static_assert(H >= 1 && H <= 4, "dred/rmr scratch");
     static_assert(LR % 1 == 0 && LR <= 1024, "t scratch");
     // dynamic-free LDS: A + A2 for MAXR rows of the larger of D / INTER
@@ -126,8 +129,9 @@ MF_FN int kn_i0(int bits, int t, int g)                             { return kn_
 MF_FN int kn_i2(int bits, int t, int g)                             { return (kn_rel(bits, t, g) + 3 * bits + 15) / 32; }
 MF_FN int kn_s2(int bits, int t, int g)                             { return (kn_i2(bits, t, g) + 1) * 32 - (kn_rel(bits, t, g) + 3 * bits + 16); }
 // the 8 trellis words (16 bit each, low half) of lane (g8, t) from its lane set w[0 .. bits] (wrap, own0 ..), in the order the decoder takes them
-template <class W> MF_FN void kn_words(int bits, const W (&w)[7], int t, unsigned (&v)[8])
+template <class W, int N> MF_FN void kn_words(int bits, const W (&w)[N], int t, unsigned (&v)[8])
 {
+    static_assert(N == 7 || N == 9, "K6 needs seven words; K8 needs nine");
     for (int g = 0; g < 2; ++g)
     {
         const unsigned long long m = ((unsigned long long) w[kn_i0(bits, t, g)] << 32) | (unsigned long long) w[kn_i2(bits, t, g)];

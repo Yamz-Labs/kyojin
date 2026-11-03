@@ -4,6 +4,8 @@ import pytest
 import torch
 from PIL import Image
 
+from hardware import require
+require("ext")
 from exllamav3 import Config, Model, Tokenizer
 from exllamav3.modules import Linear
 from exllamav3.util.memory import free_mem

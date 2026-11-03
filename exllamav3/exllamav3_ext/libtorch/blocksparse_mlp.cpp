@@ -68,7 +68,8 @@ void BC_BlockSparseMLP::run_bszN
 (
     const at::Tensor& y,
     at::Tensor& selected_experts,
-    at::Tensor& routing_weights
+    at::Tensor& routing_weights,
+    bool with_shared
 )
 {
     // Two fused launches per layer cover every (token, expert) slot of the batch (see
@@ -76,17 +77,20 @@ void BC_BlockSparseMLP::run_bszN
     // the weighted per-token reduction, with expert biases, padded dims (x zero-padded to the
     // quantized input width in the kernel, output trimmed to H) and expert-range masking
     // (out-of-range picks contribute exact zeros to the partial sum) handled inside. Nothing is
-    // captured or patched: routing tensors are read directly, so no per-bsz statics or graphs
+    // captured or patched: routing tensors are read directly, so no per-bsz statics or graphs.
+    // The row capacity is out_bszn's (python: up to 32 rows / 256 slots)
     int num_tokens = (int) y.size(0);
-    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN: bsz out of supported range");
+    TORCH_CHECK(num_tokens >= 1 && num_tokens <= out_bszn.size(0), "run_bszN: bsz out of supported range");
 
     c10::cuda::CUDAGuard device_guard(y.device());
 
     // Shared experts run through their own multi-row graph first (same stream); the kernel adds
     // the result into the routed sum, through the sigmoid gate when there is one
     c10::optional<at::Tensor> sh_o;
-    if (shared_experts)
+    if (shared_experts && with_shared)
     {
+        // The shared-expert graphs cover MAX_BSZN rows: larger batches take their shared experts from the caller
+        TORCH_CHECK(num_tokens <= MAX_BSZN, "run_bszN: shared experts above MAX_BSZN rows are the caller's");
         at::Tensor x_dense = y.unsqueeze(0);
         at::Tensor out_d_sh_n = out_d_sh.value().slice(1, 0, num_tokens);
         shared_experts->run_bszN(x_dense, out_d_sh_n);
@@ -249,6 +253,7 @@ BC_BlockSparseMLP::BC_BlockSparseMLP
         );
         coop_p.min_expert = min_expert;
         coop_p.max_expert = max_expert;
+        coop_p.rows_ref = MAX_BSZN;
     }
 
     for (int i = 0; i < max_tokens_per_expert; ++i)

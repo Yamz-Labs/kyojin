@@ -1582,7 +1582,10 @@ static void hc_mix_launch
 int hc_mix_num_chunks(int R, int row_len)
 {
     TORCH_CHECK(R >= 0 && row_len > 0, "hc_mix_num_chunks: R must be nonnegative and row_len must be positive");
-    int chunks_a = std::min(128, std::max(1, 512 / std::max(R, 1)));
+    // Verify rows (R <= 32) split the row like an 8-row call does: the chunk size, hence the partial-sum order of every row, then does not
+    // depend on how many rows the call carries (R = 9 used to halve the chunk count and change the bits of every row)
+    const int r_split = R <= 32 ? std::min(R, 8) : R;
+    int chunks_a = std::min(128, std::max(1, 512 / std::max(r_split, 1)));
     const int target_cols = (row_len + chunks_a - 1) / chunks_a;
     int chunk_cols = ((target_cols + 4 * NUM_THREADS_A - 1) / (4 * NUM_THREADS_A)) * (4 * NUM_THREADS_A);
     return (row_len + chunk_cols - 1) / chunk_cols;

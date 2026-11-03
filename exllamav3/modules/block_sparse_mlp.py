@@ -20,6 +20,7 @@ from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .quant.exl3 import dec_workspace
+from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
@@ -56,6 +57,14 @@ MOEG_ROWS = int(os.environ.get("EXL3_MOE_GROUPED_ROWS", 1 << 20))
 # restores the atomic adds
 FUSED_DET = os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
 MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
+# R-row union MoE (exl3_dec_moe_union): one kernel call carries at most MAX_BSZN (= MOE_R_MAX in exl3_dec.cu) rows; a verify step of 9..UNION_ROWS
+# rows runs as job-aligned slices of at most MAX_BSZN rows (each slice is the exact 2..8 row call, rows are independent in an MoE block).
+# ROCm only (the CUDA fused kernels have their own COOP_ROWS); EXL3_ROW_INV_MAX_ROWS=8 restores the single-call cap.
+UNION_ROWS = max(MAX_BSZN, ROW_INV_MAX_ROWS) if torch.version.hip else MAX_BSZN
+# Row capacity of the fused decode kernels (exl3_moe_coop): up to this many token rows (bounded by 256 slots = rows * top_k) take
+# them instead of the prefill-shaped exl3_moe kernel or row chunks; rows <= MAX_BSZN run exactly as before. The kernels group the
+# slots by expert, so each picked expert is decoded once for all of its rows. CUDA only; EXL3_MOE_COOP_ROWS=8 restores the old cap
+COOP_ROWS = max(MAX_BSZN, int(os.environ.get("EXL3_MOE_COOP_ROWS", "32"))) if torch.version.hip is None else MAX_BSZN
 # Row chunking: 9..EXL3_MOE_ROW_CHUNK_MAX rows of a pack without a fused MoE kernel run as <= MAX_BSZN-row slices through
 # the bszN decode kernels instead of the per-expert tier (host readback of the expert counts + one launch group per expert,
 # per layer); rows are independent in an MoE block. 0 disables. Measured on an RTX 3090 (Qwen3-30B-A3B 3INST)
@@ -70,6 +79,12 @@ _FUSED_3INST_MIN = int(os.environ.get("EXL3_MOE_FUSED_3INST_MIN", "16"))
 # expert-count readback only up to fused_rows / top_k tokens). EXL3_MOE_SYNC_FREE_TOKENS=0 restores the top-k bound.
 # CUDA default only (measured there); ROCm keeps the top-k bound unless set to 1
 SYNC_FREE_TOKENS = os.environ.get("EXL3_MOE_SYNC_FREE_TOKENS", "1" if torch.version.hip is None else "0") != "0"
+
+
+def _union_slices(x: torch.Tensor, rows: int) -> list:
+    """Row ranges (lo, hi) of the union MoE kernel calls for `rows` token rows: one call up to MAX_BSZN rows, else job-aligned slices
+    (util.row_inv.job_slices). x is the MoE input (jobs, rows per job, H) of a verify forward."""
+    return job_slices(rows, int(x.shape[-2]) if x.dim() >= 3 else 1, MAX_BSZN)
 
 
 # Expert-deduplicated grouped MoE (verify batches decode each picked expert once for all of its
@@ -190,6 +205,17 @@ class FusedBuffers:
     temp_intermediate_u: torch.Tensor
 
 
+_SHARED_SIDE_HIP = bool(torch.version.hip)   # EXL3_SHARED_SIDE=1 is read per call (A/B inside one process)
+_side_state: dict = {}
+
+
+def _side(device):
+    st = _side_state.get(device)
+    if st is None:
+        st = _side_state[device] = (torch.cuda.Stream(device = device), torch.cuda.Event(), torch.cuda.Event())
+    return st
+
+
 @dataclass
 class HIPGroupedBuffers:
     gu_had: torch.Tensor
@@ -226,6 +252,40 @@ class ExpertsCFG:
 
 # Routed-weighted per-expert Hessians for the quantizer (see Linear.cap_rkey, convert_model.build_rwh_blends)
 _RWH = os.environ.get("EXL3_RWH", "0") == "1"
+
+class _RouteTrace:
+    """Diagnostic (EXL3_ROUTE_TRACE=path): append every MoE layer's router top-k, one record per forward
+    (layer id, rows, k, segment, int16 experts). Read-only hook, outputs unchanged; SIGUSR1 starts a new segment
+    (= a new conversation). Syncs once per layer, run with graphs off."""
+    def __init__(self, path):
+        import signal, threading
+        self.f = open(path, "ab", buffering = 1 << 20)
+        self.keys = {}
+        self.seg = 0
+        self.kf = open(path + ".keys", "a")
+        self.lock = threading.Lock()
+        signal.signal(signal.SIGUSR1, self._seg)
+
+    def _seg(self, *a):
+        self.seg += 1
+        self.f.flush()
+
+    def record(self, key, bsz, sel):
+        import numpy as np
+        if torch.cuda.is_current_stream_capturing():
+            return
+        kid = self.keys.get(key)
+        if kid is None:
+            kid = self.keys[key] = len(self.keys)
+            self.kf.write(f"{kid} {key}\n"); self.kf.flush()
+        a = sel.detach().to(torch.int16).cpu().numpy().reshape(bsz, -1)
+        with self.lock:
+            np.array([kid, bsz, a.shape[1], self.seg], dtype = np.int32).tofile(self.f)
+            a.tofile(self.f)
+
+
+_ROUTE_TRACE = _RouteTrace(os.environ["EXL3_ROUTE_TRACE"]) if os.environ.get("EXL3_ROUTE_TRACE") else None
+
 
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
@@ -587,6 +647,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         self.routing_cfg = None
         self.experts_cfg = None
+        self.coop_rows = MAX_BSZN   # raised to the fused kernels' row capacity when the buffers are built
 
         # Persistent broadcast targets for TP ranks without the router (see forward)
         self.bcast_sel_bsz1 = None
@@ -974,7 +1035,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 Ipad = self.intermediate_size_padded
                 Ru = MAX_BSZN
                 self.dec_moe_union_out = g_tensor_cache.get(
-                    self.device, (Ru, self.hidden_size), torch.float, "dec_moe_union_out")
+                    self.device, (UNION_ROWS, self.hidden_size), torch.float, "dec_moe_union_out")
                 self.dec_moe_union_act = g_tensor_cache.get(
                     self.device, (Ru * numex, Ipad), torch.half, "dec_moe_union_act")
                 self.dec_moe_union_down_part = g_tensor_cache.get(
@@ -1019,7 +1080,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # graph loop's TEMP_ROWS_GRAPH requirement is larger, sharing the one cache entry per name
         # (g_tensor_cache is exact-shape-keyed and never evicts -- growing a differently-shaped
         # second entry under the same name would silently double memory forever)
-        bszn_rows = MAX_BSZN * numex
+        self.coop_rows = max(MAX_BSZN, min(COOP_ROWS, 256 // numex))
+        bszn_rows = self.coop_rows * numex
 
         temp_hidden = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, bszn_rows), Hi), torch.half, "moe1_temp_hidden")
         temp_interm = g_tensor_cache.get(device, (max(TEMP_ROWS_GRAPH * 2, 2 * bszn_rows), I), self.interm_dtype, "moe1_temp_interm")
@@ -1039,7 +1101,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Completion counters + expert-run table of the fused decode kernels
         # (BC_BlockSparseMLP.run_bszN): the kernels reset each other's counters for the next
         # call, so they only need zeroing once
-        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + MAX_BSZN * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
+        coop_ctr = g_tensor_cache.get(device, (bszn_rows * (I // 128) + self.coop_rows * (Ho // 128) + 2 * bszn_rows + 3,), torch.int, "moe1_coop_ctr")
         coop_ctr.zero_()
         # Rotated up-projection input per slot for the fused kernels at bsz > 1 (yh holds the gate's)
         had_u = g_tensor_cache.get(device, (bszn_rows, Hi), torch.half, "moe1_temp_hidden_u")
@@ -1051,7 +1113,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Routed sum of the fused decode path, one exact-width row per token (the kernel trims the
         # padded down width on the way out)
-        out_bszn = g_tensor_cache.get(device, (MAX_BSZN, H), torch.float, "moe1_out_bszn")
+        out_bszn = g_tensor_cache.get(device, (self.coop_rows, H), torch.float, "moe1_out_bszn")
 
         cfg = ExpertsCFG(
             yh = yh,
@@ -1115,7 +1177,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             ):
                 self.bc_sh_exp = True
                 sh_exp_bc = self.shared_experts.bc
-                sh_exp_t = torch.empty((1, MAX_BSZN, self.hidden_size), dtype = torch.float, device = self.device)
+                sh_exp_t = torch.empty((1, self.coop_rows, self.hidden_size), dtype = torch.float, device = self.device)
                 if self.shared_gate:
                     assert self.shared_gate.quant_type == "fp16"
                     sh_gate_bc = self.shared_gate.inner.bc
@@ -1974,7 +2036,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        if _ROW_CHUNK_MAX and MAX_BSZN < x.numel() // x.shape[-1] <= \
+        if _ROW_CHUNK_MAX and self.coop_rows < x.numel() // x.shape[-1] <= \
                 (min(_ROW_CHUNK_MAX, _FUSED_3INST_MIN) if self.support_fused else _ROW_CHUNK_MAX) and self._row_chunk_ok() and \
                 not params.get("autosplit_measure"):
             return self._forward_row_chunks(x, params, out_dtype)
@@ -1987,6 +2049,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if os.environ.get("BSZ_DEBUG"):
             print(f"[bsz_debug] layer={self.key} bsz={bsz} union={os.environ.get('EXL3_DEC_MOE_UNION')}")
         bc_sh_exp = False
+        side_y = None
         #  R-row union MoE with the unique-expert table built on device (no host sync),
         # fed by the batched router -- independent of EXL3_DEC_MOE_UNION's bit-exact per-row loops
         union_dev = os.environ.get("EXL3_DEC_MOE_UNION_DEV", "0") != "0"
@@ -2006,7 +2069,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
-        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
+        bszn_eligible = self.bc is not None and bsz <= self.coop_rows
 
         # Routing
         if self.router_pre_norm:
@@ -2029,6 +2092,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         else:
             selected_experts = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.long, device = self.device)
             routing_weights = torch.empty((bsz, self.num_experts_per_tok), dtype = torch.half, device = self.device)
+
+        if _ROUTE_TRACE is not None:
+            _ROUTE_TRACE.record(self.key, bsz, selected_experts)
 
         # Extra norm (Gemma4)
         if self.routed_pre_norm:
@@ -2119,6 +2185,21 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 self.latent_out is None and self.routed_post_norm is None and (shf or not self.shared_experts) and
                 cpu_partial is None and cpu_pending is None and not self.tp_reduce and out_dtype is None
             )
+            if (
+                _SHARED_SIDE_HIP and os.environ.get("EXL3_SHARED_SIDE", "0") != "0" and not shf and self.shared_experts is not None and isinstance(self.shared_experts, GatedMLP) and
+                self.shared_gate is None and self.shared_experts_post_norm is None and cpu_partial is None and cpu_pending is None and
+                not self.tp_reduce and not self.routed_post_norm
+            ):
+                # batch-1 decode: the shared expert's three small GEMVs do not depend on the routed experts, run them on a side
+                # stream (own GEMV scratch/counters) while the routed kernels occupy the main one; joined at the shared add below
+                from .quant.exl3 import dec_side_workspace
+                side, ev_in, ev_out = _side(y.device)
+                ev_in.record(torch.cuda.current_stream(y.device))
+                with torch.cuda.stream(side):
+                    side.wait_event(ev_in)
+                    with dec_side_workspace():
+                        side_y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+                    ev_out.record(side)
             if shf:
                 ext.exl3_dec_moe_shared(
                     y,
@@ -2185,7 +2266,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # build dominates), only R=2..5; EXL3_DEC_MOE_UNION=1 to use it anyway (e.g. to get a
         # bit-exact verify path even before that's fixed).
         elif (
-            1 < bsz <= MAX_BSZN and self.support_dec_moe and self.tp_mode is None and
+            1 < bsz <= UNION_ROWS and self.support_dec_moe and self.tp_mode is None and
             not (_MOE_VALU and self.support_hip_grouped and bsz <= 8) and
             hasattr(ext, "exl3_dec_moe_union") and
             (union_dev or union_v2 or os.environ.get("EXL3_DEC_MOE_UNION", "0") != "0") and params.get("dflash_verify") and
@@ -2206,22 +2287,25 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
             out_buf = res.view(bsz, -1) if fuse_res else self.dec_moe_union_out[:bsz]
             scratch, counters = dec_workspace(y.device)
-            ext.exl3_dec_moe_union(
-                y, out_buf, selected_experts.contiguous(), routing_weights.contiguous(),
-                self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh, self.multi_gate.ptrs_svh,
-                self.multi_up.ptrs_trellis, self.multi_up.ptrs_suh, self.multi_up.ptrs_svh,
-                self.multi_down.ptrs_trellis, self.multi_down.ptrs_suh, self.multi_down.ptrs_svh,
-                self.dec_moe_union_act[:bsz * numex],
-                self.dec_moe_union_down_part[:bsz * numex],
-                scratch, counters,
-                self.intermediate_size_padded,
-                self.multi_up.K,
-                self.multi_down.K,
-                fuse_res,
-                self.act_limit,
-                self.dec_moe_mcg,
-                union_dev or union_v2,
-            )
+            sel_c, wts_c = selected_experts.contiguous(), routing_weights.contiguous()
+            for lo, hi in _union_slices(x, bsz):
+                # one slice = the exact 2..8 row call (_union_slices never leaves a lone row: that would be the batch-1 kernel)
+                ext.exl3_dec_moe_union(
+                    y[lo:hi], out_buf[lo:hi], sel_c[lo:hi], wts_c[lo:hi],
+                    self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh, self.multi_gate.ptrs_svh,
+                    self.multi_up.ptrs_trellis, self.multi_up.ptrs_suh, self.multi_up.ptrs_svh,
+                    self.multi_down.ptrs_trellis, self.multi_down.ptrs_suh, self.multi_down.ptrs_svh,
+                    self.dec_moe_union_act[:(hi - lo) * numex],
+                    self.dec_moe_union_down_part[:(hi - lo) * numex],
+                    scratch, counters,
+                    self.intermediate_size_padded,
+                    self.multi_up.K,
+                    self.multi_down.K,
+                    fuse_res,
+                    self.act_limit,
+                    self.dec_moe_mcg,
+                    union_dev or union_v2,
+                )
             if fuse_res:
                 params["mlp_residual_done"] = True
                 return res
@@ -2792,9 +2876,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # quantized paths apply), so this is the last tier
         else:
             assert bszn_eligible
-            self.bc.run_bszN(y, selected_experts, routing_weights)
+            # Shared experts: merged in the kernel from their 8-row graph, or above MAX_BSZN rows by the regular tail below
+            # (their R-row kernels; measured 1.2-2 ms/step faster at 10-32 rows than 8-row slices of the graph)
+            sh_in_bc = self.bc_sh_exp and bsz <= MAX_BSZN
+            self.bc.run_bszN(y, selected_experts, routing_weights, sh_in_bc)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
-            bc_sh_exp = self.bc_sh_exp
+            bc_sh_exp = sh_in_bc
 
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)
@@ -2840,7 +2927,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             else:
                 ext.add_sigmoid_gate(yh.float(), z.float(), final_hidden_states)
         elif self.shared_experts and not bc_sh_exp:
-            y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+            if side_y is not None:
+                cur = torch.cuda.current_stream(final_hidden_states.device)
+                cur.wait_event(_side(final_hidden_states.device)[2])
+                side_y.record_stream(cur)
+                y = side_y
+            else:
+                y = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
             if pre_norm_reduce:
                 params["backend"].all_reduce(y, True)
             if self.shared_experts_post_norm:
@@ -2892,11 +2985,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         y = x.reshape(-1, x.shape[-1])
         routed = params.pop("dec_routed", None)
         outs = []
-        for a in range(0, y.shape[0], MAX_BSZN):
+        for a in range(0, y.shape[0], self.coop_rows):
             sub = {k: v for k, v in params.items() if k != "mlp_residual_out"}
             if routed is not None:
-                sub["dec_routed"] = (routed[0][a:a + MAX_BSZN], routed[1][a:a + MAX_BSZN])
-            o = self.forward(y[a:a + MAX_BSZN].unsqueeze(0), sub, out_dtype)
+                sub["dec_routed"] = (routed[0][a:a + self.coop_rows], routed[1][a:a + self.coop_rows])
+            o = self.forward(y[a:a + self.coop_rows].unsqueeze(0), sub, out_dtype)
             outs.append(o.reshape(-1, o.shape[-1]).clone())   # the bszN output buffer is reused by the next slice
         return torch.cat(outs).view(x.shape[:-1] + (outs[0].shape[-1],))
 
@@ -2978,7 +3071,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Also refuse above MAX_BSZN: prefill calls this with R = chunk size (hundreds+), where
         # R sequential single-row launches would be catastrophically slower than the batched
         # prefill path this falls back to -- this is not what the flag or the kernel is for.
-        if os.environ.get("EXL3_DEC_MOE_UNION", "0") == "0" or R > MAX_BSZN or not params.get("dflash_verify"):
+        if os.environ.get("EXL3_DEC_MOE_UNION", "0") == "0" or R > UNION_ROWS or not params.get("dflash_verify"):
             return None
         try:
             xa.view(R, -1)

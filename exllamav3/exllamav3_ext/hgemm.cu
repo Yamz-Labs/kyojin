@@ -363,7 +363,8 @@ namespace skinny
 constexpr int COLS = 32;         // output columns per block (one lane each)
 constexpr int WARPS = 8;         // warps per block, each a k-sub-slice of the block's k-chunk
 constexpr int THREADS = WARPS * 32;
-constexpr int MAX_M = 8;
+constexpr int EXACT_M = 8;       // rows served by one exact-M instantiation (and by skinny_cat)
+constexpr int MAX_M = 32;        // 9..32 rows run padded instantiations (12/16/24/32), same per-row reduction
 constexpr int MAX_N = 128;       // above this, let hipblaslt have it
 constexpr int K_CHUNK = 128;     // k rows per block -> 16 k's per warp, 20 blocks on k=2560
 constexpr int MAX_KSPLIT = 64;   // k <= 8192
@@ -407,7 +408,7 @@ static float* partials(int device)
 // k-split partials itself in skinny_reduce_kernel's fixed y order, so the result is bit-identical
 // to the two-launch form without the reduce launch. Every writer fences before the ticket; the
 // last block fences (acquire) before reading. It resets its counter for the next launch.
-template <int M, bool ONEPASS, typename C_T>
+template <int M, bool ONEPASS, typename C_T, int CPL = 1>
 __global__ __launch_bounds__(THREADS)
 void skinny_partials_kernel
 (
@@ -419,28 +420,47 @@ void skinny_partials_kernel
     const int lda,
     int* __restrict__ cnt,        // ONEPASS: [MAX_N / COLS] tickets
     C_T* __restrict__ c,          // ONEPASS: output [M, ldc]
-    const int ldc
+    const int ldc,
+    const int m_rt                // rows really used: M for the exact instantiations (<= 8), <= M for the padded ones
 )
 {
+    // M > EXACT_M: padded instantiation, rows >= m_rt are skipped. A row's accumulation and reduction order do not
+    // depend on M or m_rt, so rows 9..32 are bit-identical to the same rows in an exact <= 8-row launch.
+    constexpr bool PAD = M > EXACT_M;
+    const int mr = PAD ? m_rt : M;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int col = blockIdx.x * COLS + lane;
+    const int col = blockIdx.x * (COLS * CPL) + lane * CPL;
     const bool active = col < n;
     const int kbase = blockIdx.y * K_CHUNK;
 
-    float acc[M];
+    float acc[M][CPL];
     #pragma unroll
-    for (int i = 0; i < M; ++i) acc[i] = 0.0f;
+    for (int i = 0; i < M; ++i)
+        #pragma unroll
+        for (int c = 0; c < CPL; ++c) acc[i][c] = 0.0f;
 
     if (active)
     {
         constexpr int PER_WARP = K_CHUNK / WARPS;
-        float bv[PER_WARP];
+        float bv[PER_WARP][CPL];
         #pragma unroll
         for (int j = 0; j < PER_WARP; ++j)
         {
             const int kk = kbase + j * WARPS + warp;
-            bv[j] = kk < k ? __half2float(b[(size_t) kk * n + col]) : 0.0f;
+            if (kk < k)
+            {
+                if constexpr (CPL == 2)   // 4 B = two adjacent columns; n even and col even are host-checked
+                {
+                    const half2 v = *reinterpret_cast<const half2*>(b + (size_t) kk * n + col);
+                    bv[j][0] = __low2float(v);
+                    bv[j][1] = __high2float(v);
+                }
+                else bv[j][0] = __half2float(b[(size_t) kk * n + col]);
+            }
+            else
+                #pragma unroll
+                for (int c = 0; c < CPL; ++c) bv[j][c] = 0.0f;
         }
         #pragma unroll
         for (int j = 0; j < PER_WARP; ++j)
@@ -450,26 +470,38 @@ void skinny_partials_kernel
             {
                 #pragma unroll
                 for (int i = 0; i < M; ++i)
-                    acc[i] = fmaf(__half2float(a[(size_t) i * lda + kk]), bv[j], acc[i]);
+                    if (!PAD || i < mr)
+                    {
+                        const float av = __half2float(a[(size_t) i * lda + kk]);
+                        #pragma unroll
+                        for (int c = 0; c < CPL; ++c) acc[i][c] = fmaf(av, bv[j][c], acc[i][c]);
+                    }
             }
         }
     }
 
-    __shared__ float red[WARPS][M][COLS + 1];    // 33: coprime with the 32 dword banks
+    __shared__ float red[WARPS][M][COLS * CPL + 1];    // 33: coprime with the 32 dword banks
     #pragma unroll
-    for (int i = 0; i < M; ++i) red[warp][i][lane] = acc[i];
+    for (int i = 0; i < M; ++i)
+        #pragma unroll
+        for (int c = 0; c < CPL; ++c) red[warp][i][lane * CPL + c] = acc[i][c];
     __syncthreads();
 
     if (warp == 0 && active)
     {
-        float* out = part + ((size_t) blockIdx.y * M) * MAX_N;
+        float* out = part + ((size_t) blockIdx.y * mr) * MAX_N;
         #pragma unroll
         for (int i = 0; i < M; ++i)
         {
-            float s = 0.0f;
+            if (PAD && i >= mr) continue;
             #pragma unroll
-            for (int w = 0; w < WARPS; ++w) s += red[w][i][lane];
-            out[(size_t) i * MAX_N + col] = s;
+            for (int c = 0; c < CPL; ++c)
+            {
+                float s = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < WARPS; ++w) s += red[w][i][lane * CPL + c];
+                out[(size_t) i * MAX_N + col + c] = s;
+            }
         }
     }
 
@@ -487,14 +519,14 @@ void skinny_partials_kernel
         if (!last_s) return;
         __threadfence();
         const int ksplit = gridDim.y;
-        for (int idx = threadIdx.x; idx < M * COLS; idx += THREADS)
+        for (int idx = threadIdx.x; idx < mr * COLS * CPL; idx += THREADS)
         {
-            const int i = idx / COLS;
-            const int cc = blockIdx.x * COLS + idx % COLS;
+            const int i = idx / (COLS * CPL);
+            const int cc = blockIdx.x * (COLS * CPL) + idx % (COLS * CPL);
             if (cc >= n) continue;
             float s = 0.0f;
             for (int y = 0; y < ksplit; ++y)
-                s += __builtin_nontemporal_load(&part[((size_t) y * M + i) * MAX_N + cc]);
+                s += __builtin_nontemporal_load(&part[((size_t) y * mr + i) * MAX_N + cc]);
             if constexpr (std::is_same_v<C_T, float>)
                 c[(size_t) i * ldc + cc] = s;
             else
@@ -528,17 +560,58 @@ __global__ void skinny_reduce_kernel
         c[(size_t) i * ldc + col] = __float2half(s);
 }
 
-template <bool ONEPASS, typename C_T>
-static void launch_partials(int m, const half* a, const half* b, float* part, int k, int n, int lda,
-                            dim3 grid, cudaStream_t stream, int* cnt = nullptr, C_T* c = nullptr, int ldc = 0)
+template <bool ONEPASS, typename C_T, int CPL>
+static void launch_partials_cpl(int m, const half* a, const half* b, float* part, int k, int n, int lda,
+                                dim3 grid, cudaStream_t stream, int* cnt, C_T* c, int ldc)
 {
-    #define SK_CASE(MM) case MM: skinny_partials_kernel<MM, ONEPASS, C_T><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc); break;
     switch (m)
     {
-        SK_CASE(1) SK_CASE(2) SK_CASE(3) SK_CASE(4) SK_CASE(5) SK_CASE(6) SK_CASE(7) SK_CASE(8)
-        default: break;
+        case 1: skinny_partials_kernel<1, ONEPASS, C_T, CPL><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); break;
+        case 2: skinny_partials_kernel<2, ONEPASS, C_T, CPL><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); break;
+        case 3: skinny_partials_kernel<3, ONEPASS, C_T, CPL><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); break;
+        case 4: skinny_partials_kernel<4, ONEPASS, C_T, CPL><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); break;
+        case 5: skinny_partials_kernel<5, ONEPASS, C_T, CPL><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); break;
+        case 6: skinny_partials_kernel<6, ONEPASS, C_T, CPL><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); break;
+        case 7: skinny_partials_kernel<7, ONEPASS, C_T, CPL><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); break;
+        case 8: skinny_partials_kernel<8, ONEPASS, C_T, CPL><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); break;
+        default:
+            // rows 9..32 keep the one-column form (rows > 8 are the prefill/rows-scan tail, not the hot path)
+            if constexpr (CPL == 1)
+            {
+                if (m >= 9 && m <= 12) { skinny_partials_kernel<12, ONEPASS, C_T><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); return; }
+                if (m >= 13 && m <= 16) { skinny_partials_kernel<16, ONEPASS, C_T><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); return; }
+                if (m >= 17 && m <= 24) { skinny_partials_kernel<24, ONEPASS, C_T><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); return; }
+                if (m >= 25 && m <= 32) { skinny_partials_kernel<32, ONEPASS, C_T><<<grid, THREADS, 0, stream>>>(a, b, part, k, n, lda, cnt, c, ldc, m); return; }
+            }
+            else
+                launch_partials_cpl<ONEPASS, C_T, 1>(m, a, b, part, k, n, lda, grid, stream, cnt, c, ldc);
+            break;
     }
-    #undef SK_CASE
+}
+
+template <bool ONEPASS, typename C_T>
+static void launch_partials(int m, const half* a, const half* b, float* part, int k, int n, int lda,
+                            dim3 grid, cudaStream_t stream, int* cnt = nullptr, C_T* c = nullptr, int ldc = 0,
+                            int cpl = 1)
+{
+    if (cpl == 2) launch_partials_cpl<ONEPASS, C_T, 2>(m, a, b, part, k, n, lda, grid, stream, cnt, c, ldc);
+    else launch_partials_cpl<ONEPASS, C_T, 1>(m, a, b, part, k, n, lda, grid, stream, cnt, c, ldc);
+}
+
+// EXL3_SKINNY_W2 (default 0 = inert): two ADJACENT columns per lane, so a warp's weight load is one
+// 128 B line instead of half of one (the neighbouring column group re-reads the other half) and half
+// the load instructions. Bit-identical: a column's k order, warp-sum order and k-split sum are the
+// same values in the same order; only which lane owns which column changes.
+// DEFAULT ON (a micro on the GLM KDA cat shape: 25.88 -> 21.55 us/call, -16.7 %, and no measured shape slower;
+// Qwen's b/a cat -8.6 %, n=128 projections -3.4 %, n=32 untouched). Read per call (a getenv is ~0.1 us against
+// ~70 skinny calls per decode step) so a per-arm env flip in ONE loaded process switches it; EXL3_SKINNY_W2=0
+// turns it off and skinny_set_w2 forces either form without touching the environment.
+static int g_w2 = -1;
+static bool w2on()
+{
+    if (g_w2 >= 0) return g_w2 == 1;
+    const char* e = getenv("EXL3_SKINNY_W2");
+    return !(e && *e == '0');
 }
 
 // EXL3_SKINNY_1PASS (default 1): fold the reduce into the partials launch. Runtime-settable
@@ -565,6 +638,19 @@ static bool enabled()
     return cached == 1;
 }
 
+// Rows above this are left to the caller's GEMM (EXL3_HIP_SKINNY_MAX_M, default MAX_M; 8 = the old behaviour).
+static int max_rows()
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char* e = getenv("EXL3_HIP_SKINNY_MAX_M");
+        int v = e && *e ? atoi(e) : MAX_M;
+        cached = v < 1 ? 1 : (v > MAX_M ? MAX_M : v);
+    }
+    return cached;
+}
+
 // true if handled
 static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, cudaStream_t stream)
 {
@@ -575,7 +661,7 @@ static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, 
     const int k = a.size(-1);
     const int m = a.numel() / k;
     const int n = b.size(-1);
-    if (m < 1 || m > MAX_M || n < 1 || n > MAX_N || k < 1) return false;
+    if (m < 1 || m > max_rows() || n < 1 || n > MAX_N || k < 1) return false;
     const int ksplit = (k + K_CHUNK - 1) / K_CHUNK;
     if (ksplit > MAX_KSPLIT) return false;
     if (a.stride(-1) != 1 || c.stride(-1) != 1) return false;
@@ -586,22 +672,25 @@ static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, 
     if (!part) return false;
     int* cnt = counters(a.device().index());   // allocated on the first (eager) call, never under capture
 
-    dim3 grid((n + COLS - 1) / COLS, ksplit);
+    // W2: two ADJACENT columns per lane needs an even row stride (4 B aligned pair) and one full warp of pairs.
+    const int cpl = (w2on() && (n % 2 == 0) && n >= 2 * COLS) ? 2 : 1;
+    dim3 grid((n + COLS * cpl - 1) / (COLS * cpl), ksplit);
     if (onepass())
     {
         if (cnt)
         {
             if (c.dtype() == at::kFloat)
                 launch_partials<true, float>(m, (const half*) a.data_ptr(), (const half*) b.data_ptr(), part, k, n, lda, grid, stream,
-                                             cnt, (float*) c.data_ptr(), ldc);
+                                             cnt, (float*) c.data_ptr(), ldc, cpl);
             else
                 launch_partials<true, half>(m, (const half*) a.data_ptr(), (const half*) b.data_ptr(), part, k, n, lda, grid, stream,
-                                            cnt, (half*) c.data_ptr(), ldc);
+                                            cnt, (half*) c.data_ptr(), ldc, cpl);
             cuda_check(cudaPeekAtLastError());
             return true;
         }
     }
-    launch_partials<false, float>(m, (const half*) a.data_ptr(), (const half*) b.data_ptr(), part, k, n, lda, grid, stream);
+    launch_partials<false, float>(m, (const half*) a.data_ptr(), (const half*) b.data_ptr(), part, k, n, lda, grid, stream,
+                                  nullptr, nullptr, 0, cpl);
     const int total = m * n;
     const int rthreads = total < 256 ? ((total + 31) / 32) * 32 : 256;
     const int rblocks = (total + rthreads - 1) / rthreads;
@@ -633,7 +722,7 @@ struct CatSeg
     int nseg;
 };
 
-template <int M>
+template <int M, int CPL = 1>
 __global__ __launch_bounds__(THREADS)
 void skinny_cat_kernel
 (
@@ -648,13 +737,15 @@ void skinny_cat_kernel
 {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int col = blockIdx.x * COLS + lane;
+    const int col = blockIdx.x * (COLS * CPL) + lane * CPL;
     const bool active = col < n;
     const int kbase = blockIdx.y * K_CHUNK;
 
-    float acc[M];
+    float acc[M][CPL];
     #pragma unroll
-    for (int i = 0; i < M; ++i) acc[i] = 0.0f;
+    for (int i = 0; i < M; ++i)
+        #pragma unroll
+        for (int c = 0; c < CPL; ++c) acc[i][c] = 0.0f;
 
     if (active)
     {
@@ -663,12 +754,24 @@ void skinny_cat_kernel
         while (cs + 1 < seg.nseg && col >= seg.start[cs + 1]) ++cs;
         const half* bw = seg.w[cs] + (col - seg.start[cs]);
         const int ldb = seg.ldw[cs];
-        float bv[PER_WARP];
+        float bv[PER_WARP][CPL];
         #pragma unroll
         for (int j = 0; j < PER_WARP; ++j)
         {
             const int kk = kbase + j * WARPS + warp;
-            bv[j] = kk < k ? __half2float(bw[(size_t) kk * ldb]) : 0.0f;
+            if (kk < k)
+            {
+                if constexpr (CPL == 2)   // the pair stays inside one segment: host checks even widths/strides
+                {
+                    const half2 v = *reinterpret_cast<const half2*>(bw + (size_t) kk * ldb);
+                    bv[j][0] = __low2float(v);
+                    bv[j][1] = __high2float(v);
+                }
+                else bv[j][0] = __half2float(bw[(size_t) kk * ldb]);
+            }
+            else
+                #pragma unroll
+                for (int c = 0; c < CPL; ++c) bv[j][c] = 0.0f;
         }
         #pragma unroll
         for (int j = 0; j < PER_WARP; ++j)
@@ -678,14 +781,20 @@ void skinny_cat_kernel
             {
                 #pragma unroll
                 for (int i = 0; i < M; ++i)
-                    acc[i] = fmaf(__half2float(a[(size_t) i * lda + kk]), bv[j], acc[i]);
+                {
+                    const float av = __half2float(a[(size_t) i * lda + kk]);
+                    #pragma unroll
+                    for (int c = 0; c < CPL; ++c) acc[i][c] = fmaf(av, bv[j][c], acc[i][c]);
+                }
             }
         }
     }
 
-    __shared__ float red[WARPS][M][COLS + 1];
+    __shared__ float red[WARPS][M][COLS * CPL + 1];
     #pragma unroll
-    for (int i = 0; i < M; ++i) red[warp][i][lane] = acc[i];
+    for (int i = 0; i < M; ++i)
+        #pragma unroll
+        for (int c = 0; c < CPL; ++c) red[warp][i][lane * CPL + c] = acc[i][c];
     __syncthreads();
 
     if (warp == 0 && active)
@@ -694,10 +803,14 @@ void skinny_cat_kernel
         #pragma unroll
         for (int i = 0; i < M; ++i)
         {
-            float s = 0.0f;
             #pragma unroll
-            for (int w = 0; w < WARPS; ++w) s += red[w][i][lane];
-            out[(size_t) i * CAT_MAX_N + col] = s;
+            for (int c = 0; c < CPL; ++c)
+            {
+                float s = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < WARPS; ++w) s += red[w][i][lane * CPL + c];
+                out[(size_t) i * CAT_MAX_N + col + c] = s;
+            }
         }
     }
 
@@ -713,10 +826,10 @@ void skinny_cat_kernel
     if (!last_s) return;
     __threadfence();
     const int ksplit = gridDim.y;
-    for (int idx = threadIdx.x; idx < M * COLS; idx += THREADS)
+    for (int idx = threadIdx.x; idx < M * COLS * CPL; idx += THREADS)
     {
-        const int i = idx / COLS;
-        const int cc = blockIdx.x * COLS + idx % COLS;
+        const int i = idx / (COLS * CPL);
+        const int cc = blockIdx.x * (COLS * CPL) + idx % (COLS * CPL);
         if (cc >= n) continue;
         float s = 0.0f;
         for (int y = 0; y < ksplit; ++y)
@@ -790,29 +903,54 @@ static void skinny_cat_impl(at::Tensor a, const at::Tensor* b, const std::vector
             seg.ldw[s] = n;
         }
     }
-    TORCH_CHECK(m >= 1 && m <= MAX_M && n >= 1 && n <= CAT_MAX_N, "skinny_cat: shape out of range");
+    TORCH_CHECK(m >= 1 && m <= EXACT_M && n >= 1 && n <= CAT_MAX_N, "skinny_cat: shape out of range");
     const int ksplit = (k + K_CHUNK - 1) / K_CHUNK;
     TORCH_CHECK(ksplit <= MAX_KSPLIT, "skinny_cat: k too large");
 
     const int dev = a.device().index();
     TORCH_CHECK(dev >= 0 && dev < NUM_DEV, "skinny_cat: device");
     if (!g_cat_partials[dev])
-        cuda_check(cudaMalloc((void**) &g_cat_partials[dev], (size_t) MAX_KSPLIT * MAX_M * CAT_MAX_N * sizeof(float)));
+        cuda_check(cudaMalloc((void**) &g_cat_partials[dev], (size_t) MAX_KSPLIT * EXACT_M * CAT_MAX_N * sizeof(float)));
     if (!g_cat_counters[dev])
     {
         cuda_check(cudaMalloc((void**) &g_cat_counters[dev], (CAT_MAX_N / COLS) * sizeof(int)));
         cuda_check(cudaMemset(g_cat_counters[dev], 0, (CAT_MAX_N / COLS) * sizeof(int)));
         cuda_check(cudaDeviceSynchronize());
     }
-    dim3 grid((n + COLS - 1) / COLS, ksplit);
-    const half* ap = (const half*) a.data_ptr();
-    #define SC_CASE(MM) case MM: skinny_cat_kernel<MM><<<grid, THREADS, 0, stream>>>(ap, g_cat_partials[dev], k, n, k, g_cat_counters[dev], seg); break;
-    switch (m)
+    // W2: two ADJACENT columns per lane; needs every segment width and row stride even (the pair stays
+    // inside one segment and bw + kk*ldb stays 4 B aligned) and one full warp of pairs.
+    int cpl = 1;
+    if (w2on() && n % 2 == 0 && n >= 2 * COLS)
     {
-        SC_CASE(1) SC_CASE(2) SC_CASE(3) SC_CASE(4) SC_CASE(5) SC_CASE(6) SC_CASE(7) SC_CASE(8)
-        default: break;
+        cpl = 2;
+        for (int s = 0; s < seg.nseg; ++s)
+            if ((seg.start[s + 1] - seg.start[s]) % 2 || seg.ldw[s] % 2) { cpl = 1; break; }
     }
-    #undef SC_CASE
+    dim3 grid((n + COLS * cpl - 1) / (COLS * cpl), ksplit);
+    const half* ap = (const half*) a.data_ptr();
+    float* pp = g_cat_partials[dev];
+    int* ccp = g_cat_counters[dev];
+    // one launch per macro line: hipify rewrites the <<< >>> form in place and mangles multi-line macros
+    #define SC1(MM) case MM: skinny_cat_kernel<MM><<<grid, THREADS, 0, stream>>>(ap, pp, k, n, k, ccp, seg); break;
+    #define SC2(MM) case MM: skinny_cat_kernel<MM, 2><<<grid, THREADS, 0, stream>>>(ap, pp, k, n, k, ccp, seg); break;
+    if (cpl == 2)
+    {
+        switch (m)
+        {
+            SC2(1) SC2(2) SC2(3) SC2(4) SC2(5) SC2(6) SC2(7) SC2(8)
+            default: break;
+        }
+    }
+    else
+    {
+        switch (m)
+        {
+            SC1(1) SC1(2) SC1(3) SC1(4) SC1(5) SC1(6) SC1(7) SC1(8)
+            default: break;
+        }
+    }
+    #undef SC1
+    #undef SC2
     cuda_check(cudaPeekAtLastError());
 }
 
@@ -820,6 +958,7 @@ void skinny_cat(at::Tensor a, at::Tensor b, std::vector<at::Tensor> outs) { skin
 void skinny_cat_w(at::Tensor a, std::vector<at::Tensor> ws, std::vector<at::Tensor> outs) { skinny_cat_impl(a, nullptr, &ws, outs); }
 
 void skinny_set_onepass(int64_t on) { skinny::g_onepass = on ? 1 : 0; }
+void skinny_set_w2(int64_t on) { skinny::g_w2 = on ? 1 : 0; }
 
 #endif // USE_ROCM
 

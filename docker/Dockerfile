@@ -61,6 +61,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && ./build.sh \
     && python -c "import torch, exllamav3_ext" \
     && rm -rf build .rebuild.* .sdk-deps /tmp/*
+# --- Layer B2: Composable Kernel prefill attention (EXL3_PF_CK=auto, ~33 s). Optional: a failed fetch/build leaves no library and the
+# server silently keeps the Triton prefill kernel. Invalidated only by the ck_fmha sources.
+COPY tools/strix_halo/ck_fmha/ ./tools/strix_halo/ck_fmha/
+ENV EXL3_PF_CK_SO=/opt/kyojin/ck-fmha/libckpf.so
+RUN (CK_FETCH=1 EXL3_CK_OUT=$EXL3_PF_CK_SO CK_JOBS=$(nproc) tools/strix_halo/ck_fmha/build.sh \
+        || echo "ck_fmha build skipped: prefill attention stays on Triton")
 # --- Layer C: everything else (python, tools, docker/). Python-only edits land here. ---
 COPY . ./
 RUN python -c "import torch, exllamav3_ext"

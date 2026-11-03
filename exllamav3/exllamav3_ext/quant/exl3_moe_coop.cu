@@ -152,6 +152,9 @@ void exl3_moe_coop_launch(const MoeCoopParams& p_in, int K_gu, int K_d, int cb, 
     const int slots = p.bsz * p.topk;
     const int nproj = p.gated ? 2 : 1;
     p.a_global = p.bsz > 1;
+    // A scratch built for more rows must not change the launch geometry of the rows it always served
+    if (p.rows_ref > 0 && slots <= p.rows_ref * p.topk)
+        p.slots_max = std::min(p.slots_max, p.rows_ref * p.topk);
 
     const bool wide_a = moe_coop_pick_wide(p.Hi / 16, slots, device);
     const bool wide_b = moe_coop_pick_wide(p.I / 16, slots, device);

@@ -2,6 +2,8 @@
 torch reference of routing_dots (fp16 logits, sigmoid, + fp32 bias, top-k, renormalize, scale)
 and as the generic torch path (_routing_nogroup_torch) it replaces. Run: python tests/test_dec_router_ragged_e.py"""
 import sys, torch
+from hardware import require
+require("ext")
 from exllamav3.ext import exllamav3_ext as ext  # noqa
 from exllamav3.modules.quant.exl3 import dec_workspace
 from exllamav3.modules.block_sparse_mlp_routing import _routing_nogroup_torch

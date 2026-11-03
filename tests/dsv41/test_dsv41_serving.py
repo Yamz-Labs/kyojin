@@ -19,6 +19,8 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "tools", "ds41"))
+from hardware import require
+require("ext")
 import harness
 from harness import FakeTok, make_state_dict, make_engram_tables, tiny_config
 from exllamav3.dsv41.config import DSV41Config

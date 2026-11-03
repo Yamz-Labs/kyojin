@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.dsv41 import quant
 from exllamav3.dsv41.engram import (EngramLayout, NgramHasher, compute_multipliers, dequant_rows)
 

@@ -7,6 +7,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from hardware import require
+require("ext")
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.modules import hyperconnections as hc
 

@@ -17,7 +17,7 @@ ROCM_ALLOW_PREFIXES = (
 
 ROCM_EXCLUDE_FILES = {
     'norm.cu', 'activation.cu', 'attention.cu', 'routing.cu',
-    'softcap.cu', 'histogram.cu', 'sam.cpp',
+    'softcap.cu', 'histogram.cu',
     'cache/q_cache.cu',
     'quant/exl3_gemm.cu',
     'quant/exl3_moe.cu', 'quant/exl3_moe_grouped.cu', 'quant/exl3_moe_coop.cu', 'quant/exl3_kernel_map.cu',

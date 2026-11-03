@@ -98,10 +98,18 @@ def fused_law(logits: torch.Tensor, prm: tuple) -> torch.Tensor:
 
 
 def draw(p: torch.Tensor, u: float) -> torch.Tensor:
-    """Inverse-CDF draw from a dense (unnormalized) law with a uniform u in [0, 1); never returns a zero-mass index."""
+    """
+    Inverse-CDF draw from a dense (unnormalized) law with a uniform u in [0, 1); never returns a zero-mass index, so
+    never an id of the padded vocabulary (a law is zero there). The search is bounded by the last index that holds mass:
+    that is where the running sum first reaches its total. It matters when u * total rounds up to total in fp32 (the
+    search then runs off the end), and for a law without mass (all zero, or NaN from a broken row), which used to end on
+    the last column of the row, a padded id. Such a law yields index 0, a real token. No host sync.
+    """
     cs = torch.cumsum(p, 0)
-    idx = torch.searchsorted(cs, (cs[-1:] * u), right = True)
-    return idx.clamp(max = p.numel() - 1)
+    total = cs[-1:]
+    idx = torch.searchsorted(cs, total * u, right = True)
+    last = (cs < total).sum()
+    return torch.minimum(idx, last.view(1))
 
 
 def verify(logits: torch.Tensor, q: torch.Tensor, d: int, prm: tuple, rng) -> torch.Tensor:
@@ -112,5 +120,6 @@ def verify(logits: torch.Tensor, q: torch.Tensor, d: int, prm: tuple, rng) -> to
     p = law(logits, prm)
     u1, u2 = rng.random(), rng.random()
     keep = u1 * q[d] < p[d]
-    r = draw((p - q).clamp_(min = 0.0), u2)
+    res = (p - q).clamp_(min = 0.0)
+    r = draw(torch.where(res.sum() > 0, res, p), u2)   # p == q leaves no residual: draw from p then (keep is true but for rounding)
     return torch.where(keep, torch.full_like(r, d), r).view(1, 1)

@@ -343,6 +343,21 @@ __device__ __forceinline__ void gemv_int8_row_sums
 #define SQ_COUNTERS_CAP 4096                                    // fixed counter region: size_n up to 1M
 #define SQ_WS_RESERVED (SQ_COUNTERS_CAP + 4 * SQ_KSPLIT_CAP * 4)    // sq-private region at workspace start (counters + per-slice-per-row scales, m <= 4)
 
+// Weight-stream load: read-only, no L1 allocation, L2 evict-first (the trellis rows are read exactly once per
+// launch). Measured on 3090 (bit-identical): M = 1 -0.5..-1.9 us per launch, M = 2 flat-to-worse, so M = 1 only.
+template <bool hint>
+__device__ __forceinline__ uint2 ldg_stream_u2(const uint32_t* p)
+{
+#if defined(USE_ROCM)
+    return *(const uint2*) p;
+#else
+    if constexpr (!hint) return *(const uint2*) p;
+    uint2 r;
+    asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
+    return r;
+#endif
+}
+
 // Wide unit (4 bpw): one (256-column x k-slice) unit, warp per adjacent block pair, uint2 loads.
 // M activation rows share the decoded weights: extraction and the B stream are amortized, each row
 // only adds its dp4a chains against its own splat region (sh_as + r * slice_stride; residual splats
@@ -372,14 +387,14 @@ __device__ __forceinline__ void gemv_int8_unit_wide
     int shfl_src = (lane & 16) | ((lane + 15) & 15);
 
     int iacc0[M] = {}, iacc1[M] = {}, jacc0[M] = {}, jacc1[M] = {};
-    uint2 r0 = *(const uint2*) bp;
+    uint2 r0 = ldg_stream_u2<(M == 1)>(bp);
     uint2 r1 = {};
-    if (nrows > 1) r1 = *(const uint2*) (bp + row_stride);
+    if (nrows > 1) r1 = ldg_stream_u2<(M == 1)>(bp + row_stride);
 
     for (int kb = 0; kb < nrows; ++kb)
     {
         uint2 r2 = {};
-        if (kb + 2 < nrows) r2 = *(const uint2*) (bp + (size_t) (kb + 2) * row_stride);
+        if (kb + 2 < nrows) r2 = ldg_stream_u2<(M == 1)>(bp + (size_t) (kb + 2) * row_stride);
         uint32_t prev = __shfl_sync(0xffffffff, r0.y, shfl_src);
 
         uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
@@ -1018,7 +1033,33 @@ __host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
     return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
 }
 
-template <int bits, int M, bool c_fp32, bool residual>
+// L2 prefetch of the head of a unit's weight stream (first EXL3_SQ_PF block rows of its 256-column stripe), issued BEFORE the (not K=3: the extra registers drop its occupancy 5 -> 4 blocks/SM)
+// serial slice staging so the DRAM is busy during the staging instead of idle (no registers held across the staging, unlike a
+// register pre-issue). Layout: row stride 2 * bits * size_n bytes, stripe 512 * bits bytes = 4 * bits 128-byte lines.
+#ifndef EXL3_SQ_PF
+#define EXL3_SQ_PF 8
+#endif
+template <int bits>
+__device__ __forceinline__ void gemv_int8_prefetch_unit(const uint16_t* __restrict__ B, int nb256, int kb0, int nrows, int size_n)
+{
+#if !defined(USE_ROCM)
+    constexpr int lines = 4 * bits;
+    int rows_pf = nrows < EXL3_SQ_PF ? nrows : EXL3_SQ_PF;
+    int i = threadIdx.x;
+    if (i < lines * rows_pf)
+    {
+        const char* base = (const char*) B + (size_t) kb0 * size_n * 2 * bits + (size_t) nb256 * 512 * bits;
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(base + (size_t) (i / lines) * size_n * 2 * bits + (i % lines) * 128));
+    }
+#endif
+}
+
+// dual: a second matrix (B2, ...) is computed by the same launch; a separate instantiation so the single-matrix
+// kernels keep their register budget (and so their occupancy)
+// tri: three matrices of different widths over the same activations (q, k, v of an attention block) stacked along the
+// 256-column groups in one launch; the slice height comes from the host (rows_ovr), the second/third matrix are
+// (B2, C2, suh2, svh2, n2) and (B3, C3, suh3, svh3, n3), the first is the usual (B, C, suh, svh, size_n)
+template <int bits, int M, bool c_fp32, bool residual, bool dual = false, bool tri = false>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_sq_kernel
 (
@@ -1032,7 +1073,20 @@ void exl3_gemv_int8_sq_kernel
     const half* __restrict__ suh,
     half* __restrict__ A_had,
     const half* __restrict__ svh,
-    const int rows_ovr      // 0 = automatic slice height, else forced (multiple of 8)
+    const int rows_ovr,     // 0 = automatic slice height, else forced (multiple of 8)
+    // Optional second GEMV over the same shape (B2 != nullptr): one launch computes both (e.g. gate + up
+    // of a gated MLP), bit-identical to two launches
+    const half* __restrict__ A2,
+    const uint16_t* __restrict__ B2,
+    void* __restrict__ C2,
+    const half* __restrict__ suh2,
+    const half* __restrict__ svh2,
+    const int n2,
+    const uint16_t* __restrict__ B3,
+    void* __restrict__ C3,
+    const half* __restrict__ suh3,
+    const half* __restrict__ svh3,
+    const int n3
 )
 {
     extern __shared__ uint32_t shmem[];
@@ -1043,7 +1097,11 @@ void exl3_gemv_int8_sq_kernel
     // take the smallest slice height with units <= gridDim.x - but at least half-wave occupancy up
     // to 32 rows, since very short slices inflate ksplit and the epilogue's serial per-slice combine
     int rows_total = size_k >> 4;
-    int nb256_total = size_n / 256;
+    int nb256_mat = size_n / 256;
+    // A pair stacks the matrices: each (slice, 256-column) unit runs for both back to back, with the slice
+    // height, and so the numerics, of a single launch
+    const int nbm1 = tri ? n2 / 256 : 0, nbm2 = tri ? n3 / 256 : 0;
+    int nb256_total = tri ? nb256_mat + nbm1 + nbm2 : nb256_mat;
     int r = CEIL_DIVIDE(rows_total * nb256_total, (int) gridDim.x);
     int rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
     rows_per = MAX(rows_per, SQ_MINROWS);
@@ -1067,33 +1125,101 @@ void exl3_gemv_int8_sq_kernel
     __shared__ float sh_red[33];
     __shared__ int sh_last;
 
+    // Both matrices of a dual launch share the staged slice when they read the same activations
+    // with the same input signs (the staging depends on nothing else)
+    const bool share_stage = dual && A2 == A && suh2 == suh;
+    const int ms = size_m * ksplit;     // (slice, row) entries per matrix in qsums and the partials
+
     int t = threadIdx.x;
-    int prev_slice = -1;
+    int prev_key = -1;
+    if constexpr (tri)
+    {
+        const bool share3 = suh2 == suh && suh3 == suh;
+        for (int unit = blockIdx.x; unit < units; unit += gridDim.x)
+        {
+            int slice = unit / nb256_total;
+            int g = unit % nb256_total;
+            int mat = g < nb256_mat ? 0 : (g < nb256_mat + nbm1 ? 1 : 2);
+            int nb256 = mat == 0 ? g : (mat == 1 ? g - nb256_mat : g - nb256_mat - nbm1);
+            const uint16_t* B_m = mat == 0 ? B : (mat == 1 ? B2 : B3);
+            void* C_m = mat == 0 ? C : (mat == 1 ? C2 : C3);
+            const half* suh_m = mat == 0 ? suh : (mat == 1 ? suh2 : suh3);
+            const half* svh_m = mat == 0 ? svh : (mat == 1 ? svh2 : svh3);
+            int n_m = mat == 0 ? size_n : (mat == 1 ? n2 : n3);
+            int smat = share3 ? 0 : mat;
+            float* qsums_m = qsums + 4 * smat * ms;
+            int kb0 = slice * rows_per;
+            int nrows = MIN(rows_per, rows_total - kb0);
+            int key = slice * 3 + smat;
+            if (key != prev_key)
+            {
+                gemv_int8_stage_slice<M, residual>(A, size_m, size_k, suh_m, qsums_m + 4 * slice * M,
+                                                   sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
+                prev_key = key;
+            }
+            int* pacc = partials + ((size_t) mat * ms + (size_t) slice * M) * pstride;
+            if constexpr (bits == 4)
+                gemv_int8_unit_wide<M, residual, false>(B_m, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_m);
+            else if constexpr (gemv_int8_stage_smem(bits))
+                gemv_int8_unit_smem<bits, M, residual, false>(B_m, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, n_m);
+            else
+                gemv_int8_unit_narrow<bits, M, residual, false>(B_m, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, n_m);
+            __threadfence();
+            __syncthreads();
+            int* counter = counters + g;
+            if (t == 0) sh_last = (atomicAdd(counter, 1) == ksplit - 1) ? 1 : 0;
+            __syncthreads();
+            if (sh_last)
+            {
+#if defined(USE_ROCM)
+                __threadfence();
+#endif
+                gemv_int8_epilogue_group_sq<M, c_fp32, residual>(partials + (size_t) mat * ms * pstride, qsums_m, pstride, ksplit,
+                                                                 size_m, C_m, svh_m, sh_tmp, nb256, n_m);
+                if (t == 0) *counter = 0;
+            }
+        }
+        return;
+    }
     for (int unit = blockIdx.x; unit < units; unit += gridDim.x)
     {
-        int slice = unit / nb256_total;
-        int nb256 = unit % nb256_total;
+      int slice = unit / nb256_total;
+      int nb256 = unit % nb256_total;
+      for (int mat = 0; mat < (dual ? 2 : 1); ++mat)
+      {
+        const half* A_m = mat ? A2 : A;
+        const uint16_t* B_m = mat ? B2 : B;
+        void* C_m = mat ? C2 : C;
+        const half* suh_m = mat ? suh2 : suh;
+        const half* svh_m = mat ? svh2 : svh;
+        int smat = share_stage ? 0 : mat;
+        float* qsums_m = qsums + 4 * smat * ms;
         int kb0 = slice * rows_per;
         int nrows = MIN(rows_per, rows_total - kb0);
-        if (slice != prev_slice)
+        int key = slice * 2 + smat;
+#if EXL3_SQ_PF > 0
+        if constexpr (M == 1 && bits != 3) gemv_int8_prefetch_unit<bits>(B_m, nb256, kb0, nrows, size_n);
+#endif
+        if (key != prev_key)
         {
-            gemv_int8_stage_slice<M, residual>(A, size_m, size_k, suh, qsums + 4 * slice * M,
+            gemv_int8_stage_slice<M, residual>(A_m, size_m, size_k, suh_m, qsums_m + 4 * slice * M,
                                                sh_ah, sh_as, slice_stride, sh_red, kb0, nrows);
-            prev_slice = slice;
+            prev_key = key;
         }
-        int* pacc = partials + (size_t) slice * M * pstride;
+        int* pacc = partials + ((size_t) mat * ms + (size_t) slice * M) * pstride;
         if constexpr (bits == 4)
-            gemv_int8_unit_wide<M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_wide<M, residual, false>(B_m, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
         else if constexpr (gemv_int8_stage_smem(bits))
-            gemv_int8_unit_smem<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_smem<bits, M, residual, false>(B_m, pacc, pstride, sh_as, slice_stride, sh_b, nb256, kb0, nrows, size_n);
         else
-            gemv_int8_unit_narrow<bits, M, residual, false>(B, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
+            gemv_int8_unit_narrow<bits, M, residual, false>(B_m, pacc, pstride, sh_as, slice_stride, nb256, kb0, nrows, size_n);
 
         // Completion counter: the ksplit-th contributor runs the epilogue for this 256-column group.
         // (sh_last reuse across iterations is ordered by the next iteration's __syncthreads.)
         __threadfence();
         __syncthreads();
-        if (t == 0) sh_last = (atomicAdd(&counters[nb256], 1) == ksplit - 1) ? 1 : 0;
+        int* counter = counters + mat * nb256_mat + nb256;
+        if (t == 0) sh_last = (atomicAdd(counter, 1) == ksplit - 1) ? 1 : 0;
         __syncthreads();
         if (sh_last)
         {
@@ -1101,10 +1227,11 @@ void exl3_gemv_int8_sq_kernel
             // Acquire side of the counter handshake (the partials were written by other CUs)
             __threadfence();
 #endif
-            gemv_int8_epilogue_group_sq<M, c_fp32, residual>(partials, qsums, pstride, ksplit, size_m,
-                                                             C, svh, sh_tmp, nb256, size_n);
-            if (t == 0) counters[nb256] = 0;
+            gemv_int8_epilogue_group_sq<M, c_fp32, residual>(partials + (size_t) mat * ms * pstride, qsums_m, pstride, ksplit,
+                                                             size_m, C_m, svh_m, sh_tmp, nb256, size_n);
+            if (t == 0) *counter = 0;
         }
+      }
     }
 }
 

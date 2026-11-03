@@ -14,9 +14,22 @@ EXL3_ROW_INV_GROUP_ROWS overrides the row cap (1 = one forward per job, the slow
 """
 import os
 
-from ..util.row_inv import ROW_INV_MAX_ROWS
+from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS
 
 GROUPS = {"on": os.environ.get("EXL3_ROW_INV_GROUPS", "0") not in ("", "0")}
+
+
+# Plain multi-job decode (nothing drafted, several one-token sequences in one forward) through the R-row exact paths.
+# Those paths (union MoE on the device table, R-row GEMV, batched router, per-sequence attention loops) are marked by
+# params["dflash_verify"], which only a drafted verify forward carries; a plain step of N sessions otherwise falls to the
+# per-expert eager loops and the generic multi-row kernels: N x the weight reads, and thousands of host launches.
+# Rows 2..ROW_INV_MAX_ROWS only (the range those paths are bit-exact for), one-row steps are untouched.
+# EXL3_PLAIN_ROWS_VERIFY=1 turns it on; PLAIN_ROWS["on"] is mutable at run time for one-load A/B (purge the block graphs).
+PLAIN_ROWS = {"on": os.environ.get("EXL3_PLAIN_ROWS_VERIFY", "0") not in ("", "0")}
+
+
+def plain_rows_verify(rows: int, drafted: bool) -> bool:
+    return PLAIN_ROWS["on"] and not drafted and ROW_INV["on"] and 1 < rows <= ROW_INV_MAX_ROWS
 
 
 def group_rows_cap() -> int:

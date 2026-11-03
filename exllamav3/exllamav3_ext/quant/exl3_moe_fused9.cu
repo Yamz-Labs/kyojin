@@ -69,7 +69,10 @@ template <class S7, bool TM, int OCC, int INL, int ABL = 0> void launch7(const a
         mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 2><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
         mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 3><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
         mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 4><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
-        mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 5><<<p.G, mf::THREADS, 0, stream>>>(p, vmask);
+        // EXL3_MOE_COMBINE_SPLIT=0: the combine stage runs as the G-block stage-5 kernel again (A/B)
+        static const bool cmb_own = [] { const char* e = getenv("EXL3_MOE_COMBINE_SPLIT"); return !e || atoi(e) != 0; }();
+        if (cmb_own) { mf9::moe_combine9s_kernel<S7><<<DM::CMB_BLOCKS * R, 384, 0, stream>>>(p); }
+        else { mf9::moe_fused9s_kernel<S7, (bool) INL, ABL, 5><<<p.G, mf::THREADS, 0, stream>>>(p, vmask); }
     }
     else
     {
@@ -100,6 +103,16 @@ void mf9_half(at::Tensor& x, const at::Tensor& fn, const at::Tensor& fn_scale, c
         TORCH_CHECK(!timing, "mf9: wide launches (rows 5..8) have no timing build");
         const int64_t vv = variant & 0x1f0000;
         TORCH_CHECK(vv == 0x160000, "mf9: wide launches (rows 5..8) exist for the default variant 0x160000 (six stage launches) only");
+        // K6/K8 wide experiment: native, six-stage, no ablations.
+        if (Match7<mf::QwenK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB) ||
+            Match7<mf::SmallK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) {
+            TORCH_CHECK(native == 1 && (variant & ~0x1000LL) == 0x160000,
+                        "mf9: wide K6S8 requires native six-stage launches without ablations");
+            if (Match7<mf::QwenK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB))
+                L7(mf::Wide<mf::QwenK6S8>, false, 4, 1);
+            else L7(mf::Wide<mf::SmallK6S8>, false, 4, 1);
+            return;
+        }
 #define XW(SH) if (Match7<mf::Wide<SH>>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) { L7(mf::Wide<SH>, false, 4, 1); return; }
         XW(mf::QwenShape) XW(mf::SmallTestShape) XW(mf::QwenK3S4) XW(mf::QwenK3S5) XW(mf::QwenK4S4) XW(mf::QwenK4S5)
         XW(mf::SmallK3S4) XW(mf::SmallK3S5) XW(mf::SmallK4S4) XW(mf::SmallK4S5)
@@ -127,6 +140,12 @@ void mf9_half(at::Tensor& x, const at::Tensor& fn, const at::Tensor& fn_scale, c
         switch ((variant >> 8) & 3) { case 1: L7A(mf::QwenK4S5, true, 2, 1, 1); break; case 2: L7A(mf::QwenK4S5, true, 2, 1, 2); break; default: L7A(mf::QwenK4S5, true, 2, 1, 3); } return; }
     X9D(mf::QwenK3S4) X9D(mf::QwenK3S5) X9D(mf::QwenK4S4) X9D(mf::QwenK4S5)
     X9D(mf::QwenK6S6) X9D(mf::SmallK6S6)
+    if (Match7<mf::QwenK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB) || Match7<mf::SmallK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) {
+        TORCH_CHECK((variant & ~0x1000LL) == 0x160000 && !timing, "mf9: experimental K6S8 supports only six-stage launches without timing or ablations");
+        if (Match7<mf::QwenK6S8>::eq(D, H, LR, NEXP, TOPK, INTER, RB, SB)) L7(mf::QwenK6S8, false, 4, 1);
+        else L7(mf::SmallK6S8, false, 4, 1);
+        return;
+    }
     X9D(mf::QwenK4S6) X9D(mf::QwenK5S6) X9D(mf::SmallK4S6) X9D(mf::SmallK5S6)
     X9D(mf::SmallK3S4) X9D(mf::SmallK3S5) X9D(mf::SmallK4S4) X9D(mf::SmallK4S5)
 #undef X9D

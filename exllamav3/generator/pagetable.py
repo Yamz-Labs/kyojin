@@ -18,12 +18,17 @@ import time
 from ..cache import RecurrentCache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..util import profile_opt
+from ..util.attention_mode import ATTENTION_CACHE_MODE
 
 
 def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
     hasher = hashlib.blake2b(digest_size = 16)
     if prev_hash is not None:
         hasher.update(prev_hash)
+    elif ATTENTION_CACHE_MODE is not None:
+        # Salt only the root; every descendant inherits the frozen sparse policy.
+        # Normal mode keeps the exact legacy hash input and existing cache hits.
+        hasher.update(ATTENTION_CACHE_MODE.encode())
     hasher.update(tensor.numpy().tobytes())
     return hasher.digest()
 

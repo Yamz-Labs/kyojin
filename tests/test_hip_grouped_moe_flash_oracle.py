@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3 import Cache, Config, Generator, GreedySampler, Job, Model, Tokenizer
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.modules.block_sparse_mlp import BlockSparseMLP

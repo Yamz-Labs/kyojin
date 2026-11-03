@@ -2,6 +2,8 @@
 import pytest
 import torch
 
+from hardware import require
+require("ext")
 from exllamav3.ext import exllamav3_ext as ext
 
 

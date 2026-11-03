@@ -34,6 +34,7 @@ from . import ablit_runtime
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from .block_sparse_mlp import BlockSparseMLP
+from ..util.row_inv import ROW_INV_MAX_ROWS
 from .gated_delta_net import GatedDeltaNet
 from .mla_attn import MLAttention, MAX_DECODE_QLEN as _MLA_MAX_QLEN
 
@@ -45,13 +46,13 @@ BLOCK_GRAPH_MAX_SLOTS = max(1, _env_int("EXL3_BLOCK_GRAPH_MAX_SLOTS", 4))
 
 # Rows above the dense GEMV cap reconstruct+hgemm; still captureable, but the first bounded
 # implementation keeps the served decode envelope. Revisit after (B,Q) family measurements.
-BLOCK_GRAPH_MAX_ROWS = _env_int("EXL3_BLOCK_GRAPH_MAX_ROWS", 16)
+BLOCK_GRAPH_MAX_ROWS = _env_int("EXL3_BLOCK_GRAPH_MAX_ROWS", 16 if ROW_INV_MAX_ROWS <= 8 else ROW_INV_MAX_ROWS)
 BLOCK_GRAPH_DEC_MOE = os.environ.get("EXL3_BLOCK_GRAPH_DEC_MOE", "1") == "1"
 # R-row verify blocks (MTP/DFlash, union MoE on the device table): EXL3_BLOCK_GRAPH_VERIFY=1 graphs
 # them. Off by default: at R=2 on the test box it replays but runs ~0.5 ms slower than eager (glm-mtp step 2b).
 # Module global: a harness may flip it between arms.
 BLOCK_GRAPH_VERIFY = os.environ.get("EXL3_BLOCK_GRAPH_VERIFY", "0") == "1"
-BLOCK_GRAPH_VERIFY_MAX_ROWS = 8  # MOE_R_MAX
+BLOCK_GRAPH_VERIFY_MAX_ROWS = max(8, ROW_INV_MAX_ROWS)  # 8 = MOE_R_MAX; ROCm carries 9..32 rows as union slices / GEMV row chunks
 BLOCK_GRAPH_DEBUG = os.environ.get("EXL3_BLOCK_GRAPH_DEBUG", "0") == "1"
 # Piecewise capture of MLA/DSA blocks (GLM-5.3 DSA layers), see _mla_forward. The attention core
 # (cache append, indexer keys/planes, top-k, sparse/dense attention) sizes its launches from host

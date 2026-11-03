@@ -144,6 +144,84 @@ affects quantized caches.
   `EXL3_QC_ATTN=0`); only affects decode if `EXL3_BC_ATTN` is also disabled, since the graphed
   decode path reads the packed cache directly.
 
+### `EXL3_CK_PAGEDKV` (default: unset) -- EXPERIMENTAL
+
+Experimental, default-off, approximate Composable Kernel sparse prefill for the MiMo
+global-attention shape on gfx1151 ROCm. Skipping past pages changes attention output and
+therefore later layers' K/V. This is research functionality, not a general quality-adoption
+recommendation. Set to `sparse` before importing the engine to register handlers for fp16 and
+8-bit KV caches when the optional library is available. The handlers own only batch-one,
+causal Q/K=192, 64-query-head/4-KV-head, V=128 prefill chunks; unsupported shapes, decode,
+SWA and unaligned past lengths fall back to the normal backend.
+
+Build the required MIT-licensed CK specialization with local `git`, `cmake`, `nm`,
+`/usr/bin/python3`, and an already-expanded ROCm SDK (including `lib/llvm/bin/clang{,++}`):
+
+```bash
+export EXL3_CK_SOURCE=/path/to/local/composable_kernel
+export EXL3_ROCM_SDK=/path/to/already-expanded/rocm-sdk
+export EXL3_CK_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/kyojin/ck-pagedkv"
+tools/strix_halo/build_ck_pagedkv.sh
+```
+
+`EXL3_CK_SOURCE` is a read-only local Git donor containing commit
+`6f44fdf90f69adee742ec3660b95d32963b9bd2d`. The builder ignores its current HEAD and dirty
+worktree, stages that exact commit in the cache, and patches only the staged copy. It never
+fetches implicitly or sources `env.sh`. `EXL3_CK_CACHE` must be disjoint from the donor (neither
+may contain the other): choose a nonexistent directory on first use, or reuse a cache with a
+matching builder/patch/shim/SDK/commit ownership record. Existing unowned or incompatible
+caches are refused.
+
+The output is `$EXL3_CK_CACHE/libck_pagedkv.so` with a digest-bound `receipt.json`. The default
+cache is `${XDG_CACHE_HOME:-$HOME/.cache}/kyojin/ck-pagedkv`; when choosing a different cache,
+set `EXL3_CK_PAGEDKV_SO="$EXL3_CK_CACHE/libck_pagedkv.so"` before importing the engine. Build
+success proves source compilation/linking and export checks only, not native loading or
+numerical correctness. The first implementation stages all used K and V pages from an 8-bit
+cache; selected-V-only staging is not implemented yet.
+
+A missing/unloadable optional library or missing entry point warns once and leaves the normal
+handlers in place for the process. An explicit kernel rejection (`-1`) declines for that chunk;
+other invalid results and execution errors are not treated as unsupported shapes. Restart after
+building or replacing an unavailable library.
+
+The 8-bit staging pair grows in 32-page steps, capped by the packed cache's physical capacity,
+and is reused within each step. A width/bound change retires incompatible scratch; replacements
+retire the old pair first under the engine's single-stream, fully-overwritten-scratch contract.
+
+Sparse mode, retention and minimum length are frozen together at import time. Use a new process
+to change them. Sparse page hashes, disk-prefix namespaces and saved sessions are isolated from
+ordinary mode and from other sparse policies, including fallback requests in a sparse process.
+Ordinary session formats 1/2 remain readable in ordinary mode. Sparse sessions use incompatible
+formats 3/4 so older ordinary readers reject them too; current readers check the exact policy
+before restoring any pages, stash or rootless tail. The MiMo server's `+ck-sparse` model tag is
+retained as an additional separation layer.
+
+Focused CPU tests need no Torch, Triton, native extension or CUDA/HIP toolchain. Run each directly
+from the repository root to avoid package initialization:
+
+```bash
+python3 -I -S -B tests/test_ck_pagedkv_cpu.py -v
+python3 -I -S -B tests/test_ck_pagedkv_fallback_cpu.py -v
+python3 -I -S -B tests/test_ck_pagedkv_admission_cpu.py -v
+python3 -I -S -B tests/test_ck_pagedkv_sparse_memory_cpu.py -v
+python3 -I -S -B tests/test_ck_sparse_cache_cpu.py -v
+python3 -I -S -B tests/test_ck_dispatch_mode_cpu.py -v
+```
+
+### `EXL3_CK_SPARSE_RETAIN` (default: `0.5`)
+
+Nominal fraction of total pages (past plus current chunk) retained by the optional CK selector.
+Current-chunk and sink pages are always kept, even if they exceed that budget; the most-recent
+past pages are not forced. Read once before engine import and included in the sparse cache
+identity. This is a quality/performance knob; evaluate it with the same model and context before
+changing the default.
+
+### `EXL3_CK_MIN_SK` (default: `0`)
+
+Experimental minimum total KV length for sparse selection in the fp16 and packed8 handlers.
+Calls below it use the ordinary backend. Frozen at import time and included in the sparse cache
+identity. It does not enable CK for otherwise unsupported shapes.
+
 ### `EXL3_QC_PF_TWO_PASS_MIN_Q` (default: `256`)
 
 Query-length threshold for the prefill staging pass at `EXL3_QC_STAGING=1`. Chunks shorter than
@@ -156,6 +234,20 @@ Pipeline stage count for the direct quantized-cache prefill kernel. Unset/`0`, t
 {1, 2} is measured once per (shape family, device) at first use; a nonzero value pins it,
 skipping the measurement. Only relevant where the direct path still runs (`EXL3_QC_STAGING=0`,
 or short chunks below the threshold above).
+
+### `EXL3_KVWIN` (default: unset = `4:128` when k or v bits <= 5 on ROCm, off on CUDA and at 6 bits and above)
+
+`sink:window`, e.g. `4:128`; `0` / `off` disables it, an explicit value forces it at any bit width and on any backend (the unset-switch default is ROCm-only until the CUDA served A/B clears it: `DEFAULT_ON_CUDA` in `cache/kvwin.py`). Keeps the first `sink` positions and the last `window` positions of every job in fp16
+next to a quantized K/V cache (`--k-bits/--v-bits`): attention reads the quantized pool for everything in between
+and a small fp16 ring (`sink + window + 16` rows per layer and job) for the rest, merged exactly by the flash-decoding
+combine. Costs about 10 MiB of VRAM per job slot at `4:128` on a 16-layer, 4-kv-head, head-dim-256 model. Applies to
+quantized-cache attention layers of models with recurrent state slots (Qwen3.5/3.8 hybrids); the ring is part of the
+job's recurrent state, so prefix/tail checkpoints, the CPU stash and the prefix disk carry it and restores stay
+bit-exact (a checkpoint written without the switch rebuilds the ring from the pool, with quantized precision for the
+first `window` tokens). While it is on, the graph-captured decode attention (`EXL3_BC_ATTN`) and the whole-forward
+graph (`EXL3_CUDA_GRAPH`) decline, and tensor-parallel loading is not supported. Prefill chunks attend the exact
+sinks, the exact window before the chunk and all of the chunk's own rows (a superset of the per-row decode window).
+With the window off (`0`, or unset at >= 6 bits) every code path is bit-identical to a build without it.
 
 ### `EXL3_MLA_PREFILL` (default: `mha`)
 
@@ -972,6 +1064,23 @@ With `EXL3_ROW_INV_GROUPS=1`: the most token rows one forward of a decode step m
 job, which is the slowest plan and exact by construction. Values above 8 leave the range where the row-exact
 kernels apply.
 
+#### `EXL3_PLAIN_ROWS_VERIFY` (default: `0`, off; the GLM server sets `1` with `--sessions` above 1)
+
+A decode step without drafted tokens that carries 2 to 8 rows (several sessions decoding together) is run like a verify
+forward: the union MoE on the device table, the R-row GEMV, the batched router and the per-sequence attention loops
+that `EXL3_ROW_INV` enables for verify forwards. Without it such a step fell to per-expert eager loops, thousands of
+host launches. Needs `EXL3_ROW_INV` on. One-row steps are untouched, so a single request decodes as before. GLM-5.3-Flash
+on the box (v1.7.2), 4 sessions, 4 greedy prompts: 26.1 to 40.7 tok/s aggregate. Qwen already has these paths, so it does
+not change there. The text of 4 concurrent plain streams still differs from the solo run at a near-tie word (the solo step
+uses the one-row kernels), as it did before the flag.
+
+#### `QWSPEC_LOAD_ROWS` (default: `EXL3_ROW_INV_GROUP_ROWS` (`8`) with `--sessions` above 1 in the Qwen server on ROCm; on NVIDIA `16` for a dense model and `0` for a model with MoE layers; `0` elsewhere)
+
+Qwen speculative decoding: with N requests decoding together the draft depth is capped at `R // N - 1`, so the verify rows
+of the step, `N * (depth + 1)`, stay within `R` rows (no draft when that is below 1). `0` turns the cap off.
+`QWSPEC_LOAD_CAPS="N:D,..."` sets the cap for chosen N. Qwen3.8-Flash-Next on the box (v1.7.2 with an equivalent cap), 4 sessions,
+4 greedy prompts: 54.9 tok/s aggregate without the cap, 71.2 with it.
+
 #### `EXL3_MTP_EH_FP16` (default: unset, off)
 
 Path of a safetensors sidecar holding an unquantized copy of the MTP `eh_proj`, which raises
@@ -1095,6 +1204,9 @@ latch the value at import.
 | `EXL3_MOE_FUSED` | `1` | The fused MoE kernel. Ignored on a non-ROCm build. |
 | `EXL3_MOE_VALU` | `1` | The FDOT2 VALU decode matvec for K2/K4 experts instead of the WMMA body (bitwise-identical outputs). K=2 also defaults on without it; `0` forces the WMMA body everywhere. |
 | `EXL3_VERIFY_ATTN_LOOP` | `1` | Runs an R-row verify attention as the exact R single-row loop, which is what keeps a verify forward bit-identical. |
+| `EXL3_PD_BULK` | `1` on CUDA, `0` on ROCm | Prefix disk restore with one pinned bulk copy instead of per-page copies. Bulk is faster on CUDA and slower on ROCm unified memory. |
+| `EXL3_RC_ANCHOR_MAX` | `16384` | Recurrent checkpoint cache: power-of-two positions up to this value are evicted last, so a compaction turn can resume from them. `0` gives plain LRU. |
+| `QWSPEC_NG_POOL` | `4` | N-gram followers kept per server, one per conversation. `1` gives the single follower back. |
 | `EXL3_VERIFY_GEMV_R` | `1` | Runs the decode projections of an R-row verify as one multi-row GEMV instead of R single-row calls. |
 | `EXL3_GEMV_R_DEC1` | `1` | Decodes each weight pair once per verify forward and shares it across rows, instead of decoding it again per row. Bit-identical, and it needs `EXL3_GEMV_R_RM6`. |
 | `EXL3_MTP_FUSE_CATCHUP` | `0` | `0` runs a catch-up draft prefill after each accepted round, `1` folds those rows into the next draft forward, `2` does that on the union MoE path. Unset means auto. |
@@ -1138,6 +1250,8 @@ latch the value at import.
 | `EXL3_HC_FN_HALF_PF` | `1` | Reads the hyper-connection weights in fp16 at any row count, not only small ones, which halves the dominant traffic of that kernel. |
 | `EXL3_HC_1PASS_PF` | `1` | The one-pass prefill kernel for the hyper-connection mix and norm, above the decode row cap. |
 | `EXL3_DEC_DSA_FAST` | `1` | A tuned tile and split preset for the DSA decode kernel, for 2 or more rows. A list of numbers overrides the pieces. |
+| `EXL3_DSA_TQ_GATHER` | `1` | On a TurboQuant latent cache, decode first dequantizes only the gathered rows, then runs the fp16 DSA decode kernels. `0` = read the packed pages inside the kernel. |
+| `EXL3_DSA_TQ_GATHER_MAX_R` | `8` | Largest row count that takes the gathered dequantize path. |
 | `EXL3_MIDCHUNK_CKPT` | `2` | A prefill chunk that crosses a recurrent checkpoint boundary also saves the recurrent state there, so the follow-up turn can resume from it. |
 | `EXL3_PREFILL_BIG_TAIL` | `1` | Allows the big-chunk tail path. Honored only with `EXL3_MIDCHUNK_CKPT=2`. |
 | `EXL3_BIG_TAIL_DENSE` | `1` | On a sparse single-session decode pass longer than the query-length cap, lets the tail attend densely instead of sparsely. |
@@ -1217,7 +1331,7 @@ noise of the quantization), which is why each has an off switch for A/B work.
 #### `EXL3_CUDA_GRAPH` (default `0`; `tools/qwen/serve.py` and `tools/flint/serve.py` set it to `1` on NVIDIA)
 
 Whole-forward CUDA graph for decode steps (Qwen GDN, Flint sliding-window ring, MTP verify). `EXL3_CUDA_GRAPH_MULTI=1`
-(default off) lets several jobs share one graph (B in 1..4, B*Q <= 32). `EXL3_CUDA_GRAPH_MAX` bounds the graph cache.
+(default off; `tools/flint/serve.py --max-batch N` and `tools/qwen/serve.py --sessions N` set it to `1` on NVIDIA when N > 1) lets several jobs share one graph (B in 1..4, B*Q <= 32). `EXL3_CUDA_GRAPH_MAX` bounds the graph cache (16 with MULTI, 32 from the Qwen server with `--sessions` > 1).
 
 #### `EXL3_QDEC` (default `1`), `EXL3_QDEC_GRAPH` (default `1`), `EXL3_QDEC_ROWS` (default `1`)
 
@@ -1225,6 +1339,31 @@ Decode attention for quantized KV caches (K/V bits 2..8): a tensor-core split ke
 build step) that reads the packed pages directly. `EXL3_QDEC=0` falls back to the Triton kernels, `EXL3_QDEC_GRAPH=0`
 disables its CUDA-graph capture path, `EXL3_QDEC_ROWS` selects the many-row kernel for verify steps (q_len 2..8 at
 head dim 256): `0` off, `1` only where the single-row kernel cannot serve, `2` always.
+
+#### `EXL3_QWRITE_TRITON` (default `1`; ROCm)
+
+Native Triton writer for the quantized paged cache (K/V bits 2..8, `attention_fn/qwrite_triton.py`): one launch appends the new
+rows of K and V with the same arithmetic and packed plane layout as the PyTorch fallback (bit-identical words and scales,
+`tests/test_qwrite.py`). The fallback needs ~70 launches per layer (decode append 402 us, 4096-row prefill chunk 5.2 ms at
+K/V 6,6 per layer; native 17 us / 89 us). `0` restores the fallback.
+
+#### `EXL3_QDEC_HIP` (default `1`; ROCm gfx11.5)
+
+HIP counterpart of `EXL3_QDEC` for AMD (Strix Halo): a wave32 WMMA kernel (`attention_fn/qdec.hip`, compiled with hipcc at first
+use and cached under `~/.cache/exllamav3`) that dequantizes the packed K/V pages straight into the WMMA operands, plus a small
+combine kernel. Used for quantized-KV decode (K/V bits 2..8, head dim 128 or 256, q_len up to 6 at head dim 128 / 3 at 256) with
+full attention, no softcap; windowed layers, 1-bit planes and bigger shapes keep the Triton kernels. `0` keeps the Triton kernels.
+Tuning knobs for A/B work: `EXL3_QDEC_HIP_NW` (waves per CTA, default 4), `EXL3_QDEC_HIP_DW` (waves splitting the head dim),
+`EXL3_QDEC_HIP_WAVES` (target resident waves for the split count), `EXL3_QDEC_HIP_SPL` (fixed split count),
+`EXL3_QDEC_HIP_MAXO` (accumulator budget per lane, default 96).
+
+#### `EXL3_SHARED_SIDE` (default `0`; ROCm)
+
+Batch-1 MoE decode with a shared expert that is not folded into the routed launch (Flint: shared expert K=6, I=1024; the fold needs
+K=4 and the routed shape): the shared expert's GEMVs, which do not depend on the routed experts, run on a side stream with their
+own GEMV scratch/counters while the routed kernels run on the main one, and are joined at the shared add. Bit-identical results
+(same kernels, tests/gate_kv.py KL 0), Flint 4K / 32K decode +4..5 % (tests/ab_decode.py, alternating windows in one process).
+`EXL3_DEC_MIN_BLOCKS` (default 32; read per call) at 512 adds about 1.5 % on Flint (more blocks for its small GEMVs).
 
 #### `EXL3_PREFILL_WIDE` (default `1`)
 

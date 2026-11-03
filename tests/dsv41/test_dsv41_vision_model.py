@@ -18,6 +18,8 @@ from PIL import Image
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from pathlib import Path
+from hardware import require
+require("ext")
 import harness
 from harness import FakeTok, build_reference, make_engram_tables, make_state_dict, tiny_config
 from exllamav3.dsv41 import vision as V

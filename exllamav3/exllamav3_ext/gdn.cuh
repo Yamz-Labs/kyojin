@@ -187,7 +187,8 @@ void gdn_ba_gemv_gr
     const at::Tensor& w_t,          // [n, k] half
     const c10::optional<at::Tensor>& bias,  // [n] half
     at::Tensor& y,                  // [.., n] float
-    Graph* graph
+    Graph* graph,
+    cudaStream_t stream_ovr = nullptr
 );
 
 // Float-input fp16-weight GEMV for the KDA low-rank second stages (graph statics, no patching)

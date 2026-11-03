@@ -1,0 +1,3 @@
+#!/bin/sh
+# bigconv {plan,sheet} ...
+exec env PYTHONPATH="$(dirname "$0")/.." python3 -m bigconv "$@"

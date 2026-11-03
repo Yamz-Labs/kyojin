@@ -1,5 +1,7 @@
 import os, sys, unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hardware import require
+require("ext")
 from exllamav3.modules.attn import Attention
 
 class FakeLinear:

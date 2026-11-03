@@ -1075,7 +1075,9 @@ def main() -> None:
                                 vision=not args.no_vision)
         from exllamav3.generator.slot_store import SlotStore
         engine.slot_store = SlotStore(engine.generator, [c for c in (engine.cache, engine.draft_cache) if c is not None],
-                                      args.slot_save_path, args.model_id)
+                                      args.slot_save_path,
+                                      # EXL3_CK_PAGEDKV=sparse prefill writes approximate K/V: its slot files never mix with exact ones
+                                      args.model_id + ("+ck-sparse" if os.environ.get("EXL3_CK_PAGEDKV", "").lower() == "sparse" else ""))
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         if engine.supports_vision:   # the first tower pass pays kernel setup and allocator growth: not on the first user image
             from PIL import Image

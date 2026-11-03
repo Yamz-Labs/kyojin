@@ -14,6 +14,8 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from hardware import require
+require("ext")
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.generator.job import Job
 from exllamav3.tokenizer import MMEmbedding

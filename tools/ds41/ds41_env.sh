@@ -26,8 +26,16 @@ DS41_PACK=${DS41_PACK:-$HOME/models/ds41-1017-yamz}
 DS41_ENGRAM_DIR=${DS41_ENGRAM_DIR-$HOME/models/ds41-1017/engram_fp8}
 DS41_TIER=${DS41_TIER:-auto}
 DS41_VALIDATE=${DS41_VALIDATE:-1}
-# shellcheck disable=SC1091
-source "${DS41_PYENV:-$H/ds41box/pyenv.sh}" "$ROOT" || { echo "ds41: python env ${DS41_PYENV:-$H/ds41box/pyenv.sh} failed" >&2; return 5 2>/dev/null || exit 5; }
+# Python env: DS41_PYENV=<script> (sourced with the repo root) if set, else the repo's standard Strix Halo env (tools/strix_halo/env.sh,
+# venv at $EXL3_VENV or <repo>/.venv; needs ml_dtypes installed in it).
+# shellcheck disable=SC1090,SC1091
+if [ -n "${DS41_PYENV:-}" ]; then
+  source "$DS41_PYENV" "$ROOT" || { echo "ds41: python env $DS41_PYENV failed" >&2; return 5 2>/dev/null || exit 5; }
+else
+  source "$ROOT/tools/strix_halo/env.sh" >/dev/null || { echo "ds41: tools/strix_halo/env.sh failed" >&2; return 5 2>/dev/null || exit 5; }
+  export PATH="$EXL3_VENV/bin:$PATH" PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+  unset CUDA_VISIBLE_DEVICES
+fi
 export HIP_VISIBLE_DEVICES=0
 [ -f "$DS41_PACK/config.json" ] || { echo "ds41: no pack at $DS41_PACK (config.json missing)" >&2; return 2 2>/dev/null || exit 2; }
 if ! ls "$ROOT"/exllamav3_ext*.so >/dev/null 2>&1; then
@@ -40,7 +48,7 @@ pack_gib=$(du -cbL "$DS41_PACK"/*.safetensors 2>/dev/null | tail -1 | awk '{prin
 avail=$(mem_gib)
 budget_set=${DS41_BUDGET_GIB:+1}
 # DS41_BUDGET_GIB=auto: the pool takes what is free AFTER the non-expert weights are loaded, minus a reserve for what grows later:
-# prefill workspace (~chunk/4096 GiB, measured 8 GiB at chunk 32768), prefix snapshots (DS41_PFX_GIB, 4), KV + runtime (1.5), margin (DS41_AUTO_MARGIN_GIB, 2)
+# prefill workspace (chunk/4096 + 6 GiB: peak torch use above the weights, measured 3-7 GiB at chunk 4096 on 8K-80K prompts, 8 GiB at chunk 32768), prefix snapshots (DS41_PFX_GIB, 4), runtime = what the serve allocates AFTER the pool is sized: KV, Engram and drafter buffers (3.1 GiB of GTT) + python heap growth (1.4 GiB), measured at ctx 131072 draft 5 (DS41_RUNTIME_GIB, 4.5), margin (DS41_AUTO_MARGIN_GIB, 2)
 # Default since 20/10 (briefs/ds41_pool.md): auto, 86 GiB pool vs 78 on a quiet box, -13.5 % GB read per session, tokhash identical.
 if [ "${DS41_BUDGET_GIB:-auto}" = auto ]; then
   DS41_AUTO=1; DS41_BUDGET_GIB=$(( avail - 30 ))
@@ -55,7 +63,7 @@ if [ "$DS41_TIER" = 1 ]; then
   export EXL3_EXPERT_RING=${EXL3_EXPERT_RING:-128}   # pinned staging entries (12.7 MiB each): 128 = 1.6 GiB instead of 4 GiB at the old 320
   if [ "${DS41_AUTO:-}" = 1 ]; then
     export EXL3_EXPERT_BUDGET_GIB=auto
-    export EXL3_EXPERT_RESERVE_GIB=$(LC_ALL=C awk -v c="${DS41_CHUNK:-4096}" -v p="${DS41_PFX_GIB:-4}" -v m="${DS41_AUTO_MARGIN_GIB:-2}" 'BEGIN{printf "%.1f", c/4096+p+1.5+m}')
+    export EXL3_EXPERT_RESERVE_GIB=$(LC_ALL=C awk -v c="${DS41_CHUNK:-4096}" -v p="${DS41_PFX_GIB:-4}" -v m="${DS41_AUTO_MARGIN_GIB:-2}" -v r="${DS41_RUNTIME_GIB:-4.5}" 'BEGIN{printf "%.1f", c/4096+6+p+r+m}')
   fi
   export EXL3_EXPERT_HALFLIFE=${EXL3_EXPERT_HALFLIFE:-16}
   export EXL3_EXPERT_AHEAD=${EXL3_EXPERT_AHEAD:-0}

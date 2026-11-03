@@ -342,5 +342,67 @@ __device__ __forceinline__ void body9s(const Params& p, int vm)
 template <class S, bool INL, int ABL, int STAGE>
 __global__ __launch_bounds__(THREADS) __attribute__((amdgpu_num_vgpr(192))) void moe_fused9s_kernel(Params p, int vm) { body9s<S, INL, ABL, STAGE>(p, vm); }
 
+// Stage 5 as its own small kernel: one block per (128-column slice, row) item, so the combine is one round of independent blocks instead of
+// CMB_BLOCKS * R items cycled over the G resident blocks of the split launches (4 rounds of a latency-bound chain at 8 rows). Needs no sort: an
+// item only wants the sorted position of its row's own TOPK slots (rank by (expert, slot) over all R * TOPK picks, the key ph_topk_tail9 sorts by,
+// for the row of dn) and the order of the row's slots by expert (the order ph_combine9 sums in). Per-item arithmetic is ph_combine9's, in the same order.
+template <class S>
+__global__ __launch_bounds__(384) void moe_combine9s_kernel(Params p)
+{
+    MF_DIMS
+    constexpr int TA = TRows<S>::v * TOPK;
+    __shared__ float rows[(TOPK + 1) * 128];
+    __shared__ int sel[TA], spp[TOPK], ord[TOPK];
+    __shared__ half wt[TOPK];
+    const int R = p.R, NA = R * TOPK;
+    const int cb = blockIdx.x / R, r = blockIdx.x % R;
+    const int wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    if (threadIdx.x < NA) sel[threadIdx.x] = p.seldbg[threadIdx.x];
+    if (threadIdx.x < TOPK) wt[threadIdx.x] = __ushort_as_half((unsigned short) p.seldbg[sel_wt_base(TRows<S>::v) + r * TOPK + threadIdx.x]);
+    __syncthreads();
+    if (threadIdx.x < TOPK)
+    {
+        const int a = r * TOPK + threadIdx.x, e = sel[a];
+        int pp = 0, rk = 0;
+        for (int b = 0; b < NA; ++b) { const int eb = sel[b]; pp += (eb < e) || (eb == e && b < a); }
+        for (int k = 0; k < TOPK; ++k) { const int ek = sel[r * TOPK + k]; rk += (ek < e) || (ek == e && k < (int) threadIdx.x); }
+        spp[threadIdx.x] = pp; ord[rk] = threadIdx.x;
+    }
+    __syncthreads();
+    if (wave <= TOPK)
+    {
+        int pp; const half* const* sv;
+        if (wave < TOPK) { pp = spp[wave]; sv = p.svt + 6 * sel[r * TOPK + wave]; }
+        else { pp = NA + r; sv = p.svt + 6 * NEXP; }
+        float4 v = ((const float4*) (p.dn + dn_row<S>(pp) + cb * 128))[lane];
+        v = had_regs_f_post(v, sv[5] + cb * 128, lane);
+        ((float4*) (rows + wave * 128))[lane] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 128)
+    {
+        const int col = cb * 128 + threadIdx.x, c = threadIdx.x;
+        float sum = 0.0f;
+        for (int j = 0; j < TOPK; ++j)
+        {
+            const int slot = ord[j];
+            const float weighted = __fmul_rn(rows[slot * 128 + c], __half2float(wt[slot]));
+            sum = __fadd_rn(sum, weighted);
+        }
+        const float syw = 1.0f / (1.0f + __expf(-p.sgl[r]));
+        if (!(syw < 1e-8f)) sum += rows[TOPK * 128 + c] * syw;
+        p.ydbg[(size_t) r * D + col] = sum;
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+        {
+            const float po = p.post[r * H + h];
+            const float xv = p.xin[xout_idx<S>(r, h, col)];
+            float o = po * sum;
+            o += xv;
+            p.xout[xout_idx<S>(r, h, col)] = o;
+        }
+    }
+}
+
 }  // namespace mf9
 #endif

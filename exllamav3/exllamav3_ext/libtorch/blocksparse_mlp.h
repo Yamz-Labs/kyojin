@@ -155,7 +155,8 @@ struct BC_BlockSparseMLP
     (
         const at::Tensor& y,
         at::Tensor& selected_experts,
-        at::Tensor& routing_weights
+        at::Tensor& routing_weights,
+        bool with_shared = true
     );
 
     void run_single_expert_gr

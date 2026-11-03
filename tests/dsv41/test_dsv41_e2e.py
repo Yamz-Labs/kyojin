@@ -10,6 +10,8 @@ import os, sys
 import pytest
 import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hardware import require
+require("ext")
 from harness import *
 from exllamav3.dsv41.engram import build_compressed_token_map, EngramLayout, MemoryEngramStore
 from exllamav3.dsv41.weights import DictWeightSource

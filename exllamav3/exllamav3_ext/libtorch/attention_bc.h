@@ -160,6 +160,23 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("xp"),
     py::arg("yp")
 )
+.def("set_kvwin", &BC_Attention::set_kvwin,
+    py::arg("ov_k"),
+    py::arg("ov_v"),
+    py::arg("sinks"),
+    py::arg("window"),
+    py::arg("cyclic_rows"),
+    py::arg("ring_rows")
+)
+.def("configure_slot_kvwin", &BC_Attention::configure_slot_kvwin,
+    py::arg("bsz"),
+    py::arg("q_len"),
+    py::arg("regime"),
+    py::arg("pool_len"),
+    py::arg("k_ovw"),
+    py::arg("k_ring"),
+    py::arg("ovw_gy")
+)
 .def("configure_slot_qsa", &BC_Attention::configure_slot_qsa,
     py::arg("bsz"),
     py::arg("q_len"),
@@ -184,4 +201,18 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
     py::arg("qsa_split_len") = 0,
     py::arg("qsa_programs") = 0
 )
-.def("run", &BC_Attention::run);
+.def("run", &BC_Attention::run,
+    py::arg("bsz"),
+    py::arg("q_len"),
+    py::arg("x"),
+    py::arg("y"),
+    py::arg("cache_seqlens"),
+    py::arg("block_table"),
+    py::arg("position"),
+    py::arg("positions"),
+    py::arg("position_ids"),
+    py::arg("inv_freq_override"),
+    py::arg("regime"),
+    py::arg("t_total"),
+    py::arg("kvwin_slots") = c10::nullopt
+);

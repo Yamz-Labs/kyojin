@@ -38,6 +38,7 @@ def convert_dtype(dt: str):
     elif dt == "BF16": return torch.bfloat16, None, 2
     elif dt == "F32": return torch.float, np.float32, 4
     elif dt == "F8_E4M3": return torch.float8_e4m3fn, None, 1
+    elif dt == "F8_E5M2": return torch.float8_e5m2, None, 1
     elif dt == "U8": return torch.uint8, np.uint8, 1
     else:
         raise ValueError(f"Unknown dtype {dt}")
@@ -583,6 +584,28 @@ class SafetensorsCollection:
             }
         }
 
+
+    def get_tensor_mmap(self, key: str) -> torch.Tensor | None:
+        """
+        Map a bf16/fp16 tensor straight from its file (private copy-on-write mapping, nothing is copied).
+        The pages live in the page cache, so unlike a loaded copy they count as reclaimable file memory
+        instead of anonymous RSS. Returns None when the key is not a plain file tensor of such a dtype.
+        """
+        import numpy as np
+        if self.new_tensors and key in self.new_tensors:
+            return None
+        filename = self.tensor_file_map.get(key)
+        if filename is None:
+            return None
+        header = self.file_headers[filename]
+        h = header[key]
+        dtype, np_dtype, esize = convert_dtype(h["dtype"])
+        if dtype not in (torch.bfloat16, torch.float16):
+            return None
+        shape = tuple(h["shape"])
+        mm = np.memmap(filename, dtype = np.int16, mode = "c", offset = header["_header_offset"] + h["data_offsets"][0],
+                       shape = (math.prod(shape),))
+        return torch.from_numpy(mm).view(dtype).reshape(shape)
 
     def get_tensor_handle(
         self,

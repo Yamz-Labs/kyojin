@@ -32,6 +32,10 @@ pip install pytest
 for t in tests/test_ablit_runtime_cpu.py tests/test_uncensor_bundled_cpu.py tools/glm/test_serve.py tools/mimo/test_serve.py tools/mimo/test_toolcalls.py; do PYTHONPATH=. pytest -q $t; done
 ```
 
+The whole `tests/` directory also runs without a GPU: `PYTHONPATH=. pytest tests`. Tests that need a GPU, the built extension (`import exllamav3` loads it) or Triton are skipped with the reason (`-rs` lists them); the needs are checked in `tests/hardware.py`. A new test that needs one of them takes `@pytest.mark.gpu`, `@pytest.mark.ext` or `@pytest.mark.triton`, or, when its file cannot even be imported without it, calls `require("ext")` from `hardware` before that import.
+
+On the GPU machine, run the suite with `EXL3_TESTS_STRICT=1`: nothing is skipped for missing hardware, so a broken build fails instead of skipping.
+
 If a test or the first import hangs, look for a stale lock file at `~/.cache/torch_extensions/*/exllamav3_ext/lock` and remove it. GPU tests under `tests/` need a built extension and a free GPU; say in the pull request whether you ran them.
 
 ## Pull requests

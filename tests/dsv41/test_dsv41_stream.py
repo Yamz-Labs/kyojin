@@ -7,6 +7,8 @@ import os, sys
 import pytest
 import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hardware import require
+require("ext")
 from tiny_ckpt import write_tiny
 from harness import *
 from exllamav3.dsv41.weights import DictWeightSource

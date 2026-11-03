@@ -53,10 +53,19 @@ class BCMLA:
         self.w_kv = m.kv_a_proj_with_mqa.out_features
 
         self.quant = isinstance(layer, CacheLayer_MLA_quant)
+        self.tq = bool(getattr(layer, "tq", False))
+        self.tq_consts = None
         if self.quant:
             self.cache_ckv, self.cache_scales, self.cache_kpe, self.k_bits = layer.get_qc()
             from .triton_paged import _get_h32
-            h32 = _get_h32(self.device)
+            if self.tq:
+                # TurboQuant: the h32 slot of the kernels carries the fp32 codebook (C++ switches on its dtype); the append kernel's
+                # constants (rotation, codebook, midpoints) ride in the stmp slot
+                st = layer.state
+                h32 = st.cbk
+                self.tq_consts = torch.cat([st.rot_t32.reshape(-1), st.cbk, st.midk]).contiguous()
+            else:
+                h32 = _get_h32(self.device)
         else:
             self.cache_ckv, self.cache_kpe = layer.k, layer.v
             self.cache_scales, self.k_bits = None, 0
@@ -70,6 +79,8 @@ class BCMLA:
         # The staging kernel reads the norm weight as fp16; checkpoints usually store it bf16
         # (fp16-exact at weight magnitudes). The ext object keeps the converted copy alive
         kv_norm_w = m.kv_a_layernorm.weight.data.half().contiguous()
+        if getattr(layer, "tq", False):
+            kv_norm_w = torch.ones_like(kv_norm_w)      # gamma is folded into the up-projections (mla_attn.load_local)
 
         # NoPE models (GLM5.3: qk_rope_head_dim 0) have no rope instance; the rope stages are
         # compiled out of the graph and the ext object gets inert placeholders
@@ -203,7 +214,16 @@ class BCMLA:
                  BLOCK_M = absorb_bm, BLOCK_N = 128),
             4, 2)
 
-        if self.quant:
+        if self.tq:
+            from .mla_triton import _mla_tq_scatter_kernel
+            k_append = _compile_kernel(dev, _mla_tq_scatter_kernel,
+                {"ckv_new": "*fp16", "consts": "*fp32", "kpe_new": "*fp16", "qk": "*i32",
+                 "sk": "*fp16", "kpe_cache": "*fp16", "block_table": "*i32",
+                 "cache_seqlens": "*i32", "num_pages_per_seq": "i32", "append_len": "i32"}
+                | {n: "constexpr" for n in ("page_size", "BITS", "D_c", "D_r", "BK")},
+                dict(page_size = PAGE_SIZE, BITS = self.k_bits, D_c = D_c, D_r = D_r, BK = 16),
+                4, 2)
+        elif self.quant:
             groups = D_c // 32
             w_tot = groups * self.k_bits
             k_append = _compile_kernel(dev, _mla_kv_quant_scatter_kernel,
@@ -225,10 +245,10 @@ class BCMLA:
 
         # Same tuning as the dispatch wrapper (mla_attn_triton_decode)
         block_m = triton.next_power_of_2(q_len)
-        block_h = max(16 // block_m, 1)
+        block_h = max((32 if self.tq else 16) // block_m, 1)
         block_h = min(block_h, max(1, triton.next_power_of_2(H)))
         block_rows = block_m * block_h
-        block_n = 64 if self.quant else (32 if D_c <= 512 else 16)
+        block_n = 32 if self.tq else (64 if self.quant else (32 if D_c <= 512 else 16))
         n_warps = 8 if self.quant else 4
         n_stages = 1 if self.quant else 3
         h_blocks = triton.cdiv(H, block_h)
@@ -243,15 +263,15 @@ class BCMLA:
         cache_t = "*i32" if self.quant else "*fp16"
         k_split = _compile_kernel(dev, _mla_decode_split_kernel,
             {"q_lat": "*fp16", "q_pe": "*fp16", "ckv_cache": cache_t, "kpe_cache": "*fp16",
-             "ckv_scales": "*fp16", "h32": "*fp16", "block_table": "*i32",
+             "ckv_scales": "*fp16", "h32": "*fp32" if self.tq else "*fp16", "block_table": "*i32",
              "cache_seqlens": "*i32", "out": "*fp16", "partial_o": "*fp32",
              "partial_ml": "*fp32", "split_len": "i32", "num_pages_per_seq": "i32",
              "num_splits": "i32"}
             | {n: "constexpr" for n in (
-                "QC", "QC_TRANS", "Q_PE_TM", "bsz", "q_len", "pre_appended_len", "n_q_heads",
+                "QC", "TQ", "QC_TRANS", "Q_PE_TM", "bsz", "q_len", "pre_appended_len", "n_q_heads",
                 "page_size", "D_c", "D_r", "scale", "CAUSAL", "FINAL",
                 "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")},
-            dict(QC = self.k_bits, QC_TRANS = True, Q_PE_TM = True, bsz = bsz, q_len = q_len,
+            dict(QC = self.k_bits, TQ = int(self.tq), QC_TRANS = True, Q_PE_TM = True, bsz = bsz, q_len = q_len,
                  pre_appended_len = q_len, n_q_heads = H, page_size = PAGE_SIZE, D_c = D_c,
                  D_r = D_r, scale = float(self.sm_scale), CAUSAL = True, FINAL = False,
                  BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows,
@@ -259,11 +279,11 @@ class BCMLA:
             n_warps, n_stages)
 
         k_combine = _compile_kernel(dev, _mla_decode_combine_kernel,
-            {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
+            {"partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp32" if self.tq else "*fp16",
              "num_splits": "i32"}
             | {n: "constexpr" for n in (
-                "QC", "bsz", "q_len", "n_q_heads", "D_c", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")},
-            dict(QC = self.k_bits, bsz = bsz, q_len = q_len, n_q_heads = H, D_c = D_c,
+                "QC", "TQ", "bsz", "q_len", "n_q_heads", "D_c", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")},
+            dict(QC = self.k_bits, TQ = int(self.tq), bsz = bsz, q_len = q_len, n_q_heads = H, D_c = D_c,
                  BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows),
             4, 1)
 
@@ -294,7 +314,10 @@ class BCMLA:
         o = sbuf("bcm_o", R, H * D_v)
         partial_o = sbuf("bcm_po", programs * splits_cap * block_rows * D_c, dtype = torch.float)
         partial_ml = sbuf("bcm_ml", programs * splits_cap * block_rows * 2, dtype = torch.float)
-        if self.quant:
+        if self.tq:
+            qtmp = sbuf("bcm_qtmp_tq", 1, dtype = torch.int)      # unused by the TurboQuant append (C++ skips the CUDA quantizer)
+            stmp = self.tq_consts
+        elif self.quant:
             qtmp = sbuf("bcm_qtmp", R, D_c // 32 * self.k_bits, dtype = torch.int)
             stmp = sbuf("bcm_stmp", R, D_c // 32)
         else:
@@ -460,11 +483,11 @@ class BCMLA:
                 "k_len": "i32", "win_len": "i32", "pool_len": "i32",
                 "num_pages_per_row": "i32", "q_pos0": "i32", "win_floor": "i32",
                 "ring_beg": "i32", "slot_ids": "i32", "ring_stride": "i32",
-                "pool_s": "*fp16:16", "h32": "*fp16:16",
+                "pool_s": "*fp16:16", "h32": "*fp32:16" if self.tq else "*fp16:16",
             } | {n: "constexpr" for n in (
                 "H", "page_size", "D_c", "D_c_pad", "D_r", "K_pad", "compress_rate", "scale",
                 "HAS_WINDOW", "DENSE_POOL", "BLOCK_H", "BLOCK_N", "BLOCK_W", "SEQ",
-                "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT", "QC")}
+                "MULTIROW", "DEBUG_BOUNDS", "DEBUG_PAGES", "Q_SPLIT", "OUT_LATENT", "QC", "TQ")}
             consts_s = dict(
                 H = H, page_size = PAGE_SIZE, D_c = D_c,
                 D_c_pad = 1 << (D_c - 1).bit_length(), D_r = D_r, K_pad = kp,
@@ -476,7 +499,7 @@ class BCMLA:
                 SEQ = q_len, MULTIROW = 1 if bsz > 1 else 0,
                 DEBUG_BOUNDS = 0, DEBUG_PAGES = 0,
                 Q_SPLIT = 1, OUT_LATENT = 1,
-                QC = self.k_bits if self.quant else 0,
+                QC = self.k_bits if self.quant else 0, TQ = int(self.tq),
             )
             k_dsa_split = _compile_kernel(dev, _dsa_attn_split_kernel, sig_s, consts_s, 4, 2)
 
@@ -484,15 +507,15 @@ class BCMLA:
                 "ws_ml": "*fp32:16", "ws_acc": "*fp32:16", "sinks": "*fp32:16",
                 "derot_inv_freq": "*fp32:16",
                 "out": "*fp16:16", "q_pos0": "i32", "R": "i32", "n_splits": "i32",
-                "h32": "*fp16:16",
+                "h32": "*fp32:16" if self.tq else "*fp16:16",
             } | {n: "constexpr" for n in (
                 "H", "D_c", "D_r", "HAS_SINKS", "DEROTATE", "HPG", "BLOCK_H", "BLOCK_D",
-                "SEQ", "MULTIROW", "OUT_LATENT", "QC")}
+                "SEQ", "MULTIROW", "OUT_LATENT", "QC", "TQ")}
             consts_c = dict(
                 H = H, D_c = D_c, D_r = D_r, HAS_SINKS = False, DEROTATE = False,
                 HPG = 0, BLOCK_H = BLOCK_H, BLOCK_D = 128,
                 SEQ = 1, MULTIROW = 0, OUT_LATENT = 1,
-                QC = self.k_bits if self.quant else 0,
+                QC = self.k_bits if self.quant else 0, TQ = int(self.tq),
             )
             k_dsa_combine = _compile_kernel(dev, _dsa_attn_combine_kernel, sig_c, consts_c, 4, 2)
 

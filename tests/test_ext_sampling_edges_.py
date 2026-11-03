@@ -5,6 +5,8 @@ must handle an odd element count; argmax_sample's paired read must respect an od
 import os, sys
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hardware import require
+require("gpu", "ext")
 from exllamav3.ext import exllamav3_ext as ext
 
 device = "cuda:0"

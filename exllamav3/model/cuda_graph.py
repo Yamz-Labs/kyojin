@@ -50,10 +50,13 @@ EXL3_CUDA_GRAPH_MAX (6). purge() releases everything (call between harness arms 
 from __future__ import annotations
 
 import os
+import time
 import weakref
 from collections import Counter, OrderedDict
 
 import torch
+
+from ..util.knobs import knob_on
 
 _env_int = lambda name, default: int(os.environ.get(name, default) or default)
 
@@ -82,6 +85,9 @@ set_multi(os.environ.get("EXL3_CUDA_GRAPH_MULTI", "0") == "1")
 CUDA_GRAPH_CLONE = os.environ.get("EXL3_CUDA_GRAPH_CLONE", "1") != "0"
 CUDA_GRAPH_FALLBACK = os.environ.get("EXL3_CUDA_GRAPH_FALLBACK", "closed")
 CUDA_GRAPH_DEBUG = os.environ.get("EXL3_CUDA_GRAPH_DEBUG", "0") == "1"
+CUDA_GRAPH_LOG_CAPTURES = os.environ.get("EXL3_CUDA_GRAPH_LOG_CAPTURES", "0") == "1"
+# EXL3_CUDA_GRAPH_DIAG=1: event-time 300 replays and print the mean GPU time per graph step and the replay-to-replay median
+_DIAG = [None] if os.environ.get("EXL3_CUDA_GRAPH_DIAG") else None
 
 # Only these params keys may be present; anything else (export_state_layers, activate_all_experts,
 # autosplit_measure, reconstruct, capture, ovr, sim_kvq, non_causal_spans, last_tokens_only, skip_logits,
@@ -128,7 +134,7 @@ def _stream_for(dev_index: int):
 
 class _Entry:
     __slots__ = ("graph", "out", "x_in", "bt", "cs", "pos", "params", "warm", "last_used", "cache_ref", "fp",
-                 "slots", "slots_src", "exports", "swa_cs", "swa_host")
+                 "slots", "slots_src", "exports", "swa_cs", "swa_host", "ids")
 
 
 def _cache_fp(cache):
@@ -186,6 +192,7 @@ class CudaGraphRunner:
         self.has_conv = False
         self.has_mamba = False
         self.has_swa = False
+        self.has_ring = False
         self.swa_mods = []
         _registry.append(weakref.ref(self))
 
@@ -209,6 +216,7 @@ class CudaGraphRunner:
         self.has_conv = False
         self.has_mamba = False
         self.has_swa = False
+        self.has_ring = False
         self.swa_mods = []
         for mod, inst, _ in fm[1:]:
             t = type(mod)
@@ -281,6 +289,10 @@ class CudaGraphRunner:
             if mod.device is None:
                 return False
             devs.add(torch.device(mod.device))
+        # KVWIN ring-only models (plain attention + fp16 sink/window rings riding the recurrent state slots): the ring ids are
+        # static slot data exactly like a GDN model's, the ring writer/reader run inside the capture (bc_attn.py)
+        from ..cache import kvwin
+        self.has_ring = bool(kvwin.ANY_ACTIVE) and knob_on("EXL3_CUDA_GRAPH_RING") and not (self.has_gdn or self.has_conv or self.has_mamba or self.has_swa)
         if len(devs) != 1 or (self.has_gdn and self.has_conv):
             return False   # GDN graphs pass device slot ids, ShortConv reads them on the host: no mixed model
         dev = devs.pop()
@@ -290,6 +302,40 @@ class CudaGraphRunner:
             return False
         self.dev = dev
         return True
+
+    # -- GPU embedding table (EXL3_GPU_EMB: auto | 0 | 1) ----------------------------------------------------------------
+    # The table normally stays on the CPU (mmapped, gathered per step on the host: median 74 us, mean 345 us with ms-long page-fault
+    # outliers inside the server). With enough free VRAM after load it is copied to the device once and the gather runs inside the
+    # captured graph from a static id buffer; auto = only when free VRAM > table + EXL3_GPU_EMB_MARGIN_MB (default 2048), so the
+    # max-context configurations that need the memory keep the CPU table. The table only pays off for the lag-1 pipeline, so with
+    # EXL3_GPU_EMB unset it is built only when EXL3_LAG1=1: an unset switch leaves load-time VRAM exactly as in 1.8.2.
+    def _gemb_setup(self, emb, ids):
+        self._gemb = False
+        mode = os.environ.get("EXL3_GPU_EMB", "auto" if os.environ.get("EXL3_LAG1", "0") == "1" else "0")
+        if mode == "0" or emb.embedding is None or emb.normalize or emb.multiplier != 1.0:
+            return
+        w = emb.embedding.weight
+        if w.device.type != "cpu" or w.dtype not in (torch.half, torch.bfloat16):
+            return
+        need = w.numel() * w.element_size()
+        free, _ = torch.cuda.mem_get_info(self.dev)
+        margin = int(os.environ.get("EXL3_GPU_EMB_MARGIN_MB", "2048")) << 20
+        if mode == "auto" and free < need + margin:
+            return
+        probe = ids.detach().cpu().reshape(-1)[:4].reshape(1, -1).clone()
+        ref = emb.forward(probe, {})
+        wg = w.detach().to(self.dev)
+        got = wg.index_select(0, probe.to(self.dev).reshape(-1)).view(1, -1, wg.shape[1]).to(ref.dtype)
+        if got.shape != ref.shape or not torch.equal(got.cpu(), ref):
+            del wg
+            return
+        self._gemb = wg
+        self._gemb_dtype = ref.dtype
+
+    def _gemb_gather(self, e):
+        """x_in <- table[ids] (device ops: eager for warmup, captured for the graph)."""
+        w = self._gemb
+        e.x_in.copy_(w.index_select(0, e.ids.view(-1)).view(e.x_in.shape))
 
     def _decline(self, ids, params):
         """None when this call may be graphed, else a short reason."""
@@ -307,8 +353,11 @@ class CudaGraphRunner:
             return "no_block_table"
         if params.get("indexed_embeddings"):
             return "state"
+        from ..cache import kvwin
+        if kvwin.ANY_ACTIVE and kvwin.any_cold(params):
+            return "kvwin_cold"   # the cold ring fill is a host step: eager this step, graph again from the next one
         rs = params.get("recurrent_states")
-        if self.has_gdn or self.has_conv or self.has_mamba or self.has_swa:
+        if self.has_gdn or self.has_conv or self.has_mamba or self.has_swa or self.has_ring:
             slots = params.get("recurrent_slots")
             nb = ids.shape[0] if CUDA_GRAPH_MULTI else 1   # one recurrent state / slot per job
             if (not rs or len(rs) != nb or any(getattr(r, "exported", False) for r in rs[:nb])
@@ -343,14 +392,20 @@ class CudaGraphRunner:
         # Embedding stays eager, exactly as forward_ls would run it
         emb, inst0, _ = fm[0]
         params["layer_instance"] = inst0
-        x = emb.prepare_for_device(ids, params)
-        x = emb.forward(x, params)
+        if getattr(self, "_gemb", None) is None:
+            self._gemb_setup(emb, ids)
+        use_gemb = self._gemb is not False and ids.dim() == 2 and ids.dtype == torch.long
+        if use_gemb:
+            x = torch.empty((*ids.shape, emb.hidden_size), dtype = self._gemb_dtype, device = "meta")   # shape/dtype stand-in (key, buffers)
+        else:
+            x = emb.prepare_for_device(ids, params)
+            x = emb.forward(x, params)
         tail = fm[1:]
 
         key = self._key(x, params)
         if key in self.disabled:
             self.stats["declines"]["disabled_key"] += 1
-            return self._run_tail(tail, x, params)
+            return self._run_tail(tail, self._real_x(emb, ids, params, x), params)
 
         cache = params["cache"]
         e = self.entries.get(key)
@@ -364,22 +419,38 @@ class CudaGraphRunner:
         self.entries.move_to_end(key)
         dev = self.dev
 
-        self._load(e, x, params)
+        self._load(e, x, params, ids if use_gemb else None)
         if e.graph is None:
             if e.warm < CUDA_GRAPH_WARMUPS:
                 e.warm += 1
                 self.stats["warmups"] += 1
                 # real eager call through the same static buffers; output is the step's result
                 p = dict(e.params)
+                if use_gemb:
+                    self._gemb_gather(e)
                 y = self._run_tail(tail, e.x_in, p)
                 if "export_states" in p:
                     params["export_states"] = p["export_states"]
                 return y
-            if not self._capture(key, e, tail, x, params):
-                return self._run_tail(tail, x, params)   # FALLBACK=eager decline
+            t_cap = time.perf_counter()
+            ok = self._capture(key, e, tail, x, params, use_gemb)
+            if CUDA_GRAPH_LOG_CAPTURES:   # EXL3_CUDA_GRAPH_LOG_CAPTURES=1: one line per capture, with the time the decode of every job waited
+                print(f"[cudagraph] capture {time.perf_counter() - t_cap:.2f} s key={key[1:5]} captures={self.stats['captures']} "
+                      f"evictions={self.stats.get('evictions', 0)} entries={len(self.entries)}", flush = True)
+            if not ok:
+                return self._run_tail(tail, self._real_x(emb, ids, params, x), params)   # FALLBACK=eager decline
         try:
             with torch.cuda.device(dev):
+                if _DIAG:
+                    ev0 = torch.cuda.Event(enable_timing = True); ev1 = torch.cuda.Event(enable_timing = True); ev0.record()
                 e.graph.replay()
+                if _DIAG:
+                    ev1.record(); _DIAG.append((ev0, ev1, time.perf_counter()))
+                    if len(_DIAG) == 301:
+                        torch.cuda.synchronize(); d = _DIAG[1:]
+                        gpu = sum(a.elapsed_time(b) for a, b, _ in d)
+                        dl = sorted((y[2] - x[2]) * 1000 for x, y in zip(d, d[1:]))
+                        print(f"DIAG graph gpu {gpu / len(d):.3f} ms/step, replay-to-replay median {dl[len(dl) // 2]:.3f} ms, p10 {dl[len(dl) // 10]:.3f}", flush = True)
         except Exception:
             self._drop(key)
             self.disabled.add(key)
@@ -394,6 +465,12 @@ class CudaGraphRunner:
         return e.out.clone() if CUDA_GRAPH_CLONE else e.out
 
     # -- internals -----------------------------------------------------------------------------
+
+    @staticmethod
+    def _real_x(emb, ids, params, x):
+        if x.device.type != "meta":
+            return x
+        return emb.forward(emb.prepare_for_device(ids, params), params)
 
     @staticmethod
     def _run_tail(tail, x, p):
@@ -420,7 +497,7 @@ class CudaGraphRunner:
             # per-job page counts feed only the MLA decode kernel's KV split (mla_attn.py); MLAttention models
             # never get here (_check_model), and with B jobs they would recapture whenever one job crosses 16 pages
             None if CUDA_GRAPH_MULTI else (tuple(pages) if pages is not None else None),
-            (self.has_gdn, self.has_mamba), tuple(sorted(exl)) if exl else None, tuple(sorted(exn)) if exn else None,
+            (self.has_gdn, self.has_mamba, self.has_ring), tuple(sorted(exl)) if exl else None, tuple(sorted(exn)) if exn else None,
             tuple(int(s) for s in params["recurrent_slots"].tolist()) if self.has_conv else None,   # every job's conv slot is baked in
             tuple(r.slot for r in params["recurrent_states"]) if self.has_swa else None,   # per-slot ring block table is baked in
         )
@@ -442,13 +519,14 @@ class CudaGraphRunner:
         e.slots = e.slots_src = e.exports = e.swa_cs = e.swa_host = None
         with torch.cuda.device(dev):
             e.x_in = torch.empty(x.shape, dtype = x.dtype, device = dev)
+            e.ids = torch.zeros(x.shape[:2], dtype = torch.long, device = dev)
             e.bt = torch.zeros(bt.shape, dtype = bt.dtype, device = dev)
             e.cs = torch.zeros(cs.shape, dtype = cs.dtype, device = dev)
             e.pos = None if (pos is None or pos is cs) else torch.zeros(pos.shape, dtype = pos.dtype, device = dev)
             if self.has_swa:
                 e.swa_cs = torch.zeros(x.shape[0], dtype = torch.int32, device = dev)
                 e.swa_host = torch.zeros(x.shape[0], dtype = torch.int32).pin_memory()
-            if self.has_gdn or self.has_mamba:
+            if self.has_gdn or self.has_mamba or self.has_ring:
                 # Fixed-address slot buffer refreshed only when the live slot
                 # tensor object changes (stable across steps for one job, so
                 # the capture never bakes a per-step upload address).
@@ -467,7 +545,7 @@ class CudaGraphRunner:
         self.entries[key] = e
         return e
 
-    def _load(self, e, x, params):
+    def _load(self, e, x, params, gids = None):
         """Per-step values into the static buffers (stream-ordered on the current stream)."""
         # Multi-job (EXL3_CUDA_GRAPH_MULTI) per-job state, all either keyed or copied here, nothing else is read
         # inside the capture: job order / join / leave -> row order of x, block table, cache_seqlens, positions
@@ -477,7 +555,10 @@ class CudaGraphRunner:
         # replay and by the generator; state tensors are cache-owned with fixed pointers (_cache_fp), the slot
         # ids select the row inside them; BC split config derives from the (keyed) table width, not from the
         # cache lengths; per-job sampling state never enters the forward.
-        e.x_in.copy_(x, non_blocking = True)
+        if gids is not None:
+            e.ids.copy_(gids, non_blocking = gids.is_pinned())
+        else:
+            e.x_in.copy_(x, non_blocking = True)
         e.bt.copy_(params["block_table"], non_blocking = True)
         e.cs.copy_(params["cache_seqlens"], non_blocking = True)
         if e.pos is not None:
@@ -498,7 +579,7 @@ class CudaGraphRunner:
                 e.slots.copy_(get_for_device(params, "recurrent_slots", self.dev))
                 e.slots_src = live
 
-    def _capture(self, key, e, tail, x, params) -> bool:
+    def _capture(self, key, e, tail, x, params, use_gemb = False) -> bool:
         dev = self.dev
         for d in range(torch.cuda.device_count()):
             if torch.cuda.memory_allocated(d) > 0:
@@ -511,6 +592,8 @@ class CudaGraphRunner:
                                       capture_error_mode = "thread_local"):
                     assert torch.cuda.is_current_stream_capturing()
                     pc = dict(e.params)
+                    if use_gemb:
+                        self._gemb_gather(e)
                     out = self._run_tail(tail, e.x_in, pc)
         except Exception as ex:
             self._drop(key)

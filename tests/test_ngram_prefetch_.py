@@ -17,6 +17,8 @@ KEY = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
 EOS = 248044
 DEV = torch.device("cuda:0")
 
+from hardware import require
+require("ext")
 from exllamav3.loader.safetensors import SafetensorsCollection
 from exllamav3.modules import NGramEmbedding
 from exllamav3.modules import ngram_embedding as ne

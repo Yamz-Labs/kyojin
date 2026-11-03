@@ -30,6 +30,8 @@
 #define PORT_LD_STREAM(p) __builtin_nontemporal_load(p)
 #define PORT_LD_COHERENT(p) __hip_atomic_load(p, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)
 #define PORT_SHFL_XOR(v, m) __shfl_xor(v, m)
+// wave-uniform u32 into an SGPR (frees the VGPRs a uniform value would hold)
+#define PORT_READFIRSTLANE(u) __builtin_amdgcn_readfirstlane(u)
 #define PORT_TRAP() __builtin_trap()
 #define PORT_F16_BITS_TO_F32(u) ((float) __builtin_bit_cast(_Float16, (unsigned short) (u)))
 // u32 -> packed fp16 pair of the kernel's own f16x2 type
@@ -55,6 +57,7 @@ __device__ __forceinline__ float port_fdot2_f32(__half2 a, __half2 b, float acc)
 // L2 load, not served from a stale L1 line (reads of other blocks' partials after __threadfence)
 #define PORT_LD_COHERENT(p) __ldcg(p)
 #define PORT_SHFL_XOR(v, m) __shfl_xor_sync(0xffffffffu, v, m)
+#define PORT_READFIRSTLANE(u) (u)
 #define PORT_TRAP() __trap()
 #define PORT_F16_BITS_TO_F32(u) __half2float(__ushort_as_half((unsigned short) (u)))
 // __half2 is not trivially copyable, so no __builtin_bit_cast

@@ -353,4 +353,53 @@ class TI(unittest.TestCase):
         self.assertEqual(g.num_draft_tokens, 7)
         out, g = run_install([0.9] * 8, rule=sp.ProductRule(0.6, 0.3, 3), ndt=3); self.assertEqual(g.num_draft_tokens, 3)
 
+    def test_load_depth_cap(self):
+        self.assertEqual(sp.load_depth_cap(1, {}, 8), None)                 # solo keeps its rule
+        self.assertEqual(sp.load_depth_cap(2, {}, 0), None)                 # no budget, no table: off
+        self.assertEqual([sp.load_depth_cap(n, {}, 8) for n in (2, 3, 4, 8)], [3, 1, 1, 0])
+        self.assertEqual(sp.load_depth_cap(4, {4: 2}, 8), 2)                # table wins
+        os.environ["QWSPEC_LOAD_CAPS"] = "2:5, 4:0"; os.environ["QWSPEC_LOAD_ROWS"] = "8"
+        try: self.assertEqual(sp.load_caps_from_env(), ({2: 5, 4: 0}, 8))
+        finally: del os.environ["QWSPEC_LOAD_CAPS"], os.environ["QWSPEC_LOAD_ROWS"]
+
+    def test_load_rows_default_dense_cuda(self):
+        keep = {k: os.environ.pop(k, None) for k in ("QWSPEC_LOAD_ROWS", "QWSPEC_LOAD_CAPS", "EXL3_ROW_INV_GROUPS", "EXL3_ROW_INV_GROUP_ROWS")}
+        try:
+            cuda = sp.torch.version.hip is None and sp.torch.cuda.is_available()
+            self.assertEqual(sp.load_caps_from_env([object(), object()]), ({}, 16 if cuda else 0))      # dense model: a 16-row budget on CUDA only
+            os.environ["QWSPEC_LOAD_ROWS"] = "0"; self.assertEqual(sp.load_caps_from_env([object()]), ({}, 0))
+            os.environ["QWSPEC_LOAD_ROWS"] = "12"; self.assertEqual(sp.load_caps_from_env([object()]), ({}, 12))
+            del os.environ["QWSPEC_LOAD_ROWS"]
+            from exllamav3.modules import BlockSparseMLP
+            self.assertEqual(sp.load_caps_from_env([BlockSparseMLP.__new__(BlockSparseMLP)]), ({}, 0))   # a MoE layer keeps the old default (its decode kernels stop at 8 rows)
+        finally:
+            for k, v in keep.items():
+                os.environ.pop(k, None)
+                if v is not None: os.environ[k] = v
+
+    def test_load_rows_default_follows_groups(self):
+        keep = {k: os.environ.pop(k, None) for k in ("QWSPEC_LOAD_ROWS", "QWSPEC_LOAD_CAPS", "EXL3_ROW_INV_GROUPS", "EXL3_ROW_INV_GROUP_ROWS")}
+        try:
+            self.assertEqual(sp.load_caps_from_env(), ({}, 0))
+            os.environ["EXL3_ROW_INV_GROUPS"] = "1"; self.assertEqual(sp.load_caps_from_env(), ({}, 8))
+            os.environ["EXL3_ROW_INV_GROUP_ROWS"] = "6"; self.assertEqual(sp.load_caps_from_env(), ({}, 6))
+            os.environ["QWSPEC_LOAD_ROWS"] = "0"; self.assertEqual(sp.load_caps_from_env(), ({}, 0))
+        finally:
+            for k, v in keep.items():
+                os.environ.pop(k, None)
+                if v is not None: os.environ[k] = v
+
+    def test_load_cap_through_install(self):
+        os.environ["QWSPEC_LOAD_CAPS"] = "2:2,3:0"
+        try:
+            for n, want in ((1, 7), (2, 2), (3, None)):
+                g = FakeGen(7); g.active_jobs = [FakeJob() for _ in range(n)]; g.job = g.active_jobs[0]
+                dm = FakeDM(g, [0.99] * 8); lm = FakeLM(dm); g.dm, g.lm = dm, lm; dm.chain = [0.99] * 8
+                rule = sp.ProductRule(0.0, 0.0, 7)
+                unin = sp.install(g, dm, FakeModel(lm), rule=rule)
+                out = g.iterate_draftmodel_mtp_gen([])
+                self.assertEqual(None if out is None else out.shape[-1], want)
+                self.assertEqual(rule.maxd, 7); self.assertEqual(g.num_draft_tokens, 7)   # restored after the round
+        finally: del os.environ["QWSPEC_LOAD_CAPS"]
+
 if __name__ == "__main__": unittest.main(verbosity=1)

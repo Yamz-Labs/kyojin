@@ -46,6 +46,14 @@ EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
 # Name inside the model folder. Not *.safetensors, so the weight loader never indexes it as model weights
 # (same layout trick as uncensor_direction.st); the file is a normal safetensors file.
 EH_SIDECAR_IN_PACK = "mtp_eh_proj.st"
+# --sessions > 1 (several requests decode in one step): plain steps take the R-row exact paths (union MoE on the device table, R-row
+# GEMV, batched router) instead of per-expert eager loops, and 2..8-row verify blocks replay as graphs. Box 4 requests, same prompts:
+# plain 26.1 -> 40.7 tok/s aggregate, speculative 38.1 -> 42.5; one request alone and speculative text equal to the solo run unchanged.
+MULTI_SESSION_ENV = {
+    "EXL3_PLAIN_ROWS_VERIFY": "1",
+    "EXL3_BLOCK_GRAPH_VERIFY": "1",
+    "EXL3_DEC_MOE_UNION_DEV": "1",
+}
 SPEED_ENV = {
     # Vision spatial-merge convolution as one GEMM: no MIOpen solver search, so the first image of a new
     # size costs seconds, not minutes (first 1024x1024: 433 s -> 4 s; answers byte-identical). "0" = F.conv2d.
@@ -154,6 +162,8 @@ SPEED_ENV = {
     "EXL3_VERIFY_ROW_SPLIT": "2",
     "EXL3_MOE_R8": "1",
     "EXL3_GEMV_R_RM6": "1",
+    # 7..8 rows (4 sessions x 2 draft rows): one decode pass of the dense GEMV instead of two 4-row chunks, bit-identical. 0 = off.
+    "EXL3_GEMV_R_WIDE8": "1",
     # 14/10: sampled requests (temperature > 0) draw the MTP drafts from the drafter's own law and keep them with the exact
     # min(1, p / q) rule (exllamav3/generator/spec_sample.py): same output distribution, greedy untouched. One load, T 1 top_p
     # 0.95, 15 prompts x 3 seeds: prose +5.2 % decode, no measured change on chat / code / structured. 0 = argmax drafts.
@@ -503,6 +513,18 @@ def guard_stats(hit: dict, n_new: int) -> dict:
     return {"eos_reason": "loop_guard", "new_tokens": n_new, "loop_guard": hit}
 
 
+def held_tail(text: str, markers: list[str]) -> int:
+    """Characters at the end of `text` that could still become one of `markers` (a proper prefix of one). A stream holds back only
+    these: holding a marker-length tail delayed the first visible text by several tokens, which under load is several seconds."""
+    best = 0
+    for m in markers:
+        for k in range(min(len(m) - 1, len(text)), best, -1):
+            if text.endswith(m[:k]):
+                best = k
+                break
+    return best
+
+
 def opens_thinking(prompt: str) -> bool:
     """The GLM generation prompt ends in <think>, so the model output starts inside the block."""
     return prompt.rstrip().endswith("<think>")
@@ -620,7 +642,7 @@ class ResidentEngine:
     row_budget = 0
 
     def __init__(self, model_path: str, max_history: int = 1, max_ctx: int = 131072, num_draft: int = 1,
-                 vision: bool = True, sessions: int = 1,
+                 vision: bool = True, sessions: int = 1, cache_bits: int = 0, kv_mode: str = "quant",
                  image_cache_bytes: int | None = None, image_cache_items: int = 0,
                  image_cache_format: str = "fp32",
                  image_cache_dir: str | None = IMAGE_CACHE_DIR_DEFAULT,
@@ -663,6 +685,17 @@ class ResidentEngine:
         max_position = int(self.config.config_dict.get("max_position_embeddings") or self.config.config_dict.get("text_config", {}).get("max_position_embeddings") or 32768)
         ctx = min(max_position, max_ctx)
         self.ctx = ctx
+        # cache_bits 0 (default) = the fp16 MLA latent pages; 8 (--cache-bits 8) = packed int8 latent pages. The DSA
+        # indexer and k-pool planes and the rope key stay fp16, so the saving is smaller than the latent-only ratio.
+        from exllamav3 import CacheLayer_quant
+        qkw = dict(layer_type=CacheLayer_quant, k_bits=cache_bits, v_bits=cache_bits) if cache_bits else {}
+        if kv_mode == "tq" and cache_bits:
+            # TurboQuant latent (rotated, gamma-folded; see cache/mla.py CacheLayer_MLA_tq): k{bits} over the 512-wide latent
+            from exllamav3.cache.tq import CacheLayer_tq, supported as tq_supported
+            if tq_supported(512, cache_bits):
+                qkw["layer_type"] = CacheLayer_tq
+            else:
+                print(f"serve: kv-mode tq: no TurboQuant codebook for the {cache_bits}-bit latent, keeping the quant cache", flush=True)
         slots = max(sessions, int(os.environ.get("EXL3_GLM_SLOTS", "0") or 0))
         # GLM_NGRAM = "gram,K,match[,cmin]": n-gram lookup of tools/qwen/spec_policy.install_lookup. When the
         # last `match` tokens occurred before, the round verifies the K tokens that followed them instead of the drafter's
@@ -677,8 +710,9 @@ class ResidentEngine:
             max_history = max(max_history, self.lookup[1])
         self.lookup_stats: dict[str, int] = {}
         self.cache = Cache(self.model, max_num_tokens=ctx + 4096,
-                           max_history=max_history, max_batch_size=slots)
-        from exllamav3.util import jit_log, kernel_seed
+                           max_history=max_history, max_batch_size=slots, **qkw)
+        from exllamav3.util import jit_log, kernel_seed, tune_cache
+        tune_cache.install_pack(model_path)   # <pack>/tuning: GEMM autotune winners from qualify --stage autotune
         kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
         jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
         startup_health.stage("target weights")
@@ -686,7 +720,7 @@ class ResidentEngine:
         if num_draft > 0:
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
-                                     max_history=max_history, max_batch_size=slots)
+                                     max_history=max_history, max_batch_size=slots, **qkw)
             startup_health.stage("drafter weights")
             self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         else:   # --num-draft 0: plain decode, no drafter
@@ -1298,10 +1332,10 @@ def prime_dense_tune(budget_s: float = 600.0) -> tuple[int, float]:
 
 
 # Every route of create_app(), for the early /health listener (404 / 405 while loading); a test keeps it in step.
-ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",)}
+ROUTES = {"/health": ("GET",), "/v1/models": ("GET",), "/metrics": ("GET",), "/slots": ("GET",), "/v1/chat/completions": ("POST",), "/apply-template": ("POST",), "/tokenize": ("POST",), "/completion": ("POST",), "/v1/completions": ("POST",), "/slots/{id}": ("POST",), "/admin/knobs": ("GET", "POST")}
 
 
-def create_app(engine: Any, model_id: str, template: str) -> web.Application:
+def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = False) -> web.Application:
     """Build the HTTP layer around a resident engine (also accepts a fake engine in tests)."""
     queue: asyncio.Queue[tuple[dict[str, Any], asyncio.Queue, dict[str, Any]]] = asyncio.Queue()
     lock = asyncio.Lock()  # serializes generation with slot save/restore
@@ -1655,7 +1689,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             # Reasoning and prose stream as they decode. Tool calls are parsed only from complete
             # XML, so everything from <tool_call> on is held and sent once at the end.
             text, done, mode = prefix, len(prefix), "reasoning" if prefix else "content"
-            hold = max([len("</think>"), len(TOOL_OPEN)] + [len(x) for x in body["_stop"]]) - 1
+            holds = ["</think>", "<think>", TOOL_OPEN] + [x for x in body["_stop"] if x]
             visible: list[float] = []   # set at the first frame with text in it: the client's first sign of life
 
             async def flush(final: bool) -> None:
@@ -1663,7 +1697,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 while mode != "tool":
                     tags = ["</think>"] if mode == "reasoning" else ["<think>", TOOL_OPEN]
                     hits = [(text.find(t, done), t) for t in tags if text.find(t, done) >= 0]
-                    end = min(hits)[0] if hits else (len(text) if final else max(done, len(text) - hold))
+                    end = min(hits)[0] if hits else (len(text) if final else max(done, len(text) - held_tail(text, holds)))
                     piece = stop_text(text[done:end], body["_stop"])[0]
                     if piece:
                         if not visible:
@@ -2023,6 +2057,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
     if getattr(engine, "slot_store", None) is not None:
         app.router.add_get("/slots", slots)
         app.router.add_post("/slots/{id}", slot_action)
+    if admin_knobs:
+        import admin_knobs as _admin
+        h = _admin.make_handler(engine, exclusive)
+        app.router.add_get("/admin/knobs", h)
+        app.router.add_post("/admin/knobs", h)
     app.router.add_get("/health", health)
     app.router.add_get("/v1/models", models)
     app.router.add_get("/metrics", metrics_view)
@@ -2041,6 +2080,7 @@ def main() -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower (saves memory; image requests get HTTP 400)")
     parser.add_argument("--no-uncensor", action="store_true", help="ignore a bundled uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
+    parser.add_argument("--admin-knobs", action="store_true", help="opt in to POST /admin/knobs (loopback clients only): switch the A/B knobs of exllamav3.util.knobs without a reload")
     parser.add_argument("--model-id", default="glm-5.3-exl3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2055,7 +2095,14 @@ def main() -> None:
     parser.add_argument("--sessions", type=int, default=1,
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
+    parser.add_argument("--kv-mode", choices=("tq", "quant", "fp16"), default="tq",
+                        help="latent cache format. tq (default): TurboQuant, rotated Lloyd-Max codes + one scale per token, 6 bits unless --cache-bits says otherwise "
+                             "(KL below the quant cache, same decode speed); quant: packed per-32 group scales (--cache-bits 4/5/6/8, 8 if none given); fp16: the unpacked 16-bit pages")
     parser.add_argument("-c", "--max-ctx", type=int, default=131072, help="context window (capped by max_position_embeddings)")
+    parser.add_argument("--cache-bits", type=int, default=None, choices=(0, 4, 5, 6, 8),
+                        help="bits per element of the MLA latent cache pages (default: 6 with --kv-mode tq, else 0; 0 = fp16; 8 = packed int8; the DSA "
+                             "indexer and k-pool planes and the rope key stay fp16; output differs token-wise from fp16; slot "
+                             "files do not cross cache modes, and a cross-mode restore is rejected)")
     parser.add_argument("--image-cache-mb", type=int, default=IMAGE_CACHE_MB_DEFAULT,
                         help=f"host memory for the decoded image embeddings, in MiB; 0 = no byte limit. Like -c this "
                              f"is one pool shared by every --sessions request (default {IMAGE_CACHE_MB_DEFAULT}): "
@@ -2093,13 +2140,29 @@ def main() -> None:
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
+    if args.kv_mode == "fp16":
+        args.cache_bits = 0
+    elif args.cache_bits is None:
+        args.cache_bits = 6 if args.kv_mode == "tq" else 8       # default cache: TurboQuant 6-bit latent; --kv-mode quant alone = the packed int8 pages
     if not 1 <= args.sessions <= MAX_SESSIONS:
         parser.error(f"--sessions must be 1..{MAX_SESSIONS}")
     if args.sessions > 1:
+        # chunked prefill beside decoding users (EXL3_SCHED_CHUNK_IL, generator/chunk_il.py): a big prefill runs one
+        # short chunk per step and shares the step with the decode round of every running session. Default on for
+        # multi-session ROCm serving (measured on gfx1151); EXL3_SCHED_CHUNK_IL=0 restores FIFO prefills.
+        import torch as _torch
+        if _torch.version.hip:
+            os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
+            os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
+            os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
         print(f"serve: --sessions {args.sessions}: up to {args.sessions} requests share the KV pool of -c {args.max_ctx} "
               f"(per-session window = -c / sessions when all are busy); greedy output is not guaranteed equal to the same "
               f"request run alone; slot save/restore waits for every running request and acts on the last prompt noted",
               file=sys.stderr, flush=True)
+    if args.cache_bits and args.sessions > 1 and args.kv_mode != "tq":
+        print(f"serve: --cache-bits {args.cache_bits} with --sessions {args.sessions}: the packed int8 MLA pages are not "
+              f"row-invariant, so batched decode changes greedy output versus a single session (the rows still agree with "
+              f"each other). Slot files also do not cross cache modes.", file=sys.stderr, flush=True)
     if os.environ.get("EXL3_SCHED_CHUNK_IL", "0") == "1":
         # chunked-prefill interleave (exllamav3/generator/chunk_il.py): needs another request running beside the big prefill
         print("serve: chunk_il ON " + ("" if args.sessions > 1 else "(no effect: needs --sessions >= 2)"), file=sys.stderr, flush=True)
@@ -2113,6 +2176,9 @@ def main() -> None:
         os.environ["EXL3_PREFILL_BIG_TAIL"] = "0"
     for key, value in SPEED_ENV.items():
         os.environ.setdefault(key, value)
+    if args.sessions > 1:
+        for key, value in MULTI_SESSION_ENV.items():
+            os.environ.setdefault(key, value)
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
     apply_eh_sidecar_default(args.model)
     apply_draft2s_default(args.model)
@@ -2129,7 +2195,7 @@ def main() -> None:
         image_cache_size = (f"{args.image_cache_mb} MiB of host memory (--image-cache-mb)" if image_cache_bytes
                             else "no byte limit (--image-cache-mb 0)")
         engine = ResidentEngine(args.model, max_history=args.max_history or max(args.num_draft, 1), max_ctx=args.max_ctx, num_draft=args.num_draft,
-                              vision=not args.no_vision, sessions=args.sessions,
+                              vision=not args.no_vision, sessions=args.sessions, cache_bits=args.cache_bits, kv_mode=args.kv_mode,
                               image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items,
                               image_cache_format=args.image_cache_format,
                               image_cache_dir=args.image_cache_dir, image_cache_dir_max_gb=args.image_cache_dir_max_gb,
@@ -2138,6 +2204,7 @@ def main() -> None:
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
         print(f"serve: vision={engine.supports_vision}", flush=True)
+        print(f"serve: cache={args.kv_mode + str(args.cache_bits) + ' (slot files do not cross cache modes)' if args.cache_bits else 'fp16'}", flush=True)
         print(f"serve: image cache {image_cache_size}, {'no count cap' if not engine.emb_cache.max_items else str(engine.emb_cache.max_items) + ' pictures max'}, "
               f"{args.image_cache_format} rows, {engine.emb_cache.policy} policy, shared by {args.sessions} session(s)", flush=True)
         if engine.emb_disk is not None:
@@ -2191,7 +2258,7 @@ def main() -> None:
     except BaseException as exc:                                  # noqa: BLE001
         startup_health.abort(f"{type(exc).__name__}: {exc}")
         raise
-    app = create_app(engine, args.model_id, template)
+    app = create_app(engine, args.model_id, template, admin_knobs=args.admin_knobs)
     # Which run this is, in the log itself: ctx, sessions and the image-cache budget are what a later
     # "why was this request slow" question turns on, and they are not visible in the client's request.
     reqlog = app["reqlog"]

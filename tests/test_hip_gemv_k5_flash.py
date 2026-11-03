@@ -8,6 +8,8 @@ import pytest
 import torch
 
 from hip_flash_quant import exl3_expert_quant
+from hardware import require
+require("ext")
 from exllamav3 import Config, Model
 from exllamav3.ext import exllamav3_ext as ext
 

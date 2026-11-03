@@ -11,6 +11,8 @@ qwen3.5-0.8b quant (GatedDeltaNet). For BC_Mamba2 point it at a NemotronH quant.
 import sys, os, gc
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from hardware import require
+require("ext")
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler
 from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
 

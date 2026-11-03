@@ -170,6 +170,9 @@ def _qsa_sparse_split_kernel(
     PAGED: tl.constexpr = 1,
     QCK: tl.constexpr = 0,   # packed quantized K pages (bits), 0 = fp16
     QCV: tl.constexpr = 0,   # packed quantized V pages (bits), 0 = fp16
+    k_cb = None,             # TurboQuant codebooks (TQ == 1): q is already rotated, the codes read through them
+    v_cb = None,
+    TQ: tl.constexpr = 0,
 ):
     """Gathered GQA flash-decoding phase 1 over an index list, q_len == 1: one program per
     (batch, kv_head, h_block, split), iterating the row's indices instead of the sequential
@@ -193,7 +196,7 @@ def _qsa_sparse_split_kernel(
     offs_d = tl.arange(0, head_dim)
     q_base = (batch * n_q_heads + q_head) * head_dim
     q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask = valid_row[:, None], other = 0.0)
-    if QCK > 0:
+    if QCK > 0 and TQ == 0:
         # Packed keys live in the H32-rotated domain: rotate q once, scores stay exact
         q_tile = _rot_h32(q_tile, h32, BLOCK_H, head_dim)
 
@@ -217,7 +220,7 @@ def _qsa_sparse_split_kernel(
             tok = idx_c
 
         if QCK > 0:
-            k_tile = _qc_load_kt(k_cache, k_scales, tok, kv_head, offs_d, valid_n, QCK, n_kv_heads, head_dim, head_dim)
+            k_tile = _qc_load_kt(k_cache, k_scales, tok, kv_head, offs_d, valid_n, QCK, n_kv_heads, head_dim, head_dim, k_cb, TQ)
         else:
             k_ptrs = k_cache + ((tok[None, :] * n_kv_heads + kv_head) * head_dim + offs_d[:, None])
             k_tile = tl.load(k_ptrs, mask = valid_n[None, :], other = 0.0)
@@ -235,7 +238,7 @@ def _qsa_sparse_split_kernel(
 
         if QCV > 0:
             # Rotated-domain values: the partials stay rotated, the combine rotates back
-            v_tile = _qc_load_v(v_cache, v_scales, tok, kv_head, offs_d, valid_n, QCV, n_kv_heads, head_dim, head_dim)
+            v_tile = _qc_load_v(v_cache, v_scales, tok, kv_head, offs_d, valid_n, QCV, n_kv_heads, head_dim, head_dim, v_cb, TQ)
         else:
             v_ptrs = v_cache + ((tok[:, None] * n_kv_heads + kv_head) * head_dim + offs_d[None, :])
             v_tile = tl.load(v_ptrs, mask = valid_n[:, None], other = 0.0)
@@ -380,6 +383,7 @@ def qsa_sparse_attend_rows(
     qc: tuple | None = None,       # (k_scales, v_scales, k_bits, v_bits): k / v are the packed
                                    # int32 pages (CacheLayer_quant), dequantized online
     n_kv_heads: int | None = None, # required with qc (the packed rows carry no head axis)
+    tq = None,                     # TurboQuant state (cache.tq.TQState) with qc: q is already rotated, o comes back rotated
 ) -> torch.Tensor:
     """Eager gathered GQA attention, one index list per query row: the sparse prefill /
     eager-fallback form of the BC sparse decode kernels. block_table = None runs the flat
@@ -427,11 +431,12 @@ def qsa_sparse_attend_rows(
             head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
             BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
             QCK = k_bits, QCV = v_bits,
+            **(dict(k_cb = tq.cbk, v_cb = tq.cbv, TQ = 1) if tq is not None else {}),
             num_warps = QSA_PIPE_NW if use_pipe else _QSA_NW, num_stages = _QSA_NS,
         )
         _paged_attn_decode_combine_kernel[(programs,)](
             partial_o, partial_ml, o, h32, splits, partial_ml,
-            QCV = v_bits, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
+            QCV = 0 if tq is not None else v_bits, HAS_SINKS = False, q_len = 1, n_q_heads = H, n_kv_heads = kvh,
             head_dim = hd, HD_PAD = hd, BLOCK_M = 1, BLOCK_H = BLOCK_H, BLOCK_ROWS = BLOCK_H,
             num_warps = 4, num_stages = 1,
         )

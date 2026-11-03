@@ -7,6 +7,8 @@ import glob, json, os, sys
 import pytest
 import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from hardware import require
+require("ext")
 from exllamav3.dsv41.config import DSV41Config
 from exllamav3.dsv41.weights import WeightSource
 from exllamav3.dsv41.linear import DenseLin

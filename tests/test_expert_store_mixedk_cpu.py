@@ -17,6 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import torch
 
+from hardware import require
+require("ext")
 import exllamav3.modules.quant.exl3 as exl3mod
 from exllamav3.modules import expert_store as es
 from exllamav3.modules.moe_mixedk import MixedKStore, expert_ks
