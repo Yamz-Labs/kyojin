@@ -9,12 +9,8 @@ import torch
 ENGINE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGINE)
 from exllamav3 import Model, Config, Cache, Generator, Job, GreedySampler, Tokenizer
-from exllamav3.loader import gguf_tokenizer
 from exllamav3.loader.gguf_config import write_config_dir
 
-# Throughput test only: the qwen35 pre-tokenizer regex is not verified yet, so it is NOT mapped in the engine; the test borrows
-# qwen2's (token ids are meaningless on a 4-block cut anyway).
-gguf_tokenizer._PRE.setdefault("qwen35", gguf_tokenizer._PRE["qwen2"])
 
 src = os.environ["FMOE_GGUF"]
 d = write_config_dir(src, os.path.join(os.environ.get("FMOE_CFG", "/tmp"), "qwen35moe_cfg"))
