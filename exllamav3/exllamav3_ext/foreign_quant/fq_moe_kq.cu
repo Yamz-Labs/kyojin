@@ -31,7 +31,7 @@ __global__ void fq_moe_kq_upgate_kernel(const uint8_t* __restrict__ aqb,
                                         int64_t up_stride,
                                         int64_t qb_stride,
                                         __half* __restrict__ act,
-                                        int S, int I, int K, int E, int ntiles_u)
+                                        int S, int I, int K, int E, int ntiles_u, int topk)
 {
     int b = blockIdx.x;
     int s = b / ntiles_u;
@@ -41,6 +41,7 @@ __global__ void fq_moe_kq_upgate_kernel(const uint8_t* __restrict__ aqb,
     int64_t e = sel[s];
     e = (e < 0 || e >= E) ? 0 : e;
     int n = t * FQ_GEMV_OUT_PER_BLOCK + grp;
+    const uint8_t* aq = aqb + (int64_t)(s / topk) * qb_stride;   // assignment s = row * topk + j reads h row s / topk
 
     extern __shared__ float red[];
 
@@ -51,23 +52,23 @@ __global__ void fq_moe_kq_upgate_kernel(const uint8_t* __restrict__ aqb,
         const uint8_t* ur = up_bases[e] + (int64_t)n * up_stride;
         if constexpr (FMT == 0)
         {
-            g = fq_dot_q4_k_q8(gr, aqb, K, lane, FQ_GEMV_LANES);
-            u = fq_dot_q4_k_q8(ur, aqb, K, lane, FQ_GEMV_LANES);
+            g = fq_dot_q4_k_q8(gr, aq, K, lane, FQ_GEMV_LANES);
+            u = fq_dot_q4_k_q8(ur, aq, K, lane, FQ_GEMV_LANES);
         }
         else if constexpr (FMT == 1)
         {
-            g = fq_dot_q5_k_q8(gr, aqb, K, lane, FQ_GEMV_LANES);
-            u = fq_dot_q5_k_q8(ur, aqb, K, lane, FQ_GEMV_LANES);
+            g = fq_dot_q5_k_q8(gr, aq, K, lane, FQ_GEMV_LANES);
+            u = fq_dot_q5_k_q8(ur, aq, K, lane, FQ_GEMV_LANES);
         }
         else if constexpr (FMT == 2)
         {
-            g = fq_dot_q6_k_q8(gr, aqb, K, lane, FQ_GEMV_LANES);
-            u = fq_dot_q6_k_q8(ur, aqb, K, lane, FQ_GEMV_LANES);
+            g = fq_dot_q6_k_q8(gr, aq, K, lane, FQ_GEMV_LANES);
+            u = fq_dot_q6_k_q8(ur, aq, K, lane, FQ_GEMV_LANES);
         }
         else
         {
-            g = fq_dot_iq4_xs_q8(gr, aqb, K, lane, FQ_GEMV_LANES);
-            u = fq_dot_iq4_xs_q8(ur, aqb, K, lane, FQ_GEMV_LANES);
+            g = fq_dot_iq4_xs_q8(gr, aq, K, lane, FQ_GEMV_LANES);
+            u = fq_dot_iq4_xs_q8(ur, aq, K, lane, FQ_GEMV_LANES);
         }
     }
     // Two reductions in one shared row: red[2*tid] = g, red[2*tid+1] = u.
@@ -147,6 +148,10 @@ __global__ void fq_moe_kq_combine_kernel(const float* __restrict__ partial,
                                          const __half* __restrict__ wts,
                                          float* __restrict__ out, int S, int K)
 {
+    // blockIdx.y = row r: its S = topk assignments are partial[r*S .. r*S+S), weights wts[r*S ..)
+    partial += (int64_t)blockIdx.y * S * K;
+    wts += (int64_t)blockIdx.y * S;
+    out += (int64_t)blockIdx.y * K;
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < K; k += gridDim.x * blockDim.x)
     {
         float acc = 0.0f;
@@ -170,7 +175,10 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
                                      torch::Tensor partial, torch::Tensor out)
 {
     int K = (int)h.size(1);
-    int S = (int)sel.numel();
+    int R = (int)h.size(0);
+    int S = (int)sel.numel();   // R rows x topk picks, assignment s = row * topk + j
+    int topk = S / R;
+    TORCH_CHECK(S % R == 0 && R >= 1 && topk <= 32, "fq_moe_kq: sel must be R x topk with topk <= 32");
     TORCH_CHECK_DTYPE(h, kHalf);
     int E = (int)up_ptrs.numel();
     // I from the down row stride (down rows are I-wide, like Bolt's
@@ -180,7 +188,7 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     int ntiles_u = (I + FQ_GEMV_OUT_PER_BLOCK - 1) / FQ_GEMV_OUT_PER_BLOCK;
     int ntiles_d = (K + FQ_GEMV_OUT_PER_BLOCK - 1) / FQ_GEMV_OUT_PER_BLOCK;
-    torch::Tensor qb_h = fq_q8_scratch(h.get_device(), 1, K);
+    torch::Tensor qb_h = fq_q8_scratch(h.get_device(), R, K);
     fq_quant_q8_1_rows(h, qb_h);
     int64_t qb_stride_h = (int64_t)(K / FQ_Q8_1_GROUP) * FQ_Q8_1_BYTES;
     static thread_local std::map<std::tuple<int, int, int>, torch::Tensor> act_cache;
@@ -202,7 +210,7 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
         reinterpret_cast<const uint8_t* const*>(up_ptrs.data_ptr<int64_t>()),
         gate_stride, up_stride, qb_stride_h,
         reinterpret_cast<__half*>(act.data_ptr<at::Half>()),
-        S, I, K, E, ntiles_u);
+        S, I, K, E, ntiles_u, topk);
     torch::Tensor qb_act = fq_q8_scratch(h.get_device(), S, I);
     fq_quant_q8_1_rows(act, qb_act);
     int64_t qb_stride_a = (int64_t)(I / FQ_Q8_1_GROUP) * FQ_Q8_1_BYTES;
@@ -212,10 +220,10 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
         reinterpret_cast<const uint8_t* const*>(down_ptrs.data_ptr<int64_t>()),
         down_stride, partial.data_ptr<float>(), S, I, K, E, ntiles_d);
     int nblocks = (K + 255) / 256;
-    fq_moe_kq_combine_kernel<<<nblocks, 256, 0, stream>>>(
+    fq_moe_kq_combine_kernel<<<dim3(nblocks, R), 256, 0, stream>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<const __half*>(wts.data_ptr<at::Half>()),
-        out.data_ptr<float>(), S, K);
+        out.data_ptr<float>(), topk, K);
 }
 
 void fq_moe_q4k_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
