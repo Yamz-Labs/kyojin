@@ -1927,7 +1927,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         from .fq_moe_prefill import build_tiles, gmm_iq4, perm_cols
         if use_kq:
-            from .fq_moe_prefill_kq import moe_kq_prefill, PF_BM
+            from .fq_moe_prefill_kq import moe_kq_prefill, gmm_kq, PF_BM
         E = self.num_experts
         dev = y.device
         K = y.shape[1]
@@ -1954,8 +1954,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         dn = torch.empty((M, K), dtype=torch.half, device=dev)
         if use_kq:
             xs = y.index_select(0, token_sorted)
-            moe_kq_prefill(xs, gu_ptrs, dn_ptrs, a, dn, tile_e, tile_r0, offs, weight_sorted, E, I, K,
-                           _KQ[fmts[0]], _KQ[fmts[1]], bm)
+            if os.environ.get("MCPM_FQ_PF_FUSED", "0") == "1":   # weights decoded inside the GEMM tile (no fp16 scratch)
+                gmm_kq(xs, gu_ptrs, a, tile_e, tile_r0, offs, I, K, E, _KQ[fmts[0]], swiglu=True, BM=bm)
+                gmm_kq(a, dn_ptrs, dn, tile_e, tile_r0, offs, K, I, E, _KQ[fmts[1]], wrow=weight_sorted, BM=bm)
+            else:
+                moe_kq_prefill(xs, gu_ptrs, dn_ptrs, a, dn, tile_e, tile_r0, offs, weight_sorted, E, I, K,
+                               _KQ[fmts[0]], _KQ[fmts[1]], bm)
         else:
             xs = perm_cols(y.index_select(0, token_sorted))
             gmm_iq4(xs, gu_ptrs, a, tile_e, tile_r0, offs, I, K, E, swiglu=True)

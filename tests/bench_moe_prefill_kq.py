@@ -78,6 +78,13 @@ def main() -> int:
             b.record()
             torch.cuda.synchronize()
             res[mode] = (a.elapsed_time(b) / 5, y)
+        if os.environ.get("PROF") and N == 4096:
+            from torch.profiler import profile, ProfilerActivity
+            os.environ["MCPM_FQ_PF_GROUPED_KQ"] = "1"
+            with profile(activities=[ProfilerActivity.CUDA]) as p:
+                run(); torch.cuda.synchronize()
+            for e in sorted(p.key_averages(), key=lambda e: -e.device_time_total)[:6]:
+                print(f"   {e.device_time_total / 1e3:8.1f} ms  n={e.count:4d}  {e.key[:70]}")
         rel = ((res["1"][1] - res["0"][1]).norm() / res["0"][1].norm()).item()
         print(f"N={N:5d}: per-expert {res['0'][0]:8.1f} ms  grouped {res['1'][0]:8.1f} ms  ({res['0'][0] / res['1'][0]:.1f}x)  rel_diff={rel:.1e}")
     return 0

@@ -5,9 +5,11 @@ import os
 import torch
 import triton
 import triton.language as tl
+from ..ext import exllamav3_ext as ext
 
 FMT_Q4K, FMT_Q5K, FMT_Q6K = 0, 1, 2
 PF_BM = int(os.environ.get("MCPM_FQ_PF_BM", "64"))   # rows per tile: weight decode is shared by BM rows
+_NATIVE_DQ = hasattr(ext, "fq_dequant_kq_grouped") and os.environ.get("MCPM_FQ_PF_NATIVE_DQ", "0") == "1"
 BLOCK_BYTES = {FMT_Q4K: 144, FMT_Q5K: 176, FMT_Q6K: 210}
 
 
@@ -233,9 +235,14 @@ def moe_kq_prefill(y_sorted, gu_ptrs, dn_ptrs, a, dn, tile_e, tile_r0, offs, wro
         wg = _buf(dev, "g", ec * I * K)
         wu = _buf(dev, "u", ec * I * K)
         wd = _buf(dev, "d", ec * K * I)
-        _dq_kq[(triton.cdiv(I, BNd), K // 256, ec)](gu_ptrs, wg, e0, I, K, FMT=fmt_gu, BN=BNd, num_warps=4)
-        _dq_kq[(triton.cdiv(I, BNd), K // 256, ec)](gu_ptrs, wu, E + e0, I, K, FMT=fmt_gu, BN=BNd, num_warps=4)
-        _dq_kq[(triton.cdiv(K, BNd), I // 256, ec)](dn_ptrs, wd, e0, K, I, FMT=fmt_dn, BN=BNd, num_warps=4)
+        if _NATIVE_DQ:   # opt-in native grouped dequant (fq_dequant_kq.cu): slower than the Triton one on the 3090, ~1.3x on the iGPU
+            ext.fq_dequant_kq_grouped(gu_ptrs, wg, e0, ec, I, K, fmt_gu)
+            ext.fq_dequant_kq_grouped(gu_ptrs, wu, E + e0, ec, I, K, fmt_gu)
+            ext.fq_dequant_kq_grouped(dn_ptrs, wd, e0, ec, K, I, fmt_dn)
+        else:
+            _dq_kq[(triton.cdiv(I, BNd), K // 256, ec)](gu_ptrs, wg, e0, I, K, FMT=fmt_gu, BN=BNd, num_warps=4)
+            _dq_kq[(triton.cdiv(I, BNd), K // 256, ec)](gu_ptrs, wu, E + e0, I, K, FMT=fmt_gu, BN=BNd, num_warps=4)
+            _dq_kq[(triton.cdiv(K, BNd), I // 256, ec)](dn_ptrs, wd, e0, K, I, FMT=fmt_dn, BN=BNd, num_warps=4)
         T = tile_e.shape[0]
         BN, BK, nw, ns = 128, 64, 8, (2 if torch.version.hip else 3)   # 64 KiB LDS on gfx11
         _gmm_f16[(triton.cdiv(I, BN), T)](y_sorted, wg, wu, a, tile_e, tile_r0, offs, offs, I, K, y_sorted.stride(0),

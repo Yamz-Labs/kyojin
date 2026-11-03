@@ -571,6 +571,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("packed"), py::arg("out"));
     m.def("fq_dequant_nvfp4", &fq_dequant_nvfp4, "fq_dequant_nvfp4",
           py::arg("packed"), py::arg("scales"), py::arg("global_scale"), py::arg("out"));
+    m.def("fq_dequant_kq_grouped", &fq_dequant_kq_grouped, "fq_dequant_kq_grouped",
+          py::arg("ptrs"), py::arg("out"), py::arg("e0"), py::arg("ec"), py::arg("n"), py::arg("k"), py::arg("fmt"));
     m.def("fq_dequant_q4_k", &fq_dequant_q4_k, "fq_dequant_q4_k",
           py::arg("packed"), py::arg("out"));
     m.def("fq_dequant_q5_k", &fq_dequant_q5_k, "fq_dequant_q5_k",

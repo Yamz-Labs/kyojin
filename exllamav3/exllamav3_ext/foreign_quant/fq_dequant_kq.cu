@@ -43,9 +43,12 @@ namespace {
 // decoded by fq_q4k_scales(..., s >> 1) at index s & 1. First 32 elements of
 // a 64-group take the low nibble (d1, m1), next 32 the high nibble (d2, m2):
 //     y = (d*sc) * nib - (dmin*m)          (left-assoc, two roundings).
-__global__ void fq_dq_q4_k_kernel(const uint8_t* __restrict__ packed, __half* __restrict__ out,
-                                   int64_t kb)
+__global__ void fq_dq_q4_k_kernel(const uint8_t* __restrict__ packed_, __half* __restrict__ out_,
+                                   int64_t kb, const int64_t* __restrict__ ptrs, int64_t out_stride)
 {
+    // ptrs != null: grouped launch, blockIdx.z picks the expert (its packed pointer and out slice)
+    const uint8_t* packed = ptrs ? reinterpret_cast<const uint8_t*>(ptrs[blockIdx.z]) : packed_;
+    __half* out = out_ + (int64_t)blockIdx.z * out_stride;
     int b = blockIdx.x;            // 256-block index within the row
     int n = blockIdx.y;            // row
     int e = threadIdx.x;           // 0..255, element index inside the block
@@ -75,9 +78,12 @@ __global__ void fq_dq_q4_k_kernel(const uint8_t* __restrict__ packed, __half* __
 // u2 = 2<<(2*c)) while the qh byte index restarts at 0 in every group, so the
 // mask is 1 << (2*c + hi) == 1 << s and the qh byte is l, NOT l + 32*c.
 //     y = (d*sc) * (nib + 16*(qh[l] >> s & 1)) - (dmin*m)
-__global__ void fq_dq_q5_k_kernel(const uint8_t* __restrict__ packed, __half* __restrict__ out,
-                                   int64_t kb)
+__global__ void fq_dq_q5_k_kernel(const uint8_t* __restrict__ packed_, __half* __restrict__ out_,
+                                   int64_t kb, const int64_t* __restrict__ ptrs, int64_t out_stride)
 {
+    // ptrs != null: grouped launch, blockIdx.z picks the expert (its packed pointer and out slice)
+    const uint8_t* packed = ptrs ? reinterpret_cast<const uint8_t*>(ptrs[blockIdx.z]) : packed_;
+    __half* out = out_ + (int64_t)blockIdx.z * out_stride;
     int b = blockIdx.x;
     int n = blockIdx.y;
     int e = threadIdx.x;
@@ -114,9 +120,12 @@ __global__ void fq_dq_q5_k_kernel(const uint8_t* __restrict__ packed, __half* __
 // planes, so the global byte offsets are 64*half, 128 + 32*half and 192 +
 // 8*half -- dropping the 128 would silently read the wrong qh plane.
 //     y = (d * sc) * q          (left-assoc: d*sc first, then *q, q already -32)
-__global__ void fq_dq_q6_k_kernel(const uint8_t* __restrict__ packed, __half* __restrict__ out,
-                                   int64_t kb)
+__global__ void fq_dq_q6_k_kernel(const uint8_t* __restrict__ packed_, __half* __restrict__ out_,
+                                   int64_t kb, const int64_t* __restrict__ ptrs, int64_t out_stride)
 {
+    // ptrs != null: grouped launch, blockIdx.z picks the expert (its packed pointer and out slice)
+    const uint8_t* packed = ptrs ? reinterpret_cast<const uint8_t*>(ptrs[blockIdx.z]) : packed_;
+    __half* out = out_ + (int64_t)blockIdx.z * out_stride;
     int b = blockIdx.x;
     int n = blockIdx.y;
     int e = threadIdx.x;
@@ -147,9 +156,12 @@ __global__ void fq_dq_q6_k_kernel(const uint8_t* __restrict__ packed, __half* __
 // and dl = d * (ls - 32); the first 16 lanes take the low nibble of 16 qs
 // bytes, the next 16 the high nibble of the same bytes.
 //     y = (d * (ls-32)) * kvalues[nib]
-__global__ void fq_dq_iq4_xs_kernel(const uint8_t* __restrict__ packed, __half* __restrict__ out,
-                                     int64_t kb)
+__global__ void fq_dq_iq4_xs_kernel(const uint8_t* __restrict__ packed_, __half* __restrict__ out_,
+                                   int64_t kb, const int64_t* __restrict__ ptrs, int64_t out_stride)
 {
+    // ptrs != null: grouped launch, blockIdx.z picks the expert (its packed pointer and out slice)
+    const uint8_t* packed = ptrs ? reinterpret_cast<const uint8_t*>(ptrs[blockIdx.z]) : packed_;
+    __half* out = out_ + (int64_t)blockIdx.z * out_stride;
     int b = blockIdx.x;
     int n = blockIdx.y;
     int e = threadIdx.x;
@@ -216,7 +228,7 @@ void fq_dequant_q4_k(torch::Tensor packed, torch::Tensor out)
         int64_t nc = (n - n0 < FQ_DQ_KQ_MAX_ROWS) ? n - n0 : FQ_DQ_KQ_MAX_ROWS;
         dim3 grid((unsigned)kb, (unsigned)nc);
         fq_dq_q4_k_kernel<<<grid, 256, 0, stream>>>(
-            p + n0 * kb * FQ_Q4_K_BYTES, o + n0 * kb * FQ_Q4_K_GROUP, kb);
+            p + n0 * kb * FQ_Q4_K_BYTES, o + n0 * kb * FQ_Q4_K_GROUP, kb, nullptr, 0);
     }
 }
 
@@ -233,7 +245,7 @@ void fq_dequant_q5_k(torch::Tensor packed, torch::Tensor out)
         int64_t nc = (n - n0 < FQ_DQ_KQ_MAX_ROWS) ? n - n0 : FQ_DQ_KQ_MAX_ROWS;
         dim3 grid((unsigned)kb, (unsigned)nc);
         fq_dq_q5_k_kernel<<<grid, 256, 0, stream>>>(
-            p + n0 * kb * FQ_Q5_K_BYTES, o + n0 * kb * FQ_Q5_K_GROUP, kb);
+            p + n0 * kb * FQ_Q5_K_BYTES, o + n0 * kb * FQ_Q5_K_GROUP, kb, nullptr, 0);
     }
 }
 
@@ -250,7 +262,7 @@ void fq_dequant_q6_k(torch::Tensor packed, torch::Tensor out)
         int64_t nc = (n - n0 < FQ_DQ_KQ_MAX_ROWS) ? n - n0 : FQ_DQ_KQ_MAX_ROWS;
         dim3 grid((unsigned)kb, (unsigned)nc);
         fq_dq_q6_k_kernel<<<grid, 256, 0, stream>>>(
-            p + n0 * kb * FQ_Q6_K_BYTES, o + n0 * kb * FQ_Q6_K_GROUP, kb);
+            p + n0 * kb * FQ_Q6_K_BYTES, o + n0 * kb * FQ_Q6_K_GROUP, kb, nullptr, 0);
     }
 }
 
@@ -267,6 +279,26 @@ void fq_dequant_iq4_xs(torch::Tensor packed, torch::Tensor out)
         int64_t nc = (n - n0 < FQ_DQ_KQ_MAX_ROWS) ? n - n0 : FQ_DQ_KQ_MAX_ROWS;
         dim3 grid((unsigned)kb, (unsigned)nc);
         fq_dq_iq4_xs_kernel<<<grid, 256, 0, stream>>>(
-            p + n0 * kb * FQ_IQ4_XS_BYTES, o + n0 * kb * FQ_IQ4_XS_GROUP, kb);
+            p + n0 * kb * FQ_IQ4_XS_BYTES, o + n0 * kb * FQ_IQ4_XS_GROUP, kb, nullptr, 0);
+    }
+}
+// Grouped dequant: experts e0 .. e0+ec-1 of a pointer table (int64 device pointers to [n, kb*bytes] packed rows) into
+// out[ec, n, k] fp16 in ONE launch (the per-expert path launches once per expert and matrix).
+void fq_dequant_kq_grouped(torch::Tensor ptrs, torch::Tensor out, int64_t e0, int64_t ec, int64_t n, int64_t k, int64_t fmt)
+{
+    TORCH_CHECK(ptrs.is_cuda() && ptrs.dtype() == torch::kInt64 && out.is_cuda() && out.dtype() == torch::kHalf, "bad args");
+    TORCH_CHECK(k % 256 == 0 && n <= FQ_DQ_KQ_MAX_ROWS && ec <= 65535 && out.numel() >= ec * n * k, "bad shape");
+    at::cuda::CUDAGuard guard(ptrs.device());
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int64_t* pp = ptrs.data_ptr<int64_t>() + e0;
+    __half* o = reinterpret_cast<__half*>(out.data_ptr<at::Half>());
+    dim3 grid((unsigned)(k / 256), (unsigned)n, (unsigned)ec);
+    int64_t kb = k / 256;
+    switch (fmt)
+    {
+        case 0: fq_dq_q4_k_kernel<<<grid, 256, 0, stream>>>(nullptr, o, kb, pp, n * k); break;
+        case 1: fq_dq_q5_k_kernel<<<grid, 256, 0, stream>>>(nullptr, o, kb, pp, n * k); break;
+        case 2: fq_dq_q6_k_kernel<<<grid, 256, 0, stream>>>(nullptr, o, kb, pp, n * k); break;
+        default: fq_dq_iq4_xs_kernel<<<grid, 256, 0, stream>>>(nullptr, o, kb, pp, n * k); break;
     }
 }
