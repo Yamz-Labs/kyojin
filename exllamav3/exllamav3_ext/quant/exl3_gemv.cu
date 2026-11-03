@@ -8,6 +8,7 @@
 #include "hadamard.cuh"
 #if defined(USE_ROCM)
 #include "exl3_gemv_int8.cuh"   // fused int8-activation GEMV (mul1 tensors, m <= 2), opt-in via EXL3_INT8_GEMV
+#include "../rocm/quant/exl3_gemv_rdna.cuh"   // fdot2 m == 1 dot core for gfx1200/gfx1201
 #endif
 
 #include <c10/cuda/CUDAGuard.h>
@@ -1638,16 +1639,33 @@ void exl3_gemv
         (void*)& svh_ptr
     };
 
-    bool ok = exl3_gemv_try_launch
-    (
-        kernel_args, size_m, size_k, size_n, K, half_k, cb, c_fp32,
-        true, device, stream, nullptr, true
-    );
+    bool ok = false;
+    bool out_rotated = false;
+#if defined(USE_ROCM)
+    // gfx1200/gfx1201: m == 1 takes the fdot2 dot core. The input Hadamard
+    // above has already produced A_had; the output Hadamard is fused into the
+    // dot kernel when the width fits the per-device segment counters and is
+    // otherwise applied below as before. Rows > 1 and half-integer bitrates
+    // keep the WMMA kernel.
+    if (size_m == 1 && !half_k && exl3_gemv_rdna_arch(device))
+        ok = exl3_gemv_rdna_launch(A_ptr, B_ptr, C_ptr, svh_ptr, device,
+                                   size_k, size_n, K, cb, c_fp32, stream,
+                                   true, &out_rotated);
+#endif
+    if (!ok)
+        ok = exl3_gemv_try_launch
+        (
+            kernel_args, size_m, size_k, size_n, K, half_k, cb, c_fp32,
+            true, device, stream, nullptr, true
+        );
     TORCH_CHECK(ok, "exl3_gemv: call is not eligible for the GEMV kernel");
 
 #if defined(USE_ROCM)
-    at::Tensor C_view = C.view({size_m, size_n});
-    had_r_128(C_view, C_view, c10::nullopt, svh, 1.0f);
+    if (!out_rotated)
+    {
+        at::Tensor C_view = C.view({size_m, size_n});
+        had_r_128(C_view, C_view, c10::nullopt, svh, 1.0f);
+    }
     cuda_check(hipPeekAtLastError());
 #else
     cuda_check(cudaPeekAtLastError());
