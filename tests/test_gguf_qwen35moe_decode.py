@@ -23,7 +23,7 @@ gen = Generator(model=model, cache=cache, tokenizer=tok)
 ids = tok.encode("The capital of France is a city that")
 N = 64
 res = {}
-for grouped in ("0", "1", "0", "1"):
+for grouped in ("1", "0", "1"):
     os.environ["MCPM_FQ_MOE_GROUPED"] = grouped
     gen.generate("The capital of France", max_new_tokens=4, completion_only=True)  # warm
     torch.cuda.synchronize(); t = time.time()
