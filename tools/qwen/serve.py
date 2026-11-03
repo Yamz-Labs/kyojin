@@ -420,6 +420,10 @@ def sampling_from(body: dict[str, Any], defaults: dict[str, Any]) -> dict[str, A
     if s["temperature"] < 0 or not 0 < s["top_p"] <= 1 or s["top_k"] < 0 or not 0 <= s["min_p"] < 1:
         raise BadRequest("sampling parameter out of range")
     s["top_k"] = int(s["top_k"])
+    if body.get("no_tool_call") is not None and not isinstance(body["no_tool_call"], bool):
+        raise BadRequest("no_tool_call must be boolean")
+    if body.get("no_tool_call"):    # tools stay in the render (shared prefix), the sampler cannot open a call
+        s["no_tool_call"] = True
     return s
 
 
@@ -1071,10 +1075,15 @@ class QwenEngine:
 
     def _sampler(self, s: dict[str, Any]):
         from exllamav3.generator.sampler import ArgmaxSampler, ComboSampler
-        if s["temperature"] == 0 or s.get("top_k") == 1:
+        bias = None
+        if s.get("no_tool_call"):
+            ids = self.tokenizer.encode(TOOL_OPEN, add_bos=False, encode_special_tokens=True).flatten().tolist()
+            bias = {ids[0]: -1e6} if len(ids) == 1 else None
+        if not bias and (s["temperature"] == 0 or s.get("top_k") == 1):
             return ArgmaxSampler()
-        return ComboSampler(temperature=s["temperature"], top_k=s.get("top_k", 0), top_p=s.get("top_p", 1.0),
-                            min_p=s.get("min_p", 0.0))
+        # ArgmaxSampler has no bias step: a near-zero temperature keeps the greedy choice with the ban
+        return ComboSampler(temperature=s["temperature"] or 1e-4, top_k=s.get("top_k", 0), top_p=s.get("top_p", 1.0),
+                            min_p=s.get("min_p", 0.0), logit_bias=bias)
 
     def _embed(self, images: list[tuple[Any, str]]) -> list:
         """One MMEmbedding per image. The same bytes give the same embedding object (same pseudo token ids), so a
