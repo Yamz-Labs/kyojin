@@ -631,6 +631,14 @@ class CudaGraphRunner:
         self._model_ok = None
 
 
+def default_on_for_foreign():
+    """Foreign-format (GGUF stored-bytes) models are launch-bound at decode (~43 kernels per block): graph replay is ON by
+    default for them (+32 % on a 4-block qwen35moe cut, tokens identical). EXL3_CUDA_GRAPH=0 still turns it off."""
+    global CUDA_GRAPH_ENABLED
+    if os.environ.get("EXL3_CUDA_GRAPH") != "0":
+        CUDA_GRAPH_ENABLED = True
+
+
 def maybe_forward(model, ids: torch.Tensor, params: dict):
     """Hook for Model.forward (non-TP branch). Returns the logits, or None to run the eager path."""
     if not CUDA_GRAPH_ENABLED or torch.version.hip or not torch.cuda.is_available():
