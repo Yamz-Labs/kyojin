@@ -237,7 +237,7 @@ def moe_kq_prefill(y_sorted, gu_ptrs, dn_ptrs, a, dn, tile_e, tile_r0, offs, wro
         _dq_kq[(triton.cdiv(I, BNd), K // 256, ec)](gu_ptrs, wu, E + e0, I, K, FMT=fmt_gu, BN=BNd, num_warps=4)
         _dq_kq[(triton.cdiv(K, BNd), I // 256, ec)](dn_ptrs, wd, e0, K, I, FMT=fmt_dn, BN=BNd, num_warps=4)
         T = tile_e.shape[0]
-        BN, BK, nw, ns = 128, 64, 8, 3
+        BN, BK, nw, ns = 128, 64, 8, (2 if torch.version.hip else 3)   # 64 KiB LDS on gfx11
         _gmm_f16[(triton.cdiv(I, BN), T)](y_sorted, wg, wu, a, tile_e, tile_r0, offs, offs, I, K, y_sorted.stride(0),
                                           a.stride(0), e0, e0 + ec, SWIGLU=True, SCALE_ROWS=False,
                                           BM=bm, BN=BN, BK=BK, num_warps=nw, num_stages=ns)

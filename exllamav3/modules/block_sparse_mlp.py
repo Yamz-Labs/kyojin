@@ -1917,7 +1917,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if fmts is None or not (use_kq or fmts == ("iq4_xs", "iq4_xs")) or self.act_limit or \
                 self.activation_fn not in ("silu", None):
             return None
-        if use_kq and os.environ.get("MCPM_FQ_PF_GROUPED_KQ", "1") == "0":
+        # CUDA: 2.4-4.2x on the MoE layer. ROCm (iGPU): 0.9-1.1x (scratch traffic is bound by LPDDR bandwidth), so off by default there
+        if use_kq and os.environ.get("MCPM_FQ_PF_GROUPED_KQ", "0" if torch.version.hip else "1") == "0":
             return None
         if (self.num_local_experts or self.num_experts) != self.num_experts:
             return None
