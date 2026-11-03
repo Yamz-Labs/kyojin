@@ -1,9 +1,7 @@
-"""Multi-row (N users) MoE decode timing on real unsloth UD experts: N = 1,2,4,8,16,32 rows, top-8 of 256 each.
+"""Multi-row (N users) MoE decode timing on real unsloth UD experts: N = 1,2,4,8,16,32 rows, top-8 of 256 each, with the
+N-row result checked against row-by-row bsz=1 calls.
 
-Runs BlockSparseMLP.forward with pre-routed picks (batch 1, top-8 of 256) through the grouped fq_moe kernel and checks it
-against a numpy dequant + torch SwiGLU reference and against the ungrouped per-expert path.
-
-    FMOE_GGUF=<file.gguf> python tests/test_moe_foreign_mixed.py [layer]
+    FMOE_GGUF=<file.gguf> python tests/bench_moe_foreign_rows.py [layer]
 """
 from __future__ import annotations
 import os, sys
@@ -18,7 +16,8 @@ from exllamav3.modules.block_sparse_mlp import BlockSparseMLP  # noqa: E402
 from exllamav3.foreign_quant import k_quants  # noqa: E402
 
 LAYER = int(sys.argv[1]) if len(sys.argv) > 1 else 0
-FMT = {12: ("q4_k", 144, k_quants.dequant_q4_K_block), 13: ("q5_k", 176, k_quants.dequant_q5_K_block)}
+FMT = {12: ("q4_k", 144, k_quants.dequant_q4_K_block), 13: ("q5_k", 176, k_quants.dequant_q5_K_block),
+       14: ("q6_k", 210, k_quants.dequant_q6_K_block)}
 
 
 def deq(packed: np.ndarray, rows: int, cols: int, bb: int, fn) -> np.ndarray:

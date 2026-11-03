@@ -1911,7 +1911,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         R = y.shape[0]
         if R < int(os.environ.get("MCPM_FQ_PF_GROUPED_MIN", "256")):
             return None
-        if self._fq_grouped_kq_ok(y) != ("iq4_xs", "iq4_xs") or self.act_limit or self.activation_fn not in ("silu", None):
+        fmts = self._fq_grouped_kq_ok(y)
+        _KQ = {"q4_k": 0, "q5_k": 1, "q6_k": 2}
+        use_kq = fmts is not None and fmts[0] in _KQ and fmts[1] in _KQ   # Q4_K/Q5_K/Q6_K (mixed gate-up/down ok)
+        if fmts is None or not (use_kq or fmts == ("iq4_xs", "iq4_xs")) or self.act_limit or \
+                self.activation_fn not in ("silu", None):
+            return None
+        if use_kq and os.environ.get("MCPM_FQ_PF_GROUPED_KQ", "1") == "0":
             return None
         if (self.num_local_experts or self.num_experts) != self.num_experts:
             return None
@@ -1919,6 +1925,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if tuple(selected_experts.shape) != (R, top_k) or selected_experts.dtype != torch.long:
             return None
         from .fq_moe_prefill import build_tiles, gmm_iq4, perm_cols
+        if use_kq:
+            from .fq_moe_prefill_kq import moe_kq_prefill, PF_BM
         E = self.num_experts
         dev = y.device
         K = y.shape[1]
@@ -1932,7 +1940,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         weight_sorted = wts.reshape(-1)[order]
         counts = _scatter_expert_count(flat_expert, E + 1)[:E]
         M = R * top_k
-        tile_e, tile_r0, offs = build_tiles(counts, M, 64)
+        bm = PF_BM if use_kq else 64
+        tile_e, tile_r0, offs = build_tiles(counts, M, bm)
         tbl = getattr(self, "_fq_pf_ptrs", None)
         if tbl is None or tbl[0] != self.gates[0].packed.data_ptr() or tbl[3] != dev:
             gu = torch.tensor([m.packed.data_ptr() for m in self.gates + self.ups], dtype=torch.int64, device=dev)
@@ -1940,11 +1949,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             tbl = (self.gates[0].packed.data_ptr(), gu, dn_p, dev)
             self._fq_pf_ptrs = tbl
         _, gu_ptrs, dn_ptrs, _ = tbl
-        xs = perm_cols(y.index_select(0, token_sorted))
         a = torch.empty((M, I), dtype=torch.half, device=dev)
-        gmm_iq4(xs, gu_ptrs, a, tile_e, tile_r0, offs, I, K, E, swiglu=True)
         dn = torch.empty((M, K), dtype=torch.half, device=dev)
-        gmm_iq4(a, dn_ptrs, dn, tile_e, tile_r0, offs, K, I, E, wrow=weight_sorted)
+        if use_kq:
+            xs = y.index_select(0, token_sorted)
+            moe_kq_prefill(xs, gu_ptrs, dn_ptrs, a, dn, tile_e, tile_r0, offs, weight_sorted, E, I, K,
+                           _KQ[fmts[0]], _KQ[fmts[1]], bm)
+        else:
+            xs = perm_cols(y.index_select(0, token_sorted))
+            gmm_iq4(xs, gu_ptrs, a, tile_e, tile_r0, offs, I, K, E, swiglu=True)
+            gmm_iq4(a, dn_ptrs, dn, tile_e, tile_r0, offs, K, I, E, wrow=weight_sorted)
         inv = torch.empty_like(order)
         inv[order] = torch.arange(order.numel(), device=dev)    # row of each (token, k) pick in the sorted layout
         final_hidden_states = dn.index_select(0, inv).view(R, top_k, K).float().sum(1)
