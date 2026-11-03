@@ -47,7 +47,7 @@ using FragC_h = HipVec<half2, 2>;   // legacy fp16-accumulate shape, kept for sh
 // Arch family macros. gfx12 (RDNA4) and gfx11.5 (RDNA3.5) both have a wave32
 // v_wmma_f32_16x16x16_f16, but with DIFFERENT builtins and DIFFERENT fragment
 // layouts -- they are not interchangeable. See the layout comments below.
-#if defined(EXL3_HIP_WMMA_GFX12)
+#if defined(__gfx1200__) || defined(__gfx1201__)
     #define EXL3_HIP_WMMA_GFX12 1
 #endif
 #if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
