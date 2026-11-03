@@ -1921,6 +1921,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # native bandwidth-bound dequant (~220 GB/s): 1.7x at 1K rows, 1.4x at 4K, 1.1-1.2x at 8K; ~1.0x at 256 rows,
         # so there it needs the native kernel and >= 512 rows. MCPM_FQ_PF_GROUPED_KQ=0/1 overrides.
         if use_kq:
+            from .fq_moe_prefill_kq import kq_native_dq
             force = os.environ.get("MCPM_FQ_PF_GROUPED_KQ")
             if force == "0":
                 return None
@@ -1933,7 +1934,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         from .fq_moe_prefill import build_tiles, gmm_iq4, perm_cols
         if use_kq:
-            from .fq_moe_prefill_kq import moe_kq_prefill, gmm_kq, kq_native_dq, PF_BM
+            from .fq_moe_prefill_kq import moe_kq_prefill, gmm_kq, PF_BM
         E = self.num_experts
         dev = y.device
         K = y.shape[1]

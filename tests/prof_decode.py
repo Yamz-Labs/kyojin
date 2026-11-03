@@ -30,6 +30,15 @@ def active_params(mod, scale=1.0):
 BPW = float(os.environ.get("DEC_BPW", "4.0"))
 ACT = sum(active_params(m) for m in model.modules)
 g = torch.Generator().manual_seed(3)
+_toks = {}
+_iter = gen.iterate
+def _it():
+    rs = _iter()
+    for r in rs:
+        if r.get("stage") == "streaming" and "token_ids" in r:
+            _toks.setdefault(r["serial"], []).extend(r["token_ids"].flatten().tolist())
+    return rs
+gen.iterate = _it
 def start(n_new):
     for _ in range(N):
         ids = torch.randint(1000, 100000, (1, 384), generator=g)
@@ -44,6 +53,13 @@ def prefill_all():
 start(STEPS + 80); prefill_all()
 for _ in range(8): gen.iterate()
 torch.cuda.synchronize()
+if os.environ.get("DEC_CPROF"):
+    import cProfile, pstats
+    pr = cProfile.Profile(); pr.enable()
+    for _ in range(STEPS): gen.iterate()
+    torch.cuda.synchronize(); pr.disable()
+    pstats.Stats(pr).sort_stats("tottime").print_stats(14)
+    raise SystemExit
 t = time.time()
 with profile(activities=[ProfilerActivity.CUDA]) as p:
     for _ in range(STEPS): gen.iterate()
@@ -65,3 +81,10 @@ for e in p.key_averages():
 print("class split (% of device time): " + ", ".join(f"{k} {100*v/tot:.0f}" for k, v in sorted(acc.items(), key=lambda kv: -kv[1])))
 for e in sorted(p.key_averages(), key=lambda e: -e.device_time_total)[:12]:
     print(f"{100*e.device_time_total/tot:5.1f}%  {e.device_time_total/STEPS:8.0f} us/step  n/step={e.count/STEPS:6.1f}  {e.key[:80]}")
+if os.environ.get("EXL3_BLOCK_GRAPH") == "1":
+    from exllamav3.modules import block_graph
+    st = block_graph.global_stats()
+    print("block_graph:", {k: (dict(v) if hasattr(v, "items") else v) for k, v in st.items()})
+
+import hashlib
+print("tokens:", {k: hashlib.md5(str(v).encode()).hexdigest()[:8] + f"({len(v)})" for k, v in sorted(_toks.items())})

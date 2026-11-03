@@ -1,6 +1,6 @@
 """Bounded per-block HIP graph capture for ROCm decode.
 
-Opt-in via EXL3_BLOCK_GRAPH=1 (default off; deployment defaults unchanged). Scope: one graph
+Default on ROCm (EXL3_BLOCK_GRAPH=0 disables; off on CUDA, which has the whole-forward graph). Scope: one graph
 per (device, layer instance, (B, Q), recurrent-history mode,
 cache generation) slot for non-QSA GDN+MoE TransformerBlocks. QSA layers, the PLE layer, the
 epilogue (mixer + lm_head), TP modes and prefill decline and stay eager. MLA blocks (hc or the
@@ -34,19 +34,25 @@ from . import ablit_runtime
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from .block_sparse_mlp import BlockSparseMLP
+from .mlp import GatedMLP
+from .attn import Attention
 from ..util.row_inv import ROW_INV_MAX_ROWS
 from .gated_delta_net import GatedDeltaNet
 from .mla_attn import MLAttention, MAX_DECODE_QLEN as _MLA_MAX_QLEN
 
 _env_int = lambda name, default: int(os.environ.get(name, default) or default)
 
-BLOCK_GRAPH_ENABLED = os.environ.get("EXL3_BLOCK_GRAPH", "0") == "1"
+# default ON on ROCm (decode: +3..8 % on dense GDN+attn, GDN+MoE, GGUF K-quant MoE, tokens identical); EXL3_BLOCK_GRAPH=0 turns it off
+BLOCK_GRAPH_ENABLED = os.environ.get("EXL3_BLOCK_GRAPH", "1" if torch.version.hip else "0") == "1"
 BLOCK_GRAPH_WARMUPS = max(1, _env_int("EXL3_BLOCK_GRAPH_WARMUPS", 3))
 BLOCK_GRAPH_MAX_SLOTS = max(1, _env_int("EXL3_BLOCK_GRAPH_MAX_SLOTS", 4))
 
 # Rows above the dense GEMV cap reconstruct+hgemm; still captureable, but the first bounded
 # implementation keeps the served decode envelope. Revisit after (B,Q) family measurements.
 BLOCK_GRAPH_MAX_ROWS = _env_int("EXL3_BLOCK_GRAPH_MAX_ROWS", 16 if ROW_INV_MAX_ROWS <= 8 else ROW_INV_MAX_ROWS)
+# Full-attention blocks (Attention + MoE/MLP): block table / cache_seqlens / positions become static buffers refreshed
+# before every replay (the Triton paged decode sizes its launches from the block table, no host sync). 0 = eager.
+BLOCK_GRAPH_ATTN = os.environ.get("EXL3_BLOCK_GRAPH_ATTN", "1") == "1"
 BLOCK_GRAPH_DEC_MOE = os.environ.get("EXL3_BLOCK_GRAPH_DEC_MOE", "1") == "1"
 # R-row verify blocks (MTP/DFlash, union MoE on the device table): EXL3_BLOCK_GRAPH_VERIFY=1 graphs
 # them. Off by default: at R=2 on the test box it replays but runs ~0.5 ms slower than eager (glm-mtp step 2b).
@@ -129,7 +135,7 @@ def _pool_for(device_index: int):
 
 
 class _BlockGraphSlot:
-    __slots__ = ("graph", "x_in", "slots_dev", "last_used", "slots_src")
+    __slots__ = ("graph", "x_in", "slots_dev", "last_used", "slots_src", "out", "bt", "cs", "pos")
 
     def __init__(self, graph, x_in, slots_dev, stamp):
         self.graph = graph
@@ -137,6 +143,8 @@ class _BlockGraphSlot:
         self.slots_dev = slots_dev
         self.last_used = stamp
         self.slots_src = None
+        self.bt = self.cs = self.pos = None   # attention blocks: static block table / seqlens / positions
+        self.out = None   # captured block output when it is not the input buffer (plain-residual blocks)
 
 
 def _verify_union_dev_ok(x: torch.Tensor, params: dict, draft: bool = False) -> bool:
@@ -181,6 +189,8 @@ class BlockGraphRunner:
             return None
         if isinstance(attn, MLAttention) and BLOCK_GRAPH_MLA:
             return self._mla_key(x, params)
+        if BLOCK_GRAPH_ATTN and type(attn) is Attention:
+            return self._attn_key(x, params)
         if not isinstance(attn, GatedDeltaNet) or attn.bc is not None:
             self.stats["declines"]["attn_type"] += 1
             return None
@@ -210,6 +220,26 @@ class BlockGraphRunner:
                 params.get("layer_instance", 0),
                 tuple(x.shape), str(x.dtype), bool(params.get("dflash_verify")), _VF["on"], _R8["on"])
 
+    def _attn_key(self, x: torch.Tensor, params: dict):
+        """Eligibility of a full-attention block (no indexer, no TP, flash_attn decode on the paged cache)."""
+        attn = self.block.attn
+        if getattr(attn, "qsa_indexer", None) is not None or getattr(attn, "tp_reduce", False) or \
+                getattr(attn, "has_split_cache", False):
+            self.stats["declines"]["attn_type"] += 1
+            return None
+        bt, cs = params.get("block_table"), params.get("cache_seqlens")
+        if params.get("attn_mode") != "flash_attn" or bt is None or cs is None or params.get("cache") is None or \
+                params.get("inv_freq") is not None or params.get("non_causal_spans") is not None or \
+                params.get("export_state_layers") or params.get("dflash_verify"):
+            self.stats["declines"]["attn_params"] += 1
+            return None
+        if not self._mlp_io_ok(x, params):
+            return None
+        pos = params.get("positions")
+        return (x.device.index, x.shape[0], x.shape[1], False, id(params["cache"]), params.get("layer_instance", 0),
+                tuple(x.shape), str(x.dtype), False, _VF["on"], _R8["on"], tuple(bt.shape), bt.dtype, tuple(cs.shape),
+                cs.dtype, None if (pos is None or pos is cs) else (tuple(pos.shape), pos.dtype))
+
     def _mlp_io_ok(self, x: torch.Tensor, params: dict, draft: bool = False) -> bool:
         """Checks shared by every captured block type: MLP route, TP, device, io, rows. `draft`:
         plain-residual MLA block (MTP head), residual (bsz, seq, hidden) instead of an hc stack."""
@@ -219,9 +249,18 @@ class BlockGraphRunner:
         # sync-free on device tables, so a rows == 1 block is capturable
         dec_moe_ok = BLOCK_GRAPH_DEC_MOE and getattr(mlp, "support_dec_moe", False) and \
             x.dim() >= 2 and (x.shape[0] * x.shape[1] == 1 or _verify_union_dev_ok(x, params, draft))
-        if not isinstance(mlp, BlockSparseMLP) or \
-                not (getattr(mlp, "support_hip_grouped", False) or
-                     getattr(mlp, "support_hip_prefill", False) or dec_moe_ok):
+        dense = isinstance(mlp, GatedMLP)   # dense MLP: plain gate/up/down GEMVs, no routing
+        if not dense and isinstance(mlp, BlockSparseMLP) and getattr(mlp, "gates", None):
+            # GGUF K-quant / IQ4_XS routed experts: the multi-row grouped kernel is sync-free (device-side routing)
+            fg = self.__dict__.get("_foreign_grouped")
+            if fg is None:
+                from .block_sparse_mlp import FQ_GROUPED_MAX_ROWS
+                ok = mlp._fq_grouped_kq_ok(torch.empty((1, 1), dtype = torch.half, device = x.device)) is not None
+                fg = self._foreign_grouped = FQ_GROUPED_MAX_ROWS if ok else 0
+            dense = x.shape[0] * x.shape[1] <= fg
+        if not dense and (not isinstance(mlp, BlockSparseMLP) or
+                          not (getattr(mlp, "support_hip_grouped", False) or
+                               getattr(mlp, "support_hip_prefill", False) or dec_moe_ok)):
             self.stats["declines"]["mlp_route"] += 1
             return False
         if getattr(mlp, "tp_mode", None) is not None or getattr(attn, "tp_reduce", False) or \
@@ -231,7 +270,12 @@ class BlockGraphRunner:
         if x.device != torch.device(self.block.device) or x.device.type != "cuda":
             self.stats["declines"]["device"] += 1
             return False
-        if x.dtype != torch.float32 or x.dim() != (3 if draft else 4) or not x.is_contiguous():
+        plain = self.block.attn_hc is None and self.block.mlp_hc is None   # plain residual [b, s, hidden], any float dtype
+        if plain and not draft:
+            if x.dim() != 3 or not x.is_contiguous():
+                self.stats["declines"]["io"] += 1
+                return False
+        elif x.dtype != torch.float32 or x.dim() != (3 if draft else 4) or not x.is_contiguous():
             self.stats["declines"]["io"] += 1
             return False
         bsz, seqlen = x.shape[0], x.shape[1]
@@ -326,11 +370,24 @@ class BlockGraphRunner:
                 torch.cuda.synchronize(d)
         torch.cuda.synchronize(dev)
         x_in = _shared_buf(x) if BG_KNOBS["shared_x"] else torch.empty_like(x)
-        live_slots = params["recurrent_slots"]
-        slots_cpu = live_slots.clone()  # stable CPU source; its device copy is slot-static
-        slots_dev = get_static_device_copy(slots_cpu, dev)
         params_cap = dict(params)
-        params_cap["recurrent_slots"] = slots_cpu
+        if type(self.block.attn) is Attention:
+            bt, cs, pos = params["block_table"], params["cache_seqlens"], params.get("positions")
+            sbt = torch.zeros(bt.shape, dtype = bt.dtype, device = dev)
+            scs = torch.zeros(cs.shape, dtype = cs.dtype, device = dev)
+            spos = None if (pos is None or pos is cs) else torch.zeros(pos.shape, dtype = pos.dtype, device = dev)
+            # warm values so the capture-time launch geometry matches this step
+            sbt.copy_(bt); scs.copy_(cs)
+            if spos is not None: spos.copy_(pos)
+            params_cap["block_table"] = sbt
+            params_cap["cache_seqlens"] = scs
+            params_cap["positions"] = scs if spos is None else spos
+            slots_dev = None
+        else:
+            live_slots = params["recurrent_slots"]
+            slots_cpu = live_slots.clone()  # stable CPU source; its device copy is slot-static
+            slots_dev = get_static_device_copy(slots_cpu, dev)
+            params_cap["recurrent_slots"] = slots_cpu
         graph = torch.cuda.CUDAGraph()
         try:
             self._capturing = True
@@ -361,7 +418,7 @@ class BlockGraphRunner:
                             f"expected {dev.index}"
                         assert torch.cuda.current_stream(dev) == capture_stream
                         assert torch.cuda.is_current_stream_capturing()
-                    self.block.forward(x_in, params_cap)
+                    out_cap = self.block.forward(x_in, params_cap)
         except Exception as e:
             self.disabled.add(key)
             self.stats["captures"] += 1
@@ -380,6 +437,10 @@ class BlockGraphRunner:
         self.stamp += 1
         self._evict_to_limit(dev)
         self.slots[key] = _BlockGraphSlot(graph, x_in, slots_dev, self.stamp)
+        if out_cap is not x_in:
+            self.slots[key].out = out_cap
+        if type(self.block.attn) is Attention:
+            self.slots[key].bt, self.slots[key].cs, self.slots[key].pos = sbt, scs, spos
         self.stats["captures"] += 1
         _total_captures[0] += 1
         if BLOCK_GRAPH_DEBUG:
@@ -407,8 +468,13 @@ class BlockGraphRunner:
             # reassignment); same-tuple continuations upload nothing (a blocking pageable H2D
             # here would drain the queue once per captured block). The held reference makes
             # object identity exact: a recycled allocation address cannot alias the source.
-            live = params["recurrent_slots"]
-            if live is not slot.slots_src:
+            if slot.bt is not None:
+                slot.bt.copy_(params["block_table"], non_blocking = True)
+                slot.cs.copy_(params["cache_seqlens"], non_blocking = True)
+                if slot.pos is not None:
+                    slot.pos.copy_(params["positions"], non_blocking = True)
+            live = params.get("recurrent_slots") if slot.bt is None else slot.slots_src
+            if slot.bt is None and live is not slot.slots_src:
                 from ..util.tensor import get_for_device
                 live_dev = get_for_device(params, "recurrent_slots", x.device)
                 slot.slots_dev.copy_(live_dev)
@@ -424,6 +490,8 @@ class BlockGraphRunner:
         self.stats["replays"] += 1
         if BLOCK_GRAPH_DEBUG:
             print(f"[blockgraph] replay {self.block.key}", flush=True)
+        if slot.out is not None:
+            return slot.out.clone()
         if BG_KNOBS["shared_x"] and slot.x_in is _shared_x.get(
                 (x.device.index, tuple(x.shape), x.dtype)):
             return slot.x_in
@@ -654,8 +722,9 @@ def maybe_graph_forward(block, x: torch.Tensor, params: dict):
         if getattr(block, "_block_graph_checked", None) == ("checked", BLOCK_GRAPH_MLA):
             return None
         block._block_graph_checked = ("checked", BLOCK_GRAPH_MLA)
-        if not isinstance(block.mlp, BlockSparseMLP) or not (
+        if not isinstance(block.mlp, (BlockSparseMLP, GatedMLP)) or not (
             isinstance(block.attn, GatedDeltaNet) or
+            (BLOCK_GRAPH_ATTN and type(block.attn) is Attention) or
             (BLOCK_GRAPH_MLA and isinstance(block.attn, MLAttention))
         ):
             return None  # cheap structural pre-filter; full eligibility checked per call
