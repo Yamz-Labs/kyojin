@@ -1909,11 +1909,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if os.environ.get("MCPM_FQ_PF_GROUPED", "1") == "0":
             return None
         R = y.shape[0]
-        if R < int(os.environ.get("MCPM_FQ_PF_GROUPED_MIN", "256")):
-            return None
         fmts = self._fq_grouped_kq_ok(y)
         _KQ = {"q4_k": 0, "q5_k": 1, "q6_k": 2}
         use_kq = fmts is not None and fmts[0] in _KQ and fmts[1] in _KQ   # Q4_K/Q5_K/Q6_K (mixed gate-up/down ok)
+        # K-quant: grouped from 33 rows (just above the multi-row decode kernel, FQ_GROUPED_MAX_ROWS=32); below that the
+        # per-expert loop launched ~1650 small gemvs per forward (3090 cut4 8K prefill +14..25 %). Others keep 256.
+        if R < int(os.environ.get("MCPM_FQ_PF_GROUPED_MIN", "33" if use_kq else "256")):
+            return None
         if fmts is None or not (use_kq or fmts == ("iq4_xs", "iq4_xs")) or self.act_limit or \
                 self.activation_fn not in ("silu", None):
             return None
