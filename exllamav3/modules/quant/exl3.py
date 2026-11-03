@@ -230,6 +230,7 @@ def _had_cache_put(inner, n_offset, n, w, clock):
 _f32_via_f16 = os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
 _f32_via_f16_min_rows = int(os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "33"))
 _hip_gemv_support_cache: dict[int, bool] = {}
+_hip_gemv_family_cache: dict[int, int] = {}
 
 # Batch-1 decode kernels (exl3_dec.cu, gfx11.5): one launch per GEMV with both Hadamard stages
 # fused. EXL3_DEC=0 disables them (falls back to exl3_gemv / reconstruct).
@@ -294,9 +295,13 @@ def wide_scratch(device: torch.device):
 
 
 def dec_supported(inner) -> bool:
-    """True when a LinearEXL3 can run the exl3_dec kernels (mul1 codebook, supported K, shapes)."""
+    """True when a LinearEXL3 can run the exl3_dec kernels (mul1 codebook, supported K, shapes).
+
+    The exl3_dec kernels are gfx11.5 (RDNA3.5) WMMA only, so the gate also pins the device to
+    family 2 -- on gfx12 (RDNA4) the direct WMMA GEMV path must be used instead."""
     return (
         EXL3_DEC and bool(torch.version.hip) and hasattr(ext, "exl3_dec_gemv") and
+        _hip_wmma_family(inner.trellis.device) == 2 and
         inner.mul1 and not inner.mcg and (
             int(round(inner.K * 2)) in _DEC_KB2_DENSE or
             (inner.K == 8 and os.environ.get("EXL3_DENSE_K8") == "1" and
@@ -318,6 +323,7 @@ def dec_moe_supported(inner) -> bool:
     """
     return (
         EXL3_DEC and bool(torch.version.hip) and hasattr(ext, "exl3_dec_moe") and
+        _hip_wmma_family(inner.trellis.device) == 2 and
         (inner.mul1 or inner.mcg) and int(round(inner.K * 2)) in _DEC_KB2 and
         inner.K * 2 == int(round(inner.K * 2)) and
         inner.in_features % 512 == 0 and inner.out_features % 128 == 0 and
@@ -334,6 +340,16 @@ def _hip_gemv_supported(device: torch.device) -> bool:
     if index not in _hip_gemv_support_cache:
         _hip_gemv_support_cache[index] = ext.exl3_gemv_supported(index)
     return _hip_gemv_support_cache[index]
+
+
+def _hip_wmma_family(device: torch.device) -> int:
+    """Cache ext.exl3_gemv_wmma_family(index): 0 none, 1 gfx12 (RDNA4), 2 gfx11.5 (RDNA3.5)."""
+    if not torch.version.hip or not hasattr(ext, "exl3_gemv_wmma_family"):
+        return 0
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _hip_gemv_family_cache:
+        _hip_gemv_family_cache[index] = ext.exl3_gemv_wmma_family(index)
+    return _hip_gemv_family_cache[index]
 
 
 class LinearEXL3:
