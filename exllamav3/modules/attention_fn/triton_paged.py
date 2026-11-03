@@ -1264,13 +1264,13 @@ def _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, so
     sinks, has_sinks = _prep_sinks(sinks, n_q_heads, q)
     cfg = _qh.make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, qck, qcv, k_cache.shape[1], causal, softmax_scale,
                        window_left, window_right, softcap, kv_append_len, has_sinks, ring.cfg.S if ring is not None else 0, tq is not None,
-                       bsz = bsz)
+                       bsz = bsz, device = q.device)
     if cfg is None:
         # A verify step with more rows than one pass of the kernel holds (accumulator budget: 4 tokens at GQA 12, hd 256) runs as
         # row chunks, each one a smaller verify at the shifted position: the Triton split kernels cost 15-20x more at 128K
         if q_len > 1 and kv_append_len == q_len:
             n = next((n for n in range(q_len - 1, 0, -1) if _qh.make_cfg(n, n_q_heads, n_kv_heads, head_dim, qck, qcv, k_cache.shape[1], causal, softmax_scale,
-                                                                          window_left, window_right, softcap, n, has_sinks, ring.cfg.S if ring is not None else 0, tq is not None) is not None), 0)
+                                                                          window_left, window_right, softcap, n, has_sinks, ring.cfg.S if ring is not None else 0, tq is not None, device = q.device) is not None), 0)
             if n:
                 if _QDEC_HIP_DEBUG: _qdec_hip_note(("hip-chunks", f"q_len {q_len} in {n}"))
                 if out is None:
@@ -1356,7 +1356,7 @@ def paged_attn_triton_decode(
         _k = (tuple(q.shape), tuple(k_cache.shape), str(window_size), qc is not None, split_batch)
         if _k not in _ATTN16_SEEN:
             _ATTN16_SEEN.add(_k); print(" -- attn16 eager decode", _k, "new" if ATTN16 and (qc is not None or _normalize_window(window_size)[0] >= 0) else "old", flush = True)
-    if qc is not None and _QDEC_HIP and k is None:
+    if qc is not None and _QDEC_HIP and k is None and _qh._gfx115_family(q.device):
         out_hip = _qdec_hip_decode(q, k_cache, v_cache, block_table, cache_seqlens, causal, softmax_scale, window_size, softcap,
                                    sinks, out, num_splits, max_kv_len, qc, pre_appended_len, n_kv_heads_override, ring, tq)
         if out_hip is not None:

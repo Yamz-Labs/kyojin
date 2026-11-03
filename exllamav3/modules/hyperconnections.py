@@ -500,19 +500,25 @@ def _gr_hip():
     return _gr_hip_mod[0]
 
 
-def _wmma_family0() -> int:
-    """WMMA family of device 0: 0 none, 1 gfx12 (RDNA4), 2 gfx11.5 (RDNA3.5).
+def _wmma_family(device=None) -> int:
+    """WMMA family of the module device: 0 none, 1 gfx12 (RDNA4), 2 gfx11.5 (RDNA3.5).
 
     gr_mix.hip is a gfx11.5-only hand kernel (different builtin and fragment layout from
-    gfx12) and its JIT compiles for device 0, so it must not be selected when device 0 is a
-    gfx1201 part -- the PyTorch/reference gr path stays. Mirrors exl3_gemv_wmma_family, with an
-    arch-name fallback for builds that predate the probe."""
+    gfx12) and its JIT compiles for the module's device, so it must not be selected on a
+    gfx1201 part. Mirrors exl3_gemv_wmma_family, with an arch-name fallback for builds that
+    predate the probe."""
+    if device is None:
+        idx = torch.cuda.current_device()
+    elif isinstance(device, torch.device):
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+    else:
+        idx = int(device)
     try:
-        return ext.exl3_gemv_wmma_family(0)
+        return ext.exl3_gemv_wmma_family(idx)
     except Exception:                                   # noqa: BLE001
         pass
     try:
-        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        arch = torch.cuda.get_device_properties(idx).gcnArchName.split(":")[0]
         if arch in ("gfx1200", "gfx1201"):
             return 1
         if arch in ("gfx1150", "gfx1151", "gfx1152"):
@@ -752,7 +758,7 @@ class GatedResidual(Module):
                 if self.use_combine else None
             fuse = _GR_PF_FUSE and dev.type == "cuda" and torch.version.hip is not None
             gr_hip_ok = (R > 32 and os.environ.get("EXL3_GR_HIP", "0") == "1" and fuse and self.use_combine and H == 4
-                         and _wmma_family0() == 2
+                         and _wmma_family(dev) == 2
                          and tuple(self.proj_h.shape) == (324, 10240) and tuple(self.up_h.shape) == (10240, 320)
                          and self.proj_h.dtype == torch.half and self.up_h.dtype == torch.half
                          and self.proj_h.is_contiguous() and self.up_h.is_contiguous())

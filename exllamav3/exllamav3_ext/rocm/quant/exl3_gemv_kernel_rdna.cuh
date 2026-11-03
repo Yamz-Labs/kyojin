@@ -308,11 +308,6 @@ bool exl3_gemv_lds_core();
 // exl3_gemv_rdna.cu; re-read per call, baked into graphs at capture.
 int exl3_gemv_core_mode();
 
-// N-tiles per wave for the split-K kernels that take a tiles-per-block
-// argument (multi-row dot kernels, mgemv split-K): 1 unless the core is
-// TILES; EXL3_GEMV_TILES_T=1|2 overrides. Per-arch table in the definition.
-int exl3_gemv_tiles_tpb(int core, int device, int n_tiles, int bszm, int warps);
-
 // One tile's dot product for lanes 0-15 (the core contract), by core mode.
 // SINGLE picks the single-warp U. A_LDS: A lives in LDS (fused prologues).
 template <int bits, int cb, bool A_LDS, bool SINGLE>
@@ -533,266 +528,28 @@ __device__ __forceinline__ float exl3_gemv_dot_tile_splitk
     return total[0];
 }
 
-// -----------------------------------------------------------------------------
-// Slot resolution, shared by the multi-matrix kernels (exl3_mgemv_rdna.cu)
-// and the multi-row path (exl3_gemv_multirow_rdna.cu)
-// -----------------------------------------------------------------------------
-// Returns the matrix index for slot j and, through orig_pos, the position in
-// the ORIGINAL indices/weights arrays that slot j came from (equal to j when no
-// packing is active; the cooperative kernel packs weights alongside indices, so
-// weights are always addressed by packed slot once packing has happened --
-// which for this path means "the j-th valid original position").
-// Returns -1 when slot j has no matrix (fewer than j+1 indices in range).
-__device__ __forceinline__ int exl3_mgemv_mat_index
-(
-    const int64_t* __restrict__ indices,
-    int j,
-    int bszm,
-    int min_index,
-    int max_index,
-    int* orig_pos
-)
-{
-    if (!indices)
-    {
-        *orig_pos = j;
-        return j;
-    }
-    if (min_index < 0)
-    {
-        *orig_pos = j;
-        return (int) indices[j];
-    }
-    int seen = 0;
-    for (int i = 0; i < bszm; ++i)
-    {
-        int idx = (int) indices[i];
-        if (idx >= min_index && idx < max_index)
-        {
-            if (seen == j)
-            {
-                *orig_pos = i;
-                return idx - min_index;
-            }
-            seen++;
-        }
-    }
-    return -1;
-}
-
-// Packed slot count: bszm when no packing, else the number of in-range indices
-__device__ __forceinline__ int exl3_mgemv_packed_count
-(
-    const int64_t* __restrict__ indices,
-    int bszm,
-    int min_index,
-    int max_index
-)
-{
-    if (!indices || min_index < 0) return bszm;
-    int seen = 0;
-    for (int i = 0; i < bszm; ++i)
-    {
-        int idx = (int) indices[i];
-        if (idx >= min_index && idx < max_index) seen++;
-    }
-    return seen;
-}
+// =============================================================================
+// Output rotation fused into the dot kernels' store epilogue
+// =============================================================================
 
 // =============================================================================
-// Launch-count fusion: rotation prologue and rotation/reduction epilogue
-// =============================================================================
-//
-// Shared by the multi-matrix kernels (exl3_mgemv_rdna.cu, where the design
-// is written up under "Launch-count fusion") and the single-matrix graph
-// path (exl3_gemv_rdna.cu). Every helper reproduces the standalone
-// rotation kernels' arithmetic bit for bit, so a fused launch is
-// indistinguishable from the three-kernel form it replaces.
-//
-// EXL3_GEMV_FUSE_OUT=0 (exl3_gemv_fuse_out_enabled, exl3_gemv_rdna.cu)
-// switches both paths back to the separate output kernels.
-
-// =============================================================================
-// Input rotation, fused into the dot kernels' prologue
-// =============================================================================
-// Bit-for-bit the arithmetic of had_hf_r_128_inner<true, false> (the SUH-scaled
-// 128-point Hadamard the standalone had_in kernels used to run), with
-// two mechanical differences: the scale is indexed from the caller's pre-offset
-// pointer instead of blockIdx.y (these kernels use blockIdx.y for the expert
-// slot; the old kernel's grid was 1-D so its blockIdx.y term was zero), and
-// the result goes to LDS. One warp rotates one 128-block; all 32 lanes enter.
-
-__device__ __forceinline__ void exl3_gemv_had_in_128
-(
-    const half* __restrict__ input_ptr,   // 128 halves of A
-    half* output_ptr,                     // 128 halves of LDS
-    const half* __restrict__ scale,       // 128 halves of suh
-    const int lane
-)
-{
-    half4 v = ((const half4*) input_ptr)[lane];
-
-    half4 scales = ((const half4*) scale)[lane];
-    v.x = __hmul2(v.x, scales.x);
-    v.y = __hmul2(v.y, scales.y);
-
-    float v0 = __half2float(__low2half(v.x));
-    float v1 = __half2float(__high2half(v.x));
-    float v2 = __half2float(__low2half(v.y));
-    float v3 = __half2float(__high2half(v.y));
-    float s0 = v0 + v1;
-    float d0 = v0 - v1;
-    float s1 = v2 + v3;
-    float d1 = v2 - v3;
-    float h0 = s0 + s1;
-    float h1 = d0 + d1;
-    float h2 = s0 - s1;
-    float h3 = d0 - d1;
-
-    shuffle_had_f4x32(h0, h1, h2, h3, lane);
-    const float r_scale = 0.088388347648f;  // 1/sqrt(128)
-    v.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
-    v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
-
-    ((half4*) output_ptr)[lane] = v;
-}
-
-// Block-cooperative rotation of one expert's full input into sh_a: the block's
-// warps take 128-blocks round-robin. Every thread of the block must enter; the
-// caller owns the __syncthreads that publishes sh_a.
-template <int WARPS_PER_BLOCK>
-__device__ __forceinline__ void exl3_gemv_rotate_in
-(
-    const half* __restrict__ A_j,
-    const half* __restrict__ suh,
-    half* sh_a,
-    const int size_k,
-    const int warp_id,
-    const int lane
-)
-{
-    const int k_segs = size_k / 128;
-    for (int seg = warp_id; seg < k_segs; seg += WARPS_PER_BLOCK)
-        exl3_gemv_had_in_128(A_j + seg * 128, sh_a + seg * 128, suh + seg * 128, lane);
-}
-
-// Dynamic shared memory: the single-matrix carve (per-warp B staging, plus the
-// split-K reduction slots) followed by the rotated input, size_k halves. Both
-// base carves are multiples of 8 bytes, which the half4 stores need.
-static inline size_t exl3_gemv_smem_bytes_fused(int warps_per_block, bool splitk, int size_k)
-{
-    size_t base = splitk ? exl3_gemv_smem_bytes_splitk(warps_per_block)
-                         : exl3_gemv_smem_bytes(warps_per_block);
-    return base + (size_t) size_k * sizeof(half);
-}
-
-// =============================================================================
-// Output rotation, fused into the dot kernels' epilogue
-// =============================================================================
-// Bit-for-bit had_hf_r_128_inner<false, true> / had_ff_r_128_inner<false, true>
-// (the SVH-scaled 128-point output Hadamard the had_out kernels run),
-// in place, with the scale indexed by lane from the caller's pre-offset
-// pointer. One warp rotates one 128-block; all 32 lanes enter.
-
-__device__ __forceinline__ void exl3_gemv_had_out_128_h
-(
-    half* io,                             // 128 halves of C, in place
-    const half* __restrict__ scale,       // 128 halves of svh
-    const float r_scale,                  // 1/sqrt(128) * routing weight
-    const int lane
-)
-{
-    half4 v = ((half4*) io)[lane];
-
-    float v0 = __half2float(__low2half(v.x));
-    float v1 = __half2float(__high2half(v.x));
-    float v2 = __half2float(__low2half(v.y));
-    float v3 = __half2float(__high2half(v.y));
-    float s0 = v0 + v1;
-    float d0 = v0 - v1;
-    float s1 = v2 + v3;
-    float d1 = v2 - v3;
-    float h0 = s0 + s1;
-    float h1 = d0 + d1;
-    float h2 = s0 - s1;
-    float h3 = d0 - d1;
-
-    shuffle_had_f4x32(h0, h1, h2, h3, lane);
-    v.x = __floats2half2_rn(h0 * r_scale, h1 * r_scale);
-    v.y = __floats2half2_rn(h2 * r_scale, h3 * r_scale);
-
-    half4 scales = ((const half4*) scale)[lane];
-    v.x = __hmul2(v.x, scales.x);
-    v.y = __hmul2(v.y, scales.y);
-
-    ((half4*) io)[lane] = v;
-}
-
-__device__ __forceinline__ void exl3_gemv_had_out_128_f
-(
-    float* io,                            // 128 floats of C, in place
-    const half* __restrict__ scale,       // 128 halves of svh
-    const float r_scale,                  // 1/sqrt(128) * routing weight
-    const int lane
-)
-{
-    float4 v = ((float4*) io)[lane];
-
-    float v0 = v.x;
-    float v1 = v.y;
-    float v2 = v.z;
-    float v3 = v.w;
-    float s0 = v0 + v1;
-    float d0 = v0 - v1;
-    float s1 = v2 + v3;
-    float d1 = v2 - v3;
-    v.x = s0 + s1;
-    v.y = d0 + d1;
-    v.z = s0 - s1;
-    v.w = d0 - d1;
-
-    shuffle_had_f2x32(v.x, v.y, lane);
-    shuffle_had_f2x32(v.z, v.w, lane);
-    v.x *= r_scale;
-    v.y *= r_scale;
-    v.z *= r_scale;
-    v.w *= r_scale;
-
-    half4 scales = ((const half4*) scale)[lane];
-    v.x *= __low2float(scales.x);
-    v.y *= __high2float(scales.x);
-    v.z *= __low2float(scales.y);
-    v.w *= __high2float(scales.y);
-
-    ((float4*) io)[lane] = v;
-}
-
-// The fused epilogue proper (see exl3_mgemv_rdna.cu, "Launch-count fusion",
-// for the design). Entered by the warp holding one N-tile's 16
-// outputs in accum (lanes 0-15); all 32 lanes enter. Stores the tile, arrives
-// at its segment's counter, and -- as the last of the segment's 8 tiles --
-// rotates the segment in place; then, when the call has routing weights,
-// arrives at the segment's reduction counter and -- as the last of the packed
-// slots -- runs the grouped weighted sum for the segment's 128 columns, four
-// per lane, each column in exl3_mgemv_reduce_kernel's order. Single-matrix
-// callers pass red_counter = nullptr. The fences are
-// wave-uniform (outside every lane predicate) so they cover all lanes' stores.
+// Entered by the warp holding one N-tile's 16 outputs in accum (lanes 0-15);
+// all 32 lanes enter. Stores the tile, arrives at its segment's counter, and
+// -- as the last of the segment's 8 tiles -- rotates the segment in place with
+// the shared SUH/SVH Hadamard helper. The fences are wave-uniform (outside
+// every lane predicate) so they cover all lanes' stores.
 
 template <bool c_fp32>
 __device__ __forceinline__ void exl3_gemv_fused_epilogue
 (
     const float accum,
-    void* Cb,                    // output base for this matrix (C, or c_list[mat])
+    void* Cb,                    // output base for this matrix
     const int64_t row_off,       // j * size_n, or 0 for list outputs
-    const int size_n,            // row stride of C (reduction only)
     const int tile_n,
     const int lane,
     const half* __restrict__ svh,
     const float scale,           // 1/sqrt(128) * routing weight
-    int* seg_counter,            // this (slot, segment)'s arrival counter
-    int* red_counter,            // this segment's rotated-slot counter, or nullptr
-    const int red_target,        // packed slot count (read only with red_counter)
-    const int num_tokens
+    int* seg_counter             // this (slot, segment)'s arrival counter
 )
 {
     // 1. Store this tile, exactly as the unfused form does
@@ -812,64 +569,19 @@ __device__ __forceinline__ void exl3_gemv_fused_epilogue
     old = __shfl(old, 0, 32);
     if (old != 7) return;
 
-    // 3. Last of the 8 tiles: acquire, reset, rotate in place
+    // 3. Last of the 8 tiles: acquire, reset, rotate in place. The shared
+    //    hadamard helper is the same arithmetic as the old local copy; the
+    //    scale pointer is already offset to this 128-wide segment.
     __threadfence();
     if (lane == 0) *seg_counter = 0;
     const int seg = tile_n / 8;
     const int64_t seg_off = row_off + (int64_t) seg * 128;
     if constexpr (c_fp32)
-        exl3_gemv_had_out_128_f(((float*) Cb) + seg_off, svh + seg * 128, scale, lane);
+        had_ff_r_128_inner<false, true>(((float*) Cb) + seg_off, ((float*) Cb) + seg_off,
+                                       svh + seg * 128, scale);
     else
-        exl3_gemv_had_out_128_h(((half*) Cb) + seg_off, svh + seg * 128, scale, lane);
-
-    if (!red_counter) return;
-
-    // 4. Arrive at the segment's reduction
-    __threadfence();
-    if (lane == 0) old = atomicAdd(red_counter, 1);
-    old = __shfl(old, 0, 32);
-    if (old != red_target - 1) return;
-
-    // 5. Last rotated slot: acquire, reset, grouped weighted sum. Four columns
-    //    per lane with the row loop outside, so a row's four loads are in
-    //    flight together (this runs in the kernel's tail, where latency is
-    //    exposed); each column's chain is still kernel 3's exact order, and
-    //    the in-place write of row t follows every read of that column for t.
-    __threadfence();
-    if (lane == 0) *red_counter = 0;
-    const int stride = red_target / num_tokens;
-    const int col0 = seg * 128 + lane;
-    for (int t = 0; t < num_tokens; ++t)
-    {
-        if constexpr (c_fp32)
-        {
-            const float* C_ = ((const float*) Cb) + (int64_t) t * stride * size_n + col0;
-            float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            for (int jj = 0; jj < stride; ++jj)
-            {
-                #pragma unroll
-                for (int c = 0; c < 4; ++c) sum[c] += C_[c * 32];
-                C_ += size_n;
-            }
-            #pragma unroll
-            for (int c = 0; c < 4; ++c)
-                ((float*) Cb)[(int64_t) t * size_n + col0 + c * 32] = sum[c];
-        }
-        else
-        {
-            const half* C_ = ((const half*) Cb) + (int64_t) t * stride * size_n + col0;
-            half sum[4] = {};
-            for (int jj = 0; jj < stride; ++jj)
-            {
-                #pragma unroll
-                for (int c = 0; c < 4; ++c) sum[c] = __hadd(sum[c], C_[c * 32]);
-                C_ += size_n;
-            }
-            #pragma unroll
-            for (int c = 0; c < 4; ++c)
-                ((half*) Cb)[(int64_t) t * size_n + col0 + c * 32] = sum[c];
-        }
-    }
+        had_hf_r_128_inner<false, true>(((half*) Cb) + seg_off, ((half*) Cb) + seg_off,
+                                        svh + seg * 128, scale);
 }
 
 // Above this many N-tiles the single-warp form is kept; below it, split-K
@@ -926,100 +638,5 @@ void exl3_gemv_dot_kernel_splitk
             ((float*) C)[out_idx] = accum;
         else
             ((half*) C)[out_idx] = __float2half(accum);
-    }
-}
-
-// =============================================================================
-// Hadamard helper kernels (m == 1 forms)
-// =============================================================================
-//
-// The cooperative GEMM folds SUH/SVH into the matmul kernel around grid.sync().
-// This path is a plain launch, so the transforms are separate kernels either
-// side of it.
-//
-// Note the helpers index the scale array as ((half4*) scale)[blockIdx.y * 32 + t].
-// These grids are 1-D, so blockIdx.y == 0 and the per-warp offset has to be
-// folded into the pointer -- which is what the CUDA GEMM call sites do
-// (suh + (this_warp * 128) % size_k).
-
-// static: this header is included by several RDC TUs (exl3_gemv_rdna.cu,
-// exl3_mgemv_rdna.cu, ...); non-template __global__
-// definitions would collide at device link. Each TU owning a private copy is
-// harmless -- only exl3_gemv_rdna.cu launches these three.
-static __global__
-__launch_bounds__(256)
-void exl3_gemv_rdna_had_in_kernel
-(
-    const half* __restrict__ input,
-    half* __restrict__ output,
-    const half* __restrict__ scales,
-    const int size
-)
-{
-    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int total_warps = size / 128;
-
-    if (warp_id < total_warps)
-    {
-        int offset = warp_id * 128;
-        had_hf_r_128_inner<true, false>
-        (
-            input + offset,
-            output + offset,
-            scales + offset,
-            0.088388347648f  // 1/sqrt(128)
-        );
-    }
-}
-
-static __global__
-__launch_bounds__(256)
-void exl3_gemv_rdna_had_out_half_kernel
-(
-    const half* __restrict__ input,
-    half* __restrict__ output,
-    const half* __restrict__ scales,
-    const int size
-)
-{
-    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int total_warps = size / 128;
-
-    if (warp_id < total_warps)
-    {
-        int offset = warp_id * 128;
-        had_hf_r_128_inner<false, true>
-        (
-            input + offset,
-            output + offset,
-            scales + offset,
-            0.088388347648f  // 1/sqrt(128)
-        );
-    }
-}
-
-static __global__
-__launch_bounds__(256)
-void exl3_gemv_rdna_had_out_float_kernel
-(
-    const float* __restrict__ input,
-    float* __restrict__ output,
-    const half* __restrict__ scales,
-    const int size
-)
-{
-    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    int total_warps = size / 128;
-
-    if (warp_id < total_warps)
-    {
-        int offset = warp_id * 128;
-        had_ff_r_128_inner<false, true>
-        (
-            input + offset,
-            output + offset,
-            scales + offset,
-            0.088388347648f  // 1/sqrt(128)
-        );
     }
 }

@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 #include "../../util.h"
 #include "../../util.cuh"
@@ -78,31 +79,41 @@ static int splitk_warps(int k_tiles, int n_tiles)
     return 8;
 }
 
-// Per-device output-Hadamard arrival counters. Allocated once; never freed
-// (the process owns the device for its lifetime, as DevCtx does).
-static int* seg_counters(int device)
+// Per-(device, stream) output-Hadamard arrival counters. A single device-wide
+// buffer would race when two streams overlap: both kernels index the same
+// segment counters and one can rotate a segment the other is still writing.
+// An entry is never freed (the process owns the device); if the table fills,
+// the caller falls back to the separate output Hadamard.
+struct SegCounterSlot
+{
+    int device;
+    hipStream_t stream;
+    int* ptr;
+};
+
+static int* seg_counters(int device, hipStream_t stream)
 {
     static std::mutex mtx;
-    static int* blocks[64] = {};
+    static std::vector<SegCounterSlot> slots;
     if (device < 0 || device >= 64) return nullptr;
     std::lock_guard<std::mutex> lock(mtx);
-    if (!blocks[device])
+    for (const auto& s : slots)
+        if (s.device == device && s.stream == stream) return s.ptr;
+    if (slots.size() >= 64) return nullptr;
+    void* p = nullptr;
+    if (hipMalloc(&p, EXL3_GEMV_SEG_COUNTERS * sizeof(int)) != hipSuccess)
     {
-        void* p = nullptr;
-        if (hipMalloc(&p, EXL3_GEMV_SEG_COUNTERS * sizeof(int)) != hipSuccess)
-        {
-            (void) hipGetLastError();
-            return nullptr;
-        }
-        if (hipMemset(p, 0, EXL3_GEMV_SEG_COUNTERS * sizeof(int)) != hipSuccess)
-        {
-            (void) hipGetLastError();
-            hipFree(p);
-            return nullptr;
-        }
-        blocks[device] = (int*) p;
+        (void) hipGetLastError();
+        return nullptr;
     }
-    return blocks[device];
+    if (hipMemset(p, 0, EXL3_GEMV_SEG_COUNTERS * sizeof(int)) != hipSuccess)
+    {
+        (void) hipGetLastError();
+        hipFree(p);
+        return nullptr;
+    }
+    slots.push_back({device, stream, (int*) p});
+    return (int*) p;
 }
 
 bool exl3_gemv_rdna_arch(int device)
@@ -169,8 +180,8 @@ void exl3_gemv_rdna_dot_fused
 
     exl3_gemv_fused_epilogue<c_fp32>
     (
-        accum, C, 0, size_n, tile_n, lane, svh, 0.088388347648f,
-        seg + tile_n / 8, nullptr, 0, 1
+        accum, C, 0, tile_n, lane, svh, 0.088388347648f,
+        seg + tile_n / 8
     );
 }
 
@@ -212,8 +223,8 @@ void exl3_gemv_rdna_dot_fused_splitk
     if (warp_id != 0) return;
     exl3_gemv_fused_epilogue<c_fp32>
     (
-        accum, C, 0, size_n, tile_n, lane, svh, 0.088388347648f,
-        seg + tile_n / 8, nullptr, 0, 1
+        accum, C, 0, tile_n, lane, svh, 0.088388347648f,
+        seg + tile_n / 8
     );
 }
 
@@ -259,7 +270,7 @@ bool exl3_gemv_rdna_launch
     int* seg = nullptr;
     if (fuse_out && env_int("EXL3_GEMV_FUSE_OUT", 1) != 0 &&
         size_n / 128 <= EXL3_GEMV_SEG_COUNTERS)
-        seg = seg_counters(device);
+        seg = seg_counters(device, stream);
     const bool fused = seg != nullptr;
     if (out_rotated) *out_rotated = fused;
 

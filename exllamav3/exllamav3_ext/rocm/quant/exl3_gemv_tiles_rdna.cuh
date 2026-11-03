@@ -181,29 +181,10 @@ __device__ __forceinline__ half2 exl3_decode_3inst_2_fast(uint32_t w0, uint32_t 
 }
 
 
-// -----------------------------------------------------------------------------
-// Half-integer bitrates (K + 0.5 bpw, K = 1..3, mul1 codebook only)
-// -----------------------------------------------------------------------------
-// They ride the integer `bits` template slot as a pseudo width EXL3_HALF_BITS(K)
-// = 16 + K (17 / 18 / 19 = 1.5 / 2.5 / 3.5 bpw), so every GEMV body that is
-// templated on bits takes them without a new template parameter -- the integer
-// instantiations keep their names and their code (every half branch below is
-// an `if constexpr` on Exl3Width<bits>::half, false for bits 1..8). Tile layout
-// (quant/exl3_dq.cuh dq8_half): positions alternate K and K + 1 bits (odd
-// positions carry the extra bit), 4 * (2K + 1) dwords per 16x16 tile.
-// Selected only for half-rate weights, behind EXL3_ROCM_HALF_GEMV (default on;
-// =0 sends half rates back to the cooperative GEMM / mgemm).
-
-#ifndef EXL3_HALF_BITS
-#define EXL3_HALF_BITS(ka) (16 + (ka))   // also in exl3_gemv_multirow_rdna.cuh
-#endif
-
 template <int bits>
 struct Exl3Width
 {
-    static constexpr bool half = bits > 16;
-    static constexpr int ka = half ? bits - 16 : bits;                      // integer part
-    static constexpr int tile_bytes = half ? 16 * (2 * ka + 1) : 32 * bits;  // bytes per 16x16 tile
+    static constexpr int tile_bytes = 32 * bits;  // bytes per 16x16 tile
     static constexpr int tile_u16 = tile_bytes / 2;
 };
 
@@ -222,7 +203,7 @@ struct Exl3Width
 //   bits 7        dq2x2 x 2:        8 dwords
 //   half K + 0.5  dq8_half:         4 dwords (two window groups of two), shifts < 32
 
-template <int bits> struct Exl3RawCount { static constexpr int R = Exl3Width<bits>::half ? 4 : ((bits <= 4) ? 2 : (bits == 7 ? 8 : 4)); };
+template <int bits> struct Exl3RawCount { static constexpr int R = (bits <= 4) ? 2 : (bits == 7 ? 8 : 4); };
 
 template <int bits>
 struct Exl3LanePlan
@@ -272,22 +253,7 @@ __device__ __forceinline__ Exl3LanePlan<bits> exl3_lane_plan(int lane)
 {
     Exl3LanePlan<bits> p;
     const int t_offset = lane << 3;
-    if constexpr (Exl3Width<bits>::half)
-    {
-        // dq8_half's window arithmetic (quant/exl3_dq.cuh), per lane: group 7 (windows
-        // 4..7) and group 3 (windows 0..3), each two dwords and one funnel shift
-        constexpr int KA = Exl3Width<bits>::ka;
-        constexpr int bits2 = 2 * KA + 1;
-        constexpr int words = 4 * bits2;
-        constexpr int gspan = 18 + 3 * KA;
-        const int e7 = ((t_offset >> 1) + 4) * bits2 + 128 * bits2;
-        const int e3 = e7 - 2 * bits2;
-        const int hi7 = (e7 - 1) / 32, lo7 = (e7 - gspan) / 32;
-        const int hi3 = (e3 - 1) / 32, lo3 = (e3 - gspan) / 32;
-        p.off[0] = (lo7 % words) * 4; p.off[1] = (hi7 % words) * 4; p.sh[0] = (hi7 + 1) * 32 - e7;
-        p.off[2] = (lo3 % words) * 4; p.off[3] = (hi3 % words) * 4; p.sh[1] = (hi3 + 1) * 32 - e3;
-    }
-    else if constexpr (bits == 1)
+    if constexpr (bits == 1)
     {
         int i1 = t_offset >> 5;
         p.off[1] = i1 * 4;
@@ -415,26 +381,6 @@ __device__ __forceinline__ half2 exl3_dq2_fast(uint32_t a, uint32_t b, int s2)
     return exl3_decode_3inst_2_fast<cb>(w0, w1);
 }
 
-// Half-integer K + 0.5: dq8_half verbatim (the funnel shift is < 32, so one
-// v_alignbit per group), fast pair decoder on the low 16 bits of each window.
-// raw = { a7, b7, a3, b3 } (a = the lower-index word, the high half of the funnel)
-template <int KA, int cb>
-__device__ __forceinline__ void exl3_dq8_half_fast(const uint32_t* raw, int s7, int s3, FragB& frag0, FragB& frag1)
-{
-    uint32_t w7 = __funnelshift_r(raw[1], raw[0], s7);
-    uint32_t w6 = w7 >> (KA + 1);
-    uint32_t w5 = w6 >> KA;
-    uint32_t w4 = w5 >> (KA + 1);
-    uint32_t w3 = __funnelshift_r(raw[3], raw[2], s3);
-    uint32_t w2 = w3 >> (KA + 1);
-    uint32_t w1 = w2 >> KA;
-    uint32_t w0 = w1 >> (KA + 1);
-    frag0[0] = exl3_decode_3inst_2_fast<cb>(w0, w1);
-    frag0[1] = exl3_decode_3inst_2_fast<cb>(w2, w3);
-    frag1[0] = exl3_decode_3inst_2_fast<cb>(w4, w5);
-    frag1[1] = exl3_decode_3inst_2_fast<cb>(w6, w7);
-}
-
 template <int bits, int cb>
 __device__ __forceinline__ void exl3_dq_tile_decode
 (
@@ -444,8 +390,7 @@ __device__ __forceinline__ void exl3_dq_tile_decode
     FragB& frag1
 )
 {
-    if constexpr (Exl3Width<bits>::half) exl3_dq8_half_fast<Exl3Width<bits>::ka, cb>(raw, lp.sh[0], lp.sh[1], frag0, frag1);
-    else if constexpr (bits == 1) exl3_dq8_1bit_fast<cb>(raw[0], raw[1], lp.sh[0], frag0, frag1);
+    if constexpr (bits == 1) exl3_dq8_1bit_fast<cb>(raw[0], raw[1], lp.sh[0], frag0, frag1);
     else if constexpr (bits == 2) exl3_dq8_2bits_fast<cb>(raw[0], raw[1], lp.sh[0], frag0, frag1);
     else if constexpr (bits == 4) exl3_dq8_4bits_fast<cb>(raw[0], raw[1], frag0, frag1);
     else if constexpr (bits == 3) exl3_dq8_3bits_fast<bits, cb>(raw[0], raw[1], lp.sh[0], frag0, frag1);
@@ -646,13 +591,11 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_tiles
 // -----------------------------------------------------------------------------
 // Per-architecture tile shape
 // -----------------------------------------------------------------------------
-// U: k-tiles whose loads are issued together (device, compile time). T: adjacent
-// N-tiles per wave (host picks the launch grid, exl3_gemv_tiles_tpb in
-// exl3_gemv_rdna.cu; the kernels are built for EXL3_GEMV_TILES_TMAX):
+// U: k-tiles whose loads are issued together (device, compile time); all
+// instantiations here are T = 1 (one N-tile per wave):
 //
 //                       K=1-3   K=4   K=5-6   K=7-8
-//   split-K, T = 2        U2     U1     U1      U1
-//   split-K, T = 1        U4     U2     U2      U1     (EXL3_GEMV_TILES_T=1)
+//   split-K, T = 1        U4     U2     U2      U1
 //   single-warp (head)    U4     U2     U4      U1
 //   rows M = 8: U1 (register budget)
 //
@@ -661,30 +604,12 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_tiles
 // differs. The VGPR count stays <= 64 for every entry, so occupancy is not
 // what the table trades.
 
-#define EXL3_GEMV_TILES_TMAX 2
-
-// Half-integer rates (4 raw dwords per tile at every K): own table, with
-// EXL3_HALF_U_* compile-time overrides (-D).
-#ifndef EXL3_HALF_U_T2
-#define EXL3_HALF_U_T2 2
-#endif
-#ifndef EXL3_HALF_U_T1
-#define EXL3_HALF_U_T1 4
-#endif
-template <int KA, int M, int T>
-__device__ __forceinline__ constexpr int exl3_tiles_u_half_splitk()
-{
-    if constexpr (M >= 8) return 1;
-    if constexpr (M >= 4) return 2 < EXL3_HALF_U_T2 ? 2 : EXL3_HALF_U_T2;
-    if constexpr (T >= 2) return EXL3_HALF_U_T2;
-    return EXL3_HALF_U_T1;
-}
+#define EXL3_GEMV_TILES_TMAX 1
 
 template <int bits, int M, int T>
 __device__ __forceinline__ constexpr int exl3_tiles_u_splitk()
 {
 #if defined(__gfx1151__) || defined(__gfx1150__) || 1   /* all RDNA */
-    if constexpr (Exl3Width<bits>::half) return exl3_tiles_u_half_splitk<Exl3Width<bits>::ka, M, T>();
     if constexpr (M >= 8) return 1;
     if constexpr (T >= 2) return (bits <= 3) ? 2 : 1;
     return (bits <= 3) ? 4 : (bits <= 6 ? 2 : 1);
@@ -694,6 +619,5 @@ __device__ __forceinline__ constexpr int exl3_tiles_u_splitk()
 template <int bits>
 __device__ __forceinline__ constexpr int exl3_tiles_u_single()
 {
-    if constexpr (Exl3Width<bits>::half) return 4;
     return (bits <= 3) ? 4 : (bits == 4 ? 2 : (bits <= 6 ? 4 : 1));
 }

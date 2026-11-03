@@ -19,11 +19,11 @@ _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qdec.hip")
 _CACHE = os.path.expanduser(os.environ.get("EXL3_QDEC_CACHE", "~/.cache/exllamav3"))
 
 
-def _gfx115_family0() -> bool:
-    """qdec.hip uses gfx11.5-only (RDNA3.5) wave32 WMMA; enable it only when device 0 is that
-    family. On a mixed gfx1201+gfx1151 box (RX 9070 exposed as device 0) quantized-KV decode
-    keeps the Triton fallback (triton_paged.py) instead of trying to compile gfx11.5 WMMA for
-    gfx1201. An extension without the family probe keeps the historical behavior."""
+def _gfx115_family(device=None) -> bool:
+    """qdec.hip uses gfx11.5-only (RDNA3.5) wave32 WMMA; enable it only on that family.
+    The check is per call, not per process: on a mixed gfx1201+gfx1151 box the model
+    device may be index 1 while device 0 is the other part. An extension without the
+    family probe keeps the historical behavior."""
     if not torch.version.hip:
         return False
     try:
@@ -33,18 +33,24 @@ def _gfx115_family0() -> bool:
     if not hasattr(ext, "exl3_gemv_wmma_family"):
         return True
     try:
-        return ext.exl3_gemv_wmma_family(0) == 2
+        if device is None:
+            idx = torch.cuda.current_device()
+        elif isinstance(device, torch.device):
+            idx = device.index if device.index is not None else torch.cuda.current_device()
+        else:
+            idx = int(device)
+        return ext.exl3_gemv_wmma_family(idx) == 2
     except Exception:                                   # noqa: BLE001
         return False
 
 
-ENABLED = bool(torch.version.hip) and _gfx115_family0() and knob_on("EXL3_QDEC_HIP")
+ENABLED = bool(torch.version.hip) and knob_on("EXL3_QDEC_HIP")
 
 
 @on_change
 def _refresh_knobs():
     global ENABLED
-    ENABLED = bool(torch.version.hip) and _gfx115_family0() and knob_on("EXL3_QDEC_HIP")
+    ENABLED = bool(torch.version.hip) and knob_on("EXL3_QDEC_HIP")
 
 _kernels = {}
 _bufs = {}
@@ -91,10 +97,11 @@ def geometry(hd, nqh, nkv, qlen, nw, dw, smm = 0, sxmul = 0):
 
 
 def make_cfg(q_len, n_q_heads, n_kv_heads, head_dim, k_bits, v_bits, page_size, causal, sm_scale,
-             window_left, window_right, softcap, kv_append_len, has_sinks, key_lo = 0, tq = False, bsz = 1):
+             window_left, window_right, softcap, kv_append_len, has_sinks, key_lo = 0, tq = False, bsz = 1, device = None):
     """Kernel config for a call, or None when the Triton kernels must run it. key_lo: KVWIN, positions below it are not attended
-    bsz: sequences in the call; it only feeds the EXL3_QDEC_HIP_SMM default (auto: on for one sequence, see below)"""
-    if (not ENABLED or window_left >= 0 or window_right >= 0 or softcap or kv_append_len != q_len
+    bsz: sequences in the call; it only feeds the EXL3_QDEC_HIP_SMM default (auto: on for one sequence, see below)
+    device: the tensor's device; the gfx11.5 gate is per device, not per process"""
+    if (not ENABLED or not _gfx115_family(device) or window_left >= 0 or window_right >= 0 or softcap or kv_append_len != q_len
             or not (2 <= k_bits <= 8) or not (2 <= v_bits <= 8)):
         return None
     if head_dim not in (128, 256) or n_q_heads % n_kv_heads != 0 or page_size % 16 != 0:
