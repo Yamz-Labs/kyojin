@@ -1723,7 +1723,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
 
-    def _fq_grouped_kq_ok(self, y: torch.Tensor) -> str | None:
+    def _fq_grouped_kq_ok(self, y: torch.Tensor) -> tuple[str, str] | None:
         """Eligibility for the KQ grouped decode path (MiniCPM SwiGLU MoE:
         gated, ForeignLinear KQ/IQ4_XS routed experts, no latent). Returns the
         format string or None. MCPM_FQ_MOE_GROUPED=0 disables."""
@@ -1739,18 +1739,19 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if len(self.gates) != self.num_experts or len(self.ups) != self.num_experts \
                 or len(self.downs) != self.num_experts:
             return None
-        fmt = None
+        # gate/up share one format, down has its own (unsloth UD: gate/up Q4_K + down Q5_K)
+        fmt = fmt_d = None
         for m in self.gates + self.ups + self.downs:
             if not isinstance(m, ForeignLinear):
                 return None
             if m.format not in ("q4_k", "q5_k", "q6_k", "iq4_xs"):
                 return None
-            if fmt is None:
-                fmt = m.format
-            elif m.format != fmt:
-                return None  # mixed formats (Q4_K_M gate/up vs down) need separate dots
             if m.packed is None or not m.packed.is_contiguous():
                 return None
+        fmt = self.gates[0].format
+        fmt_d = self.downs[0].format
+        if any(m.format != fmt for m in self.gates + self.ups) or any(m.format != fmt_d for m in self.downs):
+            return None
         if self.router_pre_norm is not None or self.routed_pre_norm is not None:
             return None
         if self.routed_post_norm is not None:
@@ -1773,7 +1774,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         if self.activation_fn not in ("silu", None):
             return None
-        return fmt
+        return fmt, fmt_d
 
     def _forward_foreign_grouped_kq(self, x, y, selected_experts, routing_weights,
                                     params, out_dtype, eshape):
@@ -1781,9 +1782,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         all selected experts (gate+up dots, torch-half SwiGLU, down dots,
         weighted fold), replacing the per-expert torch loop (top-k launches
         + python dispatch per layer). Returns routed+shared sum or None."""
-        fmt = self._fq_grouped_kq_ok(y)
-        if fmt is None:
+        fmts = self._fq_grouped_kq_ok(y)
+        if fmts is None:
             return None
+        fmt, fmt_d = fmts
         S = self.num_experts_per_tok
         if tuple(selected_experts.shape) != (1, S):
             return None
@@ -1800,6 +1802,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         K = h.shape[1]
         _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136}
         bb = _BB[fmt]
+        bb_d = _BB[fmt_d]
         tbl = getattr(self, "_fq_kq_ptrs", None)
         if tbl is None or tbl[0] != self.gates[0].packed.data_ptr() or tbl[4] != dev:
             gate_ptrs = torch.tensor([m.packed.data_ptr() for m in self.gates],
@@ -1814,16 +1817,22 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         I = self.intermediate_size
         gate_stride = (K // 256) * bb
         up_stride = gate_stride
-        down_stride = (I // 256) * bb
+        down_stride = (I // 256) * bb_d
         if getattr(self, "_fq_kq_partial", None) is None or \
                 self._fq_kq_partial.shape != (S, K) or self._fq_kq_partial.device != dev:
             self._fq_kq_partial = torch.empty((S, K), dtype=torch.float, device=dev)
             self._fq_kq_routed = torch.empty((1, K), dtype=torch.float, device=dev)
         _FN = {"q4_k": "fq_moe_q4k_grouped_q8", "q5_k": "fq_moe_q5k_grouped_q8",
                "q6_k": "fq_moe_q6k_grouped_q8", "iq4_xs": "fq_moe_iq4xs_grouped_q8"}
-        getattr(ext, _FN[fmt])(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
-                               gate_stride, up_stride, down_stride,
-                               self._fq_kq_partial, self._fq_kq_routed)
+        if fmt == fmt_d:
+            getattr(ext, _FN[fmt])(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
+                                   gate_stride, up_stride, down_stride,
+                                   self._fq_kq_partial, self._fq_kq_routed)
+        else:
+            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3}
+            ext.fq_moe_kq_grouped_mixed_q8(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
+                                           gate_stride, up_stride, down_stride, _FID[fmt], _FID[fmt_d],
+                                           self._fq_kq_partial, self._fq_kq_routed)
         final_hidden_states = self._fq_kq_routed
         if self.shared_experts is not None:
             se_params = {**params, "moe_valu": True} if _MOE_VALU else params
@@ -1892,7 +1901,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         R = y.shape[0]
         if R < int(os.environ.get("MCPM_FQ_PF_GROUPED_MIN", "256")):
             return None
-        if self._fq_grouped_kq_ok(y) != "iq4_xs" or self.act_limit or self.activation_fn not in ("silu", None):
+        if self._fq_grouped_kq_ok(y) != ("iq4_xs", "iq4_xs") or self.act_limit or self.activation_fn not in ("silu", None):
             return None
         if (self.num_local_experts or self.num_experts) != self.num_experts:
             return None
