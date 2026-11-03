@@ -1,5 +1,5 @@
 """Multi-user TTFT with a big prefill in flight: a short request arrives while a long prompt prefills. Reports the short job's
-time to first token and the long job's total time. Run once per EXL3_SCHED_CHUNK_IL value (0/1, optionally EXL3_CIL_DECODE_PRIO=1).
+time to first token and the long job's total time. Run once per EXL3_SCHED_CHUNK_IL value (0 = off, default on, optionally EXL3_CIL_DECODE_PRIO=1).
 
     FMOE_GGUF=<file.gguf> [FMOE_LONG=24000] EXL3_SCHED_CHUNK_IL=1 python tests/test_gguf_ttft_interleave.py
 """
@@ -56,4 +56,4 @@ def run(seed):
 
 run(1)
 a, b, h = run(2)
-print(f"CHUNK_IL={os.environ.get('EXL3_SCHED_CHUNK_IL', '0')} DPRIO={os.environ.get('EXL3_CIL_DECODE_PRIO', '0')} long={L}: short TTFT {a:.2f}s, long total {b:.2f}s, tokens {h}")
+print(f"CHUNK_IL={os.environ.get('EXL3_SCHED_CHUNK_IL', '1')} DPRIO={os.environ.get('EXL3_CIL_DECODE_PRIO', '0')} long={L}: short TTFT {a:.2f}s, long total {b:.2f}s, tokens {h}")

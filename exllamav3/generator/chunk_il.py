@@ -1,4 +1,4 @@
-"""EXL3_SCHED_CHUNK_IL=1 (default off): chunked-prefill interleave planner. Pure python (no torch), importable without a GPU.
+"""Chunked-prefill interleave, default ON since 1.8.8 (EXL3_SCHED_CHUNK_IL=0 turns it off): chunked-prefill interleave planner. Pure python (no torch), importable without a GPU.
 
 The engine already prefills in chunks (EXL3_PREFILL_CHUNK, 4096 rows; Job.prefill runs ONE chunk per Generator.iterate()
 step and keeps kv_position / pages / recurrent slot between steps). This planner only decides, per step, WHICH jobs may run
@@ -35,7 +35,7 @@ from typing import Any, NamedTuple
 
 
 def chunk_il_enabled() -> bool:
-    return os.environ.get("EXL3_SCHED_CHUNK_IL", "0") == "1"
+    return os.environ.get("EXL3_SCHED_CHUNK_IL", "1") != "0"
 
 
 class View(NamedTuple):
