@@ -3,7 +3,7 @@ time to first token and the long job's total time. Run once per EXL3_SCHED_CHUNK
 
     FMOE_GGUF=<file.gguf> [FMOE_LONG=24000] EXL3_SCHED_CHUNK_IL=1 python tests/test_gguf_ttft_interleave.py
 """
-import os, sys, time
+import hashlib, os, sys, time
 import torch
 
 ENGINE = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -12,7 +12,10 @@ from exllamav3 import Model, Config, Cache, Generator, Job, GreedySampler, Token
 from exllamav3.loader.gguf_config import write_config_dir
 
 L = int(os.environ.get("FMOE_LONG", "24000"))
-d = write_config_dir(os.environ["FMOE_GGUF"], os.path.join(os.environ.get("FMOE_CFG", "/tmp"), "qwen35moe_cfg"))
+if os.environ.get("MODEL_DIR"):   # a native EXL3 directory instead of a GGUF
+    d = os.environ["MODEL_DIR"]
+else:
+    d = write_config_dir(os.environ["FMOE_GGUF"], os.path.join(os.environ.get("FMOE_CFG", "/tmp"), "qwen35moe_cfg"))
 config = Config.from_directory(d)
 model = Model.from_config(config)
 cache = Cache(model, max_num_tokens=(L + 4096) // 256 * 256 + 256)
@@ -29,6 +32,7 @@ def run(seed):
     ja = Job(input_ids=long_ids, max_new_tokens=8, sampler=GreedySampler(), stop_conditions=[], identifier="long")
     jb = Job(input_ids=short_ids, max_new_tokens=16, sampler=GreedySampler(), stop_conditions=[], identifier="short")
     first = {}
+    toks = {"long": [], "short": []}
     done = {}
     sent = False
     gen.enqueue(ja)
@@ -41,12 +45,15 @@ def run(seed):
             i = r["identifier"]
             if r["stage"] == "streaming" and "token_ids" in r and i not in first:
                 first[i] = time.time()
+            if r["stage"] == "streaming" and "token_ids" in r:
+                toks[i] += r["token_ids"].flatten().tolist()
             if r.get("eos"):
                 done[i] = time.time()
     torch.cuda.synchronize()
-    return first["short"] - tb, done["long"] - t0
+    h = " ".join(hashlib.md5(repr(toks[k]).encode()).hexdigest()[:6] + f"({k})" for k in ("long", "short")) + " L=" + str(toks["long"]) + " S=" + str(toks["short"])
+    return first["short"] - tb, done["long"] - t0, h
 
 
 run(1)
-a, b = run(2)
-print(f"CHUNK_IL={os.environ.get('EXL3_SCHED_CHUNK_IL', '0')} DPRIO={os.environ.get('EXL3_CIL_DECODE_PRIO', '0')} long={L}: short TTFT {a:.2f}s, long total {b:.2f}s")
+a, b, h = run(2)
+print(f"CHUNK_IL={os.environ.get('EXL3_SCHED_CHUNK_IL', '0')} DPRIO={os.environ.get('EXL3_CIL_DECODE_PRIO', '0')} long={L}: short TTFT {a:.2f}s, long total {b:.2f}s, tokens {h}")
