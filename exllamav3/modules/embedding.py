@@ -181,12 +181,12 @@ class Embedding(Module):
                 x = buf
             return x
 
-    # EXL3_PF_EMB_UPLOAD=1: a long chunk (>= 1024 rows) of a CPU-resident embedding is gathered straight into a pinned buffer in the
+    # EXL3_PF_EMB_UPLOAD (default on for CUDA, off for ROCm where it measured neutral; =0 turns it off): a long chunk (>= 1024 rows) of a CPU-resident embedding is gathered straight into a pinned buffer in the
     # table's own 16-bit dtype and uploaded asynchronously; the widening to out_dtype (exact, fp16/bf16 -> fp32) happens on the device
     # in Module.prepare_for_device (finish_narrow). The default path gathers, widens on the host and copies 4 bytes per element from
     # pageable memory (94 MB per 4583-row chunk: ~25 ms with the GPU idle, 3.8 GB/s). Same values bit for bit.
     def _narrow_upload_ok(self, ids: torch.Tensor, params: dict) -> bool:
-        if os.environ.get("EXL3_PF_EMB_UPLOAD", "0") != "1" or ids.device.type != "cpu" or self.normalize or params.get("pinned_staging"):
+        if os.environ.get("EXL3_PF_EMB_UPLOAD", "0" if torch.version.hip else "1") != "1" or ids.device.type != "cpu" or self.normalize or params.get("pinned_staging"):
             return False
         w = self.embedding.weight
         return w.device.type == "cpu" and w.dtype in (torch.half, torch.bfloat16) and ids.numel() >= 1024 and torch.cuda.is_available()
