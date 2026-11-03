@@ -1839,7 +1839,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             ext.fq_moe_kq_grouped_mixed_q8(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
                                            gate_stride, up_stride, down_stride, _FID[fmt], _FID[fmt_d],
                                            partial_v, routed_v)
-        final_hidden_states = routed_v
+        final_hidden_states = routed_v.view(x.shape) if R > 1 else routed_v   # rows -> [jobs, q, K] like the per-expert path
         if self.shared_experts is not None:
             se_params = {**params, "moe_valu": True} if _MOE_VALU else params
             se = self.shared_experts.forward(x, se_params)
