@@ -12,9 +12,11 @@ from exllamav3 import Model, Config, Cache, Generator, Job, GreedySampler, Token
 from exllamav3.loader.gguf_config import write_config_dir
 from exllamav3.model import cuda_graph as cg
 
-src = os.environ["FMOE_GGUF"]
 U = int(os.environ.get("FMOE_USERS", "4"))
-d = write_config_dir(src, os.path.join(os.environ.get("FMOE_CFG", "/tmp"), "qwen35moe_cfg"))
+if os.environ.get("MODEL_DIR"):   # a native EXL3 directory instead of a GGUF
+    d = os.environ["MODEL_DIR"]
+else:
+    d = write_config_dir(os.environ["FMOE_GGUF"], os.path.join(os.environ.get("FMOE_CFG", "/tmp"), "qwen35moe_cfg"))
 config = Config.from_directory(d)
 model = Model.from_config(config)
 cache = Cache(model, max_num_tokens=8192)
@@ -24,7 +26,7 @@ gen = Generator(model=model, cache=cache, tokenizer=tok)
 prompts = ["The capital of France is a city that", "Water boils at a temperature of", "In 1969 the first humans",
            "The quick brown fox jumps over", "Photosynthesis is the process by which", "The largest planet in the solar system",
            "A binary search tree is a structure", "Mount Everest is located in"][:U]
-N = 48
+N = int(os.environ.get("FMOE_NEW", "48"))
 
 
 def run():
@@ -42,7 +44,7 @@ def run():
     return out, time.time() - t
 
 
-arms = [("eager", False, False), ("graph-single", True, False), ("graph-multi", True, True)]
+arms = [("eager", False, False), ("graph-single", True, False), ("graph-multi", True, True), ("eager-again", False, False)]
 ref = None
 for name, on, multi in arms:
     cg.CUDA_GRAPH_ENABLED = on
