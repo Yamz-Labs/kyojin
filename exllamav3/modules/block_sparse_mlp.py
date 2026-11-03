@@ -1837,7 +1837,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.shared_experts is not None:
             se_params = {**params, "moe_valu": True} if _MOE_VALU else params
             se = self.shared_experts.forward(x, se_params)
-            if self.shared_gate is not None:
+            if self.shared_gate is not None and torch.version.hip:
+                # ROCm add_sigmoid_gate_proj takes a float shared-expert output: same math in torch
+                g = torch.sigmoid((x.to(torch.float) @ self.shared_gate.inner.weight.to(torch.float)))
+                final_hidden_states = final_hidden_states + se.to(torch.float) * g
+            elif self.shared_gate is not None:
                 ext.add_sigmoid_gate_proj(se, x, final_hidden_states,
                                           self.shared_gate.inner.weight)
             else:
