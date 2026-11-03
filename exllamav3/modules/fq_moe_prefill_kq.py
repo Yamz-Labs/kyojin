@@ -9,7 +9,7 @@ from ..ext import exllamav3_ext as ext
 
 FMT_Q4K, FMT_Q5K, FMT_Q6K = 0, 1, 2
 PF_BM = int(os.environ.get("MCPM_FQ_PF_BM", "64"))   # rows per tile: weight decode is shared by BM rows
-_NATIVE_DQ = hasattr(ext, "fq_dequant_kq_grouped") and os.environ.get("MCPM_FQ_PF_NATIVE_DQ", "0") == "1"
+_NATIVE_DQ = hasattr(ext, "fq_dequant_kq_grouped") and os.environ.get("MCPM_FQ_PF_NATIVE_DQ", "1") != "0"
 BLOCK_BYTES = {FMT_Q4K: 144, FMT_Q5K: 176, FMT_Q6K: 210}
 
 
@@ -223,19 +223,32 @@ def _buf(dev, name, numel):
     return b
 
 
+_ALIGNED = {}
+
+
+def _ptrs_aligned(ptrs) -> bool:
+    """The vectorised dequant does 8-byte loads: all expert pointers must be 8-aligned (checked once per table)."""
+    key = (ptrs.data_ptr(), ptrs.numel())
+    ok = _ALIGNED.get(key)
+    if ok is None:
+        ok = _ALIGNED[key] = bool(((ptrs.cpu() % 8) == 0).all())
+    return ok
+
+
 def moe_kq_prefill(y_sorted, gu_ptrs, dn_ptrs, a, dn, tile_e, tile_r0, offs, wrow, E, I, K, fmt_gu, fmt_dn, bm,
                    chunk=None):
     """Dequant a chunk of experts to fp16 scratch (one launch per matrix kind), then fused gate/up/SwiGLU and down GEMMs
     over the rows of those experts. Scratch = chunk x (2 I K + K I) halves."""
     dev = y_sorted.device
     chunk = chunk or int(os.environ.get("MCPM_FQ_PF_CHUNK", "64"))
+    native = _NATIVE_DQ and _ptrs_aligned(gu_ptrs) and _ptrs_aligned(dn_ptrs)
     BNd = 32
     for e0 in range(0, E, chunk):
         ec = min(chunk, E - e0)
         wg = _buf(dev, "g", ec * I * K)
         wu = _buf(dev, "u", ec * I * K)
         wd = _buf(dev, "d", ec * K * I)
-        if _NATIVE_DQ:   # opt-in native grouped dequant (fq_dequant_kq.cu): slower than the Triton one on the 3090, ~1.3x on the iGPU
+        if native:   # native grouped dequant (fq_dequant_kq.cu, vectorised): 770-820 GB/s on the 3090 (= Triton), ~220 GB/s on the iGPU (Triton 47)
             ext.fq_dequant_kq_grouped(gu_ptrs, wg, e0, ec, I, K, fmt_gu)
             ext.fq_dequant_kq_grouped(gu_ptrs, wu, E + e0, ec, I, K, fmt_gu)
             ext.fq_dequant_kq_grouped(dn_ptrs, wd, e0, ec, K, I, fmt_dn)
@@ -263,3 +276,7 @@ def gmm_kq(a, wptrs, out, tile_e, tile_r0, offs, N, K, E, fmt, swiglu=False, wro
                   N, K, a.stride(0), out.stride(0), E,
                   FMT=fmt, SWIGLU=swiglu, SCALE_ROWS=wrow is not None, BM=BM, BN=BN,
                   num_warps=num_warps, num_stages=num_stages)
+
+
+def kq_native_dq() -> bool:
+    return _NATIVE_DQ

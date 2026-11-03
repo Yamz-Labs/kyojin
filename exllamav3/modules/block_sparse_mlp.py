@@ -1917,9 +1917,15 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if fmts is None or not (use_kq or fmts == ("iq4_xs", "iq4_xs")) or self.act_limit or \
                 self.activation_fn not in ("silu", None):
             return None
-        # CUDA: 2.4-4.2x on the MoE layer. ROCm (iGPU): 0.9-1.1x (scratch traffic is bound by LPDDR bandwidth), so off by default there
-        if use_kq and os.environ.get("MCPM_FQ_PF_GROUPED_KQ", "0" if torch.version.hip else "1") == "0":
-            return None
+        # Scratch path (grouped dequant + fp16 grouped GEMM): CUDA 2.4-4.2x on the MoE layer. ROCm iGPU with the
+        # native bandwidth-bound dequant (~220 GB/s): 1.7x at 1K rows, 1.4x at 4K, 1.1-1.2x at 8K; ~1.0x at 256 rows,
+        # so there it needs the native kernel and >= 512 rows. MCPM_FQ_PF_GROUPED_KQ=0/1 overrides.
+        if use_kq:
+            force = os.environ.get("MCPM_FQ_PF_GROUPED_KQ")
+            if force == "0":
+                return None
+            if force is None and torch.version.hip and (not kq_native_dq() or R < 512):
+                return None
         if (self.num_local_experts or self.num_experts) != self.num_experts:
             return None
         top_k = self.num_experts_per_tok
@@ -1927,7 +1933,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         from .fq_moe_prefill import build_tiles, gmm_iq4, perm_cols
         if use_kq:
-            from .fq_moe_prefill_kq import moe_kq_prefill, gmm_kq, PF_BM
+            from .fq_moe_prefill_kq import moe_kq_prefill, gmm_kq, kq_native_dq, PF_BM
         E = self.num_experts
         dev = y.device
         K = y.shape[1]
