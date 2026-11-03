@@ -246,6 +246,8 @@ class MiniCPMV47TextModel(Model):
 
     def __init__(self, config: MiniCPMV47Config, **kwargs):
         super().__init__(config, **kwargs)
+        from ..model import cuda_graph
+        cuda_graph.default_on_for_foreign()
         H = config.hidden_size
         self.modules += [
             Embedding(config=config, key=f"{P}.embed_tokens",

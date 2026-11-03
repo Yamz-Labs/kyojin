@@ -40,4 +40,6 @@ for grouped in ("1", "0", "1"):
 n = min(len(res["1"]), len(res["0"]))
 agree = sum(a == b for a, b in zip(res["1"], res["0"]))
 print(f"token agreement {agree}/{n}")
+if os.environ.get("FMOE_TOKOUT"):
+    json.dump(res["1"], open(os.environ["FMOE_TOKOUT"], "w"))
 print("PASS")
