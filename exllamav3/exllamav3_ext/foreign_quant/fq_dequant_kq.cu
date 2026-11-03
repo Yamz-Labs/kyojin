@@ -43,9 +43,12 @@ namespace {
 // decoded by fq_q4k_scales(..., s >> 1) at index s & 1. First 32 elements of
 // a 64-group take the low nibble (d1, m1), next 32 the high nibble (d2, m2):
 //     y = (d*sc) * nib - (dmin*m)          (left-assoc, two roundings).
-__global__ void fq_dq_q4_k_kernel(const uint8_t* __restrict__ packed, __half* __restrict__ out,
-                                   int64_t kb)
+__global__ void fq_dq_q4_k_kernel(const uint8_t* __restrict__ packed_, __half* __restrict__ out_,
+                                   int64_t kb, const int64_t* __restrict__ ptrs, int64_t out_stride)
 {
+    // ptrs != null: grouped launch, blockIdx.z picks the expert (its packed pointer and out slice)
+    const uint8_t* packed = ptrs ? reinterpret_cast<const uint8_t*>(ptrs[blockIdx.z]) : packed_;
+    __half* out = out_ + (int64_t)blockIdx.z * out_stride;
     int b = blockIdx.x;            // 256-block index within the row
     int n = blockIdx.y;            // row
     int e = threadIdx.x;           // 0..255, element index inside the block
@@ -75,9 +78,12 @@ __global__ void fq_dq_q4_k_kernel(const uint8_t* __restrict__ packed, __half* __
 // u2 = 2<<(2*c)) while the qh byte index restarts at 0 in every group, so the
 // mask is 1 << (2*c + hi) == 1 << s and the qh byte is l, NOT l + 32*c.
 //     y = (d*sc) * (nib + 16*(qh[l] >> s & 1)) - (dmin*m)
-__global__ void fq_dq_q5_k_kernel(const uint8_t* __restrict__ packed, __half* __restrict__ out,
-                                   int64_t kb)
+__global__ void fq_dq_q5_k_kernel(const uint8_t* __restrict__ packed_, __half* __restrict__ out_,
+                                   int64_t kb, const int64_t* __restrict__ ptrs, int64_t out_stride)
 {
+    // ptrs != null: grouped launch, blockIdx.z picks the expert (its packed pointer and out slice)
+    const uint8_t* packed = ptrs ? reinterpret_cast<const uint8_t*>(ptrs[blockIdx.z]) : packed_;
+    __half* out = out_ + (int64_t)blockIdx.z * out_stride;
     int b = blockIdx.x;
     int n = blockIdx.y;
     int e = threadIdx.x;
@@ -114,9 +120,12 @@ __global__ void fq_dq_q5_k_kernel(const uint8_t* __restrict__ packed, __half* __
 // planes, so the global byte offsets are 64*half, 128 + 32*half and 192 +
 // 8*half -- dropping the 128 would silently read the wrong qh plane.
 //     y = (d * sc) * q          (left-assoc: d*sc first, then *q, q already -32)
-__global__ void fq_dq_q6_k_kernel(const uint8_t* __restrict__ packed, __half* __restrict__ out,
-                                   int64_t kb)
+__global__ void fq_dq_q6_k_kernel(const uint8_t* __restrict__ packed_, __half* __restrict__ out_,
+                                   int64_t kb, const int64_t* __restrict__ ptrs, int64_t out_stride)
 {
+    // ptrs != null: grouped launch, blockIdx.z picks the expert (its packed pointer and out slice)
+    const uint8_t* packed = ptrs ? reinterpret_cast<const uint8_t*>(ptrs[blockIdx.z]) : packed_;
+    __half* out = out_ + (int64_t)blockIdx.z * out_stride;
     int b = blockIdx.x;
     int n = blockIdx.y;
     int e = threadIdx.x;
@@ -147,9 +156,12 @@ __global__ void fq_dq_q6_k_kernel(const uint8_t* __restrict__ packed, __half* __
 // and dl = d * (ls - 32); the first 16 lanes take the low nibble of 16 qs
 // bytes, the next 16 the high nibble of the same bytes.
 //     y = (d * (ls-32)) * kvalues[nib]
-__global__ void fq_dq_iq4_xs_kernel(const uint8_t* __restrict__ packed, __half* __restrict__ out,
-                                     int64_t kb)
+__global__ void fq_dq_iq4_xs_kernel(const uint8_t* __restrict__ packed_, __half* __restrict__ out_,
+                                   int64_t kb, const int64_t* __restrict__ ptrs, int64_t out_stride)
 {
+    // ptrs != null: grouped launch, blockIdx.z picks the expert (its packed pointer and out slice)
+    const uint8_t* packed = ptrs ? reinterpret_cast<const uint8_t*>(ptrs[blockIdx.z]) : packed_;
+    __half* out = out_ + (int64_t)blockIdx.z * out_stride;
     int b = blockIdx.x;
     int n = blockIdx.y;
     int e = threadIdx.x;
@@ -197,6 +209,84 @@ static bool fq_dq_kq_check(torch::Tensor& packed, torch::Tensor& out, int64_t bl
     return n > 0 && kb > 0;   // empty input: nothing to launch
 }
 
+
+// ---- Vectorised grouped decode (bandwidth path) --------------------------------------------------------------
+// One thread decodes 8 consecutive outputs of one 256-block (32 threads per block, flat over rows x blocks):
+// the packed bytes of those 8 outputs are one 8-byte load (Q4_K/Q5_K, 8-aligned) and the 8 fp16 results leave as
+// one 16-byte store, so a warp streams ~4.6 KB of packed bytes per instruction group instead of 256 single bytes.
+// Same arithmetic, same rounding as the scalar kernels above.
+__device__ __forceinline__ uint2 fq_ld8(const uint8_t* p) { return *reinterpret_cast<const uint2*>(p); }
+
+__device__ __forceinline__ void fq_st8(__half* o, const float* v)
+{
+    __half2 h[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) h[i] = __halves2half2(__float2half_rn(v[2*i]), __float2half_rn(v[2*i+1]));
+    *reinterpret_cast<uint4*>(o) = *reinterpret_cast<uint4*>(h);
+}
+
+template <int FMT>
+__global__ void fq_dqv_kq_kernel(__half* __restrict__ out_, int64_t kb, int64_t rows,
+                                 const int64_t* __restrict__ ptrs, int64_t out_stride)
+{
+    const int64_t gid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t bi = gid >> 5;                   // block index inside the expert (row * kb + b)
+    if (bi >= rows * kb) return;
+    const int t = gid & 31;
+    const int e0 = t * 8;                          // first output inside the 256-block
+    constexpr int BYTES = FMT == 0 ? FQ_Q4_K_BYTES : FMT == 1 ? FQ_Q5_K_BYTES : FQ_Q6_K_BYTES;
+    const uint8_t* blk = reinterpret_cast<const uint8_t*>(ptrs[blockIdx.y]) + bi * BYTES;
+    __half* o = out_ + (int64_t)blockIdx.y * out_stride + bi * 256 + e0;
+    float v[8];
+    if (FMT < 2)
+    {
+        __half dh, dmh;
+        memcpy(&dh, blk, 2);
+        memcpy(&dmh, blk + 2, 2);
+        const float d = __half2float(dh), dmin = __half2float(dmh);
+        const int c = e0 >> 6, s = e0 >> 5, l = e0 & 31, hi = s & 1;
+        uint8_t sc[2], m[2];
+        fq_q4k_scales(blk + 4, s >> 1, sc, m);
+        const uint2 q = fq_ld8(blk + (FMT == 0 ? 16 : 48) + 32 * c + l);
+        uint32_t hb0 = 0, hb1 = 0;
+        if (FMT == 1) { uint2 h = fq_ld8(blk + 16 + l); hb0 = h.x; hb1 = h.y; }
+        const float d1 = __fmul_rn(d, (float)sc[hi]);
+        const float m1 = __fmul_rn(dmin, (float)m[hi]);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            uint32_t w = i < 4 ? q.x : q.y;
+            int qb = (w >> (8 * (i & 3))) & 0xFF;
+            int nib = hi ? (qb >> 4) : (qb & 0xF);
+            if (FMT == 1)
+            {
+                uint32_t hw = i < 4 ? hb0 : hb1;
+                nib += (((hw >> (8 * (i & 3))) >> s) & 1) << 4;
+            }
+            v[i] = __fsub_rn(__fmul_rn(d1, (float)nib), m1);
+        }
+    }
+    else
+    {
+        __half dh;
+        memcpy(&dh, blk + 208, 2);
+        const float d = __half2float(dh);
+        const int half = e0 >> 7, tt = e0 & 127, grp = tt >> 5, l = tt & 31;
+        const uint8_t* qlp = blk + 64 * half + l + 32 * (grp & 1);
+        const uint8_t* qhp = blk + 128 + 32 * half + l;
+        const float ds = __fmul_rn(d, (float)(int8_t)blk[192 + 8 * half + 2 * grp + (l >> 4)]);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            uint8_t ql = qlp[i], qh = qhp[i];
+            int q = (grp >> 1) ? (ql >> 4) : (ql & 0xF);
+            q = (q | (((qh >> (2 * grp)) & 3) << 4)) - 32;
+            v[i] = __fmul_rn(ds, (float)q);
+        }
+    }
+    fq_st8(o, v);
+}
+
 }  // namespace
 
 // gridDim.y caps at 65535: the lm_head dequant is N = 248144 rows, so every
@@ -216,7 +306,7 @@ void fq_dequant_q4_k(torch::Tensor packed, torch::Tensor out)
         int64_t nc = (n - n0 < FQ_DQ_KQ_MAX_ROWS) ? n - n0 : FQ_DQ_KQ_MAX_ROWS;
         dim3 grid((unsigned)kb, (unsigned)nc);
         fq_dq_q4_k_kernel<<<grid, 256, 0, stream>>>(
-            p + n0 * kb * FQ_Q4_K_BYTES, o + n0 * kb * FQ_Q4_K_GROUP, kb);
+            p + n0 * kb * FQ_Q4_K_BYTES, o + n0 * kb * FQ_Q4_K_GROUP, kb, nullptr, 0);
     }
 }
 
@@ -233,7 +323,7 @@ void fq_dequant_q5_k(torch::Tensor packed, torch::Tensor out)
         int64_t nc = (n - n0 < FQ_DQ_KQ_MAX_ROWS) ? n - n0 : FQ_DQ_KQ_MAX_ROWS;
         dim3 grid((unsigned)kb, (unsigned)nc);
         fq_dq_q5_k_kernel<<<grid, 256, 0, stream>>>(
-            p + n0 * kb * FQ_Q5_K_BYTES, o + n0 * kb * FQ_Q5_K_GROUP, kb);
+            p + n0 * kb * FQ_Q5_K_BYTES, o + n0 * kb * FQ_Q5_K_GROUP, kb, nullptr, 0);
     }
 }
 
@@ -250,7 +340,7 @@ void fq_dequant_q6_k(torch::Tensor packed, torch::Tensor out)
         int64_t nc = (n - n0 < FQ_DQ_KQ_MAX_ROWS) ? n - n0 : FQ_DQ_KQ_MAX_ROWS;
         dim3 grid((unsigned)kb, (unsigned)nc);
         fq_dq_q6_k_kernel<<<grid, 256, 0, stream>>>(
-            p + n0 * kb * FQ_Q6_K_BYTES, o + n0 * kb * FQ_Q6_K_GROUP, kb);
+            p + n0 * kb * FQ_Q6_K_BYTES, o + n0 * kb * FQ_Q6_K_GROUP, kb, nullptr, 0);
     }
 }
 
@@ -267,6 +357,36 @@ void fq_dequant_iq4_xs(torch::Tensor packed, torch::Tensor out)
         int64_t nc = (n - n0 < FQ_DQ_KQ_MAX_ROWS) ? n - n0 : FQ_DQ_KQ_MAX_ROWS;
         dim3 grid((unsigned)kb, (unsigned)nc);
         fq_dq_iq4_xs_kernel<<<grid, 256, 0, stream>>>(
-            p + n0 * kb * FQ_IQ4_XS_BYTES, o + n0 * kb * FQ_IQ4_XS_GROUP, kb);
+            p + n0 * kb * FQ_IQ4_XS_BYTES, o + n0 * kb * FQ_IQ4_XS_GROUP, kb, nullptr, 0);
+    }
+}
+// Grouped dequant: experts e0 .. e0+ec-1 of a pointer table (int64 device pointers to [n, kb*bytes] packed rows) into
+// out[ec, n, k] fp16 in ONE launch (the per-expert path launches once per expert and matrix).
+void fq_dequant_kq_grouped(torch::Tensor ptrs, torch::Tensor out, int64_t e0, int64_t ec, int64_t n, int64_t k, int64_t fmt)
+{
+    TORCH_CHECK(ptrs.is_cuda() && ptrs.dtype() == torch::kInt64 && out.is_cuda() && out.dtype() == torch::kHalf, "bad args");
+    TORCH_CHECK(k % 256 == 0 && n <= FQ_DQ_KQ_MAX_ROWS && ec <= 65535 && out.numel() >= ec * n * k, "bad shape");
+    at::cuda::CUDAGuard guard(ptrs.device());
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int64_t* pp = ptrs.data_ptr<int64_t>() + e0;
+    __half* o = reinterpret_cast<__half*>(out.data_ptr<at::Half>());
+    int64_t kb = k / 256;
+    if (fmt <= 2)
+    {
+        int64_t nthr = n * kb * 32;
+        dim3 vg((unsigned)((nthr + 255) / 256), (unsigned)ec);
+        // braces: hipify mangles `else <<<...>>>` into `elsehipLaunchKernelGGL`
+        if (fmt == 0) { fq_dqv_kq_kernel<0><<<vg, 256, 0, stream>>>(o, kb, n, pp, n * k); }
+        else if (fmt == 1) { fq_dqv_kq_kernel<1><<<vg, 256, 0, stream>>>(o, kb, n, pp, n * k); }
+        else { fq_dqv_kq_kernel<2><<<vg, 256, 0, stream>>>(o, kb, n, pp, n * k); }
+        return;
+    }
+    dim3 grid((unsigned)(k / 256), (unsigned)n, (unsigned)ec);
+    switch (fmt)
+    {
+        case 0: fq_dq_q4_k_kernel<<<grid, 256, 0, stream>>>(nullptr, o, kb, pp, n * k); break;
+        case 1: fq_dq_q5_k_kernel<<<grid, 256, 0, stream>>>(nullptr, o, kb, pp, n * k); break;
+        case 2: fq_dq_q6_k_kernel<<<grid, 256, 0, stream>>>(nullptr, o, kb, pp, n * k); break;
+        default: fq_dq_iq4_xs_kernel<<<grid, 256, 0, stream>>>(nullptr, o, kb, pp, n * k); break;
     }
 }

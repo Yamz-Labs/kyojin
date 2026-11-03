@@ -62,6 +62,8 @@ _env_int = lambda name, default: int(os.environ.get(name, default) or default)
 
 # Module global: a harness may flip it between arms (then call purge()).
 CUDA_GRAPH_ENABLED = os.environ.get("EXL3_CUDA_GRAPH", "0") == "1"
+# EXL3_HIP_GRAPH=1 (experimental, default off): allow the whole-forward graph on ROCm (hipGraph through torch.cuda.CUDAGraph)
+HIP_GRAPH = os.environ.get("EXL3_HIP_GRAPH", "0") == "1"
 CUDA_GRAPH_WARMUPS = max(1, _env_int("EXL3_CUDA_GRAPH_WARMUPS", 2))
 # EXL3_CUDA_GRAPH_MULTI=1 (default off): several jobs per graph (B in 1..4, Q <= 16, B*Q <= 32), bigger LRU. Off =
 # the B=1, Q <= 8 behaviour above, unchanged. set_multi() flips the globals for harness arms (then call purge()).
@@ -641,7 +643,7 @@ def default_on_for_foreign():
 
 def maybe_forward(model, ids: torch.Tensor, params: dict):
     """Hook for Model.forward (non-TP branch). Returns the logits, or None to run the eager path."""
-    if not CUDA_GRAPH_ENABLED or torch.version.hip or not torch.cuda.is_available():
+    if not CUDA_GRAPH_ENABLED or (torch.version.hip and not HIP_GRAPH) or not torch.cuda.is_available():
         return None
     r = model.__dict__.get("_cuda_graph_runner")
     if r is None:

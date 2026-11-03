@@ -318,7 +318,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         """forward() for a decode step whose ids are a device tensor (lag-1 pipeline). CUDA with the whole-forward graph: only the
         graph can take them (its GPU embedding table), a decline returns None. Otherwise the eager layers run from a device-side
         embedding gather (lag_table). Same arithmetic as forward(): the table rows are the rows Embedding.forward reads."""
-        if _cuda_graph.CUDA_GRAPH_ENABLED and not torch.version.hip:
+        if _cuda_graph.CUDA_GRAPH_ENABLED and (not torch.version.hip or _cuda_graph.HIP_GRAPH):
             if self.loaded_tp or not torch.cuda.is_available():
                 return None
             x = self.prepare_inputs(input_ids, params)
