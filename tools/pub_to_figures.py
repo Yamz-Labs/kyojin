@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn the publication measurements into doc/figures.json, then regenerate the charts and the README tables.
+"""Turn the publication measurements into doc/figures.json, then regenerate the charts and the doc tables.
 
 Inputs, in the --scratch directory:
   curve_{glm,qwen}_c272384.json  served depth curve: points["8192"].."262144"  (timings, usage)
@@ -175,7 +175,7 @@ def main(argv=None):
     ap.add_argument("--keep-card", action="store_true",
                     help="do not read bench_*.md: keep the published card values (spec, decode range); date = curve date")
     ap.add_argument("--skip-500k", action="store_true", help="do not read the 500K curves (partial dry run)")
-    ap.add_argument("--root", default=ROOT, help="repository root (doc/figures.json, tools/, README templates)")
+    ap.add_argument("--root", default=ROOT, help="repository root (doc/figures.json, tools/, doc templates)")
     ap.add_argument("--commit", help="short hash of the measured commit (default: git HEAD of --root)")
     ap.add_argument("--dry-run", action="store_true", help="print the diff of doc/figures.json; write nothing")
     ap.add_argument("--no-render", action="store_true", help="update figures.json only; skip the charts and tables")

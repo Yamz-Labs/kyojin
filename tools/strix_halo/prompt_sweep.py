@@ -47,7 +47,7 @@ print(f"{'tok/s':>8} {'accept':>8}  prompt")
 print("-" * 78)
 for p in PROMPTS:
     r = subprocess.run(
-        [str(REPO / ".venv/bin/python"), str(REPO / "bench_mtp.py")] + args + ["-p", p],
+        [str(REPO / ".venv/bin/python"), str(REPO / "tools/strix_halo/bench_mtp.py")] + args + ["-p", p],
         capture_output=True, text=True, env=env, timeout=1800)
     out = r.stdout + r.stderr
     m = re.search(r"decode:\s+([0-9.]+) tok/s", out)

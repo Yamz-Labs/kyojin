@@ -1,1 +1,0 @@
-tools/strix_halo/bench_mtp.py

@@ -8,4 +8,4 @@ for t in tests/test_ablit_runtime_cpu.py tests/test_uncensor_bundled_cpu.py tool
 Run each file separately because three files share a name (`test_serve.py`). These tests need no GPU and no built extension. GPU tests need a built extension and a free GPU.
 
 ## Build on CUDA
-The CUDA build is the upstream one and is unchanged. Install a CUDA 12.4 or newer build of PyTorch, then `pip install -r requirements.txt && pip install .`. `README.upstream.md` has the full upstream guide (wheels, PyPI, uv, Windows, architecture list, conversion tool, examples). `README.strix-halo.md` has the kernel notes and benchmark harnesses.
+The CUDA build is the upstream one and is unchanged. Install a CUDA 12.4 or newer build of PyTorch, then `pip install -r requirements.txt && pip install .`. [upstream.md](upstream.md) has the full upstream guide (wheels, PyPI, uv, Windows, architecture list, conversion tool, examples). [strix-halo.md](strix-halo.md) has the kernel notes and benchmark harnesses.

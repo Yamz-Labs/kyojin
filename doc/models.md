@@ -37,6 +37,16 @@ Architecture: `mimo_v2` with a DFlash drafter. Pack: `yamz-labs/MiMo-V2.6-Flash-
 DS41_PACK=./ds41-pack DS41_ENGRAM_DIR=./engram_fp8 DS41_DRAFT=5 tools/ds41/ds41_serve.sh
 ```
 
+## Flint-40B-A2.5B (NVIDIA)
+
+Mixture-of-experts model for coding agents, 3.43 bpw EXL3, 17.9 GB. Pack: `yamz-labs/Flint-40B-A2.5B-EXL3-Yamz`. Tested on one RTX 3090 (24 GB), 262144 tokens of context with a 6-bit KV cache. Numbers: [rtx.md](rtx.md).
+
+`hf download yamz-labs/Flint-40B-A2.5B-EXL3-Yamz --local-dir ./flint-pack`, then `python tools/flint/serve.py --model ./flint-pack -c 262144 --kv 6,6`.
+
+## Nanbeige4.3-33B (NVIDIA)
+
+Dense model for agents and coding, 4.0 bpw EXL3, 18.7 GB. Pack: `yamz-labs/Nanbeige4.3-33B-EXL3-Yamz`. Tested on one RTX 3090 (24 GB), about 77K tokens of context. The pack card has the exact `tools/qwen/serve.py` command.
+
 ## Options shared by the servers
 
 - `--sessions N` (Qwen server): decode up to N requests together; the default is 1. Details and measurements: `tools/qwen/SERVE.md`.

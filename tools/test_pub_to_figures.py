@@ -27,7 +27,7 @@ def make_root(tmp_path):
     for name in ("make_charts.py", "make_readme_table.py", "pub_to_figures.py"):
         shutil.copy(os.path.join(HERE, name), root / "tools" / name)
     shutil.copy(os.path.join(FIX, "figures.json"), root / "doc" / "figures.json")
-    shutil.copy(os.path.join(ROOT, "README.tmpl.md"), root / "README.tmpl.md")
+    shutil.copy(os.path.join(ROOT, "doc", "strix.tmpl.md"), root / "doc" / "strix.tmpl.md")
     shutil.copy(os.path.join(ROOT, "doc", "benchmarks.tmpl.md"), root / "doc" / "benchmarks.tmpl.md")
     return root
 
@@ -60,7 +60,7 @@ def test_dry_run_prints_diff_and_writes_nothing(tmp_path, capsys):
     rc = p2f.main(["--root", str(root), "--scratch", str(scratch), "--commit", "abc1234", "--dry-run"])
     assert rc == 0
     assert (root / "doc" / "figures.json").read_text(encoding="utf-8") == before
-    assert not (root / "README.md").exists() and not (root / "doc" / "img").exists()
+    assert not (root / "doc" / "strix.md").exists() and not (root / "doc" / "img").exists()
     out = capsys.readouterr().out
     assert out.startswith("--- a/doc/figures.json")
     assert '+ "commit": "abc1234",' in out
@@ -91,7 +91,7 @@ def test_writes_schema_and_renders(tmp_path, capsys):
     assert F["rivals"] == old["rivals"] and F["quality"] == old["quality"]
     # the renderers ran
     assert (root / "doc" / "img" / "prefill.svg").exists()
-    assert "1502 at 8K" in (root / "README.md").read_text(encoding="utf-8")
+    assert "1502 at 8K" in (root / "doc" / "strix.md").read_text(encoding="utf-8")
     assert "wrote" in capsys.readouterr().out
 
 
