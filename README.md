@@ -23,7 +23,7 @@ Tokens per second, served through the real server with real text. Each row says 
 |---|---|---|---|---|---|
 | [Strix Halo](#strix-halo-amd), Ryzen AI Max+ 395, 128 GB | Qwen3.8-Flash-Next | 1480 at 8K | 52.2 at 8K | 1.8.9 (prefill), 1.5.10 (decode) | 2026-11-04, 2026-10-17 |
 | [RTX 3090](#rtx-nvidia), 24 GB | Qwen3.8-27B | 1621 at 5K | 74.6 at 5K | 1.8.9 | 2026-11-04 |
-| [RTX 3090](#rtx-nvidia), 24 GB | Flint V1 | 6282 at 4K | 133.5 at 4K | 1.5.10 | earlier session |
+| [RTX 3090](#rtx-nvidia), 24 GB | Flint V1 | 6282 at 4K | 133.5 at 4K | 1.5.10 | before 2026-11-04 |
 | [Mac Studio](#mac-apple-silicon), M3 Ultra, 256 GB | DeepSeek V4.1 Flash | 3001 at 8K | 62 at 8K | 1.8.9 | 2026-11-04 |
 
 Decode on Strix Halo and RTX uses speculative decoding. Full tables and method are on the platform pages.
@@ -77,7 +77,7 @@ All packs are EXL3 and live on [Hugging Face](https://huggingface.co/yamz-labs).
 | [Flint-40B-A2.5B-EXL3-Yamz](https://huggingface.co/yamz-labs/Flint-40B-A2.5B-EXL3-Yamz) | 17.9 GB | RTX 3090 | EXL3 3.43 bpw | RTX: 6282 prefill, 133.5 decode at 4K (Kyojin 1.5.10) |
 | [Nanbeige4.3-33B-EXL3-Yamz](https://huggingface.co/yamz-labs/Nanbeige4.3-33B-EXL3-Yamz) | 18.7 GB | RTX 3090 | EXL3 4.0 bpw | not measured |
 
-**Uncensored mode.** Each model has an optional mode that makes it refuse far less. The engine applies it at load and the weights stay untouched: ready-made packs for GLM-5.3-Flash and MiMo-V2.6-Flash (rows above), and a preset inside the Qwen3.8-Flash-Next pack that is off by default. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).
+**Uncensored mode.** Each model has an optional mode that makes it refuse far less. The engine applies it at load and the weights stay untouched: ready-made packs for [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) and [MiMo-V2.6-Flash](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored), and a preset inside the [Qwen3.8-Flash-Next pack](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) that is off by default. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).
 
 ## Made with our models
 
@@ -86,8 +86,6 @@ One prompt each, written by the model running on Kyojin and published as it came
 <table align="center">
 <tr><td align="center" width="33%"><a href="https://yamz-labs.github.io/gallery/#pagoda"><img src="doc/img/gallery/glm-pagoda.webp" alt="Voxel pagoda, GLM-5.3-Flash"></a><br><sub><b>Voxel pagoda</b><br>GLM-5.3-Flash</sub></td><td align="center" width="33%"><a href="https://yamz-labs.github.io/gallery/#pagoda"><img src="doc/img/gallery/qwen-pagoda.webp" alt="Voxel pagoda, Qwen3.8-Flash-Next"></a><br><sub><b>Voxel pagoda</b><br>Qwen3.8-Flash-Next</sub></td><td align="center" width="33%"><a href="https://yamz-labs.github.io/gallery/#pagoda"><img src="doc/img/gallery/mimo-pagoda.webp" alt="Voxel pagoda, MiMo-V2.6-Flash"></a><br><sub><b>Voxel pagoda</b><br>MiMo-V2.6-Flash</sub></td></tr>
 </table>
-
-**Uncensored mode.** Each model has an optional mode that makes it refuse far less. The engine applies it at load and the weights stay untouched: ready-made packs for [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) and [MiMo-V2.6-Flash](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored), and a preset inside the [Qwen3.8-Flash-Next pack](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) that is off by default. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).
 
 ## Contributors
 
