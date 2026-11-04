@@ -61,7 +61,7 @@ HIP_VISIBLE_DEVICES=1 python tools/strix_halo/coherence_suite.py -m <model>
 HIP_VISIBLE_DEVICES=1 python tools/strix_halo/gemv_perf_ab.py -m <model> --mode both --gemm
 ```
 
-`tests/hip_gemv_logits_oracle.py` runs two worker processes (fallback and forced GEMV); the worker and oracle both read `EXL3_ORACLE_STEPS` (default 16). The oracle and worker are in `tests/`; the coherence and performance harnesses are in `tools/strix_halo/`. Report which of these you ran in the pull request.
+`tests/hip_gemv_logits_oracle.py` runs two worker processes (fallback and forced GEMV; a third unforced pass with `EXL3_ORACLE_FREE=1`); the worker and oracle both read `EXL3_ORACLE_STEPS` (default 16). The oracle and worker are in `tests/`; the coherence and performance harnesses are in `tools/strix_halo/`. Report which of these you ran in the pull request.
 
 ## Pull requests
 
