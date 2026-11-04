@@ -1140,7 +1140,7 @@ void exl3_moe_gfx12_k3_prefill
     // slots vs 514 — so take the smaller of the two; large-A prefill keeps the
     // old bound.
     const int chunk_slots = std::min(
-        CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + experts, assignments);
+        CEIL_DIVIDE(assignments, MOE_PREFILL_ROWS_PER_CHUNK) + (int) experts, assignments);
     const int pcfg = moe_prefill_cfg();
     const int pcols = pcfg == 0 ? 32 : 64;          // COLS = WNT * 16 in exl3_gemv_kernel_body
     dim3 gu_grid(intermediate / pcols, chunk_slots, 2);
