@@ -1,6 +1,6 @@
 # exllamav3 on AMD Strix Halo (gfx1151)
 
-> **Just want to run a model?** Start with the [README](README.md) and [doc/install.md](doc/install.md). This page keeps the kernel notes of the gfx1151 port.
+> **Just want to run a model?** Start with the [README](../README.md) and [doc/install.md](install.md). This page keeps the kernel notes of the gfx1151 port.
 
 > **This tree adds AMD GPU functionality to ExLlamaV3 that upstream does not have.** Upstream is
 > CUDA-only; the `sdougbrown/exllamav3` base adds a ROCm/HIP decode path for **gfx12 (RDNA 4)**

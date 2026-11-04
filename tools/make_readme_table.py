@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Fill the {{TABLE}}, {{LONG}}, {{DECODE}}, {{RIVALS}} and {{LADDER}} fields of README.md and doc/benchmarks.md from doc/figures.json.
-Templates: README.tmpl.md, doc/benchmarks.tmpl.md. usage: python3 tools/make_readme_table.py"""
+"""Fill the {{TABLE}}, {{LONG}}, {{DECODE}}, {{RIVALS}} and {{LADDER}} fields of doc/strix.md and doc/benchmarks.md from doc/figures.json.
+Templates: doc/strix.tmpl.md, doc/benchmarks.tmpl.md. README.md is written by hand. usage: python3 tools/make_readme_table.py"""
 import json, os, re
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 F = json.load(open(os.path.join(root, "doc", "figures.json"))); HP, HC = F["headline_prompt"], F["headline_prefill_ctx"]
@@ -61,7 +61,7 @@ def long_block():
 
 reps = F.get("method_ladder_reps", 1)
 ladder = "one request per depth" if reps == 1 else f"median of {reps} requests per depth"
-for tmpl, dst, tb in (("README.tmpl.md", "README.md", table), ("doc/benchmarks.tmpl.md", "doc/benchmarks.md", full)):
+for tmpl, dst, tb in (("doc/strix.tmpl.md", "doc/strix.md", table), ("doc/benchmarks.tmpl.md", "doc/benchmarks.md", full)):
     s = open(os.path.join(root, tmpl)).read().replace("{{TABLE}}", tb).replace("{{LONG}}", long_block()).replace("{{DECODE}}", dec_block).replace("{{RIVALS}}", rivals()).replace("{{LADDER}}", ladder)
     open(os.path.join(root, dst), "w").write(s)
 print("ok")

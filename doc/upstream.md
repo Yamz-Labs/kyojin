@@ -13,31 +13,31 @@
 > **Measured** on Qwen3.8-Flash-Next-EXL3 (3.05 bpw) on one gfx1151: decode **4.27 → 34.9 tok/s mean**
 > (41.1 peak), perplexity unchanged at 4.2259.
 >
-> 👉 **See [`README.strix-halo.md`](README.strix-halo.md)** for the AMD build instructions, env knobs,
+> 👉 **See [`strix-halo.md`](strix-halo.md)** for the AMD build instructions, env knobs,
 > benchmark harnesses and measured results. The Installation section below is upstream's and is
 > **CUDA-specific** — do not follow it for AMD.
 >
 > NVIDIA/CUDA code paths are untouched; everything here is behind `USE_ROCM` / arch guards.
 
 <p align="center">
-  <img src="doc/logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
+  <img src="logo.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
 [Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
 
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
-- **Quantization** - [EXL3](doc/exl3.md), based on QTIP, plus 2–8 bit cache quantization.
+- **Quantization** - [EXL3](exl3.md), based on QTIP, plus 2–8 bit cache quantization.
 - **Parallel inference** - Flexible tensor-parallel and expert-parallel inference for consumer hardware setups.
 - **CPU offloading** - Allows large MoE models to run with limited GPU resources. AVX2 and AVX512 support.  
 - **Generation** - Continuous, dynamic batching, speculative decoding, multimodal support.
-- **Integrations** - Broad [HF model support](#architecture-support), a [Transformers plugin](examples/transformers_integration.py), and an OpenAI-compatible API via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/).
+- **Integrations** - Broad [HF model support](#architecture-support), a [Transformers plugin](../examples/transformers_integration.py), and an OpenAI-compatible API via [TabbyAPI](https://github.com/theroyallab/tabbyAPI/).
 
 > [!TIP]
 > **Looking for a server?** [TabbyAPI](https://github.com/theroyallab/tabbyAPI/) is the official and recommended backend server. It provides an OpenAI-compatible API for local or remote inference, HF model downloading, embedding model support, and HF Jinja2 chat templates. Its startup script manages and installs prerequisites to help you get started.
 
 <p align="center">
-  <img src="doc/qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
+  <img src="qb_kld.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
 ## Installation
@@ -190,7 +190,7 @@ A number of example scripts are provided to showcase the features of the backend
 For instance, a versatile CLI chatbot:
 
 <p align="center">
-  <img src="doc/chatpy.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
+  <img src="chatpy.png" width="640" alt="Llama 3.1 8B Instruct quantization benchmark across bits per weight">
 </p>
 
 ```sh
@@ -274,8 +274,8 @@ The working directory is temporary storage for state checkpoints and for storing
 until the converted model can be compiled. It should have enough free space to store an entire copy 
 of the output model.
 
-See the [conversion guide](doc/convert.md) for more information, or the 
-[self-calibration guide](doc/optimize.md). 
+See the [conversion guide](convert.md) for more information, or the 
+[self-calibration guide](optimize.md). 
 
 ## EXL3 quantization
 
@@ -284,7 +284,7 @@ SOTA quantization available to users on consumer hardware. The conversion proces
 simple and efficient and requires only an input model (in HF format) and a target bitrate. By
 computing Hessians on the fly and thanks to a fused Viterbi kernel, the quantizer can convert a 
 model in a single step, taking a couple of minutes for smaller models, up to a few hours for larger
-ones (70B+) on a single high-end consumer GPU (see the [conversion guide](doc/convert.md)).
+ones (70B+) on a single high-end consumer GPU (see the [conversion guide](convert.md)).
 
 For more information, see the [**QTIP**](https://arxiv.org/abs/2406.11235) and [**QuIP#**](https://arxiv.org/abs/2402.04396) papers, as well as this 
 [excellent writeup](https://www.together.ai/blog/even-better-even-faster-quantized-llms-with-qtip) on **QTIP** from together.ai.
@@ -321,7 +321,7 @@ supporters (🐈❤️!) The following projects in particular deserve a special 
 - [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention) (chunked linear-attention prefill kernels, vendored under `exllamav3/vendor/fla`)
 
 <p align="center">
-  <img src="doc/cat.png" width="40" alt="">
+  <img src="cat.png" width="40" alt="">
 </p>
 
 
