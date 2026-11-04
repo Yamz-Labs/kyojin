@@ -38,6 +38,31 @@ On the GPU machine, run the suite with `EXL3_TESTS_STRICT=1`: nothing is skipped
 
 If a test or the first import hangs, look for a stale lock file at `~/.cache/torch_extensions/*/exllamav3_ext/lock` and remove it. GPU tests under `tests/` need a built extension and a free GPU; say in the pull request whether you ran them.
 
+### GPU decode harnesses
+
+These are manual scripts, not collected by `pytest tests`; they need a built extension, a free GPU and a model that fits the visible device (use the layer-split sibling for larger packs). Pin the target device with `HIP_VISIBLE_DEVICES`.
+
+```bash
+# Forced fallback-vs-GEMV logits oracle; prints route counts, top-1/top-5 agreement and logit deltas.
+EXL3_TEST_MODEL=<model> python tests/hip_gemv_logits_oracle.py
+
+# Longer forced trace (the oracle widens its bounds with the step count).
+EXL3_TEST_MODEL=<model> EXL3_ORACLE_STEPS=128 python tests/hip_gemv_logits_oracle.py
+
+# Optional unforced pass: prints free-run route counts and token ids for loop diagnosis;
+# it is not asserted against the forced trace.
+EXL3_TEST_MODEL=<model> EXL3_ORACLE_FREE=1 python tests/hip_gemv_logits_oracle.py
+
+# Whole-model chat-path coherence gate: 8 prompts x greedy/default, EOS, production
+# loop guard and 20-gram repetition checks.
+HIP_VISIBLE_DEVICES=1 python tools/strix_halo/coherence_suite.py -m <model>
+
+# Per-shape and streaming GEMV timings; --gemm also times ext.exl3_gemm when present.
+HIP_VISIBLE_DEVICES=1 python tools/strix_halo/gemv_perf_ab.py -m <model> --mode both --gemm
+```
+
+`tests/hip_gemv_logits_oracle.py` runs two worker processes (fallback and forced GEMV); the worker and oracle both read `EXL3_ORACLE_STEPS` (default 16). The oracle and worker are in `tests/`; the coherence and performance harnesses are in `tools/strix_halo/`. Report which of these you ran in the pull request.
+
 ## Pull requests
 
 - Keep a pull request to one change. Explain what it fixes and how you checked it.

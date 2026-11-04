@@ -67,7 +67,7 @@ Current local verification on gfx1201 includes:
 - 63 grouped K3 MoE route, numerical, multirow, safety, LoRA, and fallback tests, plus opt-in full Flash and MTP oracles
 - 44 native ROCm shared-gate fusion, stream, validation, and fallback tests
 - 25 gfx12 batch-one router numerical, tie, stream, validation, fallback, and real-layer tests
-- forced-identical-context 16-step logits oracles for mul1 and MCG models
+- forced-identical-context logits oracles for mul1 and MCG fixtures (16-step default; `EXL3_ORACLE_STEPS` for longer traces)
 
 The Qwen3.8-27B mul1 oracle reports:
 
@@ -77,14 +77,6 @@ The Qwen3.8-27B mul1 oracle reports:
 - worst-step mean delta: 0.046886
 - overall mean delta: 0.027793
 - fallback-only `-inf` positions carry <1e-6 softmax mass per step
-
-The Qwen3.5-9B MCG oracle reports:
-
-- top-1 agreement: 16/16
-- exact top-5 agreement: 16/16 steps
-- max absolute logit delta: 0.234375
-- worst-step mean delta: 0.017942
-- overall mean delta: 0.009152
 
 Warmed decode measurements on gfx1201:
 
@@ -152,8 +144,31 @@ EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 \
 EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 \
   python tests/hip_gemv_logits_oracle.py
 
-# Repeat with an MCG fixture.
-EXL3_TEST_MODEL=/path/to/Qwen3.5-9B-exl3 \
+# Longer trace: the oracle widens its delta bounds with the step count.
+EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 EXL3_ORACLE_STEPS=128 \
   python tests/hip_gemv_logits_oracle.py
 
+# Optional unforced pass: prints free-run route counts and token ids for loop
+# diagnosis; it is not asserted against the forced trace.
+EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 EXL3_ORACLE_FREE=1 \
+  python tests/hip_gemv_logits_oracle.py
 ```
+
+## GPU decode harnesses
+
+These are manual scripts, not CPU CI. They need a built extension, a free GPU and a
+model that fits the visible device (use the layer-split sibling for larger packs).
+
+```sh
+# Whole-model chat-path coherence gate: 8 prompts x greedy/default, EOS, production
+# loop guard and 20-gram repetition checks.
+HIP_VISIBLE_DEVICES=1 python tools/strix_halo/coherence_suite.py -m <model> -n 192
+
+# Per-shape GEMV timings and one streaming pass over every linear; --gemm A/Bs
+# ext.exl3_gemm when the tree exports it.
+HIP_VISIBLE_DEVICES=1 python tools/strix_halo/gemv_perf_ab.py -m <model> --mode both --gemm
+```
+
+`tests/hip_gemv_logits_oracle.py` is the forced fallback-vs-GEMV logits oracle.
+`EXL3_ORACLE_STEPS` sets the trace length (default 16); `EXL3_ORACLE_FREE=1` adds the
+unforced diagnostic pass. Both the oracle and worker read the step variable.
