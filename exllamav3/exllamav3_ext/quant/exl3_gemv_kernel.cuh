@@ -36,6 +36,14 @@
 #else
 #include "../ptx.cuh"
 #endif
+// Build-time regression guard: the gfx12 WMMA path is inert unless EXL3_HIP_WMMA_GFX12 is
+// defined from the arch guards in hip_mma.cuh (a one-line regression there silently emitted
+// zeros/garbage on gfx1200/gfx1201), so fail the device pass loudly instead.
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1200__) || defined(__gfx1201__)) \
+    && !defined(EXL3_HIP_WMMA_GFX12)
+#error "gfx12: EXL3_HIP_WMMA_GFX12 must be defined for gfx1200/gfx1201"
+#endif
+
 #include "exl3_dq.cuh"
 #include "exl3_kernel_map.cuh"
 

@@ -75,11 +75,18 @@ using HipFp32x8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 "family macros + HipFp16x16 typedef")
 
 # Swap the remaining raw gfx1200/gfx1201 guards in hip_mma.cuh to the macro so
-# the file reads consistently (there are several).
+# the file reads consistently (there are several). The guard that DEFINES the macro
+# (inserted above) must stay a raw arch test: rewriting it would make the macro
+# self-referential and leave it undefined, silently killing the whole gfx12 WMMA path
+# (this is exactly the regression that left the RX 9070 emitting zeros/garbage).
 s = mma.read_text()
 raw = "#if defined(__gfx1200__) || defined(__gfx1201__)"
+define_guard = raw + "\n    #define EXL3_HIP_WMMA_GFX12 1"
+placeholder = "// __EXL3_GFX12_DEFINE_GUARD__"
 if raw in s:
+    s = s.replace(define_guard, placeholder)
     s = s.replace(raw, "#if defined(EXL3_HIP_WMMA_GFX12)")
+    s = s.replace(placeholder, define_guard)
     mma.write_text(s)
     print(f"  OK: normalized {raw!r} -> EXL3_HIP_WMMA_GFX12 in hip_mma.cuh")
     changed.append(str(mma))

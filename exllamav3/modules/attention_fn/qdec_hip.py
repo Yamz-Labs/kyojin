@@ -17,13 +17,34 @@ from ...util.knobs import knob, knob_int, knob_on, on_change
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qdec.hip")
 _CACHE = os.path.expanduser(os.environ.get("EXL3_QDEC_CACHE", "~/.cache/exllamav3"))
-ENABLED = bool(torch.version.hip) and knob_on("EXL3_QDEC_HIP")
+
+
+def _gfx115_family0() -> bool:
+    """qdec.hip uses gfx11.5-only (RDNA3.5) wave32 WMMA; enable it only when device 0 is that
+    family. On a mixed gfx1201+gfx1151 box (RX 9070 exposed as device 0) quantized-KV decode
+    keeps the Triton fallback (triton_paged.py) instead of trying to compile gfx11.5 WMMA for
+    gfx1201. An extension without the family probe keeps the historical behavior."""
+    if not torch.version.hip:
+        return False
+    try:
+        from ...ext import exllamav3_ext as ext
+    except Exception:                                   # noqa: BLE001
+        return False
+    if not hasattr(ext, "exl3_gemv_wmma_family"):
+        return True
+    try:
+        return ext.exl3_gemv_wmma_family(0) == 2
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+ENABLED = bool(torch.version.hip) and _gfx115_family0() and knob_on("EXL3_QDEC_HIP")
 
 
 @on_change
 def _refresh_knobs():
     global ENABLED
-    ENABLED = bool(torch.version.hip) and knob_on("EXL3_QDEC_HIP")
+    ENABLED = bool(torch.version.hip) and _gfx115_family0() and knob_on("EXL3_QDEC_HIP")
 
 _kernels = {}
 _bufs = {}
