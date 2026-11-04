@@ -1,0 +1,161 @@
+{
+ "_comment": "Served, published numbers for the homepage charts (tools/make_home_charts.py). Strix Halo curves come from doc/figures.json. Sources: doc/rtx.md (RTX) and the kyojin-mac README speed table (Mac, 2026-11-04). A range in a source is plotted at its lower end.",
+ "rtx": {
+  "machine": "RTX 3090, 24 GB",
+  "qwen27": {
+   "name": "Qwen3.8-27B",
+   "note": "server, vision on, MTP + n-gram, 4-bit KV",
+   "points": [
+    {
+     "ctx": 5000,
+     "decode": 74.6,
+     "prefill": 1621,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    },
+    {
+     "ctx": 39000,
+     "decode": 69.7,
+     "prefill": 1544,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    },
+    {
+     "ctx": 79000,
+     "decode": 71.2,
+     "prefill": 1353,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    },
+    {
+     "ctx": 150000,
+     "decode": 62.5,
+     "prefill": 1118,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    },
+    {
+     "ctx": 250000,
+     "decode": 52.3,
+     "prefill": 920,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    }
+   ]
+  },
+  "flint": {
+   "name": "Flint V1",
+   "note": "6-bit KV",
+   "points": [
+    {
+     "ctx": 4096,
+     "decode": 138.7,
+     "prefill": 6930,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    },
+    {
+     "ctx": 16384,
+     "decode": 134.8,
+     "prefill": 8291,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    },
+    {
+     "ctx": 32768,
+     "decode": 127.9,
+     "prefill": 7516,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    },
+    {
+     "ctx": 65536,
+     "decode": 121.1,
+     "prefill": 5565,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    },
+    {
+     "ctx": 131072,
+     "decode": 105.6,
+     "prefill": 4047,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    },
+    {
+     "ctx": 262144,
+     "decode": 83.1,
+     "prefill": 2718,
+     "version": "1.8.9",
+     "date": "2026-11-04"
+    }
+   ]
+  },
+  "duel_version": "1.5.10",
+  "duel_date": "before 2026-11-04",
+  "duel_qwen27": {
+   "rival": "llama.cpp Q4_K_M, KV q4_0",
+   "ctx": [
+    4096,
+    32768,
+    131072,
+    250000
+   ],
+   "kyojin_decode": [
+    44.6,
+    43.0,
+    37.6,
+    25.3
+   ],
+   "rival_decode": [
+    40.5,
+    33.9,
+    21.6,
+    14.8
+   ]
+  },
+  "duel_flint": {
+   "rival": "llama.cpp Q3_K_XL, KV f16",
+   "ctx": [
+    4096,
+    32768,
+    131072
+   ],
+   "kyojin_decode": [
+    136.6,
+    127.1,
+    103.0
+   ],
+   "rival_decode": [
+    123.1,
+    111.3,
+    78.5
+   ]
+  },
+  "source": "Kamel readme189.json, served, 1 warm-up + 1 rep (3 reps median where a cell was >5 % under), actual prompt tokens: Qwen 5392/39276/81491/147740/234772; Flint 4051/15338/31190/61543/123523/227527"
+ },
+ "mac": {
+  "machine": "Mac Studio M3 Ultra, 256 GB",
+  "name": "DeepSeek V4.1 Flash",
+  "version": "1.8.9",
+  "date": "2026-11-04",
+  "source": "kyojin-mac README speed table",
+  "points": [
+   {
+    "ctx": 8192,
+    "decode": 62,
+    "prefill": 3001
+   },
+   {
+    "ctx": 131072,
+    "decode": 57,
+    "prefill": 2681
+   },
+   {
+    "ctx": 983000,
+    "decode": 48,
+    "prefill": 2199
+   }
+  ]
+ }
+}

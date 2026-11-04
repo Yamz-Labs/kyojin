@@ -4,19 +4,19 @@ Kyojin also runs on NVIDIA (sm_80 and up, tested on one RTX 3090 with 24 GB). It
 
 Machine for every table on this page: one NVIDIA RTX 3090, 24 GB. Real text, greedy, one user, KV cache quantized (Flint 6/6 bits, Qwen27 4/4 bits), tokens per second.
 
-**Flint V1.** Kyojin 1.5.10 (measured before 2026-11-04; Kyojin 1.8.9 not re-measured yet).
+**Flint V1.** Kyojin 1.8.9, served, 2026-11-04 (1 warm-up, 1 rep; 3 reps and the median at 4K). Prompts are 4,051 / 15,338 / 31,190 / 61,543 / 123,523 / 227,527 tokens.
 
 | model | | 4K | 16K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|---|---|
-| Flint V1 (3.43 bpw, 17 GiB) | decode | 133.5 | 127.0 | 122.9 | 119.5 | 102.6 | 81.3 |
-| | prefill | 6282 | 6956 | 5938 | 4449 | 2995 | 1807 |
+| Flint V1 (3.43 bpw, 17 GiB) | decode | 138.7 | 134.8 | 127.9 | 121.1 | 105.6 | 83.1 |
+| | prefill | 6930 | 8291 | 7516 | 5565 | 4047 | 2718 |
 
-**Qwen3.8-27B.** Server, vision on, MTP + n-gram. Kyojin 1.8.9, served, 2026-11-04 for 5K to 150K (1 warm-up, 1 rep; 3 reps and the median at 150K); the 250K column is Kyojin 1.5.10 (not re-measured yet).
+**Qwen3.8-27B.** Server, vision on, MTP + n-gram. Kyojin 1.8.9, served, 2026-11-04 (1 warm-up, 1 rep; 3 reps and the median at 150K). Prompts are 5,392 / 39,276 / 81,491 / 147,740 / 234,772 tokens.
 
-| model (server, vision on) | | 5K | 39K | 79K | 150K | 250K (1.5.10) |
+| model (server, vision on) | | 5K | 39K | 79K | 150K | 250K |
 |---|---|---|---|---|---|---|
-| Qwen3.8-27B (EXL3 4.0 bpw, MTP + n-gram) | decode | 74.6 | 69.7 | 71.2 | 62.5 | 49.9 |
-| | prefill | 1621 | 1544 | 1353 | 1118 | 611 |
+| Qwen3.8-27B (EXL3 4.0 bpw, MTP + n-gram) | decode | 74.6 | 69.7 | 71.2 | 62.5 | 52.3 |
+| | prefill | 1621 | 1544 | 1353 | 1118 | 920 |
 
 Plain decode without speculation on Qwen27 (Kyojin 1.5.10): 45.6 tok/s at 4K, 41.5 at 32K, 37.2 at 128K, 32.8 at 256K. Both models fit 256K tokens of context in 24 GB (peak 21 GiB for Flint, 20.5 GiB for Qwen27 with the vision tower).
 
