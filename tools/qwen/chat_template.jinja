@@ -56,6 +56,12 @@
         {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
     {%- endif %}
 {%- endif %}
+{#- Effort text goes at the TAIL (just before the generation header) so that changing the effort never invalidates the cached prefix. effort_placement='head' restores the old layout. -#}
+{%- set effort_tail = '' %}
+{%- if reasoning_instructions and (effort_placement is not defined or effort_placement != 'head') %}
+    {%- set effort_tail = reasoning_instructions %}
+    {%- set reasoning_instructions = '' %}
+{%- endif %}
 {%- if tools and tools is iterable and tools is not mapping %}
     {{- '<|im_start|>system\n' }}
     {%- if reasoning_instructions %}
@@ -163,6 +169,9 @@
     {%- endif %}
 {%- endfor %}
 {%- if add_generation_prompt %}
+    {%- if effort_tail %}
+        {{- '<|im_start|>system\n' + effort_tail + '<|im_end|>\n' }}
+    {%- endif %}
     {{- '<|im_start|>assistant\n' }}
     {%- if enable_thinking is defined and enable_thinking is false %}
         {{- '<think>\n\n</think>\n\n' }}

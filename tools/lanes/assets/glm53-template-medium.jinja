@@ -1,8 +1,12 @@
 [gMASK]<sop>
 {%- set glm_medium = (reasoning_effort is defined and reasoning_effort == 'medium') -%}
 {%- set effective_reasoning_effort = 'high' if glm_medium else (reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] else 'max') -%}
+{#- Effort lines go at the TAIL (just before <|assistant|>) so a change of effort never invalidates the cached prefix; effort_placement='head' restores the old layout. -#}
+{%- set effort_head = (effort_placement is defined and effort_placement == 'head') -%}
+{%- if effort_head -%}
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
 {%- if glm_medium -%}<|system|>Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on alternatives the task does not call for. Plan in your reasoning, but do not draft the answer there: write code and long text once, in the answer. When you have settled a point, keep it and move on.{%- endif -%}
+{%- endif -%}
 {%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
 {%- if tools -%}
 {%- macro tool_to_json(tool) -%}
@@ -259,5 +263,9 @@ For each function call, output the function name and arguments within the follow
 {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt -%}
+{%- if not effort_head -%}
+{%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
+{%- if glm_medium -%}<|system|>Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on alternatives the task does not call for. Plan in your reasoning, but do not draft the answer there: write code and long text once, in the answer. When you have settled a point, keep it and move on.{%- endif -%}
+{%- endif -%}
     <|assistant|>{{- '<think>' -}}
 {%- endif -%}
