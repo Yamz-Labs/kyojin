@@ -60,14 +60,18 @@ int main() {return !(run<10>() && run<12>() && run<14>() && run<16>());}
     subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
 
 
-def helpers():
+def helpers(family=2):
     tree = ast.parse((ROOT / 'exllamav3/modules/quant/exl3.py').read_text())
     nodes = [n for n in tree.body if
-             isinstance(n, ast.FunctionDef) and n.name in ('dec_supported','dec_moe_supported') or
-             isinstance(n, ast.Assign) and any(isinstance(t,ast.Name) and t.id in
-                ('_DEC_KB2','_DEC_KB2_DENSE','_DENSE_K8_SHAPES') for t in n.targets)]
-    ns = {'os':os,'torch':NS(version=NS(hip=True)), 'EXL3_DEC':True,
-          'ext':NS(exl3_dec_gemv=True,exl3_dec_moe=True)}
+             (isinstance(n, ast.FunctionDef) and n.name in ('dec_supported','dec_moe_supported','_hip_wmma_family')) or
+             (isinstance(n, (ast.Assign, ast.AnnAssign)) and any(isinstance(t,ast.Name) and t.id in
+                ('_DEC_KB2','_DEC_KB2_DENSE','_DENSE_K8_SHAPES','_hip_gemv_family_cache') for t in
+                (n.targets if isinstance(n, ast.Assign) else [n.target])))]
+    ns = {'os':os,
+          'torch':NS(version=NS(hip=True), device=object, cuda=NS(current_device=lambda:0)),
+          'EXL3_DEC':True,
+          'ext':NS(exl3_dec_gemv=True, exl3_dec_moe=True,
+                   exl3_gemv_wmma_family=lambda index: family)}
     exec(compile(ast.Module(body=nodes,type_ignores=[]),'eligibility','exec'),ns)
     return ns
 
@@ -75,7 +79,7 @@ def helpers():
 def inner(k=8, shape=(2560,10240)):
     i,o=shape
     return NS(K=k,mul1=True,mcg=False,in_features=i,out_features=o,
-              trellis=NS(shape=(i//16,o//16,128)),suh=1,svh=1)
+              trellis=NS(shape=(i//16,o//16,128),device=NS(index=0)),suh=1,svh=1)
 
 
 class DenseK8Checks(unittest.TestCase):
@@ -106,6 +110,13 @@ class DenseK8Checks(unittest.TestCase):
                 x = inner()
                 setattr(x,attribute,value)
                 self.assertFalse(helpers()['dec_supported'](x))
+
+    def test_wmma_family_gates_dec_kernels(self):
+        with patch.dict(os.environ, {'EXL3_DENSE_K8':'1'}):
+            for family,enabled in [(2,True),(1,False),(0,False)]:
+                ns = helpers(family)
+                self.assertEqual(ns['dec_supported'](inner()), enabled, family)
+                self.assertEqual(ns['dec_moe_supported'](inner(k=2)), enabled, family)
 
 if __name__ == '__main__':
     unittest.main()
