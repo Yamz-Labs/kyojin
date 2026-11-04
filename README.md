@@ -13,11 +13,56 @@ Open source. Our own quantised builds of GLM, Qwen, MiMo, DeepSeek, Flint and Na
 <a href="https://x.com/YamzLabs"><img alt="X" src="https://img.shields.io/badge/news-%40YamzLabs-444444"></a>
 </p>
 
-Kyojin serves large language models on three kinds of machine. Pick yours.
+**Big models, long context, one machine: up to 500K tokens on a 128 GB Strix Halo, 262K on a 24 GB RTX 3090, 983K on a Mac Studio.** Pick yours.
 
-## Summary
+<table align="center">
+<tr><td align="center" width="33%"><a href="#strix-halo-amd"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-strix-dark.svg"><img src="doc/img/home/card-strix-light.svg" alt="Strix Halo: 52.2 tok/s decode at 8K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#rtx-nvidia"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-rtx-dark.svg"><img src="doc/img/home/card-rtx-light.svg" alt="RTX 3090: 74.6 tok/s decode at 5K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#mac-apple-silicon"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-mac-dark.svg"><img src="doc/img/home/card-mac-light.svg" alt="Mac Studio: 62 tok/s decode at 8K" width="100%"></picture></a></td></tr>
+</table>
 
-Tokens per second, served through the real server with real text. Each row says its Kyojin version, date and machine.
+## Speed by context
+
+Tokens per second against context length (log scale), served through the real server with real text. Each chart says its machine, Kyojin version and date. Higher is better.
+
+**Strix Halo (AMD)**
+
+<table>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-strix-dark.svg"><img src="doc/img/home/decode-strix-light.svg" alt="Decode tok/s against context on Strix Halo, three models" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-strix-dark.svg"><img src="doc/img/home/prefill-strix-light.svg" alt="Prefill tok/s against context on Strix Halo, three models" width="100%"></picture></td></tr>
+</table>
+
+**RTX 3090 (NVIDIA)**
+
+<table>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-rtx-dark.svg"><img src="doc/img/home/decode-rtx-light.svg" alt="Decode tok/s against context, Qwen3.8-27B on RTX 3090" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-rtx-dark.svg"><img src="doc/img/home/prefill-rtx-light.svg" alt="Prefill tok/s against context, Qwen3.8-27B on RTX 3090" width="100%"></picture></td></tr>
+</table>
+
+<table>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-rtx-flint-dark.svg"><img src="doc/img/home/decode-rtx-flint-light.svg" alt="Decode tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-rtx-flint-dark.svg"><img src="doc/img/home/prefill-rtx-flint-light.svg" alt="Prefill tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td></tr>
+</table>
+
+**Mac Studio (Apple)**
+
+<table>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-mac-dark.svg"><img src="doc/img/home/decode-mac-light.svg" alt="Decode tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-mac-dark.svg"><img src="doc/img/home/prefill-mac-light.svg" alt="Prefill tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td></tr>
+</table>
+
+## Against other engines
+
+Same machine, same prompts. The number under each group is Kyojin divided by the best rival.
+
+<table>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/duel-rtx-qwen27-dark.svg"><img src="doc/img/home/duel-rtx-qwen27-light.svg" alt="Qwen3.8-27B decode, Kyojin against llama.cpp" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/duel-rtx-flint-dark.svg"><img src="doc/img/home/duel-rtx-flint-light.svg" alt="Flint V1 decode, Kyojin against llama.cpp" width="100%"></picture></td></tr>
+</table>
+
+<table>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/duel-strix-decode-dark.svg"><img src="doc/img/home/duel-strix-decode-light.svg" alt="Decode on Strix Halo, Kyojin against Strata and Gufo" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/duel-strix-prefill-dark.svg"><img src="doc/img/home/duel-strix-prefill-light.svg" alt="Prefill on Strix Halo, Kyojin against Gufo" width="100%"></picture></td></tr>
+</table>
+
+llama.cpp prefills Qwen3.8-27B 10 to 19 % faster up to 32K ([details](doc/rtx.md)). Rival figures on Strix Halo are ones we measured ([method and fidelity](doc/strix.md)).
+
+## All numbers
+
+<details>
+<summary>Summary table</summary>
 
 | Machine | Best model | Prefill | Decode | Kyojin | Date |
 |---|---|---|---|---|---|
@@ -26,7 +71,9 @@ Tokens per second, served through the real server with real text. Each row says 
 | [RTX 3090](#rtx-nvidia), 24 GB | Flint V1 | 6282 at 4K | 133.5 at 4K | 1.5.10 | before 2026-11-04 |
 | [Mac Studio](#mac-apple-silicon), M3 Ultra, 256 GB | DeepSeek V4.1 Flash | 3001 at 8K | 62 at 8K | 1.8.9 | 2026-11-04 |
 
-Decode on Strix Halo and RTX uses speculative decoding. Full tables and method are on the platform pages.
+Decode on Strix Halo and RTX uses speculative decoding. Full tables and method are on the platform pages: [Strix Halo](doc/strix.md), [RTX](doc/rtx.md), [Benchmarks](doc/benchmarks.md).
+
+</details>
 
 ## Strix Halo (AMD)
 
