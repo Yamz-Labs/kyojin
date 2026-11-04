@@ -1,4 +1,4 @@
-# EXL3_GDN_HF (default off): Qwen GDN prefill recurrence with the 16-row-chunk WY kernel adapted from hipfire (gdn_hf.hip, Apache-2.0).
+# EXL3_GDN_HF (default ON on ROCm, =0 off; gate 03/11: Flash-Next 16K/32K dNLL -0.001/-0.0065, KLD 0.006, ref top-1 always in top-5; dense 27B dNLL +0.00005, KLD 1e-5; 19/20 task prompts identical; prefill +11..23 % at 8K/32K): Qwen GDN prefill recurrence with the 16-row-chunk WY kernel adapted from hipfire (gdn_hf.hip, Apache-2.0).
 # One kernel per layer replaces kkt_solve + gdn_fused_h_o (the gated norm still runs after). F16 WMMA operands with fp32 accumulation
 # (S, T, Vnew rounded to f16 per 16-row chunk): NOT bitwise equal to the Triton / gdn_fused_h chain; quality-gated (KLD).
 # Compiled with the ROCm SDK hipcc on first use (cached by source hash), launched on torch's stream like gdn_fused_h_hip.
@@ -42,7 +42,7 @@ def _load():
 def gdn_hf_ok(q_raw, v, qn, kn, g, beta, initial_state):
     """q_raw, v: views of the conv output row (q at column 0, v at column 2 H K, same token pitch); qn, kn [1, T, H, 128] bf16
     contiguous (l2-normalized); g [1, T, HV] fp32 raw log decay (natural log, before the chunk cumsum); beta [1, T, HV]."""
-    if os.environ.get("EXL3_GDN_HF", "0") != "1" or _state.get("fail"):
+    if os.environ.get("EXL3_GDN_HF", "1" if torch.version.hip else "0") != "1" or _state.get("fail"):
         return False
     B, T, H, K = qn.shape
     HV, V = v.shape[2], v.shape[3]

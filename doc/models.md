@@ -6,6 +6,8 @@ Weights: [Yamz on Hugging Face](https://huggingface.co/yamz-labs). Serve command
 
 `hf download yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz --local-dir ./qwen-pack`, then `python tools/qwen/serve.py --model ./qwen-pack --port 8000 -c 131072`. Speculative decoding is on by default and returns the same tokens as plain decoding. The pack needs about 113 GiB of the 128 GB; start to ready takes about 90 s once the pack is in the page cache; the very first start reads 95 GB from disk and can take 7 to 8 minutes. Details: `tools/qwen/SERVE.md`.
 
+**Memory vs speed.** The 24.4 GiB n-gram table is streamed from disk by default (about 1480 tok/s prefill at 8K, 22 GiB of RAM left free). `--ngram-ram` or `EXL3_NGRAM_STREAM=0` loads it into RAM instead: about 1580 tok/s at 8K, 22 GiB more RAM used, identical output.
+
 ## GLM-5.3-Flash
 
 Architecture: `glm_moe_dsa` (MLA attention, sparse indexer, MTP). Pack: `yamz-labs/GLM-5.3-Flash-EXL3-Yamz`.

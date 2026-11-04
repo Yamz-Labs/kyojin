@@ -2441,6 +2441,7 @@ def main() -> None:
                              "off = always the fixed block. EXL3_DFLASH_ADAPT in the environment wins")
     parser.add_argument("--no-vision", action="store_true", help="do not load the vision tower (saves memory)")
     parser.add_argument("--no-uncensor", action="store_true", help="ignore a bundled uncensor_spec.json in the model directory (same as EXL3_ABLIT_RUNTIME=off)")
+    parser.add_argument("--ngram-ram", action="store_true", help="load the 24.4 GiB n-gram table into RAM instead of streaming it from disk (same as EXL3_NGRAM_STREAM=0): ~1580 vs ~1480 tok/s prefill at 8K, +22 GiB RAM")
     parser.add_argument("--default-temperature", type=float, default=None, help="when a request omits it (default: generation_config.json)")
     parser.add_argument("--default-top-p", type=float, default=None)
     parser.add_argument("--default-top-k", type=int, default=None)
@@ -2459,6 +2460,8 @@ def main() -> None:
                              "pages for its prompt + reply budget when it starts, so a request that does not fit waits. A reply longer than "
                              "its share of the context (-c / sessions) is requeued, not reserved up front")
     args = parser.parse_args()
+    if args.ngram_ram:
+        os.environ["EXL3_NGRAM_STREAM"] = "0"
     if args.draft_policy == "dflash" and not args.dflash_dir:
         parser.error("--draft-policy dflash needs --dflash-dir")
     if args.draft_policy == "dflash":
