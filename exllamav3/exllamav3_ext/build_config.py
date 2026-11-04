@@ -11,6 +11,8 @@ ROCM_EXCLUDE_DIRS = {'parallel', 'comp_units', 'foreign_quant'}
 # GEMV instances and EXL3 tile-quantizer K1..K8 instances are required by the HIP runtime/converter.
 # Other comp_units remain excluded because they implement unported MoE/GEMM paths.
 ROCM_ALLOW_PREFIXES = (
+    'foreign_quant/fq_dequant.cu', 'foreign_quant/fq_dequant_kq.cu', 'foreign_quant/fq_gemv.cu',
+    'foreign_quant/fq_gemv_kq.cu', 'foreign_quant/fq_gemv_q8.cu', 'foreign_quant/fq_moe_kq.cu', 'foreign_quant/fq_gemm.cu',
     'quant/comp_units/exl3_gemv_int8_inst_',
     'quant/comp_units/quantize_tiles_inst_',
 )

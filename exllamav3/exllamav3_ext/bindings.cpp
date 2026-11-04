@@ -87,6 +87,7 @@
 
 #else
 
+#include "foreign_quant/fq_api.h"
 #include "hgemm.cuh"
 #include "rope.cuh"
 #include "gdn.cuh"
@@ -560,7 +561,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("ngram_dequant", &ngram_dequant, "ngram_dequant");
 #endif
 
-#if !defined(USE_ROCM)
+#if 1  // foreign-quant dequant/gemv: built on ROCm too (MoE/MLP fused tiers stay CUDA-only)
     // Foreign-quant kernels (foreign_quant/*.cu): CUDA builds only (the ROCm build does not compile them).
     // No env switch: they are additive (nothing upstream is replaced); Python falls back to torch when the ext
     // predates them.
@@ -570,6 +571,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("packed"), py::arg("out"));
     m.def("fq_dequant_nvfp4", &fq_dequant_nvfp4, "fq_dequant_nvfp4",
           py::arg("packed"), py::arg("scales"), py::arg("global_scale"), py::arg("out"));
+    m.def("fq_dequant_kq_grouped", &fq_dequant_kq_grouped, "fq_dequant_kq_grouped",
+          py::arg("ptrs"), py::arg("out"), py::arg("e0"), py::arg("ec"), py::arg("n"), py::arg("k"), py::arg("fmt"));
     m.def("fq_dequant_q4_k", &fq_dequant_q4_k, "fq_dequant_q4_k",
           py::arg("packed"), py::arg("out"));
     m.def("fq_dequant_q5_k", &fq_dequant_q5_k, "fq_dequant_q5_k",
@@ -591,6 +594,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fq_gemv_nvfp4", &fq_gemv_nvfp4, "fq_gemv_nvfp4",
           py::arg("x"), py::arg("packed"), py::arg("scales"), py::arg("global_scale"), py::arg("out"),
           py::arg("pair") = true);
+#if !defined(USE_ROCM)
     m.def("fq_moe_iq2xxs_grouped", &fq_moe_iq2xxs_grouped, "fq_moe_iq2xxs_grouped",
           py::arg("h"), py::arg("sel"), py::arg("wts"),
           py::arg("up_ptrs"), py::arg("down_ptrs"),
@@ -598,6 +602,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("partial"), py::arg("out"));
     m.def("fq_mlp_shared_iq2xxs", &fq_mlp_shared_iq2xxs, "fq_mlp_shared_iq2xxs",
           py::arg("x"), py::arg("up_packed"), py::arg("h"));
+#endif
     m.def("fq_q8_scratch", &fq_q8_scratch, "fq_q8_scratch",
           py::arg("dev"), py::arg("M"), py::arg("K"));
     m.def("fq_quant_q8_1_rows", &fq_quant_q8_1_rows, "fq_quant_q8_1_rows",
@@ -616,6 +621,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_gemv_iq4_xs_q8", &fq_gemv_iq4_xs_q8, "fq_gemv_iq4_xs_q8",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
+// grouped KQ/IQ4_XS decode MoE (fq_moe_kq.cu): portable dp4a kernels, built on ROCm too
     m.def("fq_moe_q4k_grouped_q8", &fq_moe_q4k_grouped_q8, "fq_moe_q4k_grouped_q8",
           py::arg("h"), py::arg("sel"), py::arg("wts"),
           py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
@@ -635,6 +641,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("h"), py::arg("sel"), py::arg("wts"),
           py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
           py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
+          py::arg("partial"), py::arg("out"));
+    m.def("fq_moe_kq_grouped_mixed_q8", &fq_moe_kq_grouped_mixed_q8, "fq_moe_kq_grouped_mixed_q8",
+          py::arg("h"), py::arg("sel"), py::arg("wts"),
+          py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
+          py::arg("fmt_ug"), py::arg("fmt_down"),
           py::arg("partial"), py::arg("out"));
 #endif
 }

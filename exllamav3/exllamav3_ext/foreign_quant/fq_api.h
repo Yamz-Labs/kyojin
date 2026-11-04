@@ -38,6 +38,7 @@ void fq_moe_iq2xxs_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor 
 // 256-block), out = fp16 [N, K] with K = Kb*256. Bitwise-identical to
 // dequant_row(blocks, fmt).astype(np.float16) in foreign_quant/k_quants.py.
 void fq_dequant_q4_k(torch::Tensor packed, torch::Tensor out);
+void fq_dequant_kq_grouped(torch::Tensor ptrs, torch::Tensor out, int64_t e0, int64_t ec, int64_t n, int64_t k, int64_t fmt);
 void fq_dequant_q5_k(torch::Tensor packed, torch::Tensor out);
 void fq_dequant_q6_k(torch::Tensor packed, torch::Tensor out);
 void fq_dequant_iq4_xs(torch::Tensor packed, torch::Tensor out);
@@ -71,3 +72,9 @@ void fq_moe_iq4xs_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor w
                              torch::Tensor down_ptrs,
                              int64_t gate_stride, int64_t up_stride, int64_t down_stride,
                              torch::Tensor partial, torch::Tensor out);
+void fq_moe_kq_grouped_mixed_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
+                                torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
+                                torch::Tensor down_ptrs,
+                                int64_t gate_stride, int64_t up_stride, int64_t down_stride,
+                                int64_t fmt_ug, int64_t fmt_down,
+                                torch::Tensor partial, torch::Tensor out);

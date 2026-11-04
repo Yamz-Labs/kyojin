@@ -39,12 +39,15 @@ MCPM_ARCH = "MiniCPMV4_7ForConditionalGeneration"
 MCPM_GGUF_ENV = "MCPM_GGUF"
 MCPM_FOREIGN = os.environ.get("MCPM_FOREIGN", "1") != "0"
 
-_GGML_FMT = {12: "q4_k", 13: "q5_k", 14: "q6_k", 23: "iq4_xs", 0: "fp", 1: "fp"}
+_GGML_FMT = {12: "q4_k", 13: "q5_k", 14: "q6_k", 23: "iq4_xs", 8: "q8_0", 0: "fp", 1: "fp"}
 
 P = "model.language_model"
 
 
-def _gguf_path() -> str:
+def _gguf_path(directory: str | None = None) -> str:
+    # plain-GGUF config dirs (loader/gguf_config.write_config_dir) carry model.gguf next to config.json
+    if directory and os.path.exists(os.path.join(directory, "model.gguf")):
+        return os.path.join(directory, "model.gguf")
     p = os.environ.get(MCPM_GGUF_ENV)
     assert p, f"{MCPM_GGUF_ENV} must point at the MiniCPM GGUF file"
     return p
@@ -132,7 +135,7 @@ class MiniCPMV47Config(Config):
         self.model_classes.pop("vision", None)
 
         # GGUF backing store + engine->gguf name map
-        self.gguf = GGUFCollection(_gguf_path())
+        self.gguf = GGUFCollection(_gguf_path(directory))
         nm: dict[str, str] = {}
         for i in range(self.num_hidden_layers):
             _map_layer(nm, i)
@@ -153,10 +156,17 @@ class MiniCPMV47Config(Config):
         # per-block Python). Format-generic (IQ4_XS / Q4_K).
         from ..foreign_quant.k_quants import dequant_iq4_xs_bulk, dequant_q4_K_bulk
         ty, dims, off = self.gguf.infos["token_embd.weight"]
-        bbs = {23: 136, 12: 144}
+        bbs = {23: 136, 12: 144, 8: 34}
         assert ty in bbs, f"token_embd type {ty}"
         bb = bbs[ty]
         K, N = dims[0], dims[1]
+        if ty == 8:
+            from ..foreign_quant.q8_0 import dequant_q8_0
+            raw = self.gguf._pread(off, N * (K // 32) * bb).reshape(N * (K // 32), bb)
+            w = dequant_q8_0(raw).reshape(N, K).astype(np.float16)
+            self.gguf.new_tensors = {
+                f"{P}.embed_tokens.weight": torch.from_numpy(np.ascontiguousarray(w))}
+            return
         assert K % 256 == 0
         raw = self.gguf._pread(off, N * (K // 256) * bb).reshape(N, (K // 256) * bb)
         nb = N * (K // 256)
@@ -175,6 +185,15 @@ def _fp_override(config, eng_weight_key: str, gguf_name: str):
     For the tiny GDN b/a projs the fused kernels require fp16."""
     from ..foreign_quant.k_quants import dequant_row
     ty, dims, off = config.gguf.infos[gguf_name]
+    if ty in (0, 1):  # F32 / F16 stored as is: [N, K] rows -> [K, N] = [in, out]
+        K, N = dims[0], dims[1]
+        dt = np.float32 if ty == 0 else np.float16
+        raw = config.gguf._pread(off, N * K * np.dtype(dt).itemsize)
+        w = np.frombuffer(raw, dtype=dt).reshape(N, K).T
+        if config.gguf.new_tensors is None:
+            config.gguf.new_tensors = {}
+        config.gguf.new_tensors[eng_weight_key] = torch.from_numpy(np.ascontiguousarray(w))
+        return
     bbs = {12: 144, 13: 176, 14: 210, 23: 136}
     fmts = {12: "q4_k", 13: "q5_k", 14: "q6_k", 23: "iq4_xs"}
     assert ty in bbs, f"{gguf_name}: type {ty}"
@@ -227,6 +246,8 @@ class MiniCPMV47TextModel(Model):
 
     def __init__(self, config: MiniCPMV47Config, **kwargs):
         super().__init__(config, **kwargs)
+        from ..model import cuda_graph
+        cuda_graph.default_on_for_foreign()
         H = config.hidden_size
         self.modules += [
             Embedding(config=config, key=f"{P}.embed_tokens",

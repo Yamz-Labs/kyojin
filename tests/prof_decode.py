@@ -1,48 +1,90 @@
-"""prof_decode.py PACK [--depth 4096] [--kv 16|K,V] [--steps 24]: kernel-time table of steady greedy decode steps (torch profiler).
-Prints per-kernel total/avg us per step (top 40) and the step wall time, to find where a decode step spends its time."""
-import argparse, os, sys, time
-ROOT = os.environ.get("ENG") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+"""Decode per op class on the current device. MODEL_DIR | FMOE_GGUF, DEC_N (concurrent sessions, default 1), DEC_STEPS.
+Prints step time, tok/s, achieved weight bandwidth vs a measured copy-bandwidth roof, and the kernel-time split."""
+import os, sys, time
 import torch
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from exllamav3 import Model, Config, Cache, Generator, Job, GreedySampler, Tokenizer
+from exllamav3.loader.gguf_config import write_config_dir
+from exllamav3.modules import BlockSparseMLP
 from torch.profiler import profile, ProfilerActivity
-from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job
-from exllamav3.cache import CacheLayer_quant
-from exllamav3.generator.sampler.presets import GreedySampler
-ap = argparse.ArgumentParser(); ap.add_argument("pack"); ap.add_argument("--depth", type=int, default=4096); ap.add_argument("--kv", default="16")
-ap.add_argument("--steps", type=int, default=24); ap.add_argument("--top", type=int, default=40); ap.add_argument("--noprof", action="store_true")
-a = ap.parse_args()
-cfg = Config.from_directory(a.pack); model = Model.from_config(cfg); tok = Tokenizer.from_config(cfg)
-ctx = ((a.depth + a.steps + 512 + 255) // 256) * 256
-if a.kv == "16": cache = Cache(model, max_num_tokens=ctx)
-else:
-    kb, vb = (int(x) for x in a.kv.split(",")); cache = Cache(model, max_num_tokens=ctx, layer_type=CacheLayer_quant, k_bits=kb, v_bits=vb)
-model.load(progressbar=False)
-gen = Generator(model=model, cache=cache, tokenizer=tok)
-D = os.path.join(ROOT, "exllamav3/conversion/standard_cal_data")
-s = open(f"{D}/wiki.utf8", encoding="utf8").read()
-ids = tok.encode(s[3000:3000 + a.depth * 8], add_bos=False).flatten()[:a.depth].view(1, -1)
-job = Job(input_ids=ids, max_new_tokens=a.steps + 40, sampler=GreedySampler(), stop_conditions=[])
-gen.enqueue(job)
-n = 0; prof = None; t0 = None
-while gen.num_remaining_jobs():
-    if a.noprof:
+N = int(os.environ.get("DEC_N", "1")); STEPS = int(os.environ.get("DEC_STEPS", "48"))
+d = os.environ.get("MODEL_DIR") or write_config_dir(os.environ["FMOE_GGUF"], os.path.join(os.environ.get("FMOE_CFG", "/tmp"), "qwen35moe_cfg"))
+config = Config.from_directory(d); model = Model.from_config(config)
+cache = Cache(model, max_num_tokens=4096 * max(N, 1)); model.load()
+tok = Tokenizer.from_config(config); gen = Generator(model=model, cache=cache, tokenizer=tok)
+x = torch.empty(1 << 28, dtype=torch.uint8, device="cuda"); y = torch.empty_like(x)
+for _ in range(3): y.copy_(x)
+torch.cuda.synchronize(); t = time.time()
+for _ in range(10): y.copy_(x)
+torch.cuda.synchronize(); bw = 10 * 2 * x.numel() / (time.time() - t) / 1e9   # read+write
+del x, y
+def active_params(mod, scale=1.0):
+    n = 0.0
+    if isinstance(mod, BlockSparseMLP):
+        k = mod.num_experts_per_tok / mod.num_experts
+        keep = {id(getattr(mod, a, None)) for a in ("shared_experts", "shared_gate", "routing_gate", "latent_in", "latent_out")}
+        return sum(active_params(c, scale if id(c) in keep else scale * k) for c in mod.modules)
+    if hasattr(mod, "in_features") and hasattr(mod, "out_features") and not mod.modules:
+        return scale * mod.in_features * mod.out_features
+    return sum(active_params(c, scale) for c in mod.modules)
+BPW = float(os.environ.get("DEC_BPW", "4.0"))
+ACT = sum(active_params(m) for m in model.modules)
+g = torch.Generator().manual_seed(3)
+_toks = {}
+_iter = gen.iterate
+def _it():
+    rs = _iter()
+    for r in rs:
+        if r.get("stage") == "streaming" and "token_ids" in r:
+            _toks.setdefault(r["serial"], []).extend(r["token_ids"].flatten().tolist())
+    return rs
+gen.iterate = _it
+def start(n_new):
+    for _ in range(N):
+        ids = torch.randint(1000, 100000, (1, 384), generator=g)
+        gen.enqueue(Job(input_ids=ids, max_new_tokens=n_new, sampler=GreedySampler(), stop_conditions=[]))
+def prefill_all():
+    # iterate until every job has produced its first token
+    seen = set()
+    while len(seen) < N:
         for r in gen.iterate():
-            if r.get("text", "") != "": n += 1
-        continue
-    if n == 16 and prof is None:
-        torch.cuda.synchronize(); prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]); prof.__enter__(); t0 = time.time()
-    for r in gen.iterate():
-        if r.get("text", "") != "": n += 1
-    if prof is not None and n >= 16 + a.steps:
-        torch.cuda.synchronize(); wall = time.time() - t0; prof.__exit__(None, None, None); break
-if a.noprof: print("decoded", n, "tokens"); sys.exit(0)
-print(f"wall per step {wall / a.steps * 1000:.2f} ms ({a.steps / wall:.1f} tok/s under the profiler)")
-ev = prof.key_averages()
-rows = sorted(ev, key=lambda e: -e.device_time_total)
-tot = sum(e.device_time_total for e in rows if e.device_type == torch.autograd.DeviceType.CUDA) if hasattr(torch.autograd, "DeviceType") else 0
-print(f"{'kernel':80s} {'calls/step':>10s} {'us/step':>9s} {'avg us':>8s}")
-tot_us = 0
-for e in rows[:a.top]:
-    if e.device_time_total <= 0: continue
-    print(f"{e.key[:80]:80s} {e.count / a.steps:10.1f} {e.device_time_total / a.steps:9.1f} {e.device_time_total / max(e.count, 1):8.1f}")
-print("sum of listed device us/step:", sum(e.device_time_total for e in rows[:a.top] if e.device_time_total > 0) / a.steps)
+            if r.get("stage") == "error": raise SystemExit("job error: " + str(r.get("error")))
+            if r.get("stage") == "streaming" and "token_ids" in r: seen.add(r["serial"])
+start(STEPS + 80); prefill_all()
+for _ in range(8): gen.iterate()
+torch.cuda.synchronize()
+if os.environ.get("DEC_CPROF"):
+    import cProfile, pstats
+    pr = cProfile.Profile(); pr.enable()
+    for _ in range(STEPS): gen.iterate()
+    torch.cuda.synchronize(); pr.disable()
+    pstats.Stats(pr).sort_stats("tottime").print_stats(14)
+    raise SystemExit
+t = time.time()
+with profile(activities=[ProfilerActivity.CUDA]) as p:
+    for _ in range(STEPS): gen.iterate()
+    torch.cuda.synchronize()
+dt = (time.time() - t) / STEPS
+tot = sum(e.device_time_total for e in p.key_averages())
+print(f"N={N}: step {dt*1e3:.1f} ms wall, {N/dt:.1f} tok/s total, device-busy {tot/STEPS/1e3:.1f} ms/step ({100*tot/STEPS/1e6/dt:.0f} % of wall); copy roof {bw:.0f} GB/s (r+w)")
+GBT = ACT * BPW / 8 / 1e9
+print(f"active params {ACT/1e9:.2f} B x {BPW} bpw = {GBT:.2f} GB per token; one weight pass per step = {GBT/dt:.0f} GB/s read ({100*GBT/dt/(bw/2):.0f} % of half the r+w copy rate); at N={N} MoE reads more experts than one token, dense reads the same")
+classes = {"gemv/linear": ("gemv", "mpw", "fq_", "exl3", "Cijk", "gemm", "mgemm", "hgemm"), "moe": ("moe", "expert", "route", "topk"),
+           "gdn/ssm": ("chunk", "gated", "delta", "recompute", "conv", "gdn", "recurrent"), "attn": ("attn", "flash", "qsa", "rope", "paged"),
+           "norm/elem": ("norm", "gr_", "silu", "add", "mul", "hc_apply", "copy", "fill", "elementwise", "reduce")}
+acc = {k: 0.0 for k in classes}; acc["other"] = 0.0
+for e in p.key_averages():
+    n = e.key.lower()
+    for k, subs in classes.items():
+        if any(s in n for s in subs): acc[k] += e.device_time_total; break
+    else: acc["other"] += e.device_time_total
+print("class split (% of device time): " + ", ".join(f"{k} {100*v/tot:.0f}" for k, v in sorted(acc.items(), key=lambda kv: -kv[1])))
+for e in sorted(p.key_averages(), key=lambda e: -e.device_time_total)[:12]:
+    print(f"{100*e.device_time_total/tot:5.1f}%  {e.device_time_total/STEPS:8.0f} us/step  n/step={e.count/STEPS:6.1f}  {e.key[:80]}")
+if os.environ.get("EXL3_BLOCK_GRAPH") == "1":
+    from exllamav3.modules import block_graph
+    st = block_graph.global_stats()
+    print("block_graph:", {k: (dict(v) if hasattr(v, "items") else v) for k, v in st.items()})
+
+import hashlib
+print("tokens:", {k: hashlib.md5(str(v).encode()).hexdigest()[:8] + f"({len(v)})" for k, v in sorted(_toks.items())})

@@ -26,7 +26,11 @@ GGML_BBS = {
     14: 210,  # Q6_K
     23: 136,  # IQ4_XS
 }
-GGML_QUANT = set(GGML_BBS.keys())
+# (elements, bytes) per block of the formats served by gap_formats / fq_gemv_q8_0 (32- and 64-element blocks)
+GGML_BLK = {t: (256, bb) for t, bb in GGML_BBS.items()}
+GGML_BLK.update({2: (32, 18), 6: (32, 22), 8: (32, 34), 20: (32, 18), 18: (256, 98), 21: (256, 110),
+                 39: (32, 17), 40: (64, 36)})
+GGML_QUANT = set(GGML_BLK.keys())
 
 _META_SZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
@@ -65,26 +69,28 @@ class GGUFCollection:
 
             def rs():
                 n = struct.unpack("<Q", f.read(8))[0]
-                return f.read(n).decode()
+                return f.read(n).decode(errors="replace")
 
-            def sv():
-                t = struct.unpack("<I", f.read(4))[0]
-                if t in _META_SZ:
-                    f.read(_META_SZ[t])
-                elif t == 8:
-                    f.read(struct.unpack("<Q", f.read(8))[0])
-                elif t == 9:
+            _SC = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+
+            def sv(t=None):
+                if t is None:
+                    t = struct.unpack("<I", f.read(4))[0]
+                if t in _SC:
+                    return struct.unpack(_SC[t], f.read(struct.calcsize(_SC[t])))[0]
+                if t == 8:
+                    return rs()
+                if t == 9:
                     at = struct.unpack("<I", f.read(4))[0]
                     n = struct.unpack("<Q", f.read(8))[0]
-                    if at == 8:
-                        for _ in range(n):
-                            f.read(struct.unpack("<Q", f.read(8))[0])
-                    else:
-                        f.read(n * _META_SZ[at])
+                    return [sv(at) for _ in range(n)]
+                raise ValueError(f"gguf metadata type {t}")
 
+            # Metadata kept (config + tokenizer are derived from it, see loader/gguf_config.py)
+            self.meta = {}
             for _ in range(nm):
-                rs()
-                sv()
+                k = rs()
+                self.meta[k] = sv()
             self.infos = {}
             for _ in range(nt):
                 name = rs()
@@ -203,10 +209,10 @@ class GGUFCollection:
         ty, dims, off = info
         dev = device if device is not None else torch.device("cpu")
         if ty in GGML_QUANT:
-            bb = GGML_BBS[ty]
+            qk, bb = GGML_BLK[ty]
             K, N = dims[0], dims[1]
-            assert K % 256 == 0
-            nb = K // 256
+            assert K % qk == 0
+            nb = K // qk
             if exp_idx is not None:
                 assert len(dims) == 3
                 E = dims[2]
