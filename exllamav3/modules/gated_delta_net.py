@@ -1484,7 +1484,7 @@ class GatedDeltaNet(Module):
         max_rows = 2 if os.environ.get("EXL3_PF_NO_TAIL", "0") == "1" else 1
         if self.kda and os.environ.get("EXL3_NC2_CKPT4", "0") == "1":
             max_rows = 4  # CK4 kernel build (vendor/fla/hip/kda_fused_h_hip.py): 8192-row chunks
-        if (not self.kda and os.environ.get("EXL3_GDN_HF", "0") == "1") or \
+        if (not self.kda and os.environ.get("EXL3_GDN_HF", "1" if torch.version.hip else "0") == "1") or \
                 (self.kda and (int(os.environ.get("EXL3_TAIL_DENSE", "0")) > 0 or int(os.environ.get("EXL3_TAIL_SUB", "0")) > 0)):
             max_rows = 8  # gdn_hf.hip / the CK8 kda_fused_h build side-write up to 8 rows (dense prompt-tail checkpoints, see Job.tail_ckpt_rows)
         if any(r % 64 or not cdim <= r < seqlen for r in rows):
