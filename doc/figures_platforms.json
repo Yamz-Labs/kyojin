@@ -92,7 +92,7 @@
    ]
   },
   "duel_version": "1.5.10",
-  "duel_date": "2026-11-04",
+  "duel_date": "before 2026-11-04",
   "duel_qwen27": {
    "rival": "llama.cpp Q4_K_M, KV q4_0",
    "ctx": [
