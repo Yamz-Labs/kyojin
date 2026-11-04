@@ -68,7 +68,7 @@ llama.cpp prefills Qwen3.8-27B 10 to 19 % faster up to 32K ([details](doc/rtx.md
 |---|---|---|---|---|---|
 | [Strix Halo](#strix-halo-amd), Ryzen AI Max+ 395, 128 GB | Qwen3.8-Flash-Next | 1480 at 8K | 52.2 at 8K | 1.8.9 (prefill), 1.5.10 (decode) | 2026-11-04, 2026-10-17 |
 | [RTX 3090](#rtx-nvidia), 24 GB | Qwen3.8-27B | 1621 at 5K | 74.6 at 5K | 1.8.9 | 2026-11-04 |
-| [RTX 3090](#rtx-nvidia), 24 GB | Flint V1 | 6282 at 4K | 133.5 at 4K | 1.5.10 | before 2026-11-04 |
+| [RTX 3090](#rtx-nvidia), 24 GB | Flint V1 | 6930 at 4K | 138.7 at 4K | 1.8.9 | 2026-11-04 |
 | [Mac Studio](#mac-apple-silicon), M3 Ultra, 256 GB | DeepSeek V4.1 Flash | 3001 at 8K | 62 at 8K | 1.8.9 | 2026-11-04 |
 
 Decode on Strix Halo and RTX uses speculative decoding. Full tables and method are on the platform pages: [Strix Halo](doc/strix.md), [RTX](doc/rtx.md), [Benchmarks](doc/benchmarks.md).
@@ -121,7 +121,7 @@ All packs are EXL3 and live on [Hugging Face](https://huggingface.co/yamz-labs).
 | [MiMo-V2.6-Flash-MOPD-EXL3-Yamz](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz) | 105.0 GB | Strix Halo | EXL3 | Strix: 760 prefill at 8K (Kyojin 1.5) |
 | [MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored) | 105.0 GB | Strix Halo | EXL3 | not measured |
 | [DeepSeek-V4.1-Flash-EXL3-Yamz](https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz) | 184.7 GB | Strix Halo (SSD tier), Mac | EXL3 | Strix: 187 to 257 prefill at 8K; Mac: 3001 prefill, 62 decode at 8K |
-| [Flint-40B-A2.5B-EXL3-Yamz](https://huggingface.co/yamz-labs/Flint-40B-A2.5B-EXL3-Yamz) | 17.9 GB | RTX 3090 | EXL3 3.43 bpw | RTX: 6282 prefill, 133.5 decode at 4K (Kyojin 1.5.10) |
+| [Flint-40B-A2.5B-EXL3-Yamz](https://huggingface.co/yamz-labs/Flint-40B-A2.5B-EXL3-Yamz) | 17.9 GB | RTX 3090 | EXL3 3.43 bpw | RTX: 6930 prefill, 138.7 decode at 4K (Kyojin 1.8.9) |
 | [Nanbeige4.3-33B-EXL3-Yamz](https://huggingface.co/yamz-labs/Nanbeige4.3-33B-EXL3-Yamz) | 18.7 GB | RTX 3090 | EXL3 4.0 bpw | not measured |
 
 **Uncensored mode.** Each model has an optional mode that makes it refuse far less. The engine applies it at load and the weights stay untouched: ready-made packs for [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) and [MiMo-V2.6-Flash](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored), and a preset inside the [Qwen3.8-Flash-Next pack](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) that is off by default. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).

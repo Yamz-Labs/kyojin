@@ -181,8 +181,7 @@ def make_all():
     for key, label in (("decode", "Decode"), ("prefill", "Prefill")):
         def fn(th, key=key, label=label):
             ser, xs, d = rtx_series(th, key, "qwen27")
-            old = sorted({p["version"] for p in d["points"]})
-            sub = [f'{P["rtx"]["machine"]}, {d["name"]}', f'Kyojin {old[-1]} (solid), {old[0]} (hollow), {d["points"][0]["date"]}']
+            sub = [f'{P["rtx"]["machine"]}, {d["name"]}', f'Kyojin {d["points"][0]["version"]}, {d["points"][0]["date"]}']
             return line_chart(th, f"{label}, tok/s", sub, "nv", ser, xs)
         write(f"{key}-rtx", fn)
     for key, label in (("decode", "Decode"), ("prefill", "Prefill")):
