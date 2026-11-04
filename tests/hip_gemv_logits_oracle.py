@@ -10,7 +10,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = REPO_ROOT / "tests" / "hip_gemv_logits_worker.py"
 DEFAULT_MODEL = os.path.expanduser("~/Models/Qwen3.8-27B-exl3")
 MODEL = os.environ.get("EXL3_TEST_MODEL", DEFAULT_MODEL)
-STEPS = 16
+# EXL3_ORACLE_STEPS (test only): forced-trace length; both the oracle and worker read it.
+STEPS = int(os.environ.get("EXL3_ORACLE_STEPS", "16"))
 PROMPT = "The capital of France is"
 
 
@@ -35,6 +36,14 @@ def main():
         torch.save(fallback["token_ids"].clone(), forced_tokens_path)
         _run_worker("gemv", gemv_path, forced_tokens_path)
         gemv = torch.load(gemv_path, map_location="cpu")
+        # EXL3_ORACLE_FREE (test only): also run an unforced pass for loop/coherence
+        # diagnosis. It is reported, not asserted against the forced delta bounds.
+        if os.environ.get("EXL3_ORACLE_FREE", "0") != "0":
+            free_path = tmpdir / "free.pt"
+            _run_worker("free", free_path)
+            free = torch.load(free_path, map_location="cpu")
+            print(f"free_route_counts {free['counts']}")
+            print(f"free_token_ids {free['token_ids'].tolist()}")
 
     fallback_tokens = fallback["token_ids"]
     gemv_tokens = gemv["token_ids"]
@@ -55,11 +64,14 @@ def main():
         # calls are independently ineligible architecture paths, not EXL3 reconstruction.
         assert gemv_counts["gemv"] >= 5000
         assert gemv_counts["gemv"] >= 2.5 * gemv_counts["hgemm"]
+        # Route proof for this fixture: every eligible tensor must have taken the GEMV.
+        assert gemv_counts["reconstruct"] == 0
+        assert gemv_counts["reconstruct_slice"] == 0
+        assert gemv_counts["reconstruct_had_slice"] == 0
     else:
+        # Unknown fixtures: the K/codebook/shape envelope may legitimately reject some
+        # tensors, so require only that the GEMV route ran at least once.
         assert gemv_counts["gemv"] > 0
-    assert gemv_counts["reconstruct"] == 0
-    assert gemv_counts["reconstruct_slice"] == 0
-    assert gemv_counts["reconstruct_had_slice"] == 0
 
     for logits in (fallback_logits, gemv_logits):
         assert not torch.isnan(logits).any()
@@ -100,14 +112,30 @@ def main():
     top5_min_overlap = top5_overlap.min().item()
 
     print(f"route_counts fallback={fallback_counts} gemv={gemv_counts}")
-    print(f"top1={top1_agree}/16 top5_exact={top5_exact}/16 top5_min_overlap={top5_min_overlap}/5")
+    print(f"top1={top1_agree}/{STEPS} top5_exact={top5_exact}/{STEPS} top5_min_overlap={top5_min_overlap}/5")
     print(f"max={max_diff:.6f} worst_step_mean={mean_diff:.6f} overall_mean={overall_mean:.6f}")
 
-    assert top1_agree == 16
-    assert top5_min_overlap >= 4
-    assert max_diff <= 0.55
-    assert mean_diff <= 0.075
-    assert overall_mean <= 0.05
+    assert top1_agree == STEPS
+    # Forced tokens make top1 identity a hard signal: the two arms share the token
+    # sequence, so any top1 disagreement is a real bug. The raw logit deltas, however,
+    # amplify through a hybrid recurrent (GDN) state because the cache is fed by the
+    # numerically different linears. Keep the tight bounds on the short trace and
+    # widen them with EXL3_ORACLE_STEPS; calibrate the tiers on the fixture used.
+    if STEPS <= 32:
+        assert top5_min_overlap >= 4
+        assert max_diff <= 0.55
+        assert mean_diff <= 0.075
+        assert overall_mean <= 0.05
+    elif STEPS <= 64:
+        assert top5_min_overlap >= 4
+        assert max_diff <= 1.5
+        assert mean_diff <= 0.15
+        assert overall_mean <= 0.05
+    else:
+        assert top5_min_overlap >= 2
+        assert max_diff <= 12.0
+        assert mean_diff <= 1.5
+        assert overall_mean <= 0.12
 
 
 if __name__ == "__main__":

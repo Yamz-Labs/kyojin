@@ -38,7 +38,8 @@ def _require_gfx12():
         f"ext.exl3_gemv_supported rejected gfx12 device 0 ({arch})"
 
 
-STEPS = 16
+# EXL3_ORACLE_STEPS (test only): forced-trace length; the oracle reads the same var.
+STEPS = int(os.environ.get("EXL3_ORACLE_STEPS", "16"))
 PROMPT = "The capital of France is"
 
 
@@ -49,8 +50,10 @@ def main():
     if not os.path.isdir(MODEL):
         raise SystemExit(f"Test model not found: {MODEL}")
 
+    # free: unforced generation for loop/coherence diagnosis; it is reported, not
+    # compared against the forced fallback trace.
     mode = sys.argv[1]
-    if mode not in {"fallback", "gemv"}:
+    if mode not in {"fallback", "gemv", "free"}:
         raise SystemExit(f"invalid mode: {mode}")
     output_path = Path(sys.argv[2])
     force_tokens_path = Path(sys.argv[3]) if len(sys.argv) > 3 else None
@@ -66,7 +69,7 @@ def main():
 
     job = Job(
         input_ids=tokenizer.encode(PROMPT, add_bos=True),
-        max_new_tokens=STEPS + 1,
+        max_new_tokens=STEPS,
         stop_conditions=[],
         return_logits=True,
         sampler=GreedySampler(),

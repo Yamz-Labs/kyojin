@@ -235,21 +235,14 @@ def test_hip_gemv_direct_binding_accepts_rank3_inputs():
 
 
 @torch.inference_mode()
-def test_hip_gemv_k5_plain_codebook_is_rejected():
-    """K5 requires the MCG or mul1 codebook; cb0 remains unsupported."""
+def test_hip_gemv_k5_plain_codebook_accepted():
+    """K5 with the plain (cb0) codebook is GEMV-eligible and matches reconstruct+hgemm."""
     _require_gfx12()
-    size = 128
-    A = torch.randn((1, size), dtype=torch.float16, device="cuda") * 1e-3
-    B = torch.full((size // 16, size // 16, 5 * 16), 0x1111,
-                   dtype=torch.int16, device="cuda")
-    signs = torch.ones((size,), dtype=torch.float16, device="cuda")
-    actual = torch.empty((1, size), dtype=torch.float16, device="cuda")
-    A_had = torch.empty_like(A)
-
-    with pytest.raises(RuntimeError, match="not eligible"):
-        ext.exl3_gemv(A, B, actual, signs, A_had, signs, False, False)
+    _run_k5_synthetic_oracle(False, False, 128, 128, 1, torch.float16)
+    _run_k5_synthetic_oracle(False, False, 128, 128, 8, torch.float32)
 
 
+@pytest.mark.parametrize("K", [2, 3, 4, 5, 6])
 @pytest.mark.parametrize(
     "mcg, multiplier, addend",
     [
@@ -258,14 +251,13 @@ def test_hip_gemv_k5_plain_codebook_is_rejected():
     ],
 )
 @torch.inference_mode()
-def test_procedural_codebook_matches_lop3_zero_state(mcg, multiplier, addend):
+def test_procedural_codebook_matches_lop3_zero_state(K, mcg, multiplier, addend):
     """The portable codebook expression must match the original PTX lop3 LUT 0x6a.
 
     A zero packed trellis decodes every weight from state zero, making the expected
     fp16 codebook value independent of the trellis layout and reconstruction path.
     """
     _require_gfx12()
-    K = 4
     packed = torch.zeros((8, 8, K * 16), dtype=torch.int16, device="cuda")
     weight = torch.empty((128, 128), dtype=torch.float16, device="cuda")
     ext.reconstruct(weight, packed, K, mcg, False)
@@ -284,10 +276,14 @@ def test_procedural_codebook_matches_lop3_zero_state(mcg, multiplier, addend):
         pytest.param(4, False, False, id="k4-plain"),
         pytest.param(4, True, False, id="k4-mcg"),
         pytest.param(4, False, True, id="k4-mul1"),
+        pytest.param(2, False, False, id="k2-plain"),
         pytest.param(2, True, False, id="k2-mcg"),
         pytest.param(2, False, True, id="k2-mul1"),
+        pytest.param(3, False, False, id="k3-plain"),
         pytest.param(3, True, False, id="k3-mcg"),
         pytest.param(3, False, True, id="k3-mul1"),
+        pytest.param(5, False, False, id="k5-plain"),
+        pytest.param(6, False, False, id="k6-plain"),
     ],
 )
 @torch.inference_mode()
@@ -302,10 +298,14 @@ def test_hip_gemv_synthetic_oracle(K, mcg, mul1):
         (4, False, False): 0x1111,
         (4, True, False): 0x2222,
         (4, False, True): 0x1111,
+        (2, False, False): 0x1111,
         (2, True, False): 0x5555,
         (2, False, True): 0x5555,
+        (3, False, False): 0x1111,
         (3, True, False): 0x2492,
         (3, False, True): 0x2492,
+        (5, False, False): 0x1111,
+        (6, False, False): 0x1111,
     }[K, mcg, mul1]
     A = torch.randn((1, size_k), dtype=torch.float16, device="cuda") * 1e-3
     B = torch.full((size_k // 16, size_n // 16, K * 16), packed_cycle,
@@ -356,6 +356,47 @@ def test_hip_gemv_rows_9_to_16_synthetic_route_to_gemv(K, mcg, mul1, rows, out_d
     assert torch.isfinite(actual).all()
     assert torch.isfinite(expected).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
+
+
+@torch.inference_mode()
+def test_hip_gemv_mmode2_narrow_n_matches_matmul():
+    """MMODE-2 at size_n=128 matches an explicit reconstruct + torch.matmul reference.
+
+    This shape runs the ROCm skinny hgemm path (m<=32, n<=128); using reconstruct +
+    torch.matmul keeps the oracle independent of that GEMM's accumulation order.
+    """
+    from exllamav3.modules.quant.exl3 import LinearEXL3
+
+    _require_gfx12()
+    K = 5
+    size_k = size_n = 128
+    rows = 9
+    torch.manual_seed(9100)
+    trellis = _make_distinct_finite_trellis(K, size_k, size_n)
+    suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
+    svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
+    mul1 = torch.ones((), dtype=torch.int32, device="cuda")
+    linear = LinearEXL3(None, size_k, size_n, suh=suh, svh=svh, trellis=trellis,
+                        mcg=None, mul1=mul1)
+    try:
+        x = torch.randn((1, rows, size_k), dtype=torch.float16, device="cuda") * 1e-3
+        weight = torch.empty((size_k, size_n), dtype=torch.half, device="cuda")
+        ext.reconstruct(weight, trellis, K, False, True)
+        xh = torch.empty((rows, size_k), dtype=torch.half, device="cuda")
+        ext.had_r_128(x.view(rows, size_k), xh, suh, None, 1.0)
+        expected = (xh.float() @ weight.float()).half()
+        ext.had_r_128(expected, expected, None, svh, 1.0)
+
+        calls, restore = _spy_ext_route()
+        try:
+            actual = linear.forward(x, {"reconstruct": False})
+        finally:
+            restore()
+        assert calls["gemv"] == 1, calls
+        assert calls["reconstruct"] == 0 and calls["hgemm"] == 0, calls
+        torch.testing.assert_close(actual.view(rows, size_n), expected, rtol=0, atol=0.03)
+    finally:
+        linear.unload()
 
 
 @torch.inference_mode()
@@ -723,3 +764,54 @@ def test_hip_decode_smoke(model):
     # lm_head may reconstruct during sampling, but at least one decode projection must GEMV.
     assert response is not None
     assert calls["gemv"] > 0, "decode smoke test never called ext.exl3_gemv"
+
+
+@pytest.mark.parametrize(
+    "K, key",
+    [
+        pytest.param(2, "model.language_model.layers.0.mlp.down_proj", id="k2-plain"),
+        pytest.param(3, "model.language_model.layers.0.linear_attn.in_proj_z", id="k3-plain"),
+        pytest.param(5, "lm_head", id="k5-plain"),
+    ],
+)
+@torch.inference_mode()
+def test_hip_gemv_plain_codebook_real_weight(model, K, key):
+    """Real Ora-pack tensors with the plain codebook match reconstruct+hgemm.
+
+    The synthetic oracle covers the codebook arithmetic; this covers the full pipeline
+    (real trellis state, suh/svh, packed layout) for the K values the Ora fixture uses.
+    Skips when the configured pack has no such tensor.
+    """
+    _require_gfx12()
+    if not os.path.isdir(MODEL):
+        pytest.skip(f"Test model not found: {MODEL} (set EXL3_TEST_MODEL)")
+    try:
+        linear = model.find_module(key)
+    except Exception as e:
+        pytest.skip(f"{key} not present in {MODEL}: {e}")
+    if linear is None:
+        pytest.skip(f"{key} not present in {MODEL}")
+    try:
+        linear.load(device="cuda")
+        inner = linear.inner
+        if inner.K != K or inner.mcg or inner.mul1:
+            pytest.skip(f"{key} is K={inner.K} mcg={bool(inner.mcg)} mul1={bool(inner.mul1)}, not plain K{K}")
+        torch.manual_seed(0)
+        x = torch.randn((1, 1, linear.in_features), dtype=torch.float16, device="cuda") * 1e-3
+
+        calls, restore = _spy_ext_route()
+        try:
+            actual = linear.forward(x, {"reconstruct": False})
+        finally:
+            restore()
+        expected = linear.forward(x, {"reconstruct": True})
+
+        assert calls["gemv"] == 1, f"{key}: expected one exl3_gemv call, got {calls}"
+        assert calls["reconstruct"] == 0
+        assert calls["reconstruct_slice"] == 0
+        assert calls["reconstruct_had_slice"] == 0
+        assert calls["hgemm"] == 0, f"{key}: reconstruct=False must not reach ext.hgemm"
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
+    finally:
+        if linear is not None:
+            linear.unload()
