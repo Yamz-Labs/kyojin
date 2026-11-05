@@ -1640,7 +1640,7 @@ void exl3_gemv
     };
 
     bool ok = false;
-    bool out_rotated = false;
+    [[maybe_unused]] bool out_rotated = false;
 #if defined(USE_ROCM)
     // gfx1200/gfx1201: the fdot2 dot core takes the dense multi-row GEMV
     // as well as m == 1. The input Hadamard above has already produced A_had.

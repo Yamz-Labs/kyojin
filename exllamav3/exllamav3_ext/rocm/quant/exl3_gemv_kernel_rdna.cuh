@@ -13,7 +13,8 @@
 // registers, unswizzled to row-major in LDS, then consumed by V_DOT2_F32_F16.
 //
 // Handles bits 1-8, cb 0 (default) / 1 (mcg) / 2 (mul1), fp16 or fp32 C, and
-// m == 1 only. Larger m falls through to the cooperative GEMM.
+// M == 1 plus the M == 2..8 split-K MR form below. Larger M falls through to
+// the cooperative GEMM.
 // =============================================================================
 
 #include <hip/hip_runtime.h>
@@ -50,7 +51,7 @@ static inline size_t exl3_gemv_smem_bytes(int warps_per_block)
 
 // =============================================================================
 // Dot-product tile loop -- shared between the single-matrix GEMV kernel below
-// and the multi-matrix (expert-batched) GEMV in exl3_mgemv_rdna.cu
+// and the multi-row split-K form below
 // =============================================================================
 //
 // Extracted verbatim from exl3_gemv_dot_kernel; the kernel wrappers own the
@@ -574,7 +575,8 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_splitk_mr
             #pragma unroll
             for (int r = 0; r < M; ++r)
             {
-                const half* Ar = A + (size_t) r * lda;
+                const int rr = r < rows_valid ? r : rows_valid - 1;
+                const half* Ar = A + (size_t) rr * lda;
                 o[r] = core == EXL3_GEMV_CORE_LDS
                     ? exl3_gemv_dot_tile<bits, cb>(Ar, B, size_k, n_tiles, tn, lane,
                                                    my_sh_b, my_sh_b_quant, k0, k1)
@@ -649,10 +651,11 @@ __device__ __forceinline__ void exl3_gemv_fused_epilogue
 // form, which avoids 16k-block grids.
 #define EXL3_GEMV_SPLITK_MAX_TILES 2048
 
-// The split-K wave count is not a fixed constant: all three split-K sites call
-// exl3_gemv_splitk_warps() (exl3_gemv_rdna.cu), which picks 4, 8 or 16 from
-// (k_tiles, blocks = n_tiles x bszm), and EXL3_GEMV_SPLITK_WARPS (env) forces
-// one count everywhere.
+// The split-K wave count is not a fixed constant: every split-K launch site
+// calls exl3_gemv_splitk_warps() (exl3_gemv_rdna.cu), which picks 4, 8 or 16
+// from (k_tiles, blocks = n_tiles x bszm), and EXL3_GEMV_SPLITK_WARPS (env)
+// forces one count everywhere. The M == 2..8 MR kernel
+// (exl3_gemv_dot_kernel_splitk_mr) gets its wave count from that same helper.
 
 template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK>
 __global__

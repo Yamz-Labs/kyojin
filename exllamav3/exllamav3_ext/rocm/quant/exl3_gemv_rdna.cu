@@ -1,9 +1,11 @@
-// RDNA (gfx1200/gfx1201) m=1 GEMV launcher. See exl3_gemv_rdna.cuh.
+// RDNA (gfx1200/gfx1201) GEMV launcher. See exl3_gemv_rdna.cuh.
 //
 // The kernel cores are adapted from exllamav3's RDNA GEMV (rocm/quant/
 // exl3_gemv_kernel_rdna.cuh, MIT) and use the same dq chain as the rest of
-// this tree. Only the dense single-matrix m == 1 form is built here; the
-// multi-row and multi-matrix forms stay on the generic WMMA path.
+// this tree. Two dense single-matrix forms are built here: M == 1 with the
+// output Hadamard fused into the store epilogue, and M == 2..8 as a split-K
+// multi-row kernel whose C the caller rotates. The multi-matrix and expert
+// forms are not built here and stay on the generic WMMA path.
 //
 // Env switches (measurement / A-B only; all default to the measured choice):
 //   EXL3_GEMV=0                 keep the generic WMMA GEMV
@@ -13,6 +15,10 @@
 //   EXL3_GEMV_SPLITK_WARPS=4|8|16
 //   EXL3_GEMV_WARPS=4|8|16      force the single-warp block size
 //   EXL3_GEMV_FUSE_OUT=0        keep the separate output Hadamard launcher
+//
+// EXL3_GEMV_SPLITK, EXL3_GEMV_SPLITK_WARPS and EXL3_GEMV_WARPS select the
+// M == 1 form only; the M == 2..8 path always uses the split-K MR kernel and
+// ignores them. EXL3_GEMV_FUSE_OUT likewise applies to M == 1 only.
 
 #if defined(USE_ROCM)
 
@@ -377,7 +383,6 @@ bool exl3_gemv_rdna_launch
         size_n / 128 <= EXL3_GEMV_SEG_COUNTERS)
         seg = seg_counters(device, stream);
     const bool fused = seg != nullptr;
-    if (out_rotated) *out_rotated = fused;
 
     #define LAUNCH_FUSED(bits_val, codebook, w, kern)                              \
         do {                                                                       \
@@ -450,6 +455,10 @@ bool exl3_gemv_rdna_launch
     #undef LAUNCH_FOR_W
     #undef LAUNCH_PLAIN_K
     #undef LAUNCH_FUSED
+
+    // Publish only now: every LAUNCH_* path above can return false, and the
+    // caller must fall back and still run its output Hadamard in that case.
+    if (out_rotated) *out_rotated = fused;
 
     return true;
 }
