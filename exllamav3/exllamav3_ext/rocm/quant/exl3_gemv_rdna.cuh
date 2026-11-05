@@ -32,6 +32,7 @@ bool exl3_gemv_rdna_launch
     void* C,
     const half* svh,
     int device,
+    int size_m,
     int size_k,
     int size_n,
     int K,

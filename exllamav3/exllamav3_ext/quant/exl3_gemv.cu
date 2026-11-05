@@ -1642,14 +1642,15 @@ void exl3_gemv
     bool ok = false;
     bool out_rotated = false;
 #if defined(USE_ROCM)
-    // gfx1200/gfx1201: m == 1 takes the fdot2 dot core. The input Hadamard
-    // above has already produced A_had; the output Hadamard is fused into the
-    // dot kernel when the width fits the per-device segment counters and is
-    // otherwise applied below as before. Rows > 1 and half-integer bitrates
-    // keep the WMMA kernel.
-    if (size_m == 1 && !half_k && exl3_gemv_rdna_arch(device))
+    // gfx1200/gfx1201: the fdot2 dot core takes the dense multi-row GEMV
+    // as well as m == 1. The input Hadamard above has already produced A_had.
+    // For m == 1 the output Hadamard is fused into the dot kernel when the
+    // width fits the per-device segment counters; rows > 1 store the raw
+    // products and the had_r_128 below rotates the whole C as before.
+    // Half-integer bitrates keep the WMMA kernel.
+    if (!half_k && exl3_gemv_rdna_arch(device))
         ok = exl3_gemv_rdna_launch(A_ptr, B_ptr, C_ptr, svh_ptr, device,
-                                   size_k, size_n, K, cb, c_fp32, stream,
+                                   size_m, size_k, size_n, K, cb, c_fp32, stream,
                                    true, &out_rotated);
 #endif
     if (!ok)

@@ -171,6 +171,9 @@ bool exl3_gemv_rdna_arch(int device)
         cache[device] = -1;
         return false;
     }
+    // This path is tuned for gfx1200/gfx1201. Keep the arch test explicit so
+    // another RDNA family is opted in only after its own measurement and
+    // tuning.
     const bool ok =
         strncmp(prop.gcnArchName, "gfx1200", 7) == 0 ||
         strncmp(prop.gcnArchName, "gfx1201", 7) == 0;
@@ -277,6 +280,7 @@ bool exl3_gemv_rdna_launch
     void* C,
     const half* svh,
     int device,
+    int size_m,
     int size_k,
     int size_n,
     int K,
@@ -290,11 +294,71 @@ bool exl3_gemv_rdna_launch
     if (out_rotated) *out_rotated = false;
     if (K < 1 || K > 8) return false;
     if (cb < 0 || cb > 2) return false;
+    if (size_m < 1 || size_m > 8) return false;
     if (size_k % 128 || size_n % 128) return false;
     if (env_int("EXL3_GEMV", 1) == 0) return false;
 
     const int n_tiles = size_n / 16;
     const int k_blocks = size_k / 16;
+    const int core = exl3_gemv_core_mode();
+
+    // Rows 2..8: one block per N-tile, warps split K, the decoded tile is
+    // applied to every row before it is discarded. No output-Hadamard fusion
+    // (the caller's had_r_128 covers all rows), so C holds the raw products.
+    if (size_m > 1)
+    {
+        if (K < 2 || K > 6 || (cb != 1 && cb != 2)) return false;
+        const int M = size_m <= 2 ? 2 : (size_m == 3 ? 3 : (size_m == 4 ? 4 : 8));
+        const int warps = splitk_warps(k_blocks, n_tiles);
+        const size_t smem_mr = exl3_gemv_smem_bytes_splitk_mr(warps, M);
+        if (smem_mr > 64 * 1024) return false;
+
+        #define LAUNCH_MR(bits_val, codebook, m_val, w)                                \
+            do {                                                                       \
+                if (c_fp32) hipLaunchKernelGGL((exl3_gemv_dot_kernel_splitk_mr<bits_val, true,  codebook, m_val, w>), \
+                    dim3(n_tiles), dim3(w * 32), smem_mr, stream, A, B, C, size_k, size_n, size_m, core); \
+                else        hipLaunchKernelGGL((exl3_gemv_dot_kernel_splitk_mr<bits_val, false, codebook, m_val, w>), \
+                    dim3(n_tiles), dim3(w * 32), smem_mr, stream, A, B, C, size_k, size_n, size_m, core); \
+            } while (0)
+
+        #define LAUNCH_MR_W(bits_val, codebook, m_val)                                 \
+            do {                                                                       \
+                if (warps == 4)       LAUNCH_MR(bits_val, codebook, m_val, 4);         \
+                else if (warps == 8)  LAUNCH_MR(bits_val, codebook, m_val, 8);         \
+                else if (warps == 16) LAUNCH_MR(bits_val, codebook, m_val, 16);        \
+                else return false;                                                     \
+            } while (0)
+
+        #define LAUNCH_MR_CB(bits_val, m_val)                                          \
+            do {                                                                       \
+                if (cb == 1)      LAUNCH_MR_W(bits_val, 1, m_val);                     \
+                else if (cb == 2) LAUNCH_MR_W(bits_val, 2, m_val);                     \
+                else return false;                                                     \
+            } while (0)
+
+        #define LAUNCH_MR_K(m_val)                                                     \
+            do {                                                                       \
+                switch (K) {                                                           \
+                    case 2: LAUNCH_MR_CB(2, m_val); break;                             \
+                    case 3: LAUNCH_MR_CB(3, m_val); break;                             \
+                    case 4: LAUNCH_MR_CB(4, m_val); break;                             \
+                    case 5: LAUNCH_MR_CB(5, m_val); break;                             \
+                    case 6: LAUNCH_MR_CB(6, m_val); break;                             \
+                    default: return false;                                             \
+                }                                                                      \
+            } while (0)
+
+        if (M == 2) LAUNCH_MR_K(2);
+        else if (M == 3) LAUNCH_MR_K(3);
+        else if (M == 4) LAUNCH_MR_K(4);
+        else LAUNCH_MR_K(8);
+
+        #undef LAUNCH_MR_K
+        #undef LAUNCH_MR_CB
+        #undef LAUNCH_MR_W
+        #undef LAUNCH_MR
+        return true;
+    }
 
     bool splitk = splitk_enabled() && n_tiles <= EXL3_GEMV_SPLITK_MAX_TILES;
     int warps = warps_for(n_tiles, k_blocks);
@@ -308,7 +372,6 @@ bool exl3_gemv_rdna_launch
     }
     if (smem > 64 * 1024) return false;
 
-    const int core = exl3_gemv_core_mode();
     int* seg = nullptr;
     if (fuse_out && env_int("EXL3_GEMV_FUSE_OUT", 1) != 0 &&
         size_n / 128 <= EXL3_GEMV_SEG_COUNTERS)
