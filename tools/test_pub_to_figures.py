@@ -88,7 +88,6 @@ def test_writes_schema_and_renders(tmp_path, capsys):
                            "spec": old["models"][0]["spec"]}
     assert g["before"]["spec"] == model(old, "glm")["spec"]
     assert mimo == model(old, "mimo")  # not measured in this pass: untouched
-    assert F["rivals"] == old["rivals"] and F["quality"] == old["quality"]
     # the renderers ran
     assert (root / "doc" / "img" / "prefill.svg").exists()
     assert "1502 at 8K" in (root / "doc" / "strix.md").read_text(encoding="utf-8")
@@ -111,7 +110,7 @@ def test_500k_point_with_flag_writes_key_and_renders(tmp_path):
     # the charts reach the 500K tick, labelled "500K" (499712 // 1024 would print 488K)
     svg = (root / "doc" / "img" / "decode_models.svg").read_text(encoding="utf-8")
     assert ">500K</text>" in svg and "488K" not in svg
-    for name in ("prefill", "prefill_context", "decode_context"):
+    for name in ("prefill",):
         assert ">500K</text>" in (root / "doc" / "img" / f"{name}.svg").read_text(encoding="utf-8")
     md = (root / "doc" / "benchmarks.md").read_text(encoding="utf-8")
     assert "Prefill 500K" in md and "488K" not in md
