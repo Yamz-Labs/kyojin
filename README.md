@@ -14,10 +14,10 @@
 </p>
 
 <table align="center">
-<tr><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-glm-dark.svg"><img src="doc/img/home/card-glm-light.svg" alt="GLM-5.3-Flash on Strix Halo: 32 tok/s decode, 500K context" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-flash-next-dark.svg"><img src="doc/img/home/card-flash-next-light.svg" alt="Qwen3.8-Flash-Next on Strix Halo: 53 tok/s decode, 256K context" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-qwen27-dark.svg"><img src="doc/img/home/card-qwen27-light.svg" alt="Qwen3.8-27B on RTX 3090: 75 tok/s decode, 245K context" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-ds41-dark.svg"><img src="doc/img/home/card-ds41-light.svg" alt="DeepSeek V4.1 Flash on Mac Studio M5 Ultra: 62 tok/s decode, 983K context" width="100%"></picture></a></td></tr>
+<tr><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-glm-dark.svg"><img src="doc/img/home/card-glm-light.svg" alt="GLM-5.3-Flash on Strix Halo: 32 tok/s decode, 633 tok/s prefill" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-flash-next-dark.svg"><img src="doc/img/home/card-flash-next-light.svg" alt="Qwen3.8-Flash-Next on Strix Halo: 53 tok/s decode, 1,576 tok/s prefill" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-qwen27-dark.svg"><img src="doc/img/home/card-qwen27-light.svg" alt="Qwen3.8-27B on RTX 3090: 75 tok/s decode, 1,621 tok/s prefill" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-ds41-dark.svg"><img src="doc/img/home/card-ds41-light.svg" alt="DeepSeek V4.1 Flash on Mac Studio M5 Ultra: 62 tok/s decode, 3,001 tok/s prefill" width="100%"></picture></a></td></tr>
 </table>
 
-<p align="center"><sub>Decode tok/s at 8K (RTX: 5K), served. Kyojin 1.8.10 on Strix Halo, 1.8.9 on RTX and Mac.</sub></p>
+<p align="center"><sub>Decode and prefill tok/s at 8K (RTX: 5K), served. Kyojin 1.8.10 on Strix Halo, 1.8.9 on RTX and Mac.</sub></p>
 
 ## Quick start
 
@@ -86,25 +86,17 @@ One prompt each, written by the model running on Kyojin and published as it came
 
 All packs are EXL3 on Hugging Face: ours on [yamz-labs](https://huggingface.co/yamz-labs), Qwen3.8-27B from [turboderp](https://huggingface.co/turboderp/Qwen3.8-27B-exl3). Serve commands: [doc/models.md](doc/models.md).
 
-| Model | Size | Machine |
+| Pack | Machine | Size |
 |---|---|---|
-| [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz) | 100.1 GB | Strix Halo |
-| [Qwen3.8-Flash-Next](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) | 95.4 GB | Strix Halo |
-| [Qwen3.8-27B-exl3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6) (turboderp, EXL3 4.0 bpw) | 15 GiB | RTX 3090 |
-| [DeepSeek V4.1 Flash](https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz) | 184.7 GB | Mac Studio, Strix Halo (SSD tier) |
-
-<details>
-<summary>Other packs</summary>
-
-| Pack | Size | Machine |
-|---|---|---|
-| [MiMo-V2.6-Flash-MOPD](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz) | 105.0 GB | Strix Halo |
-| [MiMo-V2.6-Flash-MOPD, uncensored](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored) | 105.0 GB | Strix Halo |
-| [GLM-5.3-Flash, uncensored](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) | 100.1 GB | Strix Halo |
-| [Flint-40B-A2.5B](https://huggingface.co/yamz-labs/Flint-40B-A2.5B-EXL3-Yamz) | 17.9 GB | RTX 3090 |
-| [Nanbeige4.3-33B](https://huggingface.co/yamz-labs/Nanbeige4.3-33B-EXL3-Yamz) | 18.7 GB | RTX 3090 |
-
-</details>
+| [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz) | Strix Halo | 100.1 GB |
+| [Qwen3.8-Flash-Next](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) | Strix Halo | 95.4 GB |
+| [Qwen3.8-27B-exl3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6) (turboderp) | RTX 3090 | 15 GiB |
+| [DeepSeek V4.1 Flash](https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz) | Mac Studio, Strix Halo (SSD tier) | 184.7 GB |
+| [GLM-5.3-Flash, uncensored](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) | Strix Halo | 100.1 GB |
+| [MiMo-V2.6-Flash-MOPD](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz) | Strix Halo | 105.0 GB |
+| [MiMo-V2.6-Flash-MOPD, uncensored](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored) | Strix Halo | 105.0 GB |
+| [Flint-40B-A2.5B](https://huggingface.co/yamz-labs/Flint-40B-A2.5B-EXL3-Yamz) | RTX 3090 | 17.9 GB |
+| [Nanbeige4.3-33B](https://huggingface.co/yamz-labs/Nanbeige4.3-33B-EXL3-Yamz) | RTX 3090 | 18.7 GB |
 
 ## Contributors
 
