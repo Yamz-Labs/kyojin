@@ -1,0 +1,41 @@
+# Dependabot version updates for the Nix flake inputs.
+#
+# Scope is deliberately narrow: flake.lock only. flake.lock had never been
+# updated since the flake landed, so nixpkgs and the pyproject-nix inputs
+# drifted for weeks with no PR to review.
+#
+# Deliberately NOT included: the `uv` / `pip` ecosystems. torch, rocm*, triton
+# and rocm-sdk-* in pyproject.toml are a single hand-bumped snapshot of AMD's
+# bleeding-edge ROCm 10.1 nightly index, pinned with `==`. Dependabot bumping
+# any one of them produces a wheel set that no longer agrees with uv.lock or
+# with the compiled extension, so those pins stay a human decision.
+#
+# Also note: a flake.lock bump rebuilds the ROCm extension (~20 min cold), so
+# the cadence is weekly and the PR count is capped below.
+
+version: 2
+
+# The pyproject-nix inputs are follows-linked (uv2nix follows pyproject-nix,
+# build-system-pkgs follows both), so bumping one without the others produces a
+# combination CI cannot validate. One group, one PR, one test.
+groups:
+  nix-python-toolchain:
+    patterns:
+      - "uv2nix"
+      - "pyproject-nix"
+      - "pyproject-build-systems"
+
+  nix-build-tools:
+    patterns:
+      - "flake-parts"
+      - "git-hooks-nix"
+
+updates:
+  # nixpkgs is left out of every group on purpose: it moves torch, python and
+  # glibc, so it gets its own PR to keep the blast radius separable from a
+  # toolchain bump.
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
