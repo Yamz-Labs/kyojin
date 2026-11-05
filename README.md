@@ -13,11 +13,13 @@
 <a href="https://x.com/YamzLabs"><img alt="X" src="https://img.shields.io/badge/news-%40YamzLabs-444444"></a>
 </p>
 
+<p align="center"><a href="#quick-start">Quick start</a> · <a href="#speed-by-context">Speed</a> · <a href="#models">Models</a> · <a href="#read-more">Docs</a></p>
+
 <table align="center">
-<tr><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-glm-dark.svg"><img src="doc/img/home/card-glm-light.svg" alt="GLM-5.3-Flash on Strix Halo: 32 tok/s decode, 500K context" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-flash-next-dark.svg"><img src="doc/img/home/card-flash-next-light.svg" alt="Qwen3.8-Flash-Next on Strix Halo: 53 tok/s decode, 256K context" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-qwen27-dark.svg"><img src="doc/img/home/card-qwen27-light.svg" alt="Qwen3.8-27B on RTX 3090: 75 tok/s decode, 245K context" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-ds41-dark.svg"><img src="doc/img/home/card-ds41-light.svg" alt="DeepSeek V4.1 Flash on Mac Studio M5 Ultra: 62 tok/s decode, 983K context" width="100%"></picture></a></td></tr>
+<tr><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-glm-dark.svg"><img src="doc/img/home/card-glm-light.svg" alt="GLM-5.3-Flash on Strix Halo: 32 tok/s decode, 633 tok/s prefill" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-flash-next-dark.svg"><img src="doc/img/home/card-flash-next-light.svg" alt="Qwen3.8-Flash-Next on Strix Halo: 53 tok/s decode, 1,576 tok/s prefill" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-qwen27-dark.svg"><img src="doc/img/home/card-qwen27-light.svg" alt="Qwen3.8-27B on RTX 3090: 75 tok/s decode, 1,621 tok/s prefill" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-ds41-dark.svg"><img src="doc/img/home/card-ds41-light.svg" alt="DeepSeek V4.1 Flash on Mac Studio M5 Ultra: 62 tok/s decode, 3,001 tok/s prefill" width="100%"></picture></a></td></tr>
 </table>
 
-<p align="center"><sub>Decode tok/s at 8K (RTX: 5K), served. Kyojin 1.8.10 on Strix Halo, 1.8.9 on RTX and Mac.</sub></p>
+<p align="center"><sub>Decode and prefill tok/s at 8K (RTX: 5K), served. Kyojin 1.8.10 on Strix Halo, 1.8.9 on RTX and Mac.</sub></p>
 
 ## Quick start
 
@@ -45,6 +47,15 @@ python -m kyojin_mlx.serve.server ./ds41-pack --sessions 4 --ctx 32768 --port 80
 
 Every server speaks the OpenAI API. More commands: [doc/models.md](doc/models.md).
 
+### Test it
+
+With a server running on port 8000 (the Mac command above uses 8080):
+
+```bash
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Say hello in five words."}]}'
+```
+
 ## Speed by context
 
 Tokens per second against context length (log scale), served through the real server with real text. Each chart says its machine, Kyojin version and date. Higher is better.
@@ -67,6 +78,16 @@ Tokens per second against context length (log scale), served through the real se
 <tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-mac-dark.svg"><img src="doc/img/home/decode-mac-light.svg" alt="Decode tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-mac-dark.svg"><img src="doc/img/home/prefill-mac-light.svg" alt="Prefill tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td></tr>
 </table>
 
+### Benchmark it yourself
+
+With a server running:
+
+```bash
+tools/bench.sh --base http://localhost:8000/v1 --reps 3
+```
+
+It prints a Markdown block. Paste it in a benchmark report issue to share your results ([how the figures are measured](doc/benchmarks.md)).
+
 ## What is inside
 
 - Speculative decoding, on by default; it returns the same tokens as plain decoding.
@@ -86,25 +107,25 @@ One prompt each, written by the model running on Kyojin and published as it came
 
 All packs are EXL3 on Hugging Face: ours on [yamz-labs](https://huggingface.co/yamz-labs), Qwen3.8-27B from [turboderp](https://huggingface.co/turboderp/Qwen3.8-27B-exl3). Serve commands: [doc/models.md](doc/models.md).
 
-| Model | Size | Machine |
+| Pack | Machine | Size |
 |---|---|---|
-| [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz) | 100.1 GB | Strix Halo |
-| [Qwen3.8-Flash-Next](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) | 95.4 GB | Strix Halo |
-| [Qwen3.8-27B-exl3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6) (turboderp, EXL3 4.0 bpw) | 15 GiB | RTX 3090 |
-| [DeepSeek V4.1 Flash](https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz) | 184.7 GB | Mac Studio, Strix Halo (SSD tier) |
+| [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz) | Strix Halo | 100.1 GB |
+| [Qwen3.8-Flash-Next](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) | Strix Halo | 95.4 GB |
+| [Qwen3.8-27B-exl3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6) (turboderp) | RTX 3090 | 15 GiB |
+| [DeepSeek V4.1 Flash](https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz) | Mac Studio, Strix Halo (SSD tier) | 184.7 GB |
+| [GLM-5.3-Flash, uncensored](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) | Strix Halo | 100.1 GB |
+| [MiMo-V2.6-Flash-MOPD](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz) | Strix Halo | 105.0 GB |
+| [MiMo-V2.6-Flash-MOPD, uncensored](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored) | Strix Halo | 105.0 GB |
+| [Flint-40B-A2.5B](https://huggingface.co/yamz-labs/Flint-40B-A2.5B-EXL3-Yamz) | RTX 3090 | 17.9 GB |
+| [Nanbeige4.3-33B](https://huggingface.co/yamz-labs/Nanbeige4.3-33B-EXL3-Yamz) | RTX 3090 | 18.7 GB |
 
-<details>
-<summary>Other packs</summary>
+## Known limits
 
-| Pack | Size | Machine |
-|---|---|---|
-| [MiMo-V2.6-Flash-MOPD](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz) | 105.0 GB | Strix Halo |
-| [MiMo-V2.6-Flash-MOPD, uncensored](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored) | 105.0 GB | Strix Halo |
-| [GLM-5.3-Flash, uncensored](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) | 100.1 GB | Strix Halo |
-| [Flint-40B-A2.5B](https://huggingface.co/yamz-labs/Flint-40B-A2.5B-EXL3-Yamz) | 17.9 GB | RTX 3090 |
-| [Nanbeige4.3-33B](https://huggingface.co/yamz-labs/Nanbeige4.3-33B-EXL3-Yamz) | 18.7 GB | RTX 3090 |
-
-</details>
+- Strix Halo needs Linux (Ubuntu/Debian tested), a gfx1151 machine with 128 GB and ROCm 7.0 or newer; ROCm 6.4 has no gfx1151 code ([install](doc/install.md)).
+- NVIDIA needs sm_80 or newer; tested on one RTX 3090 with 24 GB ([RTX](doc/rtx.md)).
+- The first GLM launch tunes its kernels for about 10 minutes, and the port stays closed until it finishes ([install](doc/install.md)).
+- GLM at `-c 131072` leaves about 10 GiB free on a 128 GB machine ([install](doc/install.md)).
+- The 763B model on one 128 GB machine is experimental: real decode is about 5 to 11 tokens per second ([Strix Halo](doc/strix.md)).
 
 ## Contributors
 

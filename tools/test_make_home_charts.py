@@ -32,7 +32,7 @@ def test_numbers_come_from_data(tmp_path):
     P = json.load(open(os.path.join(ROOT, "doc", "figures_platforms.json")))
     assert ">74.6<" in rd("decode-rtx-light.svg") and P["rtx"]["qwen27"]["points"][0]["decode"] == 74.6
     assert ">3,001<" in rd("prefill-mac-light.svg")
-    assert ">62<" in rd("card-ds41-light.svg") and ">983K<" in rd("card-ds41-light.svg")
+    assert ">62<" in rd("card-ds41-light.svg") and ">3,001<" in rd("card-ds41-light.svg") and "max context" not in rd("card-ds41-light.svg")
 
 
 def test_readme_uses_every_chart(tmp_path):

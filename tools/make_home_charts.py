@@ -94,8 +94,8 @@ def line_chart(th, title, sub_lines, accent, series, xs, top=None, legend=False)
 def svg_end(s): return s + "</svg>"
 
 
-def card(th, accent, model, machine, decode, ctx):
-    """Model card: the model name is the title, the machine sits below, two figures (decode tok/s, max context)."""
+def card(th, accent, model, machine, decode, prefill):
+    """Model card: the model name is the title, the machine sits below, two figures (decode and prefill tok/s)."""
     acc = th[accent]
     w, h = 320, 200
     s = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" {FONT}>'
@@ -103,7 +103,7 @@ def card(th, accent, model, machine, decode, ctx):
          f'<rect x="0.5" y="0.5" width="{w - 1}" height="8" rx="4" fill="{acc}"/>')
     s += tx(22, 50, model, 25, th["txt"], "start", "700") + tx(22, 78, machine, 16, th["sub"])
     s += tx(22, 146, decode, 48, acc, "start", "700") + tx(22, 174, "tok/s decode", 17, th["sub"])
-    s += tx(168, 146, ctx, 48, acc, "start", "700") + tx(168, 174, "max context", 17, th["sub"])
+    s += tx(168, 146, prefill, 48, acc, "start", "700") + tx(168, 174, "tok/s prefill", 17, th["sub"])
     return svg_end(s)
 
 
@@ -171,13 +171,13 @@ def make_all():
             ser, xs = mac_series(th, key); m = P["mac"]
             return line_chart(th, f"{label}: {m['name']}", [f'{m["machine"]}, tok/s', f'Kyojin {m["version"]}, {m["date"]}'], "apple", ser, xs, legend=True)
         write(f"{key}-mac", fn)
-    # Model cards: model name as title, machine below, decode tok/s and max context
+    # Model cards: model name as title, machine below, decode and prefill tok/s
     q = M[0]; g = next(m for m in M if m["id"] == "glm")
     r = P["rtx"]["qwen27"]["points"]; mp = P["mac"]["points"]
-    cards = (("glm", "amd", "GLM-5.3-Flash", "Strix Halo, 128 GB", f'{g["decode"]["8192"]:.0f}', "500K"),
-             ("flash-next", "amd", "Qwen3.8-Flash-Next", "Strix Halo, 128 GB", f'{q["decode"]["8192"]:.0f}', "256K"),
-             ("qwen27", "nv", "Qwen3.8-27B", "RTX 3090, 24 GB", f'{r[0]["decode"]:.0f}', "245K"),
-             ("ds41", "apple", "DeepSeek V4.1 Flash", "Mac Studio M5 Ultra", f'{mp[0]["decode"]:.0f}', "983K"))
+    cards = (("glm", "amd", "GLM-5.3-Flash", "Strix Halo, 128 GB", f'{g["decode"]["8192"]:.0f}', f'{g["prefill"]["8192"]:,.0f}'),
+             ("flash-next", "amd", "Qwen3.8-Flash-Next", "Strix Halo, 128 GB", f'{q["decode"]["8192"]:.0f}', f'{q["prefill"]["8192"]:,.0f}'),
+             ("qwen27", "nv", "Qwen3.8-27B", "RTX 3090, 24 GB", f'{r[0]["decode"]:.0f}', f'{r[0]["prefill"]:,.0f}'),
+             ("ds41", "apple", "DeepSeek V4.1 Flash", "Mac Studio M5 Ultra", f'{mp[0]["decode"]:.0f}', f'{mp[0]["prefill"]:,.0f}'))
     os.makedirs(OUT, exist_ok=True)
     for key, accent, *args in cards:
         for tn, th in THEMES.items():
