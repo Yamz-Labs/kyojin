@@ -133,6 +133,9 @@ class RecurrentCache(OrderedDict):
             state_size = stashed_state["checkpoint_size"]
             while self.update_total_size() + state_size > self.max_size:
                 assert self.current_size >= 0, "Not enough space in cache for single state"
+                # disk-first (05/11): a cap below one entry (EXL3_RC_GB=0) is legal and keeps exactly the entry being stored
+                if len(self) == 0:
+                    break
                 pt = self.pagetable
 
                 # A checkpoint whose anchor page chain has been broken by KV eviction can never be restored by
@@ -158,6 +161,12 @@ class RecurrentCache(OrderedDict):
 
                 self.metrics["stash_evictions"] += 1
                 self.exact_meta.pop(popped_key, None)
+                spill = getattr(self, "on_evict", None)
+                if spill is not None and "_ev" not in popped:
+                    try:
+                        spill(popped_key, popped)    # PagedPrefixDisk.spill: queue the checkpoint for the disk tier (async write)
+                    except Exception as e:           # noqa: BLE001 the disk tier must never break a request
+                        print(f"recurrent cache spill failed: {e}", flush=True)
                 note_freed(popped["checkpoint_size"])
                 if self.model.loaded_tp:
                     self.model.tp_dispatch_all(mp_cache_recurrent_del, (id(self), popped["tp_handle"]))

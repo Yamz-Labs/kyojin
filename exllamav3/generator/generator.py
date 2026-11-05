@@ -34,6 +34,7 @@ def _log_padded_vocab(model_vocab: int, piece_count: int):
 
 
 from ..util.memory import malloc_trim
+from ..util.disk_store import env_dir as _disk_env_dir
 from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
@@ -352,16 +353,26 @@ class Generator:
 
         # Exact prompt-end checkpoints (see Job._tail_stash); EXL3_TAIL_CKPT=0 turns them off
         self.tail_ckpts = []
-        self.tail_ckpt_max = int(os.environ.get("EXL3_TAIL_CKPT", "8")) if tail_ckpt is None else int(tail_ckpt)
+        # Disk-first default: with the prefix disk tier on (EXL3_PREFIX_DISK_DIR) older checkpoints live on disk, so host RAM
+        # keeps few tail entries and a recurrent cache of one entry; without it the RAM tier is the only tier (8 / 8 / 4 GiB)
+        _disk_on = bool(_disk_env_dir())
+        self.tail_ckpt_max = int(os.environ.get("EXL3_TAIL_CKPT", "2" if _disk_on else "8")) if tail_ckpt is None else int(tail_ckpt)
         # Sub-page prompt-tail checkpoints (EXL3_TAIL_SUB, see Job.sub_ckpt_rows): same entry format as tail_ckpts, kept in
         # their own list so a long prompt's several entries never push the exact prompt-end checkpoints out. Host memory
         # bound = sub_ckpt_max x one checkpoint (142 MiB on the KDA model, 75 MiB on the GDN one), oldest dropped first
         self.sub_ckpts = []
-        self.sub_ckpt_max = max(0, int(os.environ.get("EXL3_TAIL_SUB_MAX", "8")))   # 0 = keep no sub-page entry
+        self.sub_ckpt_max = max(0, int(os.environ.get("EXL3_TAIL_SUB_MAX", "1" if _disk_on else "8")))   # 0 = keep no sub-page entry
         # prompts shorter than this never stash (the stash is 20-40 ms of host copy and 142 MiB per entry)
         self.tail_ckpt_min = int(os.environ.get("EXL3_TAIL_MIN", "512"))
 
         # Recurrent cache
+        # EXL3_RC_GB: host RAM cap of the recurrent checkpoint cache in GiB. Unset = 0 with the disk prefix tier on (the cache
+        # keeps the entry being stored, evictions spill to disk), else the argument (4 GiB by default). "" = the argument.
+        _rc_gb = os.environ.get("EXL3_RC_GB")
+        if _rc_gb is None and _disk_on:
+            _rc_gb = "0"
+        if _rc_gb:
+            recurrent_cache_size = int(float(_rc_gb) * 1024**3)
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)

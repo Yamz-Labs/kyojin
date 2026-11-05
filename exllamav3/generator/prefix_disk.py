@@ -155,6 +155,8 @@ class PagedPrefixDisk:
         sl = self.slots
         g = sl.generator
         rc = g.recurrent_cache
+        if rc is not None:
+            rc.on_evict = self.spill
         ids = ids.view(1, -1).to("cpu", torch.long)
         hashes, pages = sl._resident_chain(ids)
         if rc is None or not hashes:
@@ -242,6 +244,26 @@ class PagedPrefixDisk:
         self.stats["save_ms"] += ms
         return {"saved": wrote, "stashes": sorted(want), "tail": tail is not None, "ms": ms}
 
+    # ---- spill (disk-first)
+
+    def spill(self, anchor: bytes, stash: dict) -> None:
+        """RecurrentCache eviction hook: a checkpoint leaving host RAM goes to the disk tier (async write) when save() would keep it
+        (page aligned, 2K/4K/8K... or inside the pinned first 8K tokens), so a small RAM cap loses no resume point. Deepest and
+        prompt-end checkpoints are written by save() at the end of the request."""
+        pos = stash.get("position", 0)
+        if "tp_handle" in stash or pos <= 0 or pos % PAGE_SIZE:
+            return
+        d = pos // PAGE_SIZE
+        branch = anchor in getattr(self.slots.generator.recurrent_cache, "branch_keys", ())
+        if not (_pow2(d) or d <= PIN_PAGES or branch):
+            return
+        if anchor in self.stashes and self._have(self.stashes[anchor][0]):
+            self.disk.touch(self.stashes[anchor][0])
+            return
+        name = f"c_{_hx(anchor)[:24]}"
+        self.disk.put(name, {"stash": stash}, {"ns": self.ns, "k": "stash", "anchor": anchor, "depth": d})
+        self.stashes[anchor] = (name, d)
+
     # ---- restore
 
     @torch.inference_mode()
@@ -252,6 +274,8 @@ class PagedPrefixDisk:
         g = sl.generator
         rc = g.recurrent_cache
         pt = g.pagetable
+        if rc is not None:
+            rc.on_evict = self.spill
         if rc is None or not self.pages:
             return None
         ids = ids.view(1, -1).to("cpu", torch.long)
