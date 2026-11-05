@@ -2220,6 +2220,12 @@ class Job:
                 continue
             page = seq.allocated_pages[pos // PAGE_SIZE - 1]
             assert page.kv_position == PAGE_SIZE
+            if pos == getattr(self, "kv_only_end", -1):
+                # EXL3_BRANCH_CKPT row (end of the shared run): the disk tier keeps it when it leaves host RAM (PagedPrefixDisk.spill)
+                bk = getattr(rc, "branch_keys", None)
+                if bk is None:
+                    bk = rc.branch_keys = set()
+                bk.add(page.phash)
             rc.put(page.phash, None, stashed = stashed)
             rc.metrics["midchunk_stashes"] = rc.metrics.get("midchunk_stashes", 0) + 1
             n += 1
