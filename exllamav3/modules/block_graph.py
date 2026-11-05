@@ -46,6 +46,10 @@ _env_int = lambda name, default: int(os.environ.get(name, default) or default)
 BLOCK_GRAPH_ENABLED = os.environ.get("EXL3_BLOCK_GRAPH", "1" if torch.version.hip else "0") == "1"
 BLOCK_GRAPH_WARMUPS = max(1, _env_int("EXL3_BLOCK_GRAPH_WARMUPS", 3))
 BLOCK_GRAPH_MAX_SLOTS = max(1, _env_int("EXL3_BLOCK_GRAPH_MAX_SLOTS", 4))
+# Rows per sequence a non-MLA block graph captures. Default 1 (plain decode). Multi-row steps (n-gram or MTP
+# verify, 2..8 rows) have one specialization per row count: more keys than BLOCK_GRAPH_MAX_SLOTS, so the
+# slots evict each other and the blocks re-warm and re-capture all the time (Flash-Next 128K decode -13 %).
+BLOCK_GRAPH_MAX_Q = max(1, _env_int("EXL3_BLOCK_GRAPH_MAX_Q", 1))
 
 # Rows above the dense GEMV cap reconstruct+hgemm; still captureable, but the first bounded
 # implementation keeps the served decode envelope. Revisit after (B,Q) family measurements.
@@ -189,6 +193,9 @@ class BlockGraphRunner:
             return None
         if isinstance(attn, MLAttention) and BLOCK_GRAPH_MLA:
             return self._mla_key(x, params)
+        if x.shape[1] > BLOCK_GRAPH_MAX_Q and not isinstance(attn, MLAttention):
+            self.stats["declines"]["rows_q"] += 1
+            return None
         if BLOCK_GRAPH_ATTN and type(attn) is Attention:
             return self._attn_key(x, params)
         if not isinstance(attn, GatedDeltaNet) or attn.bc is not None:
