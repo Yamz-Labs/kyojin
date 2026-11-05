@@ -35,6 +35,10 @@
 #define EXL3_GEMV_SEG_COUNTERS 1024
 #endif
 
+// One preallocated counter slab per device; each stream owns one slice. The
+// previous lazy table was capped at 64 entries, so keep that cap here.
+static constexpr int MAX_SEG_COUNTER_STREAMS = 64;
+
 static int env_int(const char* name, int def)
 {
     const char* env = std::getenv(name);
@@ -84,6 +88,13 @@ static int splitk_warps(int k_tiles, int n_tiles)
 // segment counters and one can rotate a segment the other is still writing.
 // An entry is never freed (the process owns the device); if the table fills,
 // the caller falls back to the separate output Hadamard.
+//
+// The counter slab is preallocated and zeroed on the first eager call, then
+// handed out in per-stream slices. It must never be allocated inside a
+// captured stream: hipMalloc/hipMemset are not permitted during capture, and
+// the block graph captures on a dedicated stream that the eager warmups never
+// touch. If the slab does not exist yet while capturing, decline and let the
+// caller use the plain kernel plus the separate output Hadamard.
 struct SegCounterSlot
 {
     int device;
@@ -91,29 +102,60 @@ struct SegCounterSlot
     int* ptr;
 };
 
+struct SegCounterPool
+{
+    int device;
+    int* base;
+    int used;
+};
+
+static bool stream_is_capturing(hipStream_t stream)
+{
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    if (hipStreamIsCapturing(stream, &status) != hipSuccess) return false;
+    return status != hipStreamCaptureStatusNone;
+}
+
 static int* seg_counters(int device, hipStream_t stream)
 {
     static std::mutex mtx;
     static std::vector<SegCounterSlot> slots;
+    static std::vector<SegCounterPool> pools;
     if (device < 0 || device >= 64) return nullptr;
     std::lock_guard<std::mutex> lock(mtx);
     for (const auto& s : slots)
         if (s.device == device && s.stream == stream) return s.ptr;
-    if (slots.size() >= 64) return nullptr;
-    void* p = nullptr;
-    if (hipMalloc(&p, EXL3_GEMV_SEG_COUNTERS * sizeof(int)) != hipSuccess)
+    if (slots.size() >= (size_t) MAX_SEG_COUNTER_STREAMS) return nullptr;
+
+    SegCounterPool* pool = nullptr;
+    for (auto& p : pools)
+        if (p.device == device) { pool = &p; break; }
+
+    if (!pool)
     {
-        (void) hipGetLastError();
-        return nullptr;
+        if (stream_is_capturing(stream)) return nullptr;
+        const size_t bytes = (size_t) MAX_SEG_COUNTER_STREAMS * EXL3_GEMV_SEG_COUNTERS * sizeof(int);
+        void* base = nullptr;
+        if (hipMalloc(&base, bytes) != hipSuccess)
+        {
+            (void) hipGetLastError();
+            return nullptr;
+        }
+        if (hipMemset(base, 0, bytes) != hipSuccess)
+        {
+            (void) hipGetLastError();
+            hipFree(base);
+            return nullptr;
+        }
+        pools.push_back({device, (int*) base, 0});
+        pool = &pools.back();
     }
-    if (hipMemset(p, 0, EXL3_GEMV_SEG_COUNTERS * sizeof(int)) != hipSuccess)
-    {
-        (void) hipGetLastError();
-        hipFree(p);
-        return nullptr;
-    }
-    slots.push_back({device, stream, (int*) p});
-    return (int*) p;
+
+    if (pool->used >= MAX_SEG_COUNTER_STREAMS) return nullptr;
+    int* p = pool->base + (size_t) pool->used * EXL3_GEMV_SEG_COUNTERS;
+    pool->used++;
+    slots.push_back({device, stream, p});
+    return p;
 }
 
 bool exl3_gemv_rdna_arch(int device)
