@@ -252,5 +252,75 @@ class LoggingVocabularyTests(unittest.TestCase):
                             f"{name}: the heartbeat names no in-flight counter")
 
 
+class TalkingEngine(FakeEngine):
+    """A reply of several words, so a stream has deltas after the first token."""
+
+    async def generate(self, prompt, **kw):
+        for n, piece in enumerate(("one ", "two ", "three ", "four "), 1):
+            await asyncio.sleep(0.05)
+            if kw.get("live") is not None:
+                kw["live"]["n"] = n                  # what the real engines do at each decode event
+            yield piece
+
+
+class ProgressiveTimingsTests(unittest.TestCase):
+    """Every server: the same `timings` object rides on stream chunks while the reply decodes, and on the final chunk."""
+
+    KEYS = {"prompt_n", "prompt_ms", "prompt_per_second", "predicted_n", "predicted_ms", "predicted_per_second", "cache_n"}
+
+    def streamed_timings(self, name: str, period: float, engine=None):
+        import json
+        serve = load_server(name)
+        sc = sys.modules["serve_compat"]
+        saved = sc.LiveTimings.PERIOD_S
+        sc.LiveTimings.PERIOD_S = period
+        got = []
+
+        async def go() -> None:
+            from aiohttp.test_utils import TestClient, TestServer
+            client = TestClient(TestServer(serve.create_app((engine or TalkingEngine)(), "m", "{{ messages[0].content }}")))
+            await client.start_server()
+            try:
+                r = await client.post("/v1/chat/completions", json={
+                    "model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+                for line in (await r.text()).splitlines():
+                    if line.startswith("data: {"):
+                        o = json.loads(line[6:])
+                        got.append((o["choices"][0]["delta"] if o.get("choices") else None, o.get("timings")))
+            finally:
+                await client.close()
+
+        try:
+            asyncio.run(go())
+        finally:
+            sc.LiveTimings.PERIOD_S = saved
+        return got
+
+    def test_partial_timings_before_the_final_one(self):
+        for name in ("glm", "qwen", "mimo"):
+            chunks = self.streamed_timings(name, 0.0)
+            with_timings = [(d, t) for d, t in chunks if t is not None]
+            self.assertGreater(len(with_timings), 1, f"{name}: no partial timings before the final chunk")
+            for d, t in with_timings:
+                self.assertTrue(self.KEYS <= set(t), f"{name}: timings lack {sorted(self.KEYS - set(t))}")
+            partial = with_timings[:-1]
+            self.assertTrue(all(0 < t["predicted_n"] <= 4 for _, t in partial), f"{name}: partial timings without the engine count")
+
+    def test_an_engine_without_a_live_count_sends_the_final_timings_only(self):
+        class Silent(TalkingEngine):
+            async def generate(self, prompt, **kw):
+                kw.pop("live", None)
+                async for piece in super().generate(prompt):
+                    yield piece
+        for name in ("glm", "qwen", "mimo"):
+            chunks = self.streamed_timings(name, 0.0, Silent)
+            self.assertEqual(len([t for _, t in chunks if t is not None]), 1, f"{name}: an estimate was shown")
+
+    def test_one_second_period_sends_only_the_final_timings(self):
+        for name in ("glm", "qwen", "mimo"):
+            chunks = self.streamed_timings(name, 60.0)
+            self.assertEqual(len([t for _, t in chunks if t is not None]), 1, f"{name}: partial timings under a long period")
+
+
 if __name__ == "__main__":
     unittest.main()

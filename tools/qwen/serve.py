@@ -1277,7 +1277,7 @@ class QwenEngine:
                         cancel: asyncio.Event | None = None, seed: int | None = None, reasoning_first: bool = False,
                         thinking_budget: int | None = None, loop_guard: bool | None = None,
                         loop_final: bool | None = None, logprobs: int | None = None, stats: dict[str, Any],
-                        prompt_ids: list[int] | None = None, ignore_eos: bool = False, _mine: list) -> AsyncIterator[str]:
+                        prompt_ids: list[int] | None = None, ignore_eos: bool = False, live: dict | None = None, _mine: list) -> AsyncIterator[str]:
         """Yield decoded text pieces. Final stats land in `stats`. Every job enqueued is appended to `_mine`.
 
         Final check (on with the guard, loop_final=False turns it off): when the turn ends normally and the visible text
@@ -1373,6 +1373,8 @@ class QwenEngine:
                         lps += self._event_logprobs(ev, len(toks))
                     seg += toks
                     generated += len(toks)
+                    if live is not None and t is not None:
+                        live["n"] = generated        # the engine's own count, read by the stream for the progressive timings
                     if ev.get("text"):
                         chars += len(ev["text"])
                         vis += ev["text"]
@@ -1646,6 +1648,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             # the difference, and it is logged on its own as wait_s.
             wait = time.perf_counter() - (job.get("_queued_at") or time.perf_counter())
             started = time.perf_counter() - wait
+            job["_job_at"] = time.perf_counter()
             if job.get("cancel") is not None and job["cancel"].is_set():
                 # the client left while the job was queued: no prefill, no decode, one line
                 lifecycle.job_skipped(rid, wait)
@@ -1664,7 +1667,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                     first_token = False       # flipped once, so the log gets exactly one job_first_token line
                     try:
                         async for delta in engine.generate(
-                                job["prompt"], stats=stats, max_tokens=job["max_tokens"], sampling=job["sampling"],
+                                job["prompt"], stats=stats, live=job.setdefault("_live", {}), max_tokens=job["max_tokens"], sampling=job["sampling"],
                                 **({"prompt_ids": job["prompt_ids"]} if job.get("prompt_ids") is not None else {}),
                                 **({"ignore_eos": True} if job.get("ignore_eos") else {}),
                                 stop=job["stop"], images=job["images"], speculative=job["speculative"],
@@ -1674,6 +1677,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                                 loop_final=job.get("loop_final"), logprobs=job.get("logprobs")):
                             if not first_token:
                                 first_token = True
+                                job["_first_at"] = time.perf_counter()
                                 lifecycle.first_token(rid, started, prompt_tokens=job.get("prompt_tokens"))
                             out.put_nowait(delta)
                     finally:
@@ -1825,11 +1829,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 reason = "stop"
             usage = {"prompt_tokens": prompt_tokens, "completion_tokens": n_new,
                      "total_tokens": prompt_tokens + n_new, "prompt_tokens_details": {"cached_tokens": cache_n}}
-            timings = {"cache_n": cache_n, "prompt_n": max(prompt_tokens - cache_n, 0), "prompt_ms": pre * 1000,
-                       "predicted_n": n_new, "predicted_ms": gen * 1000,
-                       "prompt_per_second": (prompt_tokens - cache_n) / pre if pre else 0.0,
-                       "predicted_per_second": n_new / gen if gen else 0.0,
-                       "speculative": bool(getattr(engine, "spec_on", False))}
+            timings = serve_compat.timings(prompt_tokens, cache_n, pre, gen, n_new, speculative=bool(getattr(engine, "spec_on", False)))
             if stats.get("loop_guard"):
                 timings["loop_guard"] = stats["loop_guard"]
             if "accepted_draft_tokens" in stats:
@@ -1877,6 +1877,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 ping.note_output()
                 stats, full = {}, ""
                 visible = False   # flipped at the first frame with text: the client's first sign of life
+                live = serve_compat.LiveTimings(job, job["prompt_tokens"], lambda: stats)   # progressive timings, once per second
                 async for item in pieces(writer, ping, ping_at):
                     if isinstance(item, dict):
                         stats = item
@@ -1894,8 +1895,10 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                         if not visible:
                             visible = True
                             lifecycle.first_content(job["_reqid"], queued_at)
-                        await writer.write(sse(event({key: piece})))
+                        await writer.write(sse(event({key: piece}) | ({"timings": t} if (t := live.take()) else {})))
                         ping.note_output()   # the client has text: comments wait for the next silence
+                    if (t := live.take()) is not None:     # nothing went out for a second (held tool call, tags): an empty delta carries them
+                        await writer.write(sse(event({}) | {"timings": t}))
                 for kind, piece in sp.finish():
                     key = "reasoning_content" if kind == "reasoning" else "content"
                     await writer.write(sse(event({key: piece})))
