@@ -6,8 +6,7 @@
 // mma.sync and reaches 107-220 GB/s on the small dense shapes on gfx1201.
 // The RDNA dot core here runs one warp per 16-wide output tile and consumes
 // the decoded trellis through V_DOT2_F32_F16, which sustains 1.3x that on the
-// same shapes (measured against upstream exllamav3 v1.6.6; see
-// doc/gfx1201-cb0.md). The input and output Hadamards stay the caller's
+// same shapes (measured against upstream exllamav3 v1.6.6). The input and output Hadamards stay the caller's
 // had_r_128 launches, so this replaces only the middle of the three-launch
 // form.
 
