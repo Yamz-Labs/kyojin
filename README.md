@@ -7,42 +7,69 @@ Open source. Our own quantised builds of GLM, Qwen, MiMo, DeepSeek, Flint and Na
 <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/licence-MIT-444444"></a>
 <img alt="AMD" src="https://img.shields.io/badge/AMD-gfx1151%20%7C%20ROCm%207-444444">
 <img alt="NVIDIA" src="https://img.shields.io/badge/NVIDIA-RTX%203090%20%7C%20CUDA-444444">
-<img alt="Apple" src="https://img.shields.io/badge/Apple-M3%20Ultra%20%7C%20MLX-444444">
+<img alt="Apple" src="https://img.shields.io/badge/Apple-M5%20Ultra%20%7C%20MLX-444444">
 <img alt="Python" src="https://img.shields.io/badge/python-3.12-444444">
 <a href="https://huggingface.co/yamz-labs"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-444444"></a>
 <a href="https://x.com/YamzLabs"><img alt="X" src="https://img.shields.io/badge/news-%40YamzLabs-444444"></a>
 </p>
 
-**Big models, long context, one machine: up to 500K tokens on a 128 GB Strix Halo, 262K on a 24 GB RTX 3090, 983K on a Mac Studio.** Pick yours.
+**Run 100 GB-class AI models on one desktop machine, with up to 500K tokens of context.** Free, open source, and it speaks the OpenAI API, so your tools just work.
 
 <table align="center">
-<tr><td align="center" width="33%"><a href="#strix-halo-amd"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-strix-dark.svg"><img src="doc/img/home/card-strix-light.svg" alt="Strix Halo: 52.2 tok/s decode at 8K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#rtx-nvidia"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-rtx-dark.svg"><img src="doc/img/home/card-rtx-light.svg" alt="RTX 3090: 74.6 tok/s decode at 5K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#mac-apple-silicon"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-mac-dark.svg"><img src="doc/img/home/card-mac-light.svg" alt="Mac Studio: 62 tok/s decode at 8K" width="100%"></picture></a></td></tr>
+<tr><td align="center" width="33%"><a href="#strix-halo-amd"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-strix-dark.svg"><img src="doc/img/home/card-strix-light.svg" alt="Strix Halo: GLM-5.3-Flash 32 and Qwen3.8-Flash-Next 53 tok/s decode at 8K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#rtx-nvidia"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-rtx-dark.svg"><img src="doc/img/home/card-rtx-light.svg" alt="RTX 3090: 74.6 tok/s decode at 5K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#mac-apple-silicon"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-mac-dark.svg"><img src="doc/img/home/card-mac-light.svg" alt="Mac Studio: 62 tok/s decode at 8K" width="100%"></picture></a></td></tr>
 </table>
+
+## What you get
+
+| Machine | Model | Decode tok/s | Prefill tok/s | Context |
+|---|---|---|---|---|
+| **Strix Halo** (AMD, 128 GB) | GLM-5.3-Flash | 32.3 at 8K | 633 at 8K | up to 500K |
+| **Strix Halo** (AMD, 128 GB) | Qwen3.8-Flash-Next | 53.2 at 8K | 1576 at 8K | up to 256K |
+| **RTX 3090** (NVIDIA, 24 GB) | Qwen3.8-27B | 74.6 at 5K | 1621 at 5K | up to 245K |
+| **Mac Studio** (Apple, 256 GB) | DeepSeek V4.1 Flash | 62 at 8K | 3001 at 8K | up to 983K |
+
+Served through the real server with real text, Kyojin 1.8.10 on Strix Halo, 1.8.9 on RTX and Mac.
+
+## Try it in 3 lines
+
+```bash
+git clone https://github.com/Yamz-Labs/kyojin && cd kyojin
+hf download yamz-labs/GLM-5.3-Flash-EXL3-Yamz --local-dir ./glm-pack
+python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
+```
+
+That is the Strix Halo command (GLM-5.3-Flash; Qwen3.8-Flash-Next works the same way). RTX and Mac commands, and the one-time build: [Quickstart](#quickstart).
 
 ## Speed by context
 
 Tokens per second against context length (log scale), served through the real server with real text. Each chart says its machine, Kyojin version and date. Higher is better.
 
-**Strix Halo (AMD)**
+**Strix Halo (AMD), GLM-5.3-Flash and Qwen3.8-Flash-Next**
 
 <table>
-<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-strix-dark.svg"><img src="doc/img/home/decode-strix-light.svg" alt="Decode tok/s against context on Strix Halo, three models" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-strix-dark.svg"><img src="doc/img/home/prefill-strix-light.svg" alt="Prefill tok/s against context on Strix Halo, three models" width="100%"></picture></td></tr>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-strix-dark.svg"><img src="doc/img/home/decode-strix-light.svg" alt="Decode tok/s against context on Strix Halo, GLM-5.3-Flash and Qwen3.8-Flash-Next" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-strix-dark.svg"><img src="doc/img/home/prefill-strix-light.svg" alt="Prefill tok/s against context on Strix Halo, GLM-5.3-Flash and Qwen3.8-Flash-Next" width="100%"></picture></td></tr>
 </table>
 
-**RTX 3090 (NVIDIA)**
+**RTX 3090 (NVIDIA), Qwen3.8-27B**
 
 <table>
 <tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-rtx-dark.svg"><img src="doc/img/home/decode-rtx-light.svg" alt="Decode tok/s against context, Qwen3.8-27B on RTX 3090" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-rtx-dark.svg"><img src="doc/img/home/prefill-rtx-light.svg" alt="Prefill tok/s against context, Qwen3.8-27B on RTX 3090" width="100%"></picture></td></tr>
 </table>
 
-<table>
-<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-rtx-flint-dark.svg"><img src="doc/img/home/decode-rtx-flint-light.svg" alt="Decode tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-rtx-flint-dark.svg"><img src="doc/img/home/prefill-rtx-flint-light.svg" alt="Prefill tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td></tr>
-</table>
-
-**Mac Studio (Apple)**
+**Mac Studio (Apple), DeepSeek V4.1 Flash**
 
 <table>
 <tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-mac-dark.svg"><img src="doc/img/home/decode-mac-light.svg" alt="Decode tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-mac-dark.svg"><img src="doc/img/home/prefill-mac-light.svg" alt="Prefill tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td></tr>
+</table>
+
+## Details
+
+Everything below is for people who want the numbers, the comparison with other engines, the model list and the full install.
+
+**RTX 3090: Flint V1**
+
+<table>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-rtx-flint-dark.svg"><img src="doc/img/home/decode-rtx-flint-light.svg" alt="Decode tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-rtx-flint-dark.svg"><img src="doc/img/home/prefill-rtx-flint-light.svg" alt="Prefill tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td></tr>
 </table>
 
 ## Against other engines
@@ -66,10 +93,10 @@ llama.cpp prefills Qwen3.8-27B 10 to 19 % faster up to 32K ([details](doc/rtx.md
 
 | Machine | Best model | Prefill | Decode | Kyojin | Date |
 |---|---|---|---|---|---|
-| [Strix Halo](#strix-halo-amd), Ryzen AI Max+ 395, 128 GB | Qwen3.8-Flash-Next | 1480 at 8K | 52.2 at 8K | 1.8.9 (prefill), 1.5.10 (decode) | 2026-11-04, 2026-10-17 |
+| [Strix Halo](#strix-halo-amd), Ryzen AI Max+ 395, 128 GB | Qwen3.8-Flash-Next | 1576 at 8K | 53.2 at 8K | 1.8.10 | 2026-11-05 |
 | [RTX 3090](#rtx-nvidia), 24 GB | Qwen3.8-27B | 1621 at 5K | 74.6 at 5K | 1.8.9 | 2026-11-04 |
 | [RTX 3090](#rtx-nvidia), 24 GB | Flint V1 | 6930 at 4K | 138.7 at 4K | 1.8.9 | 2026-11-04 |
-| [Mac Studio](#mac-apple-silicon), M3 Ultra, 256 GB | DeepSeek V4.1 Flash | 3001 at 8K | 62 at 8K | 1.8.9 | 2026-11-04 |
+| [Mac Studio](#mac-apple-silicon), M5 Ultra, 256 GB | DeepSeek V4.1 Flash | 3001 at 8K | 62 at 8K | 1.8.9 | 2026-11-04 |
 
 Decode on Strix Halo and RTX uses speculative decoding. Full tables and method are on the platform pages: [Strix Halo](doc/strix.md), [RTX](doc/rtx.md), [Benchmarks](doc/benchmarks.md).
 
@@ -91,7 +118,7 @@ Tables, engine comparison and commands: [doc/rtx.md](doc/rtx.md).
 
 Kyojin for Apple Silicon is a separate repository: [Yamz-Labs/kyojin-mac](https://github.com/Yamz-Labs/kyojin-mac). It runs on MLX with custom Metal kernels, serves an OpenAI-compatible API and reads GGUF, EXL3 and MLX packs.
 
-Kyojin 1.8.9 on a Mac Studio M3 Ultra, 256 GB, served, 2026-11-04 (from the kyojin-mac README):
+Kyojin 1.8.9 on a Mac Studio M5 Ultra, 256 GB, served, 2026-11-04 (from the kyojin-mac README):
 
 | Model and cell | tok/s |
 |---|---|

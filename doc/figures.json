@@ -2,9 +2,9 @@
  "_comment": "Single source for the README table and the charts. null = not measured (left out of the chart). Qwen and GLM: new-user recipe at the commit below (MiMo: at 39dc956); all three: new-user recipe at the commit below. Rebuild: python3 tools/make_charts.py && python3 tools/make_readme_table.py. before = previous release, as published.",
  "machine": "Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB",
  "method": "new-user install, published packs, default environment, card prompts, greedy, server-reported prefill",
- "date": "2026-10-17",
+ "date": "2026-11-05",
  "commit": "db6103b",
- "version": "1.5.10",
+ "version": "1.8.10",
  "readme_extra_rows": [
   "<tr><td>DeepSeek-V4.1-Flash <sub>(experimental, SSD tier)</sub></td><td align=\"right\">185 GB</td><td align=\"right\">187 to 257 at 8K</td><td align=\"right\">5 to 11 <sub>(plain)</sub></td></tr>"
  ],
@@ -14,12 +14,11 @@
    "name": "Qwen3.8-Flash-Next",
    "pack_gb": 95.0,
    "prefill": {
-    "8192": 1621,
-    "32768": 1548,
-    "65536": 1542,
-    "131072": 1505,
-    "262144": 1399,
-    "499712": 1224
+    "8192": 1576,
+    "32768": 1556,
+    "65536": 1507,
+    "131072": 1502,
+    "262144": 1459
    },
    "spec": {
     "prose": 47.5,
@@ -27,12 +26,11 @@
     "code": 73.2
    },
    "decode": {
-    "8192": 52.2,
-    "32768": 51.1,
-    "65536": 46.6,
-    "131072": 54.8,
-    "262144": 46.9,
-    "499712": 48.1
+    "8192": 53.2,
+    "32768": 46.1,
+    "65536": 50.9,
+    "131072": 48.3,
+    "262144": 46.5
    },
    "table": {
     "prefill": "1480 at 8K<sup>1</sup>",
@@ -65,11 +63,11 @@
    "name": "GLM-5.3-Flash",
    "pack_gb": 99.73,
    "prefill": {
-    "8192": 652,
-    "32768": 634,
-    "65536": 629,
-    "131072": 649,
-    "262144": 619,
+    "8192": 633,
+    "32768": 609,
+    "65536": 600,
+    "131072": 584,
+    "262144": 576,
     "499712": 567
    },
    "spec": {
@@ -78,12 +76,12 @@
     "code": 36.8
    },
    "decode": {
-    "8192": 35.0,
-    "32768": 32.1,
-    "65536": 33.5,
-    "131072": 30.8,
-    "262144": 34.3,
-    "499712": 26.4
+    "8192": 32.3,
+    "32768": 32.2,
+    "65536": 32.2,
+    "131072": 32.4,
+    "262144": 32.4,
+    "499712": 32.8
    },
    "table": {
     "prefill": "652 at 8K",
@@ -114,7 +112,7 @@
   {
    "id": "mimo",
    "name": "MiMo-V2.6-Flash",
-   "earlier": "1.5",
+   "earlier": "1.5.10",
    "pack_gb": 105.8,
    "prefill": {
     "8192": 760,

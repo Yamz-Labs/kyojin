@@ -19,8 +19,8 @@ Tokens per second; prefill by context, speculative decode by kind of text.
 
 | Model | Pack | Prefill 8K | Prefill 32K | Prefill 64K | Prefill 128K | Prefill 256K | Prefill 500K | Spec prose | Spec chat | Spec code |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 95 GB | 1621 | 1548 | 1542 | 1505 | 1399 | 1224 | 47.5 | 52.8 | 73.2 |
-| GLM-5.3-Flash | 99.73 GB | 652 | 634 | 629 | 649 | 619 | 567 | 27.4 | 30.0 | 36.8 |
+| Qwen3.8-Flash-Next | 95 GB | 1576 | 1556 | 1507 | 1502 | 1459 | - | 47.5 | 52.8 | 73.2 |
+| GLM-5.3-Flash | 99.73 GB | 633 | 609 | 600 | 584 | 576 | 567 | 27.4 | 30.0 | 36.8 |
 | MiMo-V2.6-Flash | 105.8 GB | 760 | 702 | 599 | 458 | - | - | 28.9 | 31.2 | 37.0 |
 
 Kyojin 1.5, same recipe on a second Ryzen AI Max+ 395 with 128 GB: Qwen3.8-Flash-Next 1486 / 1478 / 1454 / 1397 / 1349
@@ -37,8 +37,8 @@ GLM with `--sessions 4`: 30 tok/s for one request, 37.5 in total for two at once
 
 | Model | 8K | 32K | 64K | 128K | 256K | 500K |
 |---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next | 52.2 | 51.1 | 46.6 | 54.8 | 46.9 | 48.1 |
-| GLM-5.3-Flash | 35.0 | 32.1 | 33.5 | 30.8 | 34.3 | 26.4 |
+| Qwen3.8-Flash-Next | 53.2 | 46.1 | 50.9 | 48.3 | 46.5 | - |
+| GLM-5.3-Flash | 32.3 | 32.2 | 32.2 | 32.4 | 32.4 | 32.8 |
 | MiMo-V2.6-Flash | 29.8 | 23.4 | 17.4 | 12.9 | - | - |
 
 ## Where each figure comes from
@@ -75,7 +75,7 @@ Same machine, one method for every engine we ran: non-thinking chat, an essay re
 
 | tok/s | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Kyojin | 1621 | 1548 | 1542 | 1505 | 1399 |
+| Kyojin | 1576 | 1556 | 1507 | 1502 | 1459 |
 | Gufo v0.8.0, measured by us | 1250 | 1308 | 1289 | 1230 | - |
 
 Strata prefill, independent measurement by Ciru Inference Lab ([report](https://llm.ciru.ai/strataflash/), 6 October 2026; cold prompts of 32K, 64K and 120K tokens; a different machine and different prompts; the lab states that it did not reproduce the publisher's exact workload and that the cause of the gap is not established): 795 / 762 / 709 tok/s at 32K / 64K / 120K.
@@ -86,7 +86,7 @@ Strata prefill, independent measurement by Ciru Inference Lab ([report](https://
 
 | tok/s | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|
-| Kyojin | 52.2 | 51.1 | 46.6 | 54.8 | 46.9 |
+| Kyojin | 53.2 | 46.1 | 50.9 | 48.3 | 46.5 |
 | Gufo, measured by us | 35.3 | 31.9 | 35.8 | 31.4 | - |
 | Strata, measured by us | 39.0 | 38.7 | 36.4 | 35.0 | 37.5 |
 
