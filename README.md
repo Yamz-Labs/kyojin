@@ -7,7 +7,7 @@ Open source. Our own quantised builds of GLM, Qwen, MiMo, DeepSeek, Flint and Na
 <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/licence-MIT-444444"></a>
 <img alt="AMD" src="https://img.shields.io/badge/AMD-gfx1151%20%7C%20ROCm%207-444444">
 <img alt="NVIDIA" src="https://img.shields.io/badge/NVIDIA-RTX%203090%20%7C%20CUDA-444444">
-<img alt="Apple" src="https://img.shields.io/badge/Apple-M3%20Ultra%20%7C%20MLX-444444">
+<img alt="Apple" src="https://img.shields.io/badge/Apple-M5%20Ultra%20%7C%20MLX-444444">
 <img alt="Python" src="https://img.shields.io/badge/python-3.12-444444">
 <a href="https://huggingface.co/yamz-labs"><img alt="Hugging Face" src="https://img.shields.io/badge/weights-Hugging%20Face-444444"></a>
 <a href="https://x.com/YamzLabs"><img alt="X" src="https://img.shields.io/badge/news-%40YamzLabs-444444"></a>
@@ -23,11 +23,11 @@ Open source. Our own quantised builds of GLM, Qwen, MiMo, DeepSeek, Flint and Na
 
 | Your machine | Model | Speed | In plain words |
 |---|---|---|---|
-| **Strix Halo** (AMD, 128 GB) | Qwen3.8-Flash-Next | 53.2 tok/s writing, 1576 tok/s reading, at 8K | Writes about 8 times faster than you read. An 8K-token document is read in about 6 seconds. |
-| **RTX 3090** (NVIDIA, 24 GB) | Qwen3.8-27B | 74.6 tok/s writing, 1621 tok/s reading, at 5K | Writes about 11 times faster than you read. 262K tokens of context on one 24 GB card. |
-| **Mac Studio** (Apple, 256 GB) | DeepSeek V4.1 Flash | 62 tok/s writing, 3001 tok/s reading, at 8K | Writes about 9 times faster than you read, and keeps 983K tokens of context. |
+| **Strix Halo** (AMD, 128 GB) | Qwen3.8-Flash-Next | 53.2 tok/s writing, 1576 tok/s reading, at 8K | Writes about 10 times faster than you read. An 8K-token document is read in about 6 seconds. |
+| **RTX 3090** (NVIDIA, 24 GB) | Qwen3.8-27B | 74.6 tok/s writing, 1621 tok/s reading, at 5K | Writes about 13 times faster than you read. 245K tokens of context on one 24 GB card. |
+| **Mac Studio** (Apple, 256 GB) | DeepSeek V4.1 Flash | 62 tok/s writing, 3001 tok/s reading, at 8K | Writes about 11 times faster than you read, and keeps 983K tokens of context. |
 
-"tok/s" is tokens per second (a token is about three quarters of a word). Reading speed is about 7 tok/s. Measured through the real server with real text.
+"tok/s" is tokens per second (a token is about three quarters of a word). Reading speed is about 5.5 tok/s. Measured through the real server with real text.
 
 ## Try it in 3 lines
 
@@ -93,7 +93,7 @@ llama.cpp prefills Qwen3.8-27B 10 to 19 % faster up to 32K ([details](doc/rtx.md
 | [Strix Halo](#strix-halo-amd), Ryzen AI Max+ 395, 128 GB | Qwen3.8-Flash-Next | 1576 at 8K | 53.2 at 8K | 1.8.10 | 2026-11-05 |
 | [RTX 3090](#rtx-nvidia), 24 GB | Qwen3.8-27B | 1621 at 5K | 74.6 at 5K | 1.8.9 | 2026-11-04 |
 | [RTX 3090](#rtx-nvidia), 24 GB | Flint V1 | 6930 at 4K | 138.7 at 4K | 1.8.9 | 2026-11-04 |
-| [Mac Studio](#mac-apple-silicon), M3 Ultra, 256 GB | DeepSeek V4.1 Flash | 3001 at 8K | 62 at 8K | 1.8.9 | 2026-11-04 |
+| [Mac Studio](#mac-apple-silicon), M5 Ultra, 256 GB | DeepSeek V4.1 Flash | 3001 at 8K | 62 at 8K | 1.8.9 | 2026-11-04 |
 
 Decode on Strix Halo and RTX uses speculative decoding. Full tables and method are on the platform pages: [Strix Halo](doc/strix.md), [RTX](doc/rtx.md), [Benchmarks](doc/benchmarks.md).
 
@@ -115,7 +115,7 @@ Tables, engine comparison and commands: [doc/rtx.md](doc/rtx.md).
 
 Kyojin for Apple Silicon is a separate repository: [Yamz-Labs/kyojin-mac](https://github.com/Yamz-Labs/kyojin-mac). It runs on MLX with custom Metal kernels, serves an OpenAI-compatible API and reads GGUF, EXL3 and MLX packs.
 
-Kyojin 1.8.9 on a Mac Studio M3 Ultra, 256 GB, served, 2026-11-04 (from the kyojin-mac README):
+Kyojin 1.8.9 on a Mac Studio M5 Ultra, 256 GB, served, 2026-11-04 (from the kyojin-mac README):
 
 | Model and cell | tok/s |
 |---|---|

@@ -226,7 +226,7 @@ def make_all():
     r = P["rtx"]["qwen27"]["points"]; mp = P["mac"]["points"]
     cards = (("strix", "Strix Halo", "Ryzen AI Max+ 395, 128 GB", fmt(qd[8192]), "tok/s decode at 8K", "Qwen3.8-Flash-Next", f"{fmt(qd[qlast])} at {ctx_label(qlast)}"),
              ("rtx", "RTX 3090", "NVIDIA, 24 GB", fmt(r[0]["decode"]), "tok/s decode at 5K", "Qwen3.8-27B", f'{fmt(r[3]["decode"])} at {ctx_label(r[3]["ctx"])}'),
-             ("mac", "Mac Studio", "M3 Ultra, 256 GB", fmt(mp[0]["decode"]), "tok/s decode at 8K", P["mac"]["name"], f'{fmt(mp[-1]["decode"])} at {ctx_label(mp[-1]["ctx"])}'))
+             ("mac", "Mac Studio", "M5 Ultra, 256 GB", fmt(mp[0]["decode"]), "tok/s decode at 8K", P["mac"]["name"], f'{fmt(mp[-1]["decode"])} at {ctx_label(mp[-1]["ctx"])}'))
     os.makedirs(OUT, exist_ok=True)
     for key, *args in cards:
         for tn, th in THEMES.items():
