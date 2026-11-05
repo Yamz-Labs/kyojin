@@ -1,5 +1,5 @@
 {
-  description = "kyojin - exllamav3 inference engine for AMD Strix Halo (gfx1151 / ROCm 7)";
+  description = "kyojin - exllamav3 inference engine for AMD Strix Halo (gfx1151 / ROCm 10.1 nightly)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -47,6 +47,33 @@
         let
           inherit (pkgs) lib;
           python = pkgs.python312;
+
+          # The package version, read from upstream's single source of truth
+          # (exllamav3/version.py: `__version__ = "x.y.z"`). pyproject-nix
+          # reports 0.0.0 for a setuptools-dynamic version, so the packages
+          # below would otherwise need a literal kept in sync by hand -- which
+          # silently rotted (1.5.8 in flake.nix, 17 releases newer in the tree).
+          # Never write a version literal here: this is the only place one lives.
+          # Read from the raw path, never from a filtered source: eval-time
+          # reads must not depend on a fileset (see doc/nix.md).
+          kyojinVersion =
+            let
+              lines = lib.splitString "\n" (builtins.readFile ./exllamav3/version.py);
+              grab = line: builtins.match ''[ ]*__version__[ ]*=[ ]*"([^"]+)"[ ]*'' line;
+              found = builtins.filter (m: m != null) (builtins.map grab lines);
+            in
+            if found == [ ] then
+              throw ''
+                flake.nix: no `__version__ = "x.y.z"` line in exllamav3/version.py.
+                Upstream changed how it stores the version -- update this reader
+                (and keep flake checks clean; do not reintroduce a literal).
+              ''
+            else
+              builtins.head (builtins.head found);
+
+          # OCI tags must match [\w][\w.-]{0,127}: a "+dirty"/"+git" local
+          # version or an rc suffix has to lose the '+' before it gets here.
+          kyojinImageTag = builtins.replaceStrings [ "+" ] [ "-" ] kyojinVersion;
 
           # System headers for SDK clang (it runs outside the cc
           # wrapper). They must be searched AFTER clang's resource dir so
@@ -599,9 +626,7 @@
           # Compiler-only: LD_LIBRARY_PATH stays SDK-free per Trap 5.
           kyojinServe = pkgs.stdenv.mkDerivation {
             pname = "kyojin";
-            # Keep in sync with exllamav3/version.py (pyproject-nix reports
-            # local-project version as 0.0.0 since it's setuptools-dynamic).
-            version = "1.5.8";
+            version = kyojinVersion;
             src = ./.;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             installPhase = ''
@@ -649,7 +674,7 @@
           # --corpus explicitly anywhere else.
           kyojinBench = pkgs.stdenv.mkDerivation {
             pname = "kyojin-bench";
-            version = "1.5.8";
+            version = kyojinVersion;
             src = ./.;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             installPhase = ''
@@ -740,7 +765,7 @@
             pyForHub.pkgs.huggingface-hub;
           kyojinImage = pkgs.dockerTools.buildLayeredImage {
             name = "kyojin";
-            tag = "1.5.8";
+            tag = kyojinImageTag;
             # Layer root is the cwd here: relative paths only. /tmp must
             # exist (Python tempfile, torch cuda shims); the model volume
             # supplies persistence, container /tmp stays ephemeral.
