@@ -385,7 +385,7 @@ class Lifecycle:
 
     def job_started(self, rid: str | None, wait: float, **fields: Any) -> None:
         """The worker picked the job up: `wait` is the queue time, the rest is what this server knows."""
-        self.track(rid, "prefill", prompt_tokens=fields.get("prompt_tokens"))
+        self.track(rid, "prefill", prompt_tokens=fields.get("prompt_tokens"), wait_s=wait)
         self.reqlog.log("job_start", req=rid, wait_s=round(wait, 3), **fields)
 
     def job_skipped(self, rid: str | None, queued_s: float) -> None:
@@ -403,12 +403,22 @@ class Lifecycle:
         st = stats or {}
         prompt = int(st.get("prompt_tokens") or prompt_tokens or 0)
         cache_n = int(st.get("cached_tokens") or 0)
+        new_tokens = int(st.get("new_tokens") or 0)
+        prefill_s, decode_s = float(st.get("time_prefill") or 0.0), float(st.get("time_generate") or 0.0)
+        fresh = max(prompt - cache_n, 0)
         self.reqlog.log("job_done", req=rid, elapsed_s=round(time.perf_counter() - started, 3),
                         prompt_tokens=prompt, cache_n=cache_n,
                         cache_pct=round(100.0 * cache_n / prompt, 1) if prompt else 0.0,
-                        new_tokens=int(st.get("new_tokens") or 0),
-                        prefill_s=round(float(st.get("time_prefill") or 0.0), 3),
-                        decode_s=round(float(st.get("time_generate") or 0.0), 3))
+                        new_tokens=new_tokens,
+                        prefill_s=round(prefill_s, 3), decode_s=round(decode_s, 3),
+                        prefill_tps=round(fresh / prefill_s, 1) if prefill_s else 0.0,
+                        decode_tps=round(new_tokens / decode_s, 1) if decode_s else 0.0)
+        # The speed line of every request, on stderr whatever the request log says (the Mac server prints the same fields).
+        wait = (self.inflight.get(rid) or {}).get("wait_s", 0.0) if rid else 0.0
+        print(f"{time.strftime('%H:%M:%S')} req={rid} prompt={fresh} cached={cache_n} gen={new_tokens} queue={wait:.2f}s "
+              f"prefill={prefill_s:.2f}s ({fresh / prefill_s if prefill_s else 0.0:.1f} tok/s) "
+              f"decode={decode_s:.2f}s ({new_tokens / decode_s if decode_s else 0.0:.1f} tok/s) total={time.perf_counter() - started:.2f}s",
+              file=sys.stderr, flush=True)
 
     def job_error(self, rid: str | None, exc: BaseException, started: float | None = None) -> None:
         self.reqlog.log("job_error", req=rid, error=sanitize(exc),

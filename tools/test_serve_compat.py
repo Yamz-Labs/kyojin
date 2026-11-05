@@ -41,6 +41,41 @@ class RqBudgetTests(unittest.TestCase):
         self.assertEqual(serve_compat.rq_budget(65536, 4, 64000, 5000), 65536 - 64000)   # never beyond the cache
 
 
+class TimingsTests(unittest.TestCase):
+    KEYS = {"prompt_n", "prompt_ms", "prompt_per_second", "predicted_n", "predicted_ms", "predicted_per_second", "cache_n"}
+
+    def test_shape_and_rates(self):
+        t = serve_compat.timings(1000, 200, 2.0, 4.0, 80)
+        self.assertEqual(set(t), self.KEYS)
+        self.assertEqual((t["prompt_n"], t["cache_n"], t["prompt_ms"], t["predicted_ms"]), (800, 200, 2000.0, 4000.0))
+        self.assertEqual((t["prompt_per_second"], t["predicted_per_second"]), (400.0, 20.0))
+        self.assertEqual(serve_compat.timings(10, 0, 0.0, 0.0, 0)["predicted_per_second"], 0.0)
+
+    def test_stats_timings_reads_engine_stats(self):
+        st = {"cached_tokens": 5, "time_prefill": 1.0, "time_generate": 2.0, "new_tokens": 10}
+        self.assertEqual(serve_compat.stats_timings(25, st, speculative=True),
+                         serve_compat.timings(25, 5, 1.0, 2.0, 10, speculative=True))
+
+    def test_live_timings_once_per_period_from_the_engine_count(self):
+        now = [100.0]
+        job = {"_job_at": 99.0}
+        live = serve_compat.LiveTimings(job, 500, lambda: {"cached_tokens": 100}, clock=lambda: now[0])
+        self.assertIsNone(live.take())                       # no first token yet
+        job["_first_at"] = 100.0
+        now[0] = 101.0
+        self.assertIsNone(live.take())                       # the engine has reported no count: nothing is shown
+        job["_live"] = {"n": 3}
+        t = live.take()
+        self.assertEqual(set(t), self.KEYS)
+        self.assertEqual((t["predicted_n"], t["prompt_n"], t["cache_n"], t["prompt_ms"], t["predicted_ms"]), (3, 400, 100, 1000.0, 1000.0))
+        self.assertEqual(t["predicted_per_second"], 3.0)
+        job["_live"]["n"] = 5
+        now[0] = 101.9
+        self.assertIsNone(live.take())                       # once per second at most
+        now[0] = 102.0
+        self.assertEqual(live.take()["predicted_n"], 5)
+
+
 class HelperTests(unittest.TestCase):
     def test_cache_salt(self):
         self.assertIsNone(serve_compat.cache_salt({}))

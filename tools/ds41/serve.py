@@ -313,7 +313,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
                 queue.task_done()
                 continue
             processing += 1
-            started = time.perf_counter()
+            started = body["_job_at"] = time.perf_counter()
             first_token = False
             try:
                 async with admit(body.get("_cache_salt")):
@@ -337,6 +337,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
                             **({"stats": request_stats} if sessions > 1 else {})):
                             if not first_token:
                                 first_token = True
+                                body["_first_at"] = time.perf_counter()
                                 lifecycle.first_token(rid, started, prompt_tokens=body.get("_prompt_tokens"))
                             out.put_nowait(delta)
                     finally:
@@ -497,14 +498,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
 
         def timings() -> dict[str, Any]:
             # llama.cpp names: the swap orchestrator reads cache_n as the verdict of a KV restore
-            st = request_stats
-            cache_n = int(st.get("cached_tokens", 0))
-            pre, gen = st.get("time_prefill") or 0.0, st.get("time_generate") or 0.0
-            n = int(st.get("new_tokens", 0))
-            return {"cache_n": cache_n, "prompt_n": max(prompt_tokens - cache_n, 0),
-                    "prompt_ms": pre * 1000, "predicted_n": n, "predicted_ms": gen * 1000,
-                    "prompt_per_second": (prompt_tokens - cache_n) / pre if pre else 0.0,
-                    "predicted_per_second": n / gen if gen else 0.0, **draft_timings(st)}
+            return serve_compat.stats_timings(prompt_tokens, request_stats, **draft_timings(request_stats))
 
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})

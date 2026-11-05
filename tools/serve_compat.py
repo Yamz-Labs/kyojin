@@ -4,10 +4,12 @@
 - the `cache_salt` request field
 - the POST /tokenize reply
 - the `usage` object with `prompt_tokens_details.cached_tokens`
+- the llama.cpp `timings` object (one shape on every server), final and progressive
 """
 from __future__ import annotations
 
-from typing import Any
+import time
+from typing import Any, Callable
 
 
 class CompatError(ValueError):
@@ -53,6 +55,52 @@ def usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int | None 
     if cached_tokens is not None:
         out["prompt_tokens_details"] = {"cached_tokens": max(0, min(int(cached_tokens), prompt_tokens))}
     return out
+
+
+def timings(prompt_tokens: int, cache_n: int, prefill_s: float, decode_s: float, predicted_n: int, **extra: Any) -> dict[str, Any]:
+    """The llama.cpp `timings` object: prompt_n (tokens prefilled, cache hits left out), prompt_ms, prompt_per_second, predicted_n,
+    predicted_ms, predicted_per_second, cache_n. The swap orchestrator reads cache_n as the verdict of a KV restore."""
+    prompt_n = max(prompt_tokens - cache_n, 0)
+    return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": prefill_s * 1000,
+            "prompt_per_second": prompt_n / prefill_s if prefill_s else 0.0,
+            "predicted_n": predicted_n, "predicted_ms": decode_s * 1000,
+            "predicted_per_second": predicted_n / decode_s if decode_s else 0.0, **extra}
+
+
+def stats_timings(prompt_tokens: int, st: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    """`timings` from the engine's per-request stats (cached_tokens, time_prefill, time_generate, new_tokens)."""
+    return timings(prompt_tokens, int(st.get("cached_tokens", 0)), st.get("time_prefill") or 0.0,
+                   st.get("time_generate") or 0.0, int(st.get("new_tokens", 0)), **extra)
+
+
+class LiveTimings:
+    """Progressive `timings` for one streamed reply: `take()` returns the object at most once per `period` seconds, None otherwise.
+
+    Measured numbers only. The worker stamps the job dict: `_job_at` (the job left the queue), `_first_at` (its first token) and
+    `_live["n"]` (the engine's own count of generated tokens, updated at each decode event). Prefill time is the span between the first two,
+    decode time runs from `_first_at`. While the engine has not reported a count, `take()` returns None; a server whose engine cannot
+    report one never builds a LiveTimings and sends `timings` on the final chunk only."""
+
+    PERIOD_S = 1.0
+
+    def __init__(self, job: dict[str, Any], prompt_tokens: int, stats: Callable[[], dict[str, Any]] = lambda: {},
+                 period: float | None = None, clock: Callable[[], float] = time.perf_counter) -> None:
+        self.job, self.prompt_tokens, self.stats = job, prompt_tokens, stats
+        self.period, self.clock = self.PERIOD_S if period is None else period, clock
+        self.last = None
+
+    def take(self) -> dict[str, Any] | None:
+        first, n = self.job.get("_first_at"), (self.job.get("_live") or {}).get("n")
+        if first is None or n is None:
+            return None
+        now = self.clock()
+        if self.last is None:
+            self.last = first
+        if now - self.last < self.period:
+            return None
+        self.last = now
+        return timings(self.prompt_tokens, int(self.stats().get("cached_tokens") or 0),
+                       max(first - self.job.get("_job_at", first), 0.0), now - first, n)
 
 
 RQ_MIN_TOKENS = 2048   # smallest reply span a job holds pages for before it yields them (each yield costs a short re-prefill)

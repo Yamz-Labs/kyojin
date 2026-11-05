@@ -34,6 +34,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
+import serve_compat  # noqa: E402  (the llama.cpp timings object, shared with the other servers)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
 from serve_metrics import Metrics
 # serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
@@ -448,7 +449,7 @@ class ResidentEngine:
     async def generate(self, prompt: str, *, max_tokens: int, temperature: float, top_p: float,
                        stop: list[str], reset_gate: bool = False,
                        cancel: asyncio.Event | None = None,
-                       images: list | None = None) -> AsyncIterator[str]:
+                       images: list | None = None, live: dict | None = None) -> AsyncIterator[str]:
         """Yield incremental decoded text. The caller serializes access to this method.
 
         When `cancel` is set (client gone) the job is cancelled between two generator steps. A step is one
@@ -491,6 +492,8 @@ class ResidentEngine:
                 for event in batch:
                     if event.get("error"):
                         raise RuntimeError(str(event["error"]))
+                    if live is not None and event.get("token_ids") is not None:
+                        live["n"] = live.get("n", 0) + int(event["token_ids"].numel())   # the generator's own count, read by the stream
                     text = event.get("text", "")
                     if text:
                         yield text
@@ -590,6 +593,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             # the difference, and it is logged on its own as wait_s.
             wait = time.perf_counter() - (body.get("_queued_at") or time.perf_counter())
             started = time.perf_counter() - wait
+            body["_job_at"] = time.perf_counter()
             if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
                 lifecycle.job_skipped(rid, wait)
                 out.put_nowait(None)
@@ -611,9 +615,11 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         temperature=body.get("temperature", SERVE_DEFAULTS["temperature"]),
                         top_p=body.get("top_p", SERVE_DEFAULTS["top_p"]), stop=body.get("_stop", []),
                         reset_gate=body.get("_reset_gate", False),
-                        cancel=body.get("_cancel"), **({"images": body["_images"]} if body.get("_images") else {})):
+                        cancel=body.get("_cancel"), live=body.setdefault("_live", {}),
+                        **({"images": body["_images"]} if body.get("_images") else {})):
                         if not first_token:
                             first_token = True
+                            body["_first_at"] = time.perf_counter()
                             lifecycle.first_token(rid, started, prompt_tokens=body.get("_prompt_tokens"))
                         out.put_nowait(delta)
                     request_stats.update(getattr(engine, "last_stats", None) or {})
@@ -755,14 +761,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
         def timings() -> dict[str, Any]:
             # llama.cpp names: the swap orchestrator reads cache_n as the verdict of a KV restore
-            st = request_stats
-            cache_n = int(st.get("cached_tokens", 0))
-            pre, gen = st.get("time_prefill") or 0.0, st.get("time_generate") or 0.0
-            n = int(st.get("new_tokens", 0))
-            return {"cache_n": cache_n, "prompt_n": max(prompt_tokens - cache_n, 0),
-                    "prompt_ms": pre * 1000, "predicted_n": n, "predicted_ms": gen * 1000,
-                    "prompt_per_second": (prompt_tokens - cache_n) / pre if pre else 0.0,
-                    "predicted_per_second": n / gen if gen else 0.0}
+            return serve_compat.stats_timings(prompt_tokens, request_stats)
 
         if body.get("stream", False):
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream",
@@ -780,6 +779,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             # A mutable cell, not a flag: the nested flush() assigns it, and a plain name assigned there
             # would be local to that closure (UnboundLocalError) instead of shared with the handler.
             seen = {"text": False}   # flipped at the first frame with text: the client's first sign of life
+            live = serve_compat.LiveTimings(body, prompt_tokens, lambda: request_stats)   # progressive timings, once per second
 
             async def flush(final: bool) -> None:
                 nonlocal done, mode
@@ -793,7 +793,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         if not seen["text"]:
                             seen["text"] = True
                             lifecycle.first_content(body["_reqid"], body["_queued_at"])
-                        await writer.write(sse(event({key: piece})))
+                        await writer.write(sse(event({key: piece}) | ({"timings": t} if (t := live.take()) else {})))
                         ping.note_output()   # the client has text: comments wait for the next silence
                     done = end
                     if not hits:
@@ -808,6 +808,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 async for delta in deltas(writer):
                     text += delta
                     await flush(False)
+                    if (t := live.take()) is not None:     # nothing went out for a second (held tool call, tags): an empty delta carries them
+                        await writer.write(sse(event({}) | {"timings": t}))
                 text, _ = stop_text(text, body["_stop"])
                 await flush(True)
                 message = parse_completion(text, body.get("tools"))
