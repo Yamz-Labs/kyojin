@@ -53,8 +53,8 @@ TEST_KEYS = [
     ("model.language_model.layers.0.linear_attn.in_proj_qkv", "model.language_model.layers.0.input_layernorm"),
 ]
 
-# The default fixture uses the mul1 codebook. Set EXL3_TEST_MODEL to another pack
-# to exercise different K/codebook combinations with the same oracle matrix.
+# The default Qwen3.8 fixture uses the mul1 codebook. Set EXL3_TEST_MODEL to the
+# Qwen3.5-9B fixture to exercise the MCG codebook with the same oracle matrix.
 DEFAULT_MODEL = os.path.expanduser("~/Models/Qwen3.8-27B-exl3")
 MODEL = os.environ.get("EXL3_TEST_MODEL", DEFAULT_MODEL)
 
@@ -430,6 +430,32 @@ def test_hip_gemv_k2_rows_9_falls_back():
     assert calls["gemv"] == 0
     assert calls["reconstruct"] > 0
     assert calls["hgemm"] > 0
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
+
+
+@pytest.mark.parametrize("core", ["tiles", "direct", "lds"])
+@pytest.mark.parametrize("rows", [5, 6, 7])
+@torch.inference_mode()
+def test_hip_gemv_small_rows_opt_in_cores(rows, core, monkeypatch):
+    """size_m 5/6/7 pad the MR row tile to 8; all three cores must still
+    produce the oracle result. The padded rows' reads are discarded, so this
+    cannot detect an out-of-bounds read -- that needs a sanitizer run."""
+    monkeypatch.delenv("EXL3_ROCM_GEMV_TILES", raising=False)
+    monkeypatch.delenv("EXL3_GEMV_LDS", raising=False)
+    if core == "direct":
+        monkeypatch.setenv("EXL3_ROCM_GEMV_TILES", "0")
+    elif core == "lds":
+        monkeypatch.setenv("EXL3_GEMV_LDS", "1")
+
+    actual, expected, calls, x, size_n = _run_rows_synthetic_oracle(
+        4, True, False, rows, torch.float16)
+    assert calls["gemv"] == 1
+    assert calls["reconstruct"] == 0
+    assert calls["reconstruct_slice"] == 0
+    assert calls["reconstruct_had_slice"] == 0
+    assert calls["hgemm"] == 0
     assert torch.isfinite(actual).all()
     assert torch.isfinite(expected).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)

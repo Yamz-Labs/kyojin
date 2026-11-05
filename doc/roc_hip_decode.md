@@ -78,6 +78,14 @@ The Qwen3.8-27B mul1 oracle reports:
 - overall mean delta: 0.027793
 - fallback-only `-inf` positions carry <1e-6 softmax mass per step
 
+The Qwen3.5-9B MCG oracle reports:
+
+- top-1 agreement: 16/16
+- exact top-5 agreement: 16/16 steps
+- max absolute logit delta: 0.234375
+- worst-step mean delta: 0.017942
+- overall mean delta: 0.009152
+
 Warmed decode measurements on gfx1201:
 
 | Model | Trial size | K6 reconstruct median | Direct K6 median | Uplift |
@@ -142,6 +150,10 @@ EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 \
   python -m pytest tests/test_hip_gemv_decode.py -q
 
 EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 \
+  python tests/hip_gemv_logits_oracle.py
+
+# Repeat with an MCG fixture.
+EXL3_TEST_MODEL=/path/to/Qwen3.5-9B-exl3 \
   python tests/hip_gemv_logits_oracle.py
 
 # Longer trace: the oracle widens its delta bounds with the step count.
