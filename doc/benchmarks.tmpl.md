@@ -30,7 +30,6 @@ GLM with `--sessions 4`: 30 tok/s for one request, 37.5 in total for two at once
 ## Where each figure comes from
 
 - Qwen3.8-Flash-Next, GLM-5.3-Flash and MiMo-V2.6-Flash, prefill and speculative decode (by context and on the card prompts): runs with the recipe above, at the commit named in `doc/figures.json`.
-- Strata and Gufo: the section "Strata and Gufo" below names the source of each figure.
 - Charts and the front-page table are built from `doc/figures.json` with `tools/make_charts.py` and `tools/make_readme_table.py`.
 
 Caveats, once: one machine, one OS image; prefill is the engine-reported prompt speed; figures are steady-state: the first request at a new prompt length is slower than the next ones. These are first versions and improvements are coming.
@@ -50,13 +49,6 @@ One machine: Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB LPDDR5X, ROCm. Ot
 | GLM-5.3-Flash, 82 GB pack, hook off, today's engine, `-c 131072`, client temperature 0, mean of 3 | 3.5K / 14K | 661 / 645 | 32.0 prose, 33.6 chat, 35.7 code | run, second machine (same CPU) |
 | GLM-5.3-Flash (99.7 GB), hook on + agent-lane flags, `-c 98304`, prefill mean of 3, decode mean of 6 | 3.5K / 14K / 64K | 580 / 584 / 546 | 29.0 / 30.3 / 27.6 at temperature 0; 26.0 / 28.5 / 26.4 at temperature 1.0, top-p 0.95 | run |
 | MiMo-V2.6-Flash-MOPD, 105 GB pack, speculative decoding on (default), 4 bpw drafter (702 MB), `-c 32768`, client temperature 0, decode medians of 6 runs over two loads, 128 tokens | - | 32.1 prose, 34.8 chat, 44.3 code | run, public tree |
-
-## Strata and Gufo
-
-{{RIVALS}}
-## Other engines
-
-llama.cpp (ROCm, UD-IQ1_S 1.56 bpw, `-fa 1 -ub 2048`, no MTP), same machine: pp4096 197.9, pp16384 158.3, tg128 16.74, tg at 64K 7.19 tok/s. Coarser quant: engine and format are compared together.
 
 ## Share your numbers
 

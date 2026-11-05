@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the README charts (SVG, standard library only) from doc/figures.json.
 usage: python3 tools/make_charts.py [figures.json] [out_dir]
-Four line charts, one idea each: prefill against context length (log scale), speculative decode by kind of text, and speculative decode against context length (Kyojin now and before, rivals where they publish a figure at that context), and prefill against context with the rivals. Higher is better.
+Two line charts: prefill against context length (log scale) and speculative decode against context length, one line per model.
 House style: white background, black text, steel blue accent, greys for the rest.
 A model without published values is listed in the legend and not drawn."""
 import json, sys, os
@@ -91,37 +91,6 @@ def decode_chart():
     foot = "Speculative decode by kind of text; same machine, 128 GB."
     return draw("decode", head, foot, kinds, str.capitalize, pos, lambda m: {k: v for k, v in m["spec"].items() if v}, "per context in the table")
 
-def prefill_context_chart():
-    """Prefill against context length: Kyojin and the rivals where a figure exists (Strata by the independent lab, Gufo measured by us)."""
-    q = M[0]; R = F.get("rivals", {})
-    ticks = ctx_ticks()
-    ints = lambda d: {int(c): v for c, v in d.items() if v}
-    series = [{"name": "Kyojin", "color": BLUE, "pts": ints(q["prefill"]), "below": True, "first_label": False}]
-    if R.get("strata"):
-        series.append({"name": "Strata (" + R["strata"]["independent"]["lab"] + ")", "color": "#555555", "pts": ints(R["strata"]["prefill_independent"]), "hollow": True, "dash": "8 5", "nolabel": True, "last_label": False})
-    if R.get("gufo"): series.append({"name": "Gufo (measured by us)", "color": GREY, "pts": ints(R["gufo"]["prefill_measured"]), "dash": "2 5", "first_label": False, "last_label": False})
-    xs = sorted(set(ticks) | {c for se in series for c in se["pts"]}); lo, hi = math.log2(ticks[0]), math.log2(ticks[-1])
-    pos = lambda a, b: {c: a + (b - a) * (math.log2(c) - lo) / (hi - lo) for c in xs}
-    pts = ints(q["prefill"]); cmax = max(pts) if pts else 0
-    head = f"Qwen prefill: {fmt(pts[cmax])} tok/s at {ck(cmax)}" if pts else "Qwen prefill by context"
-    foot = "Prompt tokens per second against context; same machine, 128 GB."
-    return draw_lines(head, foot, xs, lambda c: ck(c) if c in ticks else "", pos, series)
-
-def decode_context_chart():
-    """Speculative decode against context length: Kyojin now and before, and the rivals where a figure exists at that context."""
-    q = M[0]; R = F.get("rivals", {})
-    ticks = ctx_ticks()
-    lo, hi = math.log2(ticks[0]), math.log2(ticks[-1])
-    pos = lambda a, b: {c: a + (b - a) * (math.log2(c) - lo) / (hi - lo) for c in ticks}
-    ints = lambda d: {int(c): v for c, v in d.items() if v}
-    series = [{"name": "Kyojin", "color": BLUE, "pts": ints(q["decode"]), "first_label": False}]
-    if R.get("strata"): series.append({"name": "Strata (measured by us)", "color": "#555555", "pts": ints(R["strata"]["decode_measured"]), "dash": "8 5", "first_label": False, "last_label": False})
-    if R.get("gufo"): series.append({"name": "Gufo (measured by us)", "color": GREY, "pts": ints(R["gufo"]["decode_measured"]), "dash": "2 5", "first_label": False, "last_label": False})
-    pts = ints(q["decode"]); cmax = max(pts) if pts else 0
-    head = f"Qwen decode: {fmt(pts[cmax])} tok/s at {ck(cmax)}" if pts else "Qwen decode by context"
-    foot = "Speculative decode against context; same machine, 128 GB."
-    return draw_lines(head, foot, ticks, lambda c: ck(c), pos, series)
-
 def decode_models_chart():
     """Speculative decode against context length, one line per model."""
     ticks = ctx_ticks()
@@ -133,5 +102,5 @@ def decode_models_chart():
     return draw("decode_models", head, foot, ticks, lambda c: ck(c), pos, lambda m: {int(c): v for c, v in m["decode"].items() if v})
 
 os.makedirs(out, exist_ok=True)
-for name, svg in (("prefill", prefill_chart()), ("decode_models", decode_models_chart()), ("decode_context", decode_context_chart()), ("prefill_context", prefill_context_chart())): open(os.path.join(out, name + ".svg"), "w").write(svg)
+for name, svg in (("prefill", prefill_chart()), ("decode_models", decode_models_chart())): open(os.path.join(out, name + ".svg"), "w").write(svg)
 print("wrote", out)
