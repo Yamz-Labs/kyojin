@@ -56,7 +56,7 @@ def spread(ys, gap, lo, hi):
 def line_chart(th, title, sub_lines, accent, series, xs, top=None, legend=False):
     """series: [{name, color, pts [(x, value, hollow)], dash}]. Log-scale x, y from 0."""
     s = frame(th, W, H, title, sub_lines)
-    x0, x1, y0, y1 = 30, W - 78, 150 if legend else 128, 336
+    x0, x1, y0, y1 = 30, W - 78, (128 + 22 * len(series)) if legend else 128, 336
     vals = [v for se in series for _, v, _ in se["pts"]]
     top = top or max(vals) * 1.12
     lo, hi = math.log2(xs[0]), math.log2(xs[-1])
@@ -67,12 +67,11 @@ def line_chart(th, title, sub_lines, accent, series, xs, top=None, legend=False)
         s += f'<line x1="{x0}" x2="{W - 24}" y1="{y:.1f}" y2="{y:.1f}" stroke="{th["grid"]}" stroke-width="1.5"/>'
     for c in xs: s += tx(px(c), y1 + 30, ctx_label(c), 18, th["sub"], "middle")
     if legend:
-        lx = 24
-        for se in series:
+        for i, se in enumerate(series):
             d = f' stroke-dasharray="{se["dash"]}"' if se.get("dash") else ""
-            s += f'<line x1="{lx}" x2="{lx + 26}" y1="114" y2="114" stroke="{se["color"]}" stroke-width="4" stroke-linecap="round"{d}/>'
-            s += tx(lx + 34, 120, se["name"], 17, th["txt"])
-            lx += 34 + 9.4 * len(se["name"]) + 22
+            ly = 108 + 22 * i
+            s += f'<line x1="24" x2="50" y1="{ly}" y2="{ly}" stroke="{se["color"]}" stroke-width="4" stroke-linecap="round"{d}/>'
+            s += tx(58, ly + 6, se["name"], 17, th["txt"])
     starts, ends = [], []
     for se in series:
         pts = se["pts"]; col = se["color"]
@@ -141,33 +140,39 @@ def write(name, fn):
 # ---------- data ----------
 M = F["models"]; SHORT = {"qwen": "Flash-Next", "glm": "GLM-5.3", "mimo": "MiMo"}
 sv, sd = F["version"], F["date"]
-STRIX_SUB = [f'{F["machine"].split(",")[0]}, 128 GB', f"Kyojin {sv}, {sd}"]
+STRIX_SUB = [f'{F["machine"].split(",")[0]}, 128 GB, tok/s', f"Kyojin {sv}, {sd}"]
+
+
+FULL = {"qwen": "Qwen3.8-Flash-Next", "glm": "GLM-5.3-Flash"}
+
+
+def featured():
+    return [next(m for m in M if m["id"] == i) for i in ("glm", "qwen")]
 
 
 def strix_series(th, key):
     out = []
-    for m in M:
+    for m in featured():
         pts = [(int(c), v, False) for c, v in m[key].items() if v]
         if not pts: continue
-        col = {"qwen": th["amd"], "glm": th["n1"], "mimo": th["n2"]}[m["id"]]
-        name = SHORT[m["id"]] + (f' ({m["earlier"]})' if m.get("earlier") else "")
-        out.append(dict(name=name, color=col, pts=sorted(pts), dash="2 8" if m["id"] == "mimo" else None))
+        col = {"qwen": th["amd"], "glm": th["n1"]}[m["id"]]
+        out.append(dict(name=f'{FULL[m["id"]]} (Strix Halo)', color=col, pts=sorted(pts)))
     return out
 
 
 def strix_xs(key):
-    return sorted({int(c) for m in M for c, v in m[key].items() if v})
+    return sorted({int(c) for m in featured() for c, v in m[key].items() if v})
 
 
 def rtx_series(th, key, which):
     d = P["rtx"][which]; base = d["points"][0]["version"]
     pts = [(p["ctx"], p[key], p["version"] != base) for p in d["points"]]
-    return [dict(name=d["name"], color=th["nv"], pts=pts)], [p["ctx"] for p in d["points"]], d
+    return [dict(name=f'{d["name"]} (RTX 3090)', color=th["nv"], pts=pts)], [p["ctx"] for p in d["points"]], d
 
 
 def mac_series(th, key):
     m = P["mac"]
-    return [dict(name=m["name"], color=th["apple"], pts=[(p["ctx"], p[key], False) for p in m["points"]])], [p["ctx"] for p in m["points"]]
+    return [dict(name=f'{m["name"]} (Mac Studio)', color=th["apple"], pts=[(p["ctx"], p[key], False) for p in m["points"]])], [p["ctx"] for p in m["points"]]
 
 
 def make_all():
@@ -175,26 +180,26 @@ def make_all():
     for key, label in (("decode", "Decode"), ("prefill", "Prefill")):
         sub = STRIX_SUB if key == "decode" else STRIX_SUB
         def fn(th, key=key, label=label):
-            return line_chart(th, f"{label}, tok/s", sub, "amd", strix_series(th, key), strix_xs(key), legend=True)
+            return line_chart(th, f"{label}: GLM-5.3 and Flash-Next", sub, "amd", strix_series(th, key), strix_xs(key), legend=True)
         write(f"{key}-strix", fn)
     # RTX: Qwen3.8-27B and Flint, drawn in one chart per metric would mix scales, so Qwen3.8-27B carries the RTX charts
     for key, label in (("decode", "Decode"), ("prefill", "Prefill")):
         def fn(th, key=key, label=label):
             ser, xs, d = rtx_series(th, key, "qwen27")
-            sub = [f'{P["rtx"]["machine"]}, {d["name"]}', f'Kyojin {d["points"][0]["version"]}, {d["points"][0]["date"]}']
-            return line_chart(th, f"{label}, tok/s", sub, "nv", ser, xs)
+            sub = [f'{P["rtx"]["machine"]}, tok/s', f'Kyojin {d["points"][0]["version"]}, {d["points"][0]["date"]}']
+            return line_chart(th, f"{label}: {d['name']}", sub, "nv", ser, xs, legend=True)
         write(f"{key}-rtx", fn)
     for key, label in (("decode", "Decode"), ("prefill", "Prefill")):
         def fn(th, key=key, label=label):
             ser, xs, d = rtx_series(th, key, "flint")
-            sub = [f'{P["rtx"]["machine"]}, {d["name"]}', f'Kyojin {d["points"][0]["version"]}, {d["points"][0]["date"]}']
-            return line_chart(th, f"{label}, tok/s", sub, "nv", ser, xs)
+            sub = [f'{P["rtx"]["machine"]}, tok/s', f'Kyojin {d["points"][0]["version"]}, {d["points"][0]["date"]}']
+            return line_chart(th, f"{label}: {d['name']}", sub, "nv", ser, xs, legend=True)
         write(f"{key}-rtx-flint", fn)
     # Mac
     for key, label in (("decode", "Decode"), ("prefill", "Prefill")):
         def fn(th, key=key, label=label):
             ser, xs = mac_series(th, key); m = P["mac"]
-            return line_chart(th, f"{label}, tok/s", [f'{m["machine"]}, {m["name"]}', f'Kyojin {m["version"]}, {m["date"]}'], "apple", ser, xs)
+            return line_chart(th, f"{label}: {m['name']}", [f'{m["machine"]}, tok/s', f'Kyojin {m["version"]}, {m["date"]}'], "apple", ser, xs, legend=True)
         write(f"{key}-mac", fn)
     # Duels
     R = F["rivals"]; q = M[0]
@@ -213,18 +218,19 @@ def make_all():
         names = ["Kyojin", R["strata"]["name"], R["gufo"]["name"]]
         vals = [[q["decode"][str(c)] for c in ctx3], [R["strata"]["decode_measured"][str(c)] for c in ctx3], [R["gufo"]["decode_measured"][str(c)] for c in ctx3]]
         sub = [f'{F["machine"].split(",")[0]}, 128 GB, Qwen3.8-Flash-Next', f"Kyojin {sv}, {sd}, speculative decode"]
-        return bar_chart(th, "Decode vs other engines", sub, th["amd"], [ctx_label(c) for c in ctx3], names, vals, "Rivals measured by us, same machine. Multiple of the best rival.")
+        return bar_chart(th, "Flash-Next decode vs others", sub, th["amd"], [ctx_label(c) for c in ctx3], names, vals, "Rivals measured by us, same machine. Multiple of the best rival.")
     def duel_strix_prefill(th):
         names = ["Kyojin", R["gufo"]["name"]]
         vals = [[q["prefill"][str(c)] for c in ctx3], [R["gufo"]["prefill_measured"][str(c)] for c in ctx3]]
         sub = [f'{F["machine"].split(",")[0]}, 128 GB, Qwen3.8-Flash-Next', f"Kyojin {sv}, {sd}"]
-        return bar_chart(th, "Prefill vs other engines", sub, th["amd"], [ctx_label(c) for c in ctx3], names, vals, "Gufo measured by us, same machine. Multiple of the rival.")
+        return bar_chart(th, "Flash-Next prefill vs others", sub, th["amd"], [ctx_label(c) for c in ctx3], names, vals, "Gufo measured by us, same machine. Multiple of the rival.")
     write("duel-strix-decode", duel_strix_decode)
     write("duel-strix-prefill", duel_strix_prefill)
     # Cards
     qd = {int(c): v for c, v in q["decode"].items() if v}; qlast = max(qd)
     r = P["rtx"]["qwen27"]["points"]; mp = P["mac"]["points"]
-    cards = (("strix", "Strix Halo", "Ryzen AI Max+ 395, 128 GB", fmt(qd[8192]), "tok/s decode at 8K", "Qwen3.8-Flash-Next", f"{fmt(qd[qlast])} at {ctx_label(qlast)}"),
+    g = next(m for m in M if m["id"] == "glm"); gd = {int(c): v for c, v in g["decode"].items() if v}
+    cards = (("strix", "Strix Halo", "Ryzen AI Max+ 395, 128 GB", f"{gd[8192]:.0f} / {qd[8192]:.0f}", "tok/s decode at 8K", "GLM-5.3-Flash / Flash-Next", f"GLM to {ctx_label(max(gd))} of context"),
              ("rtx", "RTX 3090", "NVIDIA, 24 GB", fmt(r[0]["decode"]), "tok/s decode at 5K", "Qwen3.8-27B", f'{fmt(r[3]["decode"])} at {ctx_label(r[3]["ctx"])}'),
              ("mac", "Mac Studio", "M5 Ultra, 256 GB", fmt(mp[0]["decode"]), "tok/s decode at 8K", P["mac"]["name"], f'{fmt(mp[-1]["decode"])} at {ctx_label(mp[-1]["ctx"])}'))
     os.makedirs(OUT, exist_ok=True)

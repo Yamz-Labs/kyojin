@@ -16,50 +16,47 @@ Open source. Our own quantised builds of GLM, Qwen, MiMo, DeepSeek, Flint and Na
 **Run 100 GB-class AI models on one desktop machine, with up to 500K tokens of context.** Free, open source, and it speaks the OpenAI API, so your tools just work.
 
 <table align="center">
-<tr><td align="center" width="33%"><a href="#strix-halo-amd"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-strix-dark.svg"><img src="doc/img/home/card-strix-light.svg" alt="Strix Halo: 52.2 tok/s decode at 8K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#rtx-nvidia"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-rtx-dark.svg"><img src="doc/img/home/card-rtx-light.svg" alt="RTX 3090: 74.6 tok/s decode at 5K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#mac-apple-silicon"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-mac-dark.svg"><img src="doc/img/home/card-mac-light.svg" alt="Mac Studio: 62 tok/s decode at 8K" width="100%"></picture></a></td></tr>
+<tr><td align="center" width="33%"><a href="#strix-halo-amd"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-strix-dark.svg"><img src="doc/img/home/card-strix-light.svg" alt="Strix Halo: GLM-5.3-Flash 32 and Qwen3.8-Flash-Next 53 tok/s decode at 8K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#rtx-nvidia"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-rtx-dark.svg"><img src="doc/img/home/card-rtx-light.svg" alt="RTX 3090: 74.6 tok/s decode at 5K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#mac-apple-silicon"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-mac-dark.svg"><img src="doc/img/home/card-mac-light.svg" alt="Mac Studio: 62 tok/s decode at 8K" width="100%"></picture></a></td></tr>
 </table>
 
 ## What you get
 
-| Your machine | Model | Speed | In plain words |
-|---|---|---|---|
-| **Strix Halo** (AMD, 128 GB) | Qwen3.8-Flash-Next | 53.2 tok/s writing, 1576 tok/s reading, at 8K | Writes about 10 times faster than you read. An 8K-token document is read in about 6 seconds. |
-| **RTX 3090** (NVIDIA, 24 GB) | Qwen3.8-27B | 74.6 tok/s writing, 1621 tok/s reading, at 5K | Writes about 13 times faster than you read. 245K tokens of context on one 24 GB card. |
-| **Mac Studio** (Apple, 256 GB) | DeepSeek V4.1 Flash | 62 tok/s writing, 3001 tok/s reading, at 8K | Writes about 11 times faster than you read, and keeps 983K tokens of context. |
+| Machine | Model | Decode tok/s | Prefill tok/s | Context |
+|---|---|---|---|---|
+| **Strix Halo** (AMD, 128 GB) | GLM-5.3-Flash | 32.3 at 8K | 633 at 8K | up to 500K |
+| **Strix Halo** (AMD, 128 GB) | Qwen3.8-Flash-Next | 53.2 at 8K | 1576 at 8K | up to 256K |
+| **RTX 3090** (NVIDIA, 24 GB) | Qwen3.8-27B | 74.6 at 5K | 1621 at 5K | up to 245K |
+| **Mac Studio** (Apple, 256 GB) | DeepSeek V4.1 Flash | 62 at 8K | 3001 at 8K | up to 983K |
 
-"tok/s" is tokens per second (a token is about three quarters of a word). Reading speed is about 5.5 tok/s. Measured through the real server with real text.
+Served through the real server with real text, Kyojin 1.8.10 on Strix Halo, 1.8.9 on RTX and Mac.
 
 ## Try it in 3 lines
 
 ```bash
 git clone https://github.com/Yamz-Labs/kyojin && cd kyojin
-hf download yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz --local-dir ./qwen-pack
-python tools/qwen/serve.py --model ./qwen-pack --port 8000 -c 131072
+hf download yamz-labs/GLM-5.3-Flash-EXL3-Yamz --local-dir ./glm-pack
+python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
 ```
 
-That is the Strix Halo command. RTX and Mac commands, and the one-time build: [Quickstart](#quickstart).
+That is the Strix Halo command (GLM-5.3-Flash; Qwen3.8-Flash-Next works the same way). RTX and Mac commands, and the one-time build: [Quickstart](#quickstart).
 
 ## Speed by context
 
 Tokens per second against context length (log scale), served through the real server with real text. Each chart says its machine, Kyojin version and date. Higher is better.
 
-**Strix Halo (AMD)**
+**Strix Halo (AMD), GLM-5.3-Flash and Qwen3.8-Flash-Next**
 
 <table>
 <tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-strix-dark.svg"><img src="doc/img/home/decode-strix-light.svg" alt="Decode tok/s against context on Strix Halo, three models" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-strix-dark.svg"><img src="doc/img/home/prefill-strix-light.svg" alt="Prefill tok/s against context on Strix Halo, three models" width="100%"></picture></td></tr>
 </table>
 
-**RTX 3090 (NVIDIA)**
+**RTX 3090 (NVIDIA), Qwen3.8-27B**
 
 <table>
 <tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-rtx-dark.svg"><img src="doc/img/home/decode-rtx-light.svg" alt="Decode tok/s against context, Qwen3.8-27B on RTX 3090" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-rtx-dark.svg"><img src="doc/img/home/prefill-rtx-light.svg" alt="Prefill tok/s against context, Qwen3.8-27B on RTX 3090" width="100%"></picture></td></tr>
 </table>
 
-<table>
-<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-rtx-flint-dark.svg"><img src="doc/img/home/decode-rtx-flint-light.svg" alt="Decode tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-rtx-flint-dark.svg"><img src="doc/img/home/prefill-rtx-flint-light.svg" alt="Prefill tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td></tr>
-</table>
-
-**Mac Studio (Apple)**
+**Mac Studio (Apple), DeepSeek V4.1 Flash**
 
 <table>
 <tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-mac-dark.svg"><img src="doc/img/home/decode-mac-light.svg" alt="Decode tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-mac-dark.svg"><img src="doc/img/home/prefill-mac-light.svg" alt="Prefill tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td></tr>
@@ -68,6 +65,12 @@ Tokens per second against context length (log scale), served through the real se
 ## Details
 
 Everything below is for people who want the numbers, the comparison with other engines, the model list and the full install.
+
+**RTX 3090: Flint V1**
+
+<table>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-rtx-flint-dark.svg"><img src="doc/img/home/decode-rtx-flint-light.svg" alt="Decode tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-rtx-flint-dark.svg"><img src="doc/img/home/prefill-rtx-flint-light.svg" alt="Prefill tok/s against context, Flint V1 on RTX 3090" width="100%"></picture></td></tr>
+</table>
 
 ## Against other engines
 
