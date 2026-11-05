@@ -401,6 +401,8 @@ def template_kwargs(body: dict[str, Any]) -> dict[str, Any]:
     effort = pick("reasoning_effort", SERVE_DEFAULTS["reasoning_effort"])
     if effort is not None:
         kw["reasoning_effort"] = effort
+    if pick("effort_guidance", os.environ.get("KYOJIN_EFFORT_GUIDANCE") == "1"):   # opt-in medium guidance text
+        kw["effort_guidance"] = True
     return kw
 
 

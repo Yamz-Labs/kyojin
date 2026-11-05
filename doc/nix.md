@@ -84,6 +84,28 @@ hand-backfilled `hash = "sha256:..."` entries in `uv.lock` (convert with
 re-lock drops them, Nix evaluation fails loudly asking for a sha256.
 Then rebuild `.#torch-rocm` and `.#exllamav3`.
 
+## Dependency updates
+
+`.github/dependabot.yml` bumps **flake inputs only** (`package-ecosystem:
+nix`, weekly). `nixpkgs` gets its own PR because it moves torch, python and
+glibc; `uv2nix` / `pyproject.nix` / `build-system-pkgs` are grouped into one PR
+because they are `follows`-linked and a partial bump is a combination CI cannot
+validate.
+
+The Python ecosystems are deliberately absent. The ROCm pins above are one
+hand-bumped snapshot of AMD's nightly index; an automated bump to a single
+package yields a wheel set that disagrees with `uv.lock` and with the compiled
+extension. Those stay a human decision.
+
+Two operational notes:
+
+- **Dependabot PRs can arrive with no checks attached** when the PR is created
+  with the default `GITHUB_TOKEN`. Here CI is the whole argument for automated
+  bumps, so configure a PAT or a GitHub App for Dependabot; otherwise close and
+  reopen the PR to trigger `nix.yml`.
+- A `flake.lock` bump rebuilds the extension (~20 min cold), which is why the
+  cadence is weekly and `open-pull-requests-limit` is 5.
+
 ## Running on gfx1151 hardware
 
 Bare metal (after `nix copy` to the machine, or with a shared store):
@@ -104,7 +126,7 @@ podman run -d --name kyojin --replace \
   -v kyojin-models:/models -p 8000:8000 \
   -e KYOJIN_FLAVOR=qwen \
   -e KYOJIN_MODEL_REPO=yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz \
-  kyojin:1.5.8 -- -c 262144
+  "kyojin:$(nix eval --raw .#docker.imageTag)" -- -c 262144
 curl http://localhost:8000/v1/models
 ```
 
