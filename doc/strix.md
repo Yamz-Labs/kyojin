@@ -6,7 +6,7 @@ Kyojin was built for this machine first: one Ryzen AI Max+ 395 with 128 GB of un
 <tr><th align="left">Model</th><th>Pack</th><th>Prefill</th><th>Speculative decode</th></tr>
 <tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">95 GB</td><td align="right">1480 at 8K<sup>1</sup></td><td align="right"><b>47.5 to 73.2</b></td></tr>
 <tr><td><b>GLM-5.3-Flash</b></td><td align="right">99.73 GB</td><td align="right">652 at 8K</td><td align="right"><b>27.4 to 36.8</b></td></tr>
-<tr><td>MiMo-V2.6-Flash <sub>(1.5)</sub></td><td align="right">105.8 GB</td><td align="right">760 at 8K</td><td align="right">28.9 to 37.0</td></tr>
+<tr><td>MiMo-V2.6-Flash <sub>(1.5.10)</sub></td><td align="right">105.8 GB</td><td align="right">760 at 8K</td><td align="right">28.9 to 37.0</td></tr>
 <tr><td>DeepSeek-V4.1-Flash <sub>(experimental, SSD tier)</sub></td><td align="right">185 GB</td><td align="right">187 to 257 at 8K</td><td align="right">5 to 11 <sub>(plain)</sub></td></tr>
 </table>
 
@@ -21,11 +21,10 @@ Kyojin was built for this machine first: one Ryzen AI Max+ 395 with 128 GB of un
 
 <table align="center">
 <tr><th align="left">Model</th><th>128K</th><th>256K</th><th>500K</th></tr>
-<tr><td><b>Qwen3.8-Flash-Next</b></td><td align="right">1505 / 54.8</td><td align="right">1399 / 46.9</td><td align="right">1224 / 48.1</td></tr>
-<tr><td><b>GLM-5.3-Flash</b></td><td align="right">649 / 30.8</td><td align="right">619 / 34.3</td><td align="right">567 / 26.4</td></tr>
+<tr><td><b>GLM-5.3-Flash</b></td><td align="right">584 / 32.4</td><td align="right">576 / 32.4</td><td align="right">567 / 32.8</td></tr>
 </table>
 
-<p align="center"><sub>Prefill / speculative decode, tokens per second, Kyojin 1.5.10 on one Ryzen AI Max+ 395 with 128 GB. One real document read as a growing prompt (500K = 499,712 tokens); prefill as reported by the server. Both models recalled two facts hidden at 40 % and 85 % of a ~500K-token prompt (needle test, Kyojin 1.5.3, 15/10).</sub></p>
+<p align="center"><sub>Prefill / speculative decode, tokens per second, Kyojin 1.8.10 on one Ryzen AI Max+ 395 with 128 GB. One real document read as a growing prompt (500K = 499,712 tokens); prefill as reported by the server. Both models recalled two facts hidden at 40 % and 85 % of a ~500K-token prompt (needle test, Kyojin 1.5.3, 15/10).</sub></p>
 
 500K needs <code>-c 524288</code> at launch. Qwen also needs <code>--cache-bits 8</code>: past 262K it uses the 8-bit cache.
 

@@ -13,11 +13,31 @@ Open source. Our own quantised builds of GLM, Qwen, MiMo, DeepSeek, Flint and Na
 <a href="https://x.com/YamzLabs"><img alt="X" src="https://img.shields.io/badge/news-%40YamzLabs-444444"></a>
 </p>
 
-**Big models, long context, one machine: up to 500K tokens on a 128 GB Strix Halo, 262K on a 24 GB RTX 3090, 983K on a Mac Studio.** Pick yours.
+**Run 100 GB-class AI models on one desktop machine, with up to 500K tokens of context.** Free, open source, and it speaks the OpenAI API, so your tools just work.
 
 <table align="center">
 <tr><td align="center" width="33%"><a href="#strix-halo-amd"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-strix-dark.svg"><img src="doc/img/home/card-strix-light.svg" alt="Strix Halo: 52.2 tok/s decode at 8K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#rtx-nvidia"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-rtx-dark.svg"><img src="doc/img/home/card-rtx-light.svg" alt="RTX 3090: 74.6 tok/s decode at 5K" width="100%"></picture></a></td><td align="center" width="33%"><a href="#mac-apple-silicon"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-mac-dark.svg"><img src="doc/img/home/card-mac-light.svg" alt="Mac Studio: 62 tok/s decode at 8K" width="100%"></picture></a></td></tr>
 </table>
+
+## What you get
+
+| Your machine | Model | Speed | In plain words |
+|---|---|---|---|
+| **Strix Halo** (AMD, 128 GB) | Qwen3.8-Flash-Next | 53.2 tok/s writing, 1576 tok/s reading, at 8K | Writes about 8 times faster than you read. An 8K-token document is read in about 6 seconds. |
+| **RTX 3090** (NVIDIA, 24 GB) | Qwen3.8-27B | 74.6 tok/s writing, 1621 tok/s reading, at 5K | Writes about 11 times faster than you read. 262K tokens of context on one 24 GB card. |
+| **Mac Studio** (Apple, 256 GB) | DeepSeek V4.1 Flash | 62 tok/s writing, 3001 tok/s reading, at 8K | Writes about 9 times faster than you read, and keeps 983K tokens of context. |
+
+"tok/s" is tokens per second (a token is about three quarters of a word). Reading speed is about 7 tok/s. Measured through the real server with real text.
+
+## Try it in 3 lines
+
+```bash
+git clone https://github.com/Yamz-Labs/kyojin && cd kyojin
+hf download yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz --local-dir ./qwen-pack
+python tools/qwen/serve.py --model ./qwen-pack --port 8000 -c 131072
+```
+
+That is the Strix Halo command. RTX and Mac commands, and the one-time build: [Quickstart](#quickstart).
 
 ## Speed by context
 
@@ -45,6 +65,10 @@ Tokens per second against context length (log scale), served through the real se
 <tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-mac-dark.svg"><img src="doc/img/home/decode-mac-light.svg" alt="Decode tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-mac-dark.svg"><img src="doc/img/home/prefill-mac-light.svg" alt="Prefill tok/s against context, DeepSeek V4.1 Flash on Mac Studio" width="100%"></picture></td></tr>
 </table>
 
+## Details
+
+Everything below is for people who want the numbers, the comparison with other engines, the model list and the full install.
+
 ## Against other engines
 
 Same machine, same prompts. The number under each group is Kyojin divided by the best rival.
@@ -66,7 +90,7 @@ llama.cpp prefills Qwen3.8-27B 10 to 19 % faster up to 32K ([details](doc/rtx.md
 
 | Machine | Best model | Prefill | Decode | Kyojin | Date |
 |---|---|---|---|---|---|
-| [Strix Halo](#strix-halo-amd), Ryzen AI Max+ 395, 128 GB | Qwen3.8-Flash-Next | 1480 at 8K | 52.2 at 8K | 1.8.9 (prefill), 1.5.10 (decode) | 2026-11-04, 2026-10-17 |
+| [Strix Halo](#strix-halo-amd), Ryzen AI Max+ 395, 128 GB | Qwen3.8-Flash-Next | 1576 at 8K | 53.2 at 8K | 1.8.10 | 2026-11-05 |
 | [RTX 3090](#rtx-nvidia), 24 GB | Qwen3.8-27B | 1621 at 5K | 74.6 at 5K | 1.8.9 | 2026-11-04 |
 | [RTX 3090](#rtx-nvidia), 24 GB | Flint V1 | 6930 at 4K | 138.7 at 4K | 1.8.9 | 2026-11-04 |
 | [Mac Studio](#mac-apple-silicon), M3 Ultra, 256 GB | DeepSeek V4.1 Flash | 3001 at 8K | 62 at 8K | 1.8.9 | 2026-11-04 |

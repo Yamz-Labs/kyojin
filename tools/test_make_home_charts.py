@@ -27,8 +27,8 @@ def test_numbers_come_from_data(tmp_path):
     rd = lambda n: open(os.path.join(tmp_path, n)).read()
     F = json.load(open(os.path.join(ROOT, "doc", "figures.json")))
     q = F["models"][0]
-    assert ">52.2<" in rd("decode-strix-light.svg") and f"Kyojin {F['version']}" in rd("decode-strix-light.svg")
-    assert ">1,621<" in rd("prefill-strix-light.svg") and q["prefill"]["8192"] == 1621
+    assert f">{q['decode']['8192']}<" in rd("decode-strix-light.svg") and f"Kyojin {F['version']}" in rd("decode-strix-light.svg")
+    assert f">{q['prefill']['8192']:,}<" in rd("prefill-strix-light.svg")
     P = json.load(open(os.path.join(ROOT, "doc", "figures_platforms.json")))
     assert ">74.6<" in rd("decode-rtx-light.svg") and P["rtx"]["qwen27"]["points"][0]["decode"] == 74.6
     assert ">3,001<" in rd("prefill-mac-light.svg")
