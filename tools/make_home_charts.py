@@ -126,7 +126,7 @@ def card(th, key, name, spec, big, unit, model, extra):
          f'<rect x="0.5" y="0.5" width="{w - 1}" height="{h - 1}" rx="10" fill="{th["bg"]}" stroke="{th["edge"]}"/>'
          f'<rect x="0.5" y="0.5" width="{w - 1}" height="8" rx="4" fill="{acc}"/>')
     s += tx(22, 48, name, 26, th["txt"], "start", "700") + tx(22, 74, spec, 16, th["sub"])
-    s += tx(22, 134, big, 64, acc, "start", "700") + tx(22, 158, unit, 17, th["sub"])
+    s += tx(22, 128, big, 56, acc, "start", "700") + tx(22, 162, unit, 17, th["sub"])
     s += tx(22, 190, model, 18, th["txt"], "start", "700") + tx(22, 214, extra, 17, th["sub"])
     return svg_end(s)
 

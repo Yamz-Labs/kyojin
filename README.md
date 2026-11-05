@@ -47,7 +47,7 @@ Tokens per second against context length (log scale), served through the real se
 **Strix Halo (AMD), GLM-5.3-Flash and Qwen3.8-Flash-Next**
 
 <table>
-<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-strix-dark.svg"><img src="doc/img/home/decode-strix-light.svg" alt="Decode tok/s against context on Strix Halo, three models" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-strix-dark.svg"><img src="doc/img/home/prefill-strix-light.svg" alt="Prefill tok/s against context on Strix Halo, three models" width="100%"></picture></td></tr>
+<tr><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/decode-strix-dark.svg"><img src="doc/img/home/decode-strix-light.svg" alt="Decode tok/s against context on Strix Halo, GLM-5.3-Flash and Qwen3.8-Flash-Next" width="100%"></picture></td><td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/prefill-strix-dark.svg"><img src="doc/img/home/prefill-strix-light.svg" alt="Prefill tok/s against context on Strix Halo, GLM-5.3-Flash and Qwen3.8-Flash-Next" width="100%"></picture></td></tr>
 </table>
 
 **RTX 3090 (NVIDIA), Qwen3.8-27B**
