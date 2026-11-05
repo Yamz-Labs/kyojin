@@ -93,7 +93,7 @@ It prints a Markdown block. Paste it in a [benchmark report](https://github.com/
 - Speculative decoding, on by default; it returns the same tokens as plain decoding.
 - Long context: up to 983K tokens (DeepSeek V4.1 Flash on a Mac Studio), 500K on GLM-5.3-Flash.
 - Image input on Qwen3.8-27B.
-- Optional uncensored mode: ready-made packs for [GLM-5.3-Flash](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) and [MiMo-V2.6-Flash](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored), and a preset in the [Qwen3.8-Flash-Next pack](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz), off by default. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).
+- Optional uncensored mode: a small run-time preset on the normal packs, off by default; it edits no weights. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).
 
 ## Made with our models
 
@@ -113,9 +113,7 @@ All packs are EXL3 on Hugging Face: ours on [yamz-labs](https://huggingface.co/y
 | [Qwen3.8-Flash-Next](https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz) | Strix Halo | 95.4 GB |
 | [Qwen3.8-27B-exl3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6) (turboderp) | RTX 3090 | 15 GiB |
 | [DeepSeek V4.1 Flash](https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz) | Mac Studio, Strix Halo (SSD tier) | 184.7 GB |
-| [GLM-5.3-Flash, uncensored](https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz-Uncensored) | Strix Halo | 100.1 GB |
 | [MiMo-V2.6-Flash-MOPD](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz) | Strix Halo | 105.0 GB |
-| [MiMo-V2.6-Flash-MOPD, uncensored](https://huggingface.co/yamz-labs/MiMo-V2.6-Flash-MOPD-EXL3-Yamz-Uncensored) | Strix Halo | 105.0 GB |
 | [Flint-40B-A2.5B](https://huggingface.co/yamz-labs/Flint-40B-A2.5B-EXL3-Yamz) | RTX 3090 | 17.9 GB |
 | [Nanbeige4.3-33B](https://huggingface.co/yamz-labs/Nanbeige4.3-33B-EXL3-Yamz) | RTX 3090 | 18.7 GB |
 
@@ -129,16 +127,10 @@ All packs are EXL3 on Hugging Face: ours on [yamz-labs](https://huggingface.co/y
 
 ## Contributors
 
-Thank you to everyone who tests Kyojin on their own machine and writes precise reports.
+Thank you to everyone who tests Kyojin on their own machine and writes precise reports. Who did what: [doc/credits.md](doc/credits.md#contributors).
 
-- [@felladrin](https://github.com/felladrin): pull requests for the GLM start-up, the GPU target lookup, the bench tool tests, the troubleshooting page, `--sessions` in the Qwen server and `tools/bench.sh --json`; bug reports, an independent benchmark and issue triage.
-- [@MangetsuC](https://github.com/MangetsuC): the GLM image path without solver searches (first image of a new size in seconds) and the dense GEMM tune primer.
-- [@nobert](https://github.com/nobert): the Prometheus `/metrics` endpoint, merged for GLM and MiMo.
-- [@morrisfamily](https://github.com/morrisfamily): benchmark report on a BOSGAME Beyond-Max.
-- [@ChrisC381](https://github.com/ChrisC381): reported the GLM difference between paired jobs.
-- [@dturini12](https://github.com/dturini12): reported streaming without `finish_reason`; fixed and confirmed.
-- [@mostlygeek](https://github.com/mostlygeek): proposal for a container setup.
-- [@kamjin3086](https://github.com/kamjin3086): benchmark of Kyojin 1.6 against another engine and the report of a host freeze at start-up; both led to fixes in 1.7.
+- Code: [@felladrin](https://github.com/felladrin), [@twstagg](https://github.com/twstagg), [@resynth](https://github.com/resynth), [@razethion](https://github.com/razethion), [@MangetsuC](https://github.com/MangetsuC), [@mostlygeek](https://github.com/mostlygeek), [@zaxbysauce](https://github.com/zaxbysauce), [@thebigen01](https://github.com/thebigen01), [@nobert](https://github.com/nobert), [@Idriss091](https://github.com/Idriss091), [@JoaoFay](https://github.com/JoaoFay).
+- Reports and benchmarks: [@kamjin3086](https://github.com/kamjin3086), [@OleksKon](https://github.com/OleksKon), [@spawnax](https://github.com/spawnax), [@alanoo81](https://github.com/alanoo81), [@dturini12](https://github.com/dturini12), [@ChrisC381](https://github.com/ChrisC381), [@morrisfamily](https://github.com/morrisfamily), [@xXm-mXx](https://github.com/xXm-mXx).
 
 ## Read more
 
