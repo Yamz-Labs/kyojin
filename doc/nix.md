@@ -104,7 +104,7 @@ podman run -d --name kyojin --replace \
   -v kyojin-models:/models -p 8000:8000 \
   -e KYOJIN_FLAVOR=qwen \
   -e KYOJIN_MODEL_REPO=yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz \
-  kyojin:1.5.8 -- -c 262144
+  "kyojin:$(nix eval --raw .#docker.imageTag)" -- -c 262144
 curl http://localhost:8000/v1/models
 ```
 
