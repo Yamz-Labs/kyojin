@@ -55,6 +55,10 @@ def get_sources(sources_dir, is_rocm, base_dir=None):
                 continue
             rel_path = os.path.relpath(os.path.join(root, file), start=sources_dir)
             norm_rel = rel_path.replace('\\', '/')
+            # rocm/ contains HIP-only translation units (for example the RDNA fdot2
+            # GEMV); a CUDA build must not see them.
+            if not is_rocm and norm_rel.startswith('rocm/'):
+                continue
             if is_rocm and not norm_rel.startswith(ROCM_ALLOW_PREFIXES):
                 parts = norm_rel.split('/')
                 if any(d in parts for d in ROCM_EXCLUDE_DIRS):
