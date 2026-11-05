@@ -86,7 +86,7 @@ With a server running:
 tools/bench.sh --base http://localhost:8000/v1 --reps 3
 ```
 
-It prints a Markdown block. Paste it in a benchmark report issue to share your results ([how the figures are measured](doc/benchmarks.md)).
+It prints a Markdown block. Paste it in a [benchmark report](https://github.com/Yamz-Labs/kyojin/issues/new?template=benchmark_report.yml) to share your results ([how the figures are measured](doc/benchmarks.md)).
 
 ## What is inside
 
