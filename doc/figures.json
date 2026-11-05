@@ -2,9 +2,9 @@
  "_comment": "Single source for the README table and the charts. null = not measured (left out of the chart). Qwen and GLM: new-user recipe at the commit below (MiMo: at 39dc956); all three: new-user recipe at the commit below. Rebuild: python3 tools/make_charts.py && python3 tools/make_readme_table.py. before = previous release, as published.",
  "machine": "Ryzen AI Max+ 395, Radeon 8060S (gfx1151), 128 GB",
  "method": "new-user install, published packs, default environment, card prompts, greedy, server-reported prefill",
- "date": "2026-10-17",
+ "date": "2026-11-05",
  "commit": "db6103b",
- "version": "1.5.10",
+ "version": "1.8.10",
  "readme_extra_rows": [
   "<tr><td>DeepSeek-V4.1-Flash <sub>(experimental, SSD tier)</sub></td><td align=\"right\">185 GB</td><td align=\"right\">187 to 257 at 8K</td><td align=\"right\">5 to 11 <sub>(plain)</sub></td></tr>"
  ],
@@ -14,12 +14,11 @@
    "name": "Qwen3.8-Flash-Next",
    "pack_gb": 95.0,
    "prefill": {
-    "8192": 1621,
-    "32768": 1548,
-    "65536": 1542,
-    "131072": 1505,
-    "262144": 1399,
-    "499712": 1224
+    "8192": 1576,
+    "32768": 1556,
+    "65536": 1507,
+    "131072": 1502,
+    "262144": 1459
    },
    "spec": {
     "prose": 47.5,
@@ -27,15 +26,14 @@
     "code": 73.2
    },
    "decode": {
-    "8192": 52.2,
-    "32768": 51.1,
-    "65536": 46.6,
-    "131072": 54.8,
-    "262144": 46.9,
-    "499712": 48.1
+    "8192": 53.2,
+    "32768": 46.1,
+    "65536": 50.9,
+    "131072": 48.3,
+    "262144": 46.5
    },
    "table": {
-    "prefill": "1480 at 8K<sup>1</sup>",
+    "prefill": "1576 at 8K",
     "decode": "47.5 to 73.2"
    },
    "before": {
@@ -65,11 +63,11 @@
    "name": "GLM-5.3-Flash",
    "pack_gb": 99.73,
    "prefill": {
-    "8192": 652,
-    "32768": 634,
-    "65536": 629,
-    "131072": 649,
-    "262144": 619,
+    "8192": 633,
+    "32768": 609,
+    "65536": 600,
+    "131072": 584,
+    "262144": 576,
     "499712": 567
    },
    "spec": {
@@ -78,15 +76,15 @@
     "code": 36.8
    },
    "decode": {
-    "8192": 35.0,
-    "32768": 32.1,
-    "65536": 33.5,
-    "131072": 30.8,
-    "262144": 34.3,
-    "499712": 26.4
+    "8192": 32.3,
+    "32768": 32.2,
+    "65536": 32.2,
+    "131072": 32.4,
+    "262144": 32.4,
+    "499712": 32.8
    },
    "table": {
-    "prefill": "652 at 8K",
+    "prefill": "633 at 8K",
     "decode": "27.4 to 36.8"
    },
    "before": {
@@ -114,7 +112,7 @@
   {
    "id": "mimo",
    "name": "MiMo-V2.6-Flash",
-   "earlier": "1.5",
+   "earlier": "1.5.10",
    "pack_gb": 105.8,
    "prefill": {
     "8192": 760,
@@ -156,107 +154,5 @@
  ],
  "headline_prompt": "chat",
  "headline_prefill_ctx": "8192",
- "rivals": {
-  "strata": {
-   "name": "Strata",
-   "version": "v0.1.40",
-   "pack": "UD-IQ4_XS",
-   "pack_gb": 93.7,
-   "repo": "https://github.com/Niko1221/Strata",
-   "source_url": "https://github.com/Niko1221/Strata/releases/tag/v0.1.40",
-   "seen": "2026-10-07",
-   "prefill_independent": {
-    "32768": 795.1,
-    "65536": 762.5,
-    "120000": 709.1
-   },
-   "independent": {
-    "lab": "Ciru Inference Lab",
-    "date": "6 October 2026",
-    "url": "https://llm.ciru.ai/strataflash/",
-    "audit_url": "https://github.com/ciru-ai/strataflash/blob/main/benchmark/advertised-prefill-audit.json",
-    "sizes": "32K, 64K and 120K tokens"
-   },
-   "decode_measured": {
-    "8192": 39.0,
-    "32768": 38.7,
-    "65536": 36.4,
-    "131072": 35.0,
-    "262144": 37.5
-   },
-   "card_measured": {
-    "chat": 46.7,
-    "prose": 41.5,
-    "code": 61.6
-   },
-   "latest_release_note": "v0.1.40.1 (2026-10-06) is a server hotfix, same engine as v0.1.40: figures unchanged"
-  },
-  "gufo": {
-   "name": "Gufo",
-   "version": "v0.8.0",
-   "pack": "UD-Q4_K_XL",
-   "pack_gb": 111.3,
-   "repo": "https://github.com/gufo-org/gufo",
-   "source_url": "https://github.com/gufo-org/gufo/blob/main/docs/models/qwen3.8-flash-next/BENCHMARKS.md",
-   "seen": "2026-10-07",
-   "prefill_measured": {
-    "8192": 1250.5,
-    "32768": 1308.1,
-    "65536": 1289.0,
-    "131072": 1230.2
-   },
-   "decode_measured": {
-    "8192": 35.3,
-    "32768": 31.9,
-    "65536": 35.8,
-    "131072": 31.4
-   },
-   "card_measured": {
-    "chat": 37.3,
-    "prose": 32.5,
-    "code": 52.3
-   },
-   "note_256K": "the 256K prompt (about 264K tokens by Gufo's count) exceeds its 262144-token window",
-   "prev_seen_2026_10_06": {
-    "prefill_readme": {
-     "8K": 1492.95,
-     "32K": 1449.56,
-     "64K": 1316.7,
-     "128K": 1335.91
-    },
-    "decode_readme": {
-     "8K": 36.08,
-     "32K": 31.03,
-     "64K": 32.63,
-     "128K": 34.2
-    }
-   },
-   "source_commit_note": "benchmarks page updated 2026-10-06 21:57 UTC (perf: reduce prefill work at long context, #463), single-user figures dated October 6, 2026 (4c5a00d2); latest release v0.8.1"
-  }
- },
- "quality": {
-  "reference": "official FP8 release of the model",
-  "set": "200 public neutral texts, 3,084 scored positions, one scorer for all three engines, row-cluster bootstrap",
-  "positions": 3084,
-  "texts": 200,
-  "kyojin": {
-   "top1": 93.81,
-   "kl": 0.0216,
-   "kl_variation": 0.0008,
-   "pack_gb": 95.0
-  },
-  "strata": {
-   "top1": 93.64,
-   "kl": 0.0316,
-   "kl_variation": 0.0074,
-   "pack_gb": 93.7
-  },
-  "gufo": {
-   "top1": 95.36,
-   "kl": 0.0156,
-   "kl_variation": 0.0,
-   "pack_gb": 111.3
-  }
- },
  "method_ladder_reps": 1
 }

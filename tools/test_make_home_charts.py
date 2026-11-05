@@ -14,7 +14,7 @@ def build(tmp_path):
 
 def test_files_valid_and_paired(tmp_path):
     names = build(tmp_path)
-    assert len(names) == 30
+    assert len(names) == 20
     for n in names:
         if n.endswith("-light.svg"): assert n.replace("-light", "-dark") in names
         ET.parse(os.path.join(tmp_path, n))
@@ -27,12 +27,12 @@ def test_numbers_come_from_data(tmp_path):
     rd = lambda n: open(os.path.join(tmp_path, n)).read()
     F = json.load(open(os.path.join(ROOT, "doc", "figures.json")))
     q = F["models"][0]
-    assert ">52.2<" in rd("decode-strix-light.svg") and f"Kyojin {F['version']}" in rd("decode-strix-light.svg")
-    assert ">1,621<" in rd("prefill-strix-light.svg") and q["prefill"]["8192"] == 1621
+    assert f">{q['decode']['8192']}<" in rd("decode-strix-light.svg") and f"Kyojin {F['version']}" in rd("decode-strix-light.svg")
+    assert f">{q['prefill']['8192']:,}<" in rd("prefill-strix-light.svg")
     P = json.load(open(os.path.join(ROOT, "doc", "figures_platforms.json")))
     assert ">74.6<" in rd("decode-rtx-light.svg") and P["rtx"]["qwen27"]["points"][0]["decode"] == 74.6
     assert ">3,001<" in rd("prefill-mac-light.svg")
-    assert ">1.7x<" in rd("duel-rtx-qwen27-light.svg")
+    assert ">62<" in rd("card-ds41-light.svg") and ">3,001<" in rd("card-ds41-light.svg") and "max context" not in rd("card-ds41-light.svg")
 
 
 def test_readme_uses_every_chart(tmp_path):

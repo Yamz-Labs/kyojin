@@ -293,6 +293,8 @@ def resolve_template_kwargs(body: dict[str, Any], defaults: dict[str, Any]) -> d
     ctk = body.get("chat_template_kwargs") or {}
     if not isinstance(ctk, dict):
         raise BadRequest("chat_template_kwargs must be an object")
+    if ctk.get("effort_guidance") or (ctk.get("effort_guidance") is None and os.environ.get("KYOJIN_EFFORT_GUIDANCE") == "1"):
+        kw["effort_guidance"] = True   # opt-in medium guidance text (off by default)
     for key in ("enable_thinking", "reasoning_effort"):
         for src in (ctk, body, defaults):
             if src.get(key) is not None:

@@ -63,3 +63,12 @@ def test_thinking_off_without_effort_renders_as_before(body):
     kw = serve.resolve_template_kwargs(body, DEFAULTS)
     assert "reasoning_effort" not in kw
     assert render(TEMPLATE, **kw) == render(LEGACY_TEMPLATE, **kw)
+
+
+def test_medium_effort_guidance_is_opt_in(monkeypatch):
+    monkeypatch.delenv("KYOJIN_EFFORT_GUIDANCE", raising=False)
+    plain = render(TEMPLATE, **serve.resolve_template_kwargs({"reasoning_effort": "medium"}, DEFAULTS))
+    assert "Reasoning effort is set to medium." in plain and "Match the depth" not in plain
+    on = render(TEMPLATE, **serve.resolve_template_kwargs(
+        {"reasoning_effort": "medium", "chat_template_kwargs": {"effort_guidance": True}}, DEFAULTS))
+    assert "Reasoning effort is set to medium. Match the depth" in on and "think only about the next step" in on

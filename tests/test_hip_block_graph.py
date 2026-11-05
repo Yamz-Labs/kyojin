@@ -186,6 +186,17 @@ class TestDeclines:
         assert runner.stats["declines"]["recurrent_slots"] == 1
 
 
+@pytest.mark.skipif(not (torch.version.hip and torch.cuda.is_available()), reason="requires a ROCm device")
+def test_multirow_step_declines_by_default():
+    # n-gram / MTP verify steps carry 2..8 rows: one specialization per row count would
+    # thrash the per-block slots, so only single-row decode is captured unless raised.
+    device = torch.device("cuda", 0)
+    runner = _runner(device)
+    assert block_graph.BLOCK_GRAPH_MAX_Q == 1
+    assert runner.slot_key(_decode_input(device, rows=4), _eligible_params()) is None
+    assert runner.stats["declines"]["rows_q"] == 1
+
+
 @pytest.mark.skipif(not _gfx12_available(), reason="requires a gfx12 device")
 def test_eligible_call_produces_slot_key():
     device = torch.device("cuda", 0)
