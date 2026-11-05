@@ -29,10 +29,10 @@ hf download yamz-labs/GLM-5.3-Flash-EXL3-Yamz --local-dir ./glm-pack
 python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
 ```
 
-RTX 3090 (NVIDIA): build for CUDA once ([tools/cuda/README.md](tools/cuda/README.md)), then Qwen3.8-27B with 256K of context:
+RTX 3090 (NVIDIA): build for CUDA once ([tools/cuda/README.md](tools/cuda/README.md)), then Qwen3.8-27B with 245K of context (the served settings, one session; the pack is not on Hugging Face yet):
 
 ```bash
-python tools/qwen/serve.py --model ./qwen27-pack -c 262144 --k-bits 4 --v-bits 4
+python tools/qwen/serve.py --model ./qwen27-pack -c 245760 --k-bits 6 --v-bits 6 --draft-policy mix
 ```
 
 Mac Studio (Apple): follow the [kyojin-mac](https://github.com/Yamz-Labs/kyojin-mac#install) install, then DeepSeek V4.1 Flash:
