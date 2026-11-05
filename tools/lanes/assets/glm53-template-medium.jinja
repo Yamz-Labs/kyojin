@@ -5,7 +5,7 @@
 {%- set effort_head = (effort_placement is defined and effort_placement == 'head') -%}
 {%- if effort_head -%}
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
-{%- if glm_medium -%}<|system|>Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on alternatives the task does not call for. Plan in your reasoning, but do not draft the answer there: write code and long text once, in the answer. When you have settled a point, keep it and move on.{%- endif -%}
+{%- if glm_medium and effort_guidance is defined and effort_guidance -%}<|system|>Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on alternatives the task does not call for. Between tool calls, think only about the next step. Check facts with the tools rather than in your head. Plan in your reasoning, but do not draft the answer there: write code and long text once, in the answer. When you have settled a point, keep it and move on.{%- endif -%}
 {%- endif -%}
 {%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
 {%- if tools -%}
@@ -265,7 +265,7 @@ For each function call, output the function name and arguments within the follow
 {%- if add_generation_prompt -%}
 {%- if not effort_head -%}
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
-{%- if glm_medium -%}<|system|>Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on alternatives the task does not call for. Plan in your reasoning, but do not draft the answer there: write code and long text once, in the answer. When you have settled a point, keep it and move on.{%- endif -%}
+{%- if glm_medium and effort_guidance is defined and effort_guidance -%}<|system|>Match the depth of your work to the difficulty of the task: spend it on the points that decide the answer, not on alternatives the task does not call for. Between tool calls, think only about the next step. Check facts with the tools rather than in your head. Plan in your reasoning, but do not draft the answer there: write code and long text once, in the answer. When you have settled a point, keep it and move on.{%- endif -%}
 {%- endif -%}
     <|assistant|>{{- '<think>' -}}
 {%- endif -%}
