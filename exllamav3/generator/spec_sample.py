@@ -123,3 +123,69 @@ def verify(logits: torch.Tensor, q: torch.Tensor, d: int, prm: tuple, rng) -> to
     res = (p - q).clamp_(min = 0.0)
     r = draw(torch.where(res.sum() > 0, res, p), u2)   # p == q leaves no residual: draw from p then (keep is true but for rounding)
     return torch.where(keep, torch.full_like(r, d), r).view(1, 1)
+
+
+# Relaxed ("typical") acceptance, Medusa rule (Cai et al. 2024, arXiv 2401.10774) for sampled jobs that keep the argmax draft:
+# the verify keeps draft j when the sampled token equals it (exact) OR when p(draft_j) >= min(eps, delta * exp(-H_j)), p and H
+# being the job's sampling law (top-k / top-p cuts, then temperature) at row j. A token cut by the filters has p = 0 and is never
+# kept. At the first rejected row the token is the normal sample. EXL3_SPEC_TYPICAL=0 (default): nothing changes, bit for bit.
+TYPICAL = os.environ.get("EXL3_SPEC_TYPICAL", "0") != "0"
+TYP_EPS = float(os.environ.get("EXL3_SPEC_TYPICAL_EPS", "0.09"))
+TYP_DELTA = float(os.environ.get("EXL3_SPEC_TYPICAL_DELTA", "0.3"))
+# Read-only probe: EXL3_SPEC_PTAP=<file.jsonl> appends one line per verify round (p_draft, entropy, match per row)
+PTAP = os.environ.get("EXL3_SPEC_PTAP") or None
+# Test switch for in-server A/B: EXL3_SPEC_TYPICAL_FILE=<path>, the rule is on while the file holds "1" (re-read when its mtime changes)
+_TFILE = os.environ.get("EXL3_SPEC_TYPICAL_FILE") or None
+_tstate = [0.0, TYPICAL]
+
+
+def typical_on() -> bool:
+    if _TFILE is None:
+        return TYPICAL
+    try:
+        m = os.stat(_TFILE).st_mtime
+        if m != _tstate[0]:
+            _tstate[0] = m
+            _tstate[1] = open(_TFILE).read().strip() == "1"
+    except OSError:
+        pass
+    return _tstate[1]
+
+
+def _topk_of(prm: tuple):
+    """The top-K cut of the law (None = no cut): lets typical_rows work on K logits per row instead of the whole vocabulary."""
+    kind, x, vs = prm
+    if kind == "fused":
+        return x[3] if x[2] & SS_Fused.F_TOPK and 0 < x[3] < vs else None
+    ks = [st.top_k for st in x if type(st) is SS_TopK and 0 < st.top_k < vs]
+    return min(ks) if ks else None
+
+
+def typical_rows(rows: torch.Tensor, drafts: list, prm: tuple, eps: float, delta: float):
+    """
+    rows: (n, V) verify logits of the n draft rows; drafts: the n drafted ids. Returns (p, H, ok) as python lists, one
+    host sync: p = law probability of the draft, H = entropy of the law, ok = p > 0 and p >= min(eps, delta * exp(-H)).
+    With a top-K cut in the law only the K best logits of each row are sorted and normalised (the law is zero elsewhere,
+    so p and H are those of the dense law).
+    """
+    ps, hs = [], []
+    K = _topk_of(prm)
+    if K is not None:
+        kind, x, vs = prm
+        v, ix = torch.topk(rows[:, :vs].float(), K, dim = -1)
+        sub = (kind, x, K)
+        dr = torch.tensor(drafts, dtype = ix.dtype, device = ix.device).view(-1, 1)
+        hit = (ix == dr)
+    for i, d in enumerate(drafts):
+        if K is not None:
+            pl = law(v[i], sub)
+            ps.append((pl * hit[i]).sum())
+        else:
+            pl = law(rows[i], prm)
+            ps.append(pl[d])
+        hs.append(-(pl * torch.log(pl.clamp_min(1e-30))).sum())
+    p = torch.stack(ps)
+    h = torch.stack(hs)
+    ok = (p > 0) & (p >= torch.clamp(delta * torch.exp(-h), max = eps))
+    out = torch.stack([p, h, ok.float()]).tolist()
+    return out[0], out[1], [x > 0.5 for x in out[2]]
