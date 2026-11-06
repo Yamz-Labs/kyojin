@@ -673,7 +673,9 @@ static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, 
     int* cnt = counters(a.device().index());   // allocated on the first (eager) call, never under capture
 
     // W2: two ADJACENT columns per lane needs an even row stride (4 B aligned pair) and one full warp of pairs.
-    const int cpl = (w2on() && (n % 2 == 0) && n >= 2 * COLS) ? 2 : 1;
+    // Rows 9..32 use the padded one-column instantiations (the branch below); sizing the grid
+    // for CPL=2 there left columns 64..127 unwritten because that path falls back to CPL=1.
+    const int cpl = (w2on() && m <= EXACT_M && (n % 2 == 0) && n >= 2 * COLS) ? 2 : 1;
     dim3 grid((n + COLS * cpl - 1) / (COLS * cpl), ksplit);
     if (onepass())
     {
