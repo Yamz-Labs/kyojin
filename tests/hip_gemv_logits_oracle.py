@@ -12,7 +12,14 @@ DEFAULT_MODEL = os.path.expanduser("~/Models/Qwen3.8-27B-exl3")
 MODEL = os.environ.get("EXL3_TEST_MODEL", DEFAULT_MODEL)
 # EXL3_ORACLE_STEPS (test only): forced-trace length; both the oracle and worker read it.
 STEPS = int(os.environ.get("EXL3_ORACLE_STEPS", "16"))
+FIXTURE = os.environ.get("EXL3_ORACLE_FIXTURE", "auto").strip().lower()
 PROMPT = "The capital of France is"
+
+
+def _strict_fixture():
+    if FIXTURE == "auto":
+        return Path(MODEL).name.startswith("Qwen3.8-27B")
+    return FIXTURE in {"qwen38-27b", "strict"}
 
 
 def _run_worker(mode, out_path, forced_path=None):
@@ -59,7 +66,7 @@ def main():
     assert fallback_counts["gemv"] == 0
     assert fallback_counts["reconstruct"] > 0
     assert fallback_counts["hgemm"] > 0
-    if Path(MODEL).name == "Qwen3.8-27B-exl3":
+    if _strict_fixture():
         # The known Qwen3.8-27B fixture produces about 6,813 GEMV calls. Remaining hgemm
         # calls are independently ineligible architecture paths, not EXL3 reconstruction.
         assert gemv_counts["gemv"] >= 5000

@@ -245,19 +245,33 @@ def test_hip_gemv_direct_binding_accepts_rank3_inputs():
 
 
 @torch.inference_mode()
-def test_hip_gemv_k5_plain_codebook_is_rejected():
-    """K5 requires the MCG or mul1 codebook; cb0 remains unsupported."""
-    _require_gfx12()
-    size = 128
-    A = torch.randn((1, size), dtype=torch.float16, device="cuda") * 1e-3
-    B = torch.full((size // 16, size // 16, 5 * 16), 0x1111,
-                   dtype=torch.int16, device="cuda")
-    signs = torch.ones((size,), dtype=torch.float16, device="cuda")
-    actual = torch.empty((1, size), dtype=torch.float16, device="cuda")
-    A_had = torch.empty_like(A)
+def test_hip_gemv_k5_plain_codebook_falls_back():
+    """K5/cb0 is outside the model dispatch envelope and must use reconstruct+hgemm."""
+    from exllamav3.modules.quant.exl3 import LinearEXL3
 
-    with pytest.raises(RuntimeError, match="not eligible"):
-        ext.exl3_gemv(A, B, actual, signs, A_had, signs, False, False)
+    _require_gfx12()
+    torch.manual_seed(5500)
+    size_k = size_n = 128
+    trellis = _make_distinct_finite_trellis(5, size_k, size_n)
+    suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
+    svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
+    linear = LinearEXL3(None, size_k, size_n, suh=suh, svh=svh, trellis=trellis,
+                        mcg=None, mul1=None)
+    try:
+        x = torch.randn((1, 1, size_k), dtype=torch.float16, device="cuda") * 1e-3
+        calls, restore = _spy_ext_route()
+        try:
+            actual = linear.forward(x, {"reconstruct": False})
+        finally:
+            restore()
+        assert calls["gemv"] == 0
+        assert calls["reconstruct"] > 0
+        assert calls["hgemm"] > 0
+        expected = linear.forward(x, {"reconstruct": True})
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
+    finally:
+        linear.unload()
 
 
 @pytest.mark.parametrize("K", [2, 3, 4, 5, 6])

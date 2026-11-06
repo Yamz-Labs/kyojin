@@ -164,6 +164,12 @@ EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 EXL3_ORACLE_STEPS=128 \
 # diagnosis; it is not asserted against the forced trace.
 EXL3_TEST_MODEL=/path/to/Qwen3.8-27B-exl3 EXL3_ORACLE_FREE=1 \
   python tests/hip_gemv_logits_oracle.py
+
+# The strict route counts apply automatically to a directory named Qwen3.8-27B*.
+# Name the fixture explicitly for a 27B pack stored under another name; use
+# EXL3_ORACLE_FIXTURE=generic to force the permissive branch.
+EXL3_TEST_MODEL=/path/to/pack EXL3_ORACLE_FIXTURE=qwen38-27b \
+  python tests/hip_gemv_logits_oracle.py
 ```
 
 ## GPU decode harnesses

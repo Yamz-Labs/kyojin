@@ -79,6 +79,8 @@ def main():
     print(f"model: {args.model}")
     print(f"ext:   {ext.__file__}")
     print(f"linears: {len(linears)}  weight stream: {total_bytes / 1e9:.3f} GB")
+    if args.gemm and not hasattr(ext, "exl3_gemm"):
+        print("ext.exl3_gemm not exported; skipping the --gemm A/B")
 
     def buffers(l):
         x = torch.randn((1, l.in_features), dtype=torch.half, device=dev) * 0.5

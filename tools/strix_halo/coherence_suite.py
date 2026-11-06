@@ -40,7 +40,7 @@ PROMPTS = [
     ("factual", "Who wrote the novel Pride and Prejudice?", ["austen"]),
     ("arithmetic", "A shop sells pens for 3 dollars each. How much do 7 pens cost? Answer with the number.", ["21"]),
     ("code", "Write a Python function called is_even that returns True for even integers. Reply with code only.", ["def", "is_even"]),
-    ("instruction", "List exactly three primary colours, one per line, and nothing else.", ["red", "blue", "green"]),
+    ("instruction", "List exactly three primary colours of light, one per line, and nothing else.", ["red", "blue", "green"]),
     ("instruction", "Reply with the single word: BANANA", ["banana"]),
     ("long-form", "Explain in two short paragraphs why the sky appears blue during the day.", []),
     ("long-form", "Describe the water cycle in three sentences.", []),
@@ -75,7 +75,8 @@ def _render(tokenizer, prompt):
 
 
 def _tokenize(tokenizer, prompt):
-    ids = tokenizer.encode(_render(tokenizer, prompt), add_bos=True)
+    ids = tokenizer.encode(_render(tokenizer, prompt), add_bos=True,
+                           encode_special_tokens=True)
     if ids.dim() == 1:
         ids = ids.unsqueeze(0)
     return ids.contiguous()
