@@ -56,6 +56,31 @@ If a test or the first import hangs, look for a stale lock file at `~/.cache/tor
 
 Kyojin is built on ExLlamaV3 by turboderp. A change that belongs to ExLlamaV3 itself (general quantisation, the CUDA path, the tokenizer, shared generator logic) should go to [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) first. Send to this repository what is specific to gfx1151, ROCm, the Strix Halo serving tools or the supported models.
 
+## Optional GPU decode checks
+
+These are extra manual checks for the ROCm decode path. They are not part of `pytest tests`
+and each needs a built extension, a free GPU and a model that fits the card. Set
+`EXL3_TEST_MODEL` to the pack and pin the device with `HIP_VISIBLE_DEVICES`.
+
+```bash
+# Run the same short prompt through the normal reconstruction path and the fast GEMV
+# path, then print top-1 agreement, route counts and logit differences.
+EXL3_TEST_MODEL=<model> python tests/hip_gemv_logits_oracle.py
+
+# Longer trace, and an optional unforced run that prints tokens for loop diagnosis.
+EXL3_TEST_MODEL=<model> EXL3_ORACLE_STEPS=128 python tests/hip_gemv_logits_oracle.py
+EXL3_TEST_MODEL=<model> EXL3_ORACLE_FREE=1 python tests/hip_gemv_logits_oracle.py
+
+# Eight everyday questions in two sampling modes: checks EOS, loop guard and repetition.
+HIP_VISIBLE_DEVICES=1 python tools/strix_halo/coherence_suite.py -m <model>
+
+# Times each matrix shape and a full streaming pass; --gemm compares with exl3_gemm.
+HIP_VISIBLE_DEVICES=1 python tools/strix_halo/gemv_perf_ab.py -m <model> --mode both --gemm
+```
+
+For an MCG-codebook pack, point `EXL3_TEST_MODEL` at that pack; the oracle command is
+the same. Say in the pull request which checks you ran.
+
 ## Licence
 
 Contributions are under the MIT licence of the repository.

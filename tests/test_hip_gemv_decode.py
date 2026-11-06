@@ -153,6 +153,11 @@ def _spy_ext_route():
 
 # The livescope model fixture used by the comparison test loads individual modules and MUST
 # unload them even when an assertion fails, or aggregate modules stay resident for later tests.
+def _mmode2_eligible(linear):
+    return (int(linear.K), bool(linear.mcg), bool(linear.mul1)) in \
+        exl3_quant._EXL3_GEMV_HIP_MMODE2_VARIANTS
+
+
 def _load_then_compare(model, linear_key, norm_key, batch_size, out_dtype=None, expected_K=None):
     # Route proof: a missing binding is a FAILURE, not a skip -- the whole point of this
     # suite is to prove the HIP GEMV route executes.
@@ -165,9 +170,14 @@ def _load_then_compare(model, linear_key, norm_key, batch_size, out_dtype=None, 
         if norm:
             norm.load(device="cuda")
         linear.load(device="cuda")
-        if expected_K is not None:
-            assert linear.inner.K == expected_K
-            assert linear.inner.mcg != linear.inner.mul1
+        if batch_size > exl3_quant._EXL3_GEMV_HIP_MMODE1_MAX_M and not _mmode2_eligible(linear.inner):
+            pytest.skip(f"{linear_key}: no MMODE-2 kernel for K={linear.inner.K} "
+                        f"mcg={bool(linear.inner.mcg)} mul1={bool(linear.inner.mul1)}")
+        if expected_K is not None and (linear.inner.K != expected_K or
+                                       bool(linear.inner.mcg) == bool(linear.inner.mul1)):
+            pytest.skip(f"{linear_key}: K={linear.inner.K} "
+                        f"mcg={bool(linear.inner.mcg)} mul1={bool(linear.inner.mul1)} "
+                        f"does not match the expected K={expected_K} fixture")
 
         torch.manual_seed(0)
         x = torch.randn((1, batch_size, linear.in_features), dtype=torch.float16, device="cuda")
@@ -235,21 +245,36 @@ def test_hip_gemv_direct_binding_accepts_rank3_inputs():
 
 
 @torch.inference_mode()
-def test_hip_gemv_k5_plain_codebook_is_rejected():
-    """K5 requires the MCG or mul1 codebook; cb0 remains unsupported."""
+def test_hip_gemv_k5_plain_codebook_falls_back():
+    """K5/cb0 is outside the model dispatch envelope and must use reconstruct+hgemm."""
+    from exllamav3.modules.quant.exl3 import LinearEXL3
+
     _require_gfx12()
-    size = 128
-    A = torch.randn((1, size), dtype=torch.float16, device="cuda") * 1e-3
-    B = torch.full((size // 16, size // 16, 5 * 16), 0x1111,
-                   dtype=torch.int16, device="cuda")
-    signs = torch.ones((size,), dtype=torch.float16, device="cuda")
-    actual = torch.empty((1, size), dtype=torch.float16, device="cuda")
-    A_had = torch.empty_like(A)
+    torch.manual_seed(5500)
+    size_k = size_n = 128
+    trellis = _make_distinct_finite_trellis(5, size_k, size_n)
+    suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
+    svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
+    linear = LinearEXL3(None, size_k, size_n, suh=suh, svh=svh, trellis=trellis,
+                        mcg=None, mul1=None)
+    try:
+        x = torch.randn((1, 1, size_k), dtype=torch.float16, device="cuda") * 1e-3
+        calls, restore = _spy_ext_route()
+        try:
+            actual = linear.forward(x, {"reconstruct": False})
+        finally:
+            restore()
+        assert calls["gemv"] == 0
+        assert calls["reconstruct"] > 0
+        assert calls["hgemm"] > 0
+        expected = linear.forward(x, {"reconstruct": True})
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
+    finally:
+        linear.unload()
 
-    with pytest.raises(RuntimeError, match="not eligible"):
-        ext.exl3_gemv(A, B, actual, signs, A_had, signs, False, False)
 
-
+@pytest.mark.parametrize("K", [2, 3, 4, 5, 6])
 @pytest.mark.parametrize(
     "mcg, multiplier, addend",
     [
@@ -258,14 +283,13 @@ def test_hip_gemv_k5_plain_codebook_is_rejected():
     ],
 )
 @torch.inference_mode()
-def test_procedural_codebook_matches_lop3_zero_state(mcg, multiplier, addend):
+def test_procedural_codebook_matches_lop3_zero_state(K, mcg, multiplier, addend):
     """The portable codebook expression must match the original PTX lop3 LUT 0x6a.
 
     A zero packed trellis decodes every weight from state zero, making the expected
     fp16 codebook value independent of the trellis layout and reconstruction path.
     """
     _require_gfx12()
-    K = 4
     packed = torch.zeros((8, 8, K * 16), dtype=torch.int16, device="cuda")
     weight = torch.empty((128, 128), dtype=torch.float16, device="cuda")
     ext.reconstruct(weight, packed, K, mcg, False)
@@ -325,7 +349,7 @@ def test_hip_gemv_synthetic_oracle(K, mcg, mul1):
     ext.hgemm(A_ref, weight, expected)
     ext.had_r_128(expected, expected, None, svh, 1.0)
 
-    # All seven cases were bit-identical on gfx1201. A 0.03 absolute allowance retains
+    # These cases were bit-identical on gfx1201. A 0.03 absolute allowance retains
     # modest fp16 rounding headroom without hiding an extraction/codebook mismatch.
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
 
@@ -359,6 +383,47 @@ def test_hip_gemv_rows_9_to_16_synthetic_route_to_gemv(K, mcg, mul1, rows, out_d
 
 
 @torch.inference_mode()
+def test_hip_gemv_mmode2_narrow_n_matches_matmul():
+    """MMODE-2 at size_n=128 matches an explicit reconstruct + torch.matmul reference.
+
+    This shape runs the ROCm skinny hgemm path (m<=32, n<=128); using reconstruct +
+    torch.matmul keeps the oracle independent of that GEMM's accumulation order.
+    """
+    from exllamav3.modules.quant.exl3 import LinearEXL3
+
+    _require_gfx12()
+    K = 5
+    size_k = size_n = 128
+    rows = 9
+    torch.manual_seed(9100)
+    trellis = _make_distinct_finite_trellis(K, size_k, size_n)
+    suh = (torch.randint(0, 2, (size_k,), device="cuda") * 2 - 1).to(torch.float16)
+    svh = (torch.randint(0, 2, (size_n,), device="cuda") * 2 - 1).to(torch.float16)
+    mul1 = torch.ones((), dtype=torch.int32, device="cuda")
+    linear = LinearEXL3(None, size_k, size_n, suh=suh, svh=svh, trellis=trellis,
+                        mcg=None, mul1=mul1)
+    try:
+        x = torch.randn((1, rows, size_k), dtype=torch.float16, device="cuda") * 1e-3
+        weight = torch.empty((size_k, size_n), dtype=torch.half, device="cuda")
+        ext.reconstruct(weight, trellis, K, False, True)
+        xh = torch.empty((rows, size_k), dtype=torch.half, device="cuda")
+        ext.had_r_128(x.view(rows, size_k), xh, suh, None, 1.0)
+        expected = (xh.float() @ weight.float()).half()
+        ext.had_r_128(expected, expected, None, svh, 1.0)
+
+        calls, restore = _spy_ext_route()
+        try:
+            actual = linear.forward(x, {"reconstruct": False})
+        finally:
+            restore()
+        assert calls["gemv"] == 1, calls
+        assert calls["reconstruct"] == 0 and calls["hgemm"] == 0, calls
+        torch.testing.assert_close(actual.view(rows, size_n), expected, rtol=0, atol=0.03)
+    finally:
+        linear.unload()
+
+
+@torch.inference_mode()
 def test_hip_gemv_k2_rows_8_routes_to_gemv():
     _require_gfx12()
     actual, expected, calls, x, size_n = _run_rows_synthetic_oracle(2, True, False, 8, torch.float16)
@@ -379,6 +444,32 @@ def test_hip_gemv_k2_rows_9_falls_back():
     assert calls["gemv"] == 0
     assert calls["reconstruct"] > 0
     assert calls["hgemm"] > 0
+    assert torch.isfinite(actual).all()
+    assert torch.isfinite(expected).all()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
+
+
+@pytest.mark.parametrize("core", ["tiles", "direct", "lds"])
+@pytest.mark.parametrize("rows", [5, 6, 7])
+@torch.inference_mode()
+def test_hip_gemv_small_rows_opt_in_cores(rows, core, monkeypatch):
+    """size_m 5/6/7 pad the MR row tile to 8; all three cores must still
+    produce the oracle result. The padded rows' reads are discarded, so this
+    cannot detect an out-of-bounds read -- that needs a sanitizer run."""
+    monkeypatch.delenv("EXL3_ROCM_GEMV_TILES", raising=False)
+    monkeypatch.delenv("EXL3_GEMV_LDS", raising=False)
+    if core == "direct":
+        monkeypatch.setenv("EXL3_ROCM_GEMV_TILES", "0")
+    elif core == "lds":
+        monkeypatch.setenv("EXL3_GEMV_LDS", "1")
+
+    actual, expected, calls, x, size_n = _run_rows_synthetic_oracle(
+        4, True, False, rows, torch.float16)
+    assert calls["gemv"] == 1
+    assert calls["reconstruct"] == 0
+    assert calls["reconstruct_slice"] == 0
+    assert calls["reconstruct_had_slice"] == 0
+    assert calls["hgemm"] == 0
     assert torch.isfinite(actual).all()
     assert torch.isfinite(expected).all()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.03)
@@ -533,8 +624,9 @@ def test_hip_gemv_rows_9_to_16_route_to_gemv(model, rows):
     linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
     try:
         linear.load(device="cuda")
-        assert linear.inner.K == 4
-        assert linear.inner.mcg != linear.inner.mul1
+        if not _mmode2_eligible(linear.inner):
+            pytest.skip(f"q_proj is K={linear.inner.K} mcg={bool(linear.inner.mcg)} "
+                        f"mul1={bool(linear.inner.mul1)}; no MMODE-2 kernel for m={rows}")
         x = torch.randn((1, rows, linear.in_features), dtype=torch.float16, device="cuda")
         calls, restore = _spy_ext_route()
         try:
@@ -614,13 +706,11 @@ def test_hip_gemv_rollback_cap_falls_back(model, monkeypatch):
 
 @torch.inference_mode()
 def test_hip_gemv_rows_over_limit_falls_back(model):
-    """A K=4 decode batch with exactly seventeen rows must bypass HIP GEMV."""
+    """A decode batch with exactly seventeen rows must bypass HIP GEMV."""
     assert exl3_quant.EXL3_GEMV_HIP_MAX_M == 16
     linear = model.find_module("model.language_model.layers.3.self_attn.q_proj")
     try:
         linear.load(device="cuda")
-        assert linear.inner.K == 4
-        assert linear.inner.mcg != linear.inner.mul1
         x = torch.randn((1, 17, linear.in_features), dtype=torch.float16, device="cuda")
         calls, restore = _spy_ext_route()
         try:
@@ -640,7 +730,8 @@ def test_hip_gemv_env_opt_out_falls_back(model, monkeypatch):
     linear = model.find_module("lm_head")
     try:
         linear.load(device="cuda")
-        assert linear.inner.K == 6
+        if linear.inner.K != 6:
+            pytest.skip(f"lm_head is K={linear.inner.K}; this test covers the K6 head")
         x = torch.randn((1, 1, linear.in_features), dtype=torch.float16, device="cuda")
         monkeypatch.setenv("EXL3_GEMV", "0")
         calls, restore = _spy_ext_route()
