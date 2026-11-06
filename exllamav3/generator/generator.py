@@ -2164,6 +2164,17 @@ class Generator:
                         else:
                             pre = None
                         _hacc("t_samp_h", _hs)
+                    typ = None
+                    if draft_tokens is not None and spec is None and (spec_sample.typical_on() or spec_sample.PTAP) \
+                            and npos > 1 and not self.dflash_draft:
+                        _tp = spec_sample.eligible(job)
+                        if _tp is not None:
+                            _dr = [int(draft_tokens[j, pi]) for pi in range(npos - 1)]
+                            typ = (spec_sample.typical_rows(job_logits[0, :npos - 1, :], _dr, _tp, spec_sample.TYP_EPS, spec_sample.TYP_DELTA), _dr)
+                            if spec_sample.PTAP:
+                                import json as _json
+                                with open(spec_sample.PTAP, "a") as _f:
+                                    _f.write(_json.dumps({"src": "mtp", "p_draft": typ[0][0], "entropy": typ[0][1]}) + "\n")
                     for i in range(batch_logits.shape[1]):
                         token_logits = job_logits[:, i:i + 1, :]
                         if pre is not None:
@@ -2174,6 +2185,8 @@ class Generator:
                             next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                                 token_logits,
                             )
+                        if typ is not None and spec_sample.typical_on() and i < npos - 1 and typ[0][2][i] and int(next_token.view(-1)[0]) != typ[1][i]:
+                            next_token = torch.full_like(next_token, typ[1][i])
                         eos, sampled_token, rq = job.receive_sample(
                             token_logits,
                             next_token,
