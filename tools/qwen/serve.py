@@ -960,6 +960,11 @@ class QwenEngine:
             self.slot_store.generator = self.generator
 
     def warmup(self) -> None:
+        if self.draft_model is not None and self.draft_policy != "dflash":
+            # The MTP drafter's two-stage head (EXL3_DRAFT2S) is built here, before the first step, not during warm-up (#125).
+            from exllamav3.modules import draft2s
+            with Heartbeat("loading the two-stage draft head"):
+                draft2s.preload(self.model)
         # dense GEMM warm-up at load (EXL3_WARM_DENSE=0 = off): the first request at a new row-count class
         # no longer pays the rocBLAS solution screening (0.15-4 s per shape).
         from exllamav3.model.dense_warmup import warm_dense_gemm

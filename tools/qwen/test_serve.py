@@ -99,6 +99,27 @@ def sse_events(raw: str):
 
 
 class ParserTests(unittest.TestCase):
+    def test_draft2s_preload(self):
+        # #125: the head is built at load time (before warm-up) for an MTP drafter, never for DFlash or with the head off
+        from unittest import mock
+        from exllamav3.modules import draft2s
+        lm = object()
+        model = types.SimpleNamespace(modules=["emb", lm], logit_layer_idx=1, config=types.SimpleNamespace(vocab_size=7))
+        with mock.patch.object(draft2s, "head_for", return_value="head") as head_for:
+            with mock.patch.dict(os.environ, {"EXL3_DRAFT2S": ""}):
+                self.assertIsNone(draft2s.preload(model))
+            with mock.patch.dict(os.environ, {"EXL3_DRAFT2S": "/p/draft2s.st"}):
+                self.assertEqual(draft2s.preload(model), "head")
+            head_for.assert_called_once_with(lm, 7)
+            for policy, calls in (("mix", 2), ("dflash", 2)):
+                engine = types.SimpleNamespace(draft_model=object(), draft_policy=policy, model=model,
+                                               generator=types.SimpleNamespace(max_chunk_size=1))
+                with mock.patch.dict(os.environ, {"EXL3_DRAFT2S": "/p/draft2s.st"}), \
+                        mock.patch("exllamav3.model.dense_warmup.warm_dense_gemm", side_effect=StopIteration):
+                    with self.assertRaises(StopIteration):
+                        serve.QwenEngine.warmup(engine)
+                self.assertEqual(head_for.call_count, calls)
+
     def test_draft2s_sidecar(self):
         import tempfile
         from unittest import mock
