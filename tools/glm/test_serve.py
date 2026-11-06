@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -1010,6 +1011,55 @@ class VllmCompatTests(unittest.TestCase):
         self.assertEqual(serve.template_kwargs({"chat_template_kwargs": {"clear_thinking": False}})["clear_thinking"], False)
         with self.assertRaises(Exception):
             serve.template_kwargs({"chat_template_kwargs": "x"})
+
+
+class RunawayWatchTests(unittest.TestCase):
+    """06/11/2026: the guard that stops a job gone wrong must never touch a normal one."""
+
+    def watch(self, max_tokens=512, stall_s=300.0):
+        clock = [0.0]
+        return serve.RunawayWatch(max_tokens, stall_s=stall_s, clock=lambda: clock[0]), clock
+
+    def test_a_long_normal_generation_is_never_stopped(self):
+        w, clock = self.watch(max_tokens=200_000)
+        for step in range(1, 100_001):                 # 2 tokens a step, 30 s between steps: slow but moving
+            clock[0] += 30
+            self.assertIsNone(w.check(2 * step))
+
+    def test_a_long_prefill_is_never_timed(self):
+        w, clock = self.watch()
+        for _ in range(100):                           # 100 steps of 60 s without a token: the prefill of a huge prompt
+            clock[0] += 60
+            self.assertIsNone(w.check(0))
+        clock[0] += 1
+        self.assertIsNone(w.check(1))
+
+    def test_the_budget_allows_a_speculative_overshoot(self):
+        w, _ = self.watch(max_tokens=512)
+        self.assertIsNone(w.check(512 + serve.RUNAWAY_SLACK))
+        self.assertEqual(w.check(512 + serve.RUNAWAY_SLACK + 1), "over_budget")
+
+    def test_no_new_token_after_decoding_started_is_a_stall(self):
+        w, clock = self.watch(stall_s=300)
+        self.assertIsNone(w.check(5))
+        clock[0] += 300
+        self.assertIsNone(w.check(5))                  # exactly the limit: still allowed
+        clock[0] += 1
+        self.assertEqual(w.check(5), "stalled")
+
+    def test_stall_zero_turns_the_stall_check_off(self):
+        w, clock = self.watch(stall_s=0)
+        w.check(5)
+        clock[0] += 10_000
+        self.assertIsNone(w.check(5))
+
+    def test_stall_default_comes_from_the_environment(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"EXL3_STALL_S": "42"}):
+            self.assertEqual(serve.RunawayWatch(10).stall_s, 42.0)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("EXL3_STALL_S", None)
+            self.assertEqual(serve.RunawayWatch(10).stall_s, 300.0)
 
 
 if __name__ == "__main__":
