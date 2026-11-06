@@ -180,7 +180,8 @@ class Draft2SHead:
         from exllamav3.modules.quant.exl3 import dec_workspace
         self.ext = ext
         dev = inner.trellis.device
-        P = load_file(pack_path, device=str(dev))
+        # Read on the host, then copy: safetensors' direct device load stalled warm-up on ROCm 7.13 (#125).
+        P = {k: v.to(dev) for k, v in load_file(pack_path, device="cpu").items()}
         with safe_open(pack_path, "pt") as fm: self.M = int((fm.metadata() or {}).get("m", M))
         self.E, self.pcodes, self.pscale = P["E"].contiguous(), P["pcodes"].contiguous(), P["pscale"].float().contiguous()
         self.q3, self.q3s, self.had = P["q3"].contiguous(), P["q3s"].contiguous(), P["had"].contiguous()
@@ -248,3 +249,10 @@ def head_for(lm, vocab):
         _heads[key] = Draft2SHead(path, inner, vocab) if ok else None
         print(f" -- EXL3_DRAFT2S: {'two-stage draft head ON' if ok else 'head not eligible, OFF'} ({path})")
     return _heads[key]
+
+
+def preload(model):
+    """Build the head of *model*'s logit layer now (load time) instead of inside the first draft step, so a slow or
+    failing pack load shows at start-up, before warm-up, with its own log line. No-op when EXL3_DRAFT2S is off."""
+    if not os.environ.get("EXL3_DRAFT2S"): return None
+    return head_for(model.modules[model.logit_layer_idx], model.config.vocab_size)
