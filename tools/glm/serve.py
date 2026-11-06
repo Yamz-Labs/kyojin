@@ -515,6 +515,34 @@ def guard_stats(hit: dict, n_new: int) -> dict:
     return {"eos_reason": "loop_guard", "new_tokens": n_new, "loop_guard": hit}
 
 
+RUNAWAY_SLACK = 64   # tokens past max_tokens before a job counts as runaway (a speculative step may overshoot by its drafts)
+
+
+class RunawayWatch:
+    """Stops a single-session job that went wrong without ending: more tokens than its max_tokens, or no new token for
+    EXL3_STALL_S seconds (default 300, 0 = off) once decoding has started. A job that streams within its budget is never
+    touched, and the prefill (no token yet, however long) is never timed. Checked between two generator steps, so a
+    step that never returns is out of its reach. (06/11/2026: a title call kept GLM at 99 % GPU for 25 min.)"""
+
+    def __init__(self, max_tokens: int, stall_s: float | None = None, clock=time.monotonic):
+        self.max_tokens = int(max_tokens)
+        self.stall_s = float(os.environ.get("EXL3_STALL_S", "300")) if stall_s is None else float(stall_s)
+        self.clock = clock
+        self.seen = 0
+        self.last = None                    # time of the last new token; None until the first one
+
+    def check(self, seen: int) -> str | None:
+        """'over_budget' or 'stalled' when the job must stop, None otherwise. `seen` = tokens produced so far."""
+        now = self.clock()
+        if seen > self.seen:
+            self.seen, self.last = seen, now
+        if seen > self.max_tokens + RUNAWAY_SLACK:
+            return "over_budget"
+        if self.stall_s > 0 and self.last is not None and now - self.last > self.stall_s:
+            return "stalled"
+        return None
+
+
 def held_tail(text: str, markers: list[str]) -> int:
     """Characters at the end of `text` that could still become one of `markers` (a proper prefix of one). A stream holds back only
     these: holding a marker-length tail delayed the first visible text by several tokens, which under load is several seconds."""
@@ -1006,6 +1034,7 @@ class ResidentEngine:
         guard_on = loop_guard_default() if loop_guard is None else bool(loop_guard)   # loop_guard=False in the request turns it off
         tap = AnswerTap(opens_thinking(prompt)) if guard_on and not ignore_eos else None
         seen = 0                            # tokens streamed so far, for the guard stop report
+        watch = RunawayWatch(max_tokens)
         generator.enqueue(job)
         try:
             while generator.num_remaining_jobs():
@@ -1034,6 +1063,12 @@ class ResidentEngine:
                             probe.request(int(ids.numel()), int(event.get("new_tokens", 0)),
                                           time.perf_counter() - t0)
                         return
+                why = watch.check(seen)
+                if why is not None:
+                    generator.cancel(job)
+                    self.last_stats = {"eos_reason": "max_new_tokens", "new_tokens": seen, "runaway": why}
+                    print(f"serve: job stopped ({why}): {seen} tokens for max_tokens {max_tokens}", file=sys.stderr, flush=True)
+                    return
             torch.cuda.synchronize()
         finally:
             # Whatever way the call ends (error, client gone, cancelled task) no job stays in the Generator:
@@ -1672,7 +1707,7 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
         def finish_for(message: dict[str, Any], raw: str) -> str:
             # A reply cut by max_tokens is "length", not "stop" (clients use it to tell a truncated answer).
             finish = message.pop("finish_reason", "stop")
-            if finish == "stop" and (request_stats.get("eos_reason") == "loop_guard"
+            if finish == "stop" and (request_stats.get("eos_reason") == "loop_guard" or request_stats.get("runaway")
                                      or engine.count_tokens(raw) >= token_limit(body)):
                 finish = "length"
             return finish
