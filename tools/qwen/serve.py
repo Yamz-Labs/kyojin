@@ -1336,6 +1336,8 @@ class QwenEngine:
         generated = 0                      # tokens the model produced, including the discarded thinking tail
         discount = 0                       # discarded tokens of final-check recoveries: not charged to max_tokens
         final_tries = 0
+        open_eos = False
+        open_tried = False                 # the EOS-inside-an-open-think recovery runs once
         final_on = guard_on and reasoning_first and close_id is not None and loop_final is not False
         vis = ""                          # the text the client holds (Retract applied)
         gmarks: list[tuple[int, int]] = [(0, 0)]   # (len(token_ids), chars) after each event, all segments
@@ -1390,6 +1392,15 @@ class QwenEngine:
                         hit = mon.feed(toks, ev.get("text") or "")
                         if hit:
                             break
+                    if ev.get("eos") and final_on and not open_tried and ev.get("eos_reason") == "stop_token" \
+                            and THINK_CLOSE_TAG not in vis and generated - discount < max_tokens:
+                        # EOS inside a think block that never closed: the client would get reasoning only and an empty answer.
+                        # Keep the thinking (cut by final_cut when it loops), force the close and let the model answer, once.
+                        open_tried = True
+                        open_eos = True
+                        final_c = (final_cut(vis) if text_loop(gate_text(vis)) else None) or len(vis)
+                        redo = True
+                        break
                     if ev.get("eos") and final_on and final_tries < FINAL_TRIES and text_loop(gate_text(vis)) \
                             and (THINK_CLOSE_TAG in vis or ev.get("eos_reason") == "max_new_tokens"
                                  or generated - discount >= max_tokens) \
@@ -1418,11 +1429,15 @@ class QwenEngine:
             if redo:
                 self._routes.pop(job.serial_number, None)   # it sent its eos
                 cut_chars = final_c
-                final_tries += 1
                 keep_tokens, keep_chars = max(m for m in gmarks if m[1] <= cut_chars)
-                fired = {"phase": "think", "kind": "final", "cut": keep_tokens, "at": len(token_ids), "period": 0,
+                kind = "open_think" if open_eos else "final"
+                if not open_eos:
+                    final_tries += 1
+                fired = {"phase": "think", "kind": kind, "cut": keep_tokens, "at": len(token_ids), "period": 0,
                          "tokens_streamed": len(token_ids), "kept_tokens": keep_tokens, "tries": final_tries}
-                print(f"qserve: loop guard final in think: gate rule holds on the answer, thinking cut to {keep_tokens} tokens "
+                open_eos = False
+                print(f"qserve: loop guard {kind} in think: " + ("EOS before </think>, close forced" if kind == "open_think" else
+                      "gate rule holds on the answer") + f", thinking kept to {keep_tokens} tokens "
                       f"({keep_chars} chars of {len(vis)}), try {final_tries}", file=sys.stderr, flush=True)
                 spent += time.perf_counter() - seg_t0
                 yield Retract(len(vis) - keep_chars)
