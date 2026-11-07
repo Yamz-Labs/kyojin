@@ -500,32 +500,40 @@ def _gr_hip():
     return _gr_hip_mod[0]
 
 
+_wmma_family_cache: dict[int, int] = {}
+
+
 def _wmma_family(device=None) -> int:
     """WMMA family of the module device: 0 none, 1 gfx12 (RDNA4), 2 gfx11.5 (RDNA3.5).
 
     gr_mix.hip is a gfx11.5-only hand kernel (different builtin and fragment layout from
     gfx12) and its JIT compiles for the module's device, so it must not be selected on a
     gfx1201 part. Mirrors exl3_gemv_wmma_family, with an arch-name fallback for builds that
-    predate the probe."""
+    predate the probe. Cached per device index: the probe runs through pybind + a mutex and
+    this predicate is evaluated per forward."""
     if device is None:
         idx = torch.cuda.current_device()
     elif isinstance(device, torch.device):
         idx = device.index if device.index is not None else torch.cuda.current_device()
     else:
         idx = int(device)
+    cached = _wmma_family_cache.get(idx)
+    if cached is not None:
+        return cached
+    family = 0
     try:
-        return ext.exl3_gemv_wmma_family(idx)
+        family = int(ext.exl3_gemv_wmma_family(idx))
     except Exception:                                   # noqa: BLE001
-        pass
-    try:
-        arch = torch.cuda.get_device_properties(idx).gcnArchName.split(":")[0]
-        if arch in ("gfx1200", "gfx1201"):
-            return 1
-        if arch in ("gfx1150", "gfx1151", "gfx1152"):
-            return 2
-    except Exception:                                   # noqa: BLE001
-        pass
-    return 0
+        try:
+            arch = torch.cuda.get_device_properties(idx).gcnArchName.split(":")[0]
+            if arch in ("gfx1200", "gfx1201"):
+                family = 1
+            elif arch in ("gfx1150", "gfx1151", "gfx1152"):
+                family = 2
+        except Exception:                               # noqa: BLE001
+            pass
+    _wmma_family_cache[idx] = family
+    return family
 
 
 class GatedResidual(Module):

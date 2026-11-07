@@ -177,12 +177,16 @@ bool exl3_gemv_rdna_arch(int device)
         cache[device] = -1;
         return false;
     }
-    // This path is tuned for gfx1200/gfx1201. Keep the arch test explicit so
-    // another RDNA family is opted in only after its own measurement and
-    // tuning.
+    // Shared RDNA fdot2 core: the instructions are gfx10.3+/gfx11/gfx12
+    // compatible, and the decode path was measured on both families. Keep the
+    // arch test explicit so another part is opted in only after its own
+    // measurement and tuning.
     const bool ok =
         strncmp(prop.gcnArchName, "gfx1200", 7) == 0 ||
-        strncmp(prop.gcnArchName, "gfx1201", 7) == 0;
+        strncmp(prop.gcnArchName, "gfx1201", 7) == 0 ||
+        strncmp(prop.gcnArchName, "gfx1150", 7) == 0 ||
+        strncmp(prop.gcnArchName, "gfx1151", 7) == 0 ||
+        strncmp(prop.gcnArchName, "gfx1152", 7) == 0;
     cache[device] = ok ? 1 : -1;
     return ok;
 }

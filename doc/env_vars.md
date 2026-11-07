@@ -1401,6 +1401,15 @@ persistent expert-group kernel.
 Slice height of the int8 decode GEMV on 4/5-bit weights: taller k-slices, about two work units per SM. `0` restores the
 former rule, `EXL3_GEMV_ROWS=<n>` forces a slice height.
 
+#### `EXL3_DEC_DENSE` (default `1`; ROCm)
+
+Dense-only switch for the batch-1 `exl3_dec` GEMV, which fuses both Hadamard stages into one launch on gfx11.5. `0`
+keeps the routed-MoE `dec` kernels but moves the K<=6 dense projections (and the fused dense MLA dec projections) to
+the shared `exl3_gemv` route, which is the RDNA fdot2 kernel on gfx12 and gfx11.5. K7 and opt-in K8 dense projections
+stay on `dec` even with the switch off, because the HIP GEMV gate caps K at 6 and there is no shared-route alternative.
+Pack-dependent and not a universal gfx1151 default: on the K6 Qwen3.8-Flash-Next pack it is +3.9% decode, on the K3 27B
+pack it is -3.7% plain (MTP unchanged). `EXL3_DEC=0` still disables both the dense and MoE dec kernels.
+
 #### `EXL3_QC_PF_MAXNREG` (default `255` for 8-bit K+V and above, else `0`)
 
 Register cap of the quantized-KV prefill attention kernel (`0` = compiler default). Uncapped registers free 1.3 GiB of

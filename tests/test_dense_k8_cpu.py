@@ -60,7 +60,7 @@ int main() {return !(run<10>() && run<12>() && run<14>() && run<16>());}
     subprocess.run([str(exe)],check=True,env={**os.environ,'ASAN_OPTIONS':'detect_leaks=0'})
 
 
-def helpers(family=2):
+def helpers(family=2, dense=True):
     tree = ast.parse((ROOT / 'exllamav3/modules/quant/exl3.py').read_text())
     nodes = [n for n in tree.body if
              (isinstance(n, ast.FunctionDef) and n.name in ('dec_supported','dec_moe_supported','_hip_wmma_family')) or
@@ -70,6 +70,7 @@ def helpers(family=2):
     ns = {'os':os,
           'torch':NS(version=NS(hip=True), device=object, cuda=NS(current_device=lambda:0)),
           'EXL3_DEC':True,
+          'EXL3_DEC_DENSE':dense,
           'ext':NS(exl3_dec_gemv=True, exl3_dec_moe=True,
                    exl3_gemv_wmma_family=lambda index: family)}
     exec(compile(ast.Module(body=nodes,type_ignores=[]),'eligibility','exec'),ns)
@@ -117,6 +118,16 @@ class DenseK8Checks(unittest.TestCase):
                 ns = helpers(family)
                 self.assertEqual(ns['dec_supported'](inner()), enabled, family)
                 self.assertEqual(ns['dec_moe_supported'](inner(k=2)), enabled, family)
+
+    def test_dec_dense_switch_is_dense_only(self):
+        """EXL3_DEC_DENSE=0 moves K<=6 dense GEMV off exl3_dec but keeps dec_moe and K7/K8."""
+        with patch.dict(os.environ, {'EXL3_DENSE_K8':'1'}):
+            ns = helpers(2, dense=False)
+            self.assertFalse(ns['dec_supported'](inner(k=3)))
+            # K7 and the opt-in K8 shapes have no HIP GEMV alternative, so they stay on dec.
+            self.assertTrue(ns['dec_supported'](inner(k=7)))
+            self.assertTrue(ns['dec_supported'](inner()))
+            self.assertTrue(ns['dec_moe_supported'](inner(k=2)))
 
 if __name__ == '__main__':
     unittest.main()
