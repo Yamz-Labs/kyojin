@@ -30,6 +30,24 @@ def is_loop(text):
     return zlib_low(text) and max_span_repeat(text) >= SPAN_MIN
 
 
+LINE_MIN, LINE_REPEAT = 40, 3
+
+
+def long_period_line(text):
+    """Long-period loop rule for thinking text: end offset of the first line with at least LINE_MIN non-space characters seen
+    LINE_REPEAT times anywhere in the text, else None. The tail rules above are blind to loops whose period exceeds the
+    window (a 30-line block repeated); a long identical line repeated 3 times is not natural prose."""
+    seen = Counter(); pos = 0
+    for line in text.split("\n"):
+        pos += len(line) + 1
+        s = line.strip()
+        if len("".join(s.split())) >= LINE_MIN:
+            seen[s] += 1
+            if seen[s] >= LINE_REPEAT:
+                return pos
+    return None
+
+
 def summarize(recs):
     """recs: run_suite jsonl records (_id, text, hit_cap) -> {n, loops, ids, capped}."""
     ids = sorted(r["_id"] for r in recs if is_loop(r["text"]))
