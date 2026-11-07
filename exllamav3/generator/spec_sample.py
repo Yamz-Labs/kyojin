@@ -132,6 +132,10 @@ def verify(logits: torch.Tensor, q: torch.Tensor, d: int, prm: tuple, rng) -> to
 TYPICAL = os.environ.get("EXL3_SPEC_TYPICAL", "0") != "0"
 TYP_EPS = float(os.environ.get("EXL3_SPEC_TYPICAL_EPS", "0.09"))
 TYP_DELTA = float(os.environ.get("EXL3_SPEC_TYPICAL_DELTA", "0.3"))
+# EXL3_SPEC_TYPICAL_HMAX (nats, default unset = off): entropy gate. A non-matching draft is relaxed only at rows whose entropy H
+# is <= HMAX, in addition to the p >= min(eps, delta * exp(-H)) rule; above it the draft is kept by equality only.
+_hm = os.environ.get("EXL3_SPEC_TYPICAL_HMAX", "").strip()
+TYP_HMAX = float(_hm) if _hm else None
 # Read-only probe: EXL3_SPEC_PTAP=<file.jsonl> appends one line per verify round (p_draft, entropy, match per row)
 PTAP = os.environ.get("EXL3_SPEC_PTAP") or None
 # Test switch for in-server A/B: EXL3_SPEC_TYPICAL_FILE=<path>, the rule is on while the file holds "1" (re-read when its mtime changes)
@@ -253,7 +257,8 @@ def _topk_of(prm: tuple):
 def typical_rows(rows: torch.Tensor, drafts: list, prm: tuple, eps: float, delta: float):
     """
     rows: (n, V) verify logits of the n draft rows; drafts: the n drafted ids. Returns (p, H, ok) as python lists, one
-    host sync: p = law probability of the draft, H = entropy of the law, ok = p > 0 and p >= min(eps, delta * exp(-H)).
+    host sync: p = law probability of the draft, H = entropy of the law, ok = p > 0 and p >= min(eps, delta * exp(-H))
+    and, when TYP_HMAX is set, H <= TYP_HMAX.
     With a top-K cut in the law only the K best logits of each row are sorted and normalised (the law is zero elsewhere,
     so p and H are those of the dense law).
     """
@@ -276,5 +281,7 @@ def typical_rows(rows: torch.Tensor, drafts: list, prm: tuple, eps: float, delta
     p = torch.stack(ps)
     h = torch.stack(hs)
     ok = (p > 0) & (p >= torch.clamp(delta * torch.exp(-h), max = eps))
+    if TYP_HMAX is not None:
+        ok = ok & (h <= TYP_HMAX)
     out = torch.stack([p, h, ok.float()]).tolist()
     return out[0], out[1], [x > 0.5 for x in out[2]]

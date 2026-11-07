@@ -87,6 +87,46 @@ class TypicalRule(unittest.TestCase):
         self.assertIsNone(ss.eligible(J()))
 
 
+class EntropyGate(unittest.TestCase):
+    """EXL3_SPEC_TYPICAL_HMAX: relaxation only at rows with H <= HMAX."""
+    P = [0.5, 0.3, 0.2] + [0.0] * (V - 3)
+    H = -sum(x * math.log(x) for x in P if x > 0)
+
+    def setUp(self): self.old = ss.TYP_HMAX
+    def tearDown(self): ss.TYP_HMAX = self.old
+
+    def run_rule(self):
+        return ss.typical_rows(row_from_probs(self.P), [2], PRM_FULL, 0.09, 0.3)
+
+    def test_default_off(self):
+        self.assertIsNone(self.old)
+        ss.TYP_HMAX = None
+        pp, hh, ok = self.run_rule()
+        self.assertTrue(ok[0])
+
+    def test_above_hmax_never_relaxed(self):
+        ss.TYP_HMAX = self.H - 0.01
+        pp, hh, ok = self.run_rule()
+        self.assertGreater(pp[0], 0.09)   # high p, still refused
+        self.assertFalse(ok[0])
+
+    def test_below_hmax_as_before(self):
+        ss.TYP_HMAX = self.H + 0.01
+        self.assertTrue(self.run_rule()[2][0])
+        # a draft under the threshold stays refused
+        pp, hh, ok = ss.typical_rows(row_from_probs(self.P), [2], PRM_FULL, 1.0, 1.0)
+        self.assertFalse(ok[0])
+
+    def test_greedy_not_eligible(self):
+        class J:
+            filters = []; forced_ids = None; return_probs = False; return_top_tokens = False; device_logit_mask = None; sequences = [1]
+            sampler = CustomSampler([SS_Argmax()])
+            class generator:
+                class tokenizer: actual_vocab_size = V
+        ss.TYP_HMAX = 0.1
+        self.assertIsNone(ss.eligible(J()))
+
+
 class CopiedDrafts(unittest.TestCase):
     """EXL3_SPEC_TYPICAL_LOOKUP: copied drafts keep the exact rule; model-head drafts stay relaxed."""
     class Gen:
