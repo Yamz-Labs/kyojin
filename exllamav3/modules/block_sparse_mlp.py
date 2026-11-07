@@ -18,6 +18,7 @@ from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
 from .moe_batch_recon import PAD_MAX
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+from ..util.knobs import knob_on
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .quant.exl3 import dec_workspace
 from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices
@@ -165,6 +166,10 @@ def _scatter_expert_count(flat_expert_local: torch.Tensor, num_bins: int) -> tor
 # every (expert, sub-chunk) segment starts on an even row (the GEMM result of a row depends on its row parity
 # inside the expert list), so the output is bit-identical to running the sub-chunks one after the other.
 _MOE_ALIGN_CHUNK = int(os.environ.get("EXL3_MOE_ALIGN_CHUNK", "4096"))
+
+# EXL3_SHGATE_REDUCE_LOG=1: print once when a prefill forward sums the gated shared expert in the reduce (A/B check)
+_SHGATE_REDUCE_LOG = os.environ.get("EXL3_SHGATE_REDUCE_LOG", "0") == "1"
+_shgate_reduce_seen = []
 
 
 def _aligned_expert_layout(flat: torch.Tensor, num_tokens: int, top_k: int, num_experts: int, chunk: int):
@@ -2577,6 +2582,31 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 else:
                     raise RuntimeError(f"EXL3_NC2_SHARED_FUSE: shared expert output {sh_add.dtype}, contiguous "
                                        f"{sh_add.is_contiguous()}: fp16 contiguous needed")
+            # EXL3_SHGATE_REDUCE (default 1, read per call, needs the ext flag): a sigmoid-gated shared expert (Qwen3.8) is
+            # summed in by the reduce epilogue as float(y) * sigmoid(z), the arithmetic of the tail EXL3_SHGATE_FUSE pass
+            # (gr_pf.shgate_add: unfused fp32 multiply + add) on the same routed fp32 sum, so the fp32 output is not read
+            # and rewritten by a second pass. Same inputs (the shared expert and its gate only read x), same tail
+            # conditions. Bit-identical. 0 goes back to the tail pass.
+            sh_gate = None
+            sh_late = None
+            if (sh_add is None and self.shared_experts and self.shared_gate is not None and num_tokens > 32 and
+                    not self.shared_experts_post_norm and not self.tp_reduce and
+                    self.routed_post_norm is None and self.latent_out is None and
+                    hasattr(ext, "EXL3_MPW_ADDEND_GATE") and knob_on("EXL3_SHGATE_REDUCE", "1") and
+                    os.environ.get("EXL3_SHGATE_FUSE", "1") != "0"):
+                sh_params = {**params, "moe_valu": True} if _MOE_VALU else dict(params)
+                sh_params["nc2_down_half"] = True
+                yh = self.shared_experts.forward(x, sh_params)
+                z = self.shared_gate.forward(x, params)
+                if yh.dtype == torch.half and yh.is_contiguous() and z.dtype == torch.float and z.is_contiguous():
+                    sh_add = yh.view(num_tokens, self.hidden_size)
+                    sh_gate = torch.sigmoid(z).view(-1)
+                    if _SHGATE_REDUCE_LOG and not _shgate_reduce_seen:
+                        _shgate_reduce_seen.append(self.key)
+                        print(f" -- EXL3_SHGATE_REDUCE: gated shared expert summed in the reduce ({self.key}, {num_tokens} rows)")
+                else:
+                    sh_late = (yh, z)   # the tail fallback (add_sigmoid_gate), applied after the reduce
+                bc_sh_exp = True
             ext.exl3_moe_prefill_wmma(
                 y_k, output, sel_k, rw_k, order, expert_count,
                 self.multi_gate.ptrs_trellis, self.multi_gate.ptrs_suh, self.multi_gate.ptrs_svh,
@@ -2588,7 +2618,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 down_out,
                 ws["offsets"], ws["inverse"][:assignments], ws["tiles"], ws["tile_count"],
                 float(self.act_limit), bool(self.wmma_mcg), sh_add,
+                **({"addend_gate": sh_gate} if sh_gate is not None else {}),
             )
+            if sh_late is not None:
+                ext.add_sigmoid_gate(sh_late[0].float(), sh_late[1].float(), output[:num_tokens].view(eshape))
             final_hidden_states = output[:num_tokens].view(eshape)
 
         # Torch/C++/fused path
