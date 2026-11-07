@@ -36,7 +36,8 @@ void exl3_moe_prefill_wmma
     at::Tensor& tile_count,           // int32 [1]
     double act_limit,                 // clamped SwiGLU limit, 0 = unclamped
     bool mcg,                         // trellis codebook: true = mcg, false = mul1
-    const c10::optional<at::Tensor>& addend   // fp16 [<= rows, H] widened and added to output rows (shared expert), or none
+    const c10::optional<at::Tensor>& addend,  // fp16 [<= rows, H] widened and added to output rows (shared expert), or none
+    const c10::optional<at::Tensor>& addend_gate = c10::nullopt   // fp32 [addend rows]: add float(addend) * gate[row] (sigmoid-gated shared expert)
 );
 
 // Mixed-K layer (no pruned experts) in one pipeline: E-length pointer tables, one gather/act/reduce pass, the two GEMMs

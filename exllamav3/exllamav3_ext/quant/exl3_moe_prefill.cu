@@ -271,7 +271,8 @@ void mpw_reduce_had_kernel
     int top_k,
     int width,
     const half* __restrict__ addend,
-    int addend_rows
+    int addend_rows,
+    const float* __restrict__ addend_gate = nullptr
 )
 {
     const int blocks = width / 128;
@@ -301,11 +302,26 @@ void mpw_reduce_had_kernel
     // Shared-expert output (fp16 GEMM result) added in the epilogue (EXL3_NC2_SHARED_FUSE): the exact
     // fp16 -> fp32 widen and the single fp32 add of the `y.copy_(y_)` + `final += y` pair it replaces.
     // Rows past addend_rows (alignment dummies) skip it.
+    // EXL3_SHGATE_REDUCE: a sigmoid-gated shared expert (Qwen3.8) adds float(a) * s[row], s = sigmoid(gate) in fp32:
+    // one fp32 multiply then one fp32 add, unfused (__fmul_rn / __fadd_rn), the arithmetic of gr_pf.shgate_add
+    // (enable_fp_fusion = False) that it replaces, applied to the same routed fp32 sum.
     if (addend && row < addend_rows)
     {
         const half4 a = ((const half4*) (addend + row * width + blk * 128))[t];
-        sum.x += __low2float(a.x); sum.y += __high2float(a.x);
-        sum.z += __low2float(a.y); sum.w += __high2float(a.y);
+        if (addend_gate)
+        {
+            // HIP maps __fmul_rn / __fadd_rn to plain operators and -ffp-contract=fast fuses them into an fma: the empty asm
+            // makes each product an opaque value, so the add stays a separate rounding (shgate_add is unfused)
+            const float g = addend_gate[row];
+            float p0 = __low2float(a.x) * g, p1 = __high2float(a.x) * g, p2 = __low2float(a.y) * g, p3 = __high2float(a.y) * g;
+            asm volatile("" : "+v"(p0), "+v"(p1), "+v"(p2), "+v"(p3));
+            sum.x += p0; sum.y += p1; sum.z += p2; sum.w += p3;
+        }
+        else
+        {
+            sum.x += __low2float(a.x); sum.y += __high2float(a.x);
+            sum.z += __low2float(a.y); sum.w += __high2float(a.y);
+        }
     }
     ((float4*) (output + row * width + blk * 128))[t] = sum;
 }
@@ -1643,7 +1659,8 @@ void exl3_moe_prefill_wmma
     at::Tensor& tile_count,
     double act_limit,
     bool mcg,
-    const c10::optional<at::Tensor>& addend
+    const c10::optional<at::Tensor>& addend,
+    const c10::optional<at::Tensor>& addend_gate
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
@@ -1692,6 +1709,15 @@ void exl3_moe_prefill_wmma
                     ad.size(0) <= rows && ad.device() == A.device(), "addend must be fp16 [<= rows, H] contiguous");
         add_ptr = (const half*) ad.data_ptr();
         add_rows = ad.size(0);
+    }
+    const float* gate_ptr = nullptr;
+    if (addend_gate.has_value())
+    {
+        const at::Tensor& ag = addend_gate.value();
+        TORCH_CHECK(add_ptr, "exl3_moe_prefill_wmma: addend_gate needs addend");
+        TORCH_CHECK(ag.dtype() == at::kFloat && ag.is_contiguous() && ag.numel() == add_rows && ag.device() == A.device(),
+                    "addend_gate must be fp32 [addend rows] contiguous");
+        gate_ptr = (const float*) ag.data_ptr();
     }
     const int kern = mpw_kern(assignments, experts);
     const int slots = tile_slots(assignments, experts, kern);
@@ -1750,7 +1776,7 @@ void exl3_moe_prefill_wmma
     else
     mpw_reduce_had_kernel<<<CEIL_DIVIDE(rjobs, 8), 256, 0, stream>>>
     ((const float*) down_out.data_ptr(), sel, (const float*) weights.data_ptr(), inv, P(down_svh),
-     (float*) output.data_ptr(), rows, top_k, H, add_ptr, add_rows);
+     (float*) output.data_ptr(), rows, top_k, H, add_ptr, add_rows, gate_ptr);
     cuda_check(hipPeekAtLastError());
 }
 
