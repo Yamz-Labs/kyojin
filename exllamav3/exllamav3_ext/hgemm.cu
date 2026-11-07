@@ -964,6 +964,298 @@ void skinny_set_w2(int64_t on) { skinny::g_w2 = on ? 1 : 0; }
 
 #endif // USE_ROCM
 
+#if !defined(USE_ROCM)
+
+/*
+Tuned dense GEMM for CUDA prefill (EXL3_CUDA_GEMM_TUNE, default on; 0 = off, read on every call so an in-process A/B
+can toggle it). cublasGemmEx's heuristic picks a 128x128 tile for some large prefill shapes on Ampere: Qwen3.8-27B
+mlp down (k=17408, n=5120, 4096 rows) runs at ~100 TFLOPS on a 3090 against ~115 for a 256x128 / 128x256 cuBLASLt
+config of the same shape (-13 %). Per (n, k, m class, layout, out dtype) key, every cuBLASLt config (algo id x tile x
+stages x CTA swizzle, split-K 1, tiles of at least 64x128) is screened on the live operands with two reps; the 24
+fastest are run once more and only the ones whose output is BIT-IDENTICAL to cublasGemmEx's stay (no split-K, same
+fp32 accumulation order: every big-tile config of these shapes matched); the best 6 are re-timed against cublasGemmEx
+in 5 interleaved rounds (device drained before each) and must beat it by 3 %. The winner (or 0 = untuned) is kept in memory and appended to a cache
+file keyed by the cuBLASLt version and the device, so a process tunes a shape class once ever. Never tunes under
+stream capture or inside a graph; any failure falls back to cublasGemmEx.
+*/
+
+#include <cublasLt.h>
+#include <algorithm>
+#include <map>
+#include <tuple>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <cstdio>
+#include <sys/stat.h>
+
+namespace ltune
+{
+
+constexpr int MIN_M = 256;             // rows below this: untuned path (decode, verify, short tails)
+constexpr int NUM_DEV = MAX_DEVICES;
+
+typedef std::tuple<int, int, int, int, int> Key;   // n, k, m class, layout bits, out fp32
+struct Cfg { int id, tile, stages, swz; };
+static std::map<Key, Cfg> g_cache;     // id < 0: cublasGemmEx wins
+static bool g_loaded = false;
+static std::mutex g_mutex;
+static cublasLtHandle_t g_handle[NUM_DEV] = {};
+static std::string g_tag;
+
+static bool enabled()
+{
+    const char* e = getenv("EXL3_CUDA_GEMM_TUNE");
+    return !e || *e != '0';   // on by default: winners are bit-exact with the untuned path
+}
+
+static int m_class(int m) { return ((m + 255) / 256) * 256; }
+
+static std::string cache_path()
+{
+    const char* p = getenv("EXL3_CUDA_GEMM_TUNE_FILE");
+    if (p && *p) return p;
+    const char* h = getenv("HOME");
+    std::string d = std::string(h ? h : "/tmp") + "/.cache/exllamav3";
+    mkdir((std::string(h ? h : "/tmp") + "/.cache").c_str(), 0755);
+    mkdir(d.c_str(), 0755);
+    return d + "/cuda_gemm_tune.txt";
+}
+
+static void load(int device)
+{
+    if (g_loaded) return;
+    g_loaded = true;
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    g_tag = "lt" + std::to_string(cublasLtGetVersion()) + "|" + prop.name + "|sm" + std::to_string(prop.major * 10 + prop.minor) + "|exact1";
+    for (auto& ch : g_tag) if (ch == ' ') ch = '_';
+    FILE* f = fopen(cache_path().c_str(), "r");
+    if (!f) return;
+    char tag[512]; int n, k, mc, lay, f32, id, tile, stages, swz;
+    while (fscanf(f, "%511s %d %d %d %d %d %d %d %d %d", tag, &n, &k, &mc, &lay, &f32, &id, &tile, &stages, &swz) == 10)
+        if (g_tag == tag) g_cache[Key(n, k, mc, lay, f32)] = Cfg{id, tile, stages, swz};
+    fclose(f);
+}
+
+static void store(const Key& key, const Cfg& c)
+{
+    FILE* f = fopen(cache_path().c_str(), "a");
+    if (!f) return;
+    fprintf(f, "%s %d %d %d %d %d %d %d %d %d\n", g_tag.c_str(), std::get<0>(key), std::get<1>(key),
+            std::get<2>(key), std::get<3>(key), std::get<4>(key), c.id, c.tile, c.stages, c.swz);
+    fclose(f);
+}
+
+static cublasLtHandle_t handle(int device)
+{
+    if (!g_handle[device]) cublasLtCreate(&g_handle[device]);
+    return g_handle[device];
+}
+
+// tile edge product; 0 = unknown / too small to win a large prefill GEMM
+static int tile_area(int t)
+{
+    switch (t)
+    {
+        case CUBLASLT_MATMUL_TILE_64x128: case CUBLASLT_MATMUL_TILE_128x64: return 64 * 128;
+        case CUBLASLT_MATMUL_TILE_64x256: case CUBLASLT_MATMUL_TILE_256x64: return 64 * 256;
+        case CUBLASLT_MATMUL_TILE_128x128: return 128 * 128;
+        case CUBLASLT_MATMUL_TILE_64x512: case CUBLASLT_MATMUL_TILE_512x64: return 64 * 512;
+        case CUBLASLT_MATMUL_TILE_128x256: case CUBLASLT_MATMUL_TILE_256x128: return 128 * 256;
+        case CUBLASLT_MATMUL_TILE_256x256: return 256 * 256;
+        default: return 0;
+    }
+}
+
+// row-major C[m, n] = A[m, k] @ B[k, n] as column-major C^T = B^T A^T
+struct Call
+{
+    cublasLtHandle_t h;
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t lb = nullptr, la = nullptr, lc = nullptr;
+    const void* a; const void* b; void* c;
+    void* ws; size_t ws_size;
+    Call(cublasLtHandle_t h_, int m, int n, int k, int lda, int ldc, bool f32, const void* a_, const void* b_, void* c_, void* ws_)
+        : h(h_), a(a_), b(b_), c(c_), ws(ws_), ws_size(WORKSPACE_SIZE)
+    {
+        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        cublasLtMatrixLayoutCreate(&lb, CUDA_R_16F, n, k, n);
+        cublasLtMatrixLayoutCreate(&la, CUDA_R_16F, k, m, lda);
+        cublasLtMatrixLayoutCreate(&lc, f32 ? CUDA_R_32F : CUDA_R_16F, n, m, ldc);
+    }
+    ~Call()
+    {
+        if (lc) cublasLtMatrixLayoutDestroy(lc);
+        if (la) cublasLtMatrixLayoutDestroy(la);
+        if (lb) cublasLtMatrixLayoutDestroy(lb);
+        if (op) cublasLtMatmulDescDestroy(op);
+    }
+    bool algo(const Cfg& g, cudaDataType_t ct, cublasLtMatmulAlgo_t& al) const
+    {
+        if (cublasLtMatmulAlgoInit(h, CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16F, CUDA_R_16F, ct, ct, g.id, &al) != CUBLAS_STATUS_SUCCESS) return false;
+        int one = 1;
+        cublasLtMatmulAlgoConfigSetAttribute(&al, CUBLASLT_ALGO_CONFIG_TILE_ID, &g.tile, sizeof(g.tile));
+        cublasLtMatmulAlgoConfigSetAttribute(&al, CUBLASLT_ALGO_CONFIG_STAGES_ID, &g.stages, sizeof(g.stages));
+        cublasLtMatmulAlgoConfigSetAttribute(&al, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &g.swz, sizeof(g.swz));
+        cublasLtMatmulAlgoConfigSetAttribute(&al, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &one, sizeof(one));
+        cublasLtMatmulHeuristicResult_t hr;
+        if (cublasLtMatmulAlgoCheck(h, op, lb, la, lc, lc, &al, &hr) != CUBLAS_STATUS_SUCCESS) return false;
+        return hr.workspaceSize <= ws_size;
+    }
+    bool run(const cublasLtMatmulAlgo_t& al, cudaStream_t s) const
+    {
+        float alpha = 1.0f, beta = 0.0f;
+        return cublasLtMatmul(h, op, &alpha, b, lb, a, la, &beta, c, lc, c, lc, &al, ws, ws_size, s) == CUBLAS_STATUS_SUCCESS;
+    }
+};
+
+template <typename F>
+static float time_fn(F&& fn, cudaStream_t stream, int reps)
+{
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    if (!fn()) { cudaEventDestroy(e0); cudaEventDestroy(e1); return 1e30f; }
+    cudaEventRecord(e0, stream);
+    for (int i = 0; i < reps; ++i) fn();
+    cudaEventRecord(e1, stream);
+    cudaEventSynchronize(e1);
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, e0, e1) != cudaSuccess) ms = 1e30f * reps;
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    return ms / reps;
+}
+
+template <typename T, typename S>
+static Cfg tune(const Call& call, cudaDataType_t ct, cudaStream_t stream, int m, int n, int k, T&& def_time, S&& same)
+{
+    Cfg none{-1, 0, 0, 0};
+    int ids[128]; int nid = 0;
+    if (cublasLtMatmulAlgoGetIds(call.h, CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16F, CUDA_R_16F, ct, ct, 128, ids, &nid)
+        != CUBLAS_STATUS_SUCCESS || nid <= 0) return none;
+    // screen: every config with a big enough tile, two timed reps. Work queued on other streams (the side streams of
+    // a server) would land inside the event window and pick losers: drain the device first, and before each round.
+    cudaDeviceSynchronize();
+    std::vector<std::pair<float, Cfg>> t;
+    for (int ii = 0; ii < nid; ++ii)
+    {
+        cublasLtMatmulAlgo_t al;
+        if (cublasLtMatmulAlgoInit(call.h, CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16F, CUDA_R_16F, ct, ct, ids[ii], &al) != CUBLAS_STATUS_SUCCESS) continue;
+        size_t sz = 0;
+        std::vector<int> tiles, stages;
+        cublasLtMatmulAlgoCapGetAttribute(&al, CUBLASLT_ALGO_CAP_TILE_IDS, nullptr, 0, &sz);
+        if (!sz) continue;
+        tiles.resize(sz / sizeof(int));
+        cublasLtMatmulAlgoCapGetAttribute(&al, CUBLASLT_ALGO_CAP_TILE_IDS, tiles.data(), sz, &sz);
+        sz = 0; cublasLtMatmulAlgoCapGetAttribute(&al, CUBLASLT_ALGO_CAP_STAGES_IDS, nullptr, 0, &sz);
+        if (sz) { stages.resize(sz / sizeof(int)); cublasLtMatmulAlgoCapGetAttribute(&al, CUBLASLT_ALGO_CAP_STAGES_IDS, stages.data(), sz, &sz); }
+        else stages.push_back(CUBLASLT_MATMUL_STAGES_UNDEFINED);
+        int swmax = 0;
+        cublasLtMatmulAlgoCapGetAttribute(&al, CUBLASLT_ALGO_CAP_CTA_SWIZZLING_SUPPORT, &swmax, sizeof(swmax), &sz);
+        for (int tile : tiles)
+        {
+            if (tile_area(tile) < 64 * 128) continue;
+            for (int st : stages) for (int sw = 0; sw <= (swmax ? 1 : 0); ++sw)
+            {
+                Cfg g{ids[ii], tile, st, sw};
+                cublasLtMatmulAlgo_t a2;
+                if (!call.algo(g, ct, a2)) continue;
+                float ms = time_fn([&]{ return call.run(a2, stream); }, stream, 2);
+                cudaGetLastError();
+                if (ms < 1e29f) t.push_back({ms, g});
+            }
+        }
+    }
+    std::sort(t.begin(), t.end(), [](const std::pair<float, Cfg>& x, const std::pair<float, Cfg>& y) { return x.first < y.first; });
+    // finalists: up to 6 of the 24 fastest whose output is bit-identical to cublasGemmEx
+    std::vector<Cfg> fin;
+    for (int i = 0; i < (int) t.size() && i < 24 && fin.size() < 6; ++i)
+    {
+        cublasLtMatmulAlgo_t al;
+        if (!call.algo(t[i].second, ct, al) || !call.run(al, stream)) continue;
+        if (same()) fin.push_back(t[i].second);
+    }
+    std::vector<float> tm(fin.size(), 1e30f);
+    float best_def = 1e30f;
+    for (int r = 0; r < 5; ++r)
+    {
+        cudaDeviceSynchronize();
+        best_def = fminf(best_def, def_time(5));
+        for (size_t i = 0; i < fin.size(); ++i)
+        {
+            cublasLtMatmulAlgo_t al;
+            if (!call.algo(fin[i], ct, al)) continue;
+            tm[i] = fminf(tm[i], time_fn([&]{ return call.run(al, stream); }, stream, 5));
+        }
+    }
+    float best = best_def * 0.97f;
+    Cfg win = none;
+    for (size_t i = 0; i < fin.size(); ++i) if (tm[i] < best) { best = tm[i]; win = fin[i]; }
+    if (getenv("EXL3_CUDA_GEMM_TUNE_DEBUG"))
+    {
+        fprintf(stderr, "[ltune] n=%d k=%d m=%d screened=%d exact=%d def=%.3f", n, k, m, (int) t.size(), (int) fin.size(), best_def);
+        for (size_t i = 0; i < fin.size(); ++i) fprintf(stderr, " %d/%d/%d/%d:%.3f", fin[i].id, fin[i].tile, fin[i].stages, fin[i].swz, tm[i]);
+        fprintf(stderr, " -> %d/%d/%d/%d\n", win.id, win.tile, win.stages, win.swz);
+    }
+    return win;
+}
+
+// true if handled
+template <typename D>
+static bool try_launch(const at::Tensor& a, const at::Tensor& b, at::Tensor& c, cudaStream_t stream, D&& def_run)
+{
+    if (!enabled()) return false;
+    if (a.dtype() != at::kHalf || b.dtype() != at::kHalf) return false;
+    if (c.dtype() != at::kHalf && c.dtype() != at::kFloat) return false;
+    if (b.dim() != 2 || !b.is_contiguous() || c.dim() < 2 || c.stride(-1) != 1) return false;
+    const int k = a.size(-1);
+    if (k < 1) return false;
+    const int m = a.numel() / k;
+    const int n = b.size(-1);
+    if (m < MIN_M || b.size(0) != k || c.size(-1) != n) return false;
+    int64_t lda = 0;
+    if (!a_row_pitch(a, lda)) return false;
+    const int64_t ldc = c.stride(-2);
+    if (ldc < n || ldc > std::numeric_limits<int>::max()) return false;
+    if (c.numel() / n != m) return false;
+    int device;
+    cudaGetDevice(&device);
+    if (device < 0 || device >= NUM_DEV) return false;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    load(device);
+    const bool f32 = c.dtype() == at::kFloat;
+    const cudaDataType_t ct = f32 ? CUDA_R_32F : CUDA_R_16F;
+    Key key(n, k, m_class(m), (ldc == n ? 1 : 0) | (lda != k ? 2 : 0), f32 ? 1 : 0);
+    Call call(handle(device), m, n, k, (int) lda, (int) ldc, f32, a.data_ptr(), b.data_ptr(), c.data_ptr(),
+              DevCtx::instance().get_ws(device));
+    auto it = g_cache.find(key);
+    Cfg g;
+    if (it != g_cache.end()) g = it->second;
+    else
+    {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        cudaStreamIsCapturing(stream, &cs);
+        if (cs != cudaStreamCaptureStatusNone) return false;
+        def_run();
+        at::Tensor ref = c.clone();
+        g = tune(call, ct, stream, m, n, k, [&](int reps){ return time_fn([&]{ def_run(); return true; }, stream, reps); },
+                 [&]{ return c.equal(ref); });
+        ref = at::Tensor();
+        g_cache[key] = g;
+        store(key, g);
+        cudaGetLastError();
+    }
+    if (g.id < 0) return false;   // caller runs cublasGemmEx
+    cublasLtMatmulAlgo_t al;
+    if (!call.algo(g, ct, al)) return false;
+    return call.run(al, stream);   // the final run writes the real result (tuning reps wrote the same product)
+}
+
+} // namespace ltune
+
+#endif // !USE_ROCM
+
 void hgemm_gr
 (
     at::Tensor a,
@@ -976,6 +1268,8 @@ void hgemm_gr
 #if defined(USE_ROCM)
     if (skinny::try_launch(a, b, c, stream)) return;
     if (!graph && dtune::try_launch(a, b, c, stream, [&]{ hgemm_gemmex_impl(a, b, c, stream); })) return;
+#else
+    if (!graph && ltune::try_launch(a, b, c, stream, [&]{ hgemm_gemmex_impl(a, b, c, stream); })) return;
 #endif
     hgemm_gemmex_impl(a, b, c, stream);
 

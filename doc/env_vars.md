@@ -977,6 +977,25 @@ libraries into the cache key, and the engine replaces that prefix by a placehold
 the mode in which a seed is built from an empty cache. Rebuild with `tools/kernel_seed/` (sweep,
 then build).
 
+#### `EXL3_CUDA_GEMM_TUNE` (default: `1`, CUDA only)
+
+Tunes the large fp16 GEMMs of the reconstruct (prefill) path on CUDA. `cublasGemmEx`'s heuristic
+picks a 128x128 tile for some large shapes on Ampere: Qwen3.8-27B's MLP down projection (k 17408,
+n 5120, 4096 rows) runs at about 100 TFLOPS on a 3090, against about 115 for a 128x256 cuBLASLt
+config. For each (n, k, rows rounded up to 256, layout, output dtype) the engine screens every
+cuBLASLt config (algo, tile of at least 64x128, stages, CTA swizzle, split-K 1) on the live
+operands. It keeps only configs whose output is bit-identical to `cublasGemmEx`, re-times the
+best 6 against it (device drained before each round), and uses a winner only when it is at least 3 % faster. Results never change: only
+the kernel does. Tuning a new shape class costs about 0.1-2.6 s once (first prefill that meets it),
+then the choice comes from memory or the cache file. Never tunes inside a CUDA graph or under stream
+capture. `0` = plain `cublasGemmEx` (read on every call). The ROCm build uses `EXL3_DENSE_GEMM_TUNE` instead.
+
+#### `EXL3_CUDA_GEMM_TUNE_FILE` (default: `$HOME/.cache/exllamav3/cuda_gemm_tune.txt`)
+
+The file that holds the tuned config per shape class, keyed by the cuBLASLt version and the GPU.
+Lines for another library or GPU are ignored. `EXL3_CUDA_GEMM_TUNE_DEBUG=1` prints one `[ltune]`
+line per tuned shape (candidates, times, winner) to stderr.
+
 #### `EXL3_LOG_JIT` (default: `0`)
 
 `1` prints one `[jit]` line per Triton kernel the server compiles or loads, with its time. Use it to
