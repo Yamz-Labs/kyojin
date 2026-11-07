@@ -145,8 +145,8 @@ PTAP = os.environ.get("EXL3_SPEC_PTAP") or None
 TYPICAL_LOOKUP = os.environ.get("EXL3_SPEC_TYPICAL_LOOKUP", "rep").strip().lower()
 if TYPICAL_LOOKUP not in ("rep", "0", "1"):
     TYPICAL_LOOKUP = "rep"
-REP_N = int(os.environ.get("EXL3_SPEC_TYPICAL_REP_N", "8"))
-REP_W = int(os.environ.get("EXL3_SPEC_TYPICAL_REP_W", "512"))
+REP_N = int(os.environ.get("EXL3_SPEC_TYPICAL_REP_N", "12"))
+REP_W = int(os.environ.get("EXL3_SPEC_TYPICAL_REP_W", "2048"))
 REP_COUNT = 2
 REP_REFUSED = [0]   # relaxed acceptances refused by the repetition check, whole process
 _TFILE = os.environ.get("EXL3_SPEC_TYPICAL_FILE") or None
