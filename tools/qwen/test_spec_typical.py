@@ -99,13 +99,13 @@ class CopiedDrafts(unittest.TestCase):
         ss.TYPICAL_LOOKUP = self.old
 
     def test_default_is_exact_for_copies(self):
-        self.assertFalse(ss.TYPICAL_LOOKUP)
+        self.assertEqual(ss.TYPICAL_LOOKUP, "rep")
 
     def test_model_head_vs_copy(self):
         g = self.Gen()
         mtp = g.draft_ids_pinned[:, :3]            # drafter round: slice of the pinned buffer
         copy = torch.tensor([[1, 2, 3]])           # lookup round: tensor of its own
-        for flag, want_copy in ((False, False), (True, True)):
+        for flag, want_copy in (("0", False), ("1", True), ("rep", True)):
             ss.TYPICAL_LOOKUP = flag
             self.assertTrue(ss.relax_allowed(g, mtp, 0))          # MTP unchanged in both modes
             self.assertEqual(ss.relax_allowed(g, copy, 0), want_copy)
@@ -114,7 +114,7 @@ class CopiedDrafts(unittest.TestCase):
         g = self.Gen()
         t = torch.tensor([[1, 2], [3, 4]])
         g.draft_copy_rows = (t, [True, False])
-        ss.TYPICAL_LOOKUP = False
+        ss.TYPICAL_LOOKUP = "0"
         self.assertFalse(ss.relax_allowed(g, t, 0))
         self.assertTrue(ss.relax_allowed(g, t, 1))
         g.draft_copy_rows = (torch.tensor([[9]]), [False, False])   # stale mark for another tensor: ignored
@@ -126,9 +126,9 @@ class CopiedDrafts(unittest.TestCase):
         _, _, ok = ss.typical_rows(row_from_probs(p), [2], PRM_FULL, 0.09, 0.3)
         self.assertTrue(ok[0])
         g = self.Gen(); copy = torch.tensor([[2]])
-        ss.TYPICAL_LOOKUP = False
+        ss.TYPICAL_LOOKUP = "0"
         self.assertFalse(ok[0] and ss.relax_allowed(g, copy, 0))
-        ss.TYPICAL_LOOKUP = True
+        ss.TYPICAL_LOOKUP = "1"
         self.assertTrue(ok[0] and ss.relax_allowed(g, copy, 0))
 
     def test_greedy_unchanged(self):
@@ -138,9 +138,83 @@ class CopiedDrafts(unittest.TestCase):
             sampler = CustomSampler([SS_Argmax()])
             class generator:
                 class tokenizer: actual_vocab_size = V
-        for flag in (False, True):
+        for flag in ("0", "1", "rep"):
             ss.TYPICAL_LOOKUP = flag
             self.assertIsNone(ss.eligible(J()))
+
+
+class FakeSeq:
+    def __init__(self, ids): self.ids = list(ids)
+    def __len__(self): return len(self.ids)
+    def torch_slice(self, a, b): return torch.tensor(self.ids[a:b], dtype=torch.long)
+
+
+class FakeJob:
+    def __init__(self, prompt, gen=()):
+        self.seq = FakeSeq(list(prompt) + list(gen)); self.new_tokens = len(gen)
+        class S: pass
+        s = S(); s.sequence_ids = self.seq; self.sequences = [s]
+    def emit(self, t): self.seq.ids.append(t); self.new_tokens += 1
+
+
+class RepetitionAware(unittest.TestCase):
+    """Default "rep": the relaxed rule is refused for a draft that completes an n-gram the job already repeated >= 2 times."""
+    def setUp(self):
+        self.old = (ss.TYPICAL_LOOKUP, ss.REP_N, ss.REP_W); ss.TYPICAL_LOOKUP = "rep"; ss.REP_N = 8; ss.REP_W = 512
+        self.n0 = ss.REP_REFUSED[0]
+
+    def tearDown(self):
+        ss.TYPICAL_LOOKUP, ss.REP_N, ss.REP_W = self.old
+
+    def test_prompt_copy_stays_relaxed(self):
+        prompt = list(range(100, 160))
+        gen = [5, 6, 7, 8, 9, 10, 11, 12]       # output so far; the draft continues a span that exists only in the prompt
+        j = FakeJob(prompt, gen)
+        self.assertFalse(ss.rep_refused(j, 13))
+        self.assertEqual(ss.REP_REFUSED[0], self.n0)
+
+    def test_own_output_repeat_refused(self):
+        loop = list(range(200, 220))             # a 20-token span emitted twice, third copy starts
+        j = FakeJob([1, 2, 3], loop + loop + loop[:10])
+        self.assertTrue(ss.rep_refused(j, loop[10]))      # would continue the third copy of a span seen twice
+        self.assertFalse(ss.rep_refused(j, 999))          # a different token is not a repeat
+        self.assertEqual(ss.REP_REFUSED[0], self.n0 + 1)
+        self.assertEqual(j.rep_refused, 1)
+
+    def test_seen_once_not_refused(self):
+        loop = list(range(200, 220))
+        j = FakeJob([1], loop + loop[:10])              # the span seen only once so far
+        self.assertFalse(ss.rep_refused(j, loop[10]))
+
+    def test_incremental_and_equality(self):
+        loop = list(range(200, 220))
+        j = FakeJob([1], loop + loop[:3])
+        self.assertFalse(ss.rep_refused(j, loop[3]))
+        for t in loop[3:] + loop + loop[:10]: j.emit(t)   # tracker catches up from the new tail
+        self.assertTrue(ss.rep_refused(j, loop[10]))
+        # equality still accepts: the generator only replaces the sampled token by a draft when not refused, so a refused draft
+        # reaches acceptance only if the target sampled the same token (nothing in rep_refused touches that path)
+
+    def test_window_evicts(self):
+        ss.REP_W = 40
+        loop = list(range(200, 220))
+        j = FakeJob([1], loop + loop + list(range(300, 360)) + loop[:10])   # the repeats left the window
+        self.assertFalse(ss.rep_refused(j, loop[10]))
+
+    def test_other_arms_never_refuse(self):
+        loop = list(range(200, 220))
+        j = FakeJob([1], loop + loop + loop[:10])
+        for arm in ("0", "1"):
+            ss.TYPICAL_LOOKUP = arm
+            self.assertFalse(ss.rep_refused(j, loop[10]))
+
+    def test_mtp_source_checked_too(self):
+        # the check is keyed on the output only: relax_allowed (source gate) is True for a model-head draft, rep_refused still applies
+        class G: draft_ids_pinned = torch.zeros(1, 4, dtype=torch.long)
+        g = G(); mtp = g.draft_ids_pinned[:, :2]
+        loop = list(range(200, 220)); j = FakeJob([1], loop + loop + loop[:10])
+        self.assertTrue(ss.relax_allowed(g, mtp, 0))
+        self.assertTrue(ss.rep_refused(j, loop[10]))
 
 
 if __name__ == "__main__":

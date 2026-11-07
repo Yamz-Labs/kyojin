@@ -135,10 +135,20 @@ TYP_DELTA = float(os.environ.get("EXL3_SPEC_TYPICAL_DELTA", "0.3"))
 # Read-only probe: EXL3_SPEC_PTAP=<file.jsonl> appends one line per verify round (p_draft, entropy, match per row)
 PTAP = os.environ.get("EXL3_SPEC_PTAP") or None
 # Test switch for in-server A/B: EXL3_SPEC_TYPICAL_FILE=<path>, the rule is on while the file holds "1" (re-read when its mtime changes)
-# EXL3_SPEC_TYPICAL_LOOKUP=0 (default): drafts copied from the context (n-gram / prompt lookup) keep the exact acceptance rule; the relaxed
-# rule applies to model-head drafts only (a copied draft is right by construction wherever the text repeats, so relaxing it lets a
-# sampled job re-enter its own loop). 1 = relaxed rule for every draft source.
-TYPICAL_LOOKUP = os.environ.get("EXL3_SPEC_TYPICAL_LOOKUP", "0") != "0"
+# EXL3_SPEC_TYPICAL_LOOKUP, how the relaxed rule treats the draft sources:
+#   "rep" (default): relaxed for model-head (MTP) drafts and for drafts copied from the prompt / tool outputs, except that a draft
+#       token which would complete an n-gram (REP_N tokens) already seen >= 2 times in the job's last REP_W generated tokens is
+#       accepted by equality only. Source-independent and keyed on the job's own output: a sampled job cannot be pulled around a
+#       loop by relaxed drafts, a copy of the prompt stays relaxed.
+#   "0": drafts copied from the context keep the exact rule, relaxed for model-head drafts only (measurement arm).
+#   "1": relaxed rule for every draft source, no repetition check (the old behaviour; measurement arm).
+TYPICAL_LOOKUP = os.environ.get("EXL3_SPEC_TYPICAL_LOOKUP", "rep").strip().lower()
+if TYPICAL_LOOKUP not in ("rep", "0", "1"):
+    TYPICAL_LOOKUP = "rep"
+REP_N = int(os.environ.get("EXL3_SPEC_TYPICAL_REP_N", "8"))
+REP_W = int(os.environ.get("EXL3_SPEC_TYPICAL_REP_W", "512"))
+REP_COUNT = 2
+REP_REFUSED = [0]   # relaxed acceptances refused by the repetition check, whole process
 _TFILE = os.environ.get("EXL3_SPEC_TYPICAL_FILE") or None
 _tstate = [0.0, TYPICAL]
 
@@ -169,7 +179,66 @@ def draft_is_copy(gen, draft_tokens: torch.Tensor, row: int) -> bool:
 
 
 def relax_allowed(gen, draft_tokens: torch.Tensor, row: int) -> bool:
-    return TYPICAL_LOOKUP or not draft_is_copy(gen, draft_tokens, row)
+    """Source gate: False only in arm "0" for a copied draft. The repetition check (rep_refused) is separate."""
+    return TYPICAL_LOOKUP != "0" or not draft_is_copy(gen, draft_tokens, row)
+
+
+class RepTracker:
+    """
+    Counts the REP_N-grams of one job's last REP_W generated tokens (a dict from n-gram to count, updated from the new tail of
+    the sequence on each call, so O(new tokens) per round and O(REP_N) per check).
+    """
+    def __init__(self):
+        self.toks = []        # generated tokens inside the window
+        self.end = 0          # absolute length of the sequence consumed so far
+        self.counts = {}
+
+    def _add(self, t):
+        self.toks.append(t)
+        if len(self.toks) >= REP_N:
+            k = tuple(self.toks[-REP_N:])
+            self.counts[k] = self.counts.get(k, 0) + 1
+        if len(self.toks) > REP_W:   # evict the oldest token and the n-gram that started on it
+            k = tuple(self.toks[:REP_N])
+            c = self.counts.get(k, 0) - 1
+            if c > 0: self.counts[k] = c
+            else: self.counts.pop(k, None)
+            del self.toks[0]
+
+    def feed(self, seq, ngen: int):
+        """seq: the job's token sequence (len, torch_slice), ngen: how many trailing tokens were generated. Reads only the new tail."""
+        n = len(seq)
+        if self.end and self.end <= n and n - self.end <= REP_W:
+            lo = self.end
+        else:   # first call, truncation or a long gap: rebuild from the generated tail
+            lo = max(n - min(max(ngen, 0), REP_W), 0)
+            self.toks, self.counts = [], {}
+        for t in (seq.torch_slice(lo, n).tolist() if n > lo else []):
+            self._add(t)
+        self.end = n
+
+    def repeated(self, d: int) -> bool:
+        if len(self.toks) < REP_N - 1:
+            return False
+        return self.counts.get(tuple(self.toks[-(REP_N - 1):]) + (d,), 0) >= REP_COUNT
+
+
+def rep_refused(job, d: int) -> bool:
+    """
+    True when draft token d, appended to the job's generated output so far, would complete a REP_N-gram already seen
+    >= REP_COUNT times in its last REP_W generated tokens. Only meaningful in "rep" mode. Counts the refusal.
+    """
+    if TYPICAL_LOOKUP != "rep":
+        return False
+    tr = getattr(job, "_rep_tracker", None)
+    if tr is None:
+        tr = job._rep_tracker = RepTracker()
+    tr.feed(job.sequences[0].sequence_ids, job.new_tokens)
+    if tr.repeated(d):
+        REP_REFUSED[0] += 1
+        job.rep_refused = getattr(job, "rep_refused", 0) + 1
+        return True
+    return False
 
 
 def _topk_of(prm: tuple):

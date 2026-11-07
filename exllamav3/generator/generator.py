@@ -2165,7 +2165,8 @@ class Generator:
                             pre = None
                         _hacc("t_samp_h", _hs)
                     typ = None
-                    # Copied drafts (lookup) keep the exact rule unless EXL3_SPEC_TYPICAL_LOOKUP=1 (the probe still logs them)
+                    # EXL3_SPEC_TYPICAL_LOOKUP: arm "0" keeps copied drafts exact; default "rep" refuses the relaxed rule (rep_refused, below) for a draft that
+                    # completes an n-gram the job already repeated in its own output. The probe still logs every draft.
                     typ_relax = draft_tokens is not None and spec_sample.relax_allowed(self, draft_tokens, j)
                     if draft_tokens is not None and spec is None and (spec_sample.typical_on() or spec_sample.PTAP) \
                             and npos > 1 and not self.dflash_draft:
@@ -2187,7 +2188,8 @@ class Generator:
                             next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
                                 token_logits,
                             )
-                        if typ is not None and typ_relax and spec_sample.typical_on() and i < npos - 1 and typ[0][2][i] and int(next_token.view(-1)[0]) != typ[1][i]:
+                        if typ is not None and typ_relax and spec_sample.typical_on() and i < npos - 1 and typ[0][2][i] and int(next_token.view(-1)[0]) != typ[1][i] \
+                                and not spec_sample.rep_refused(job, typ[1][i]):
                             next_token = torch.full_like(next_token, typ[1][i])
                         eos, sampled_token, rq = job.receive_sample(
                             token_logits,
