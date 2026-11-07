@@ -40,7 +40,7 @@ the fit needs K=1 for the cold experts and/or pruning.
 * Quantizer: yes. `quantize_exl3` accepts K = 1..8 and the CUDA tile quantizer has K=1 instances (`quantize_tiles_inst_k1.cu`,
   optimized kernel on sm_86 / the 3090). On ROCm `quantize_tiles_mode` sends K=1 to the BASE kernel (RDNA path is K 2-3, optimized
   K 4-5): the iGPU may be several times slower on K=1 experts (`EXL3_QT_KERNEL=opt` selects the optimized instance, unverified for
-  bit-equality). `smoke_alloc_kamel.sh` S0/S0b measure both.
+  bit-equality). the allocation smoke S0/S0b measures both.
 * Error (CPU trellis, mul1 codebook, 16-bit state, tail-biting 256, iid N(0,1), `scratch/k1_trellis.py`, 32 tiles):
   K=1 relative MSE **0.2745 +- 0.0049**, K=2 0.0687 +- 0.0012, ratio **3.99** (R-D bound 0.25 / 0.0625). The real K=2 proxy (Hessian
   weighted, 0.0489) therefore puts K=1 at ~0.196: a K=1 expert has 4x the error energy of K=2, 16x that of K=3. Never use K=1 on a hot
@@ -154,7 +154,7 @@ python3 tools/ds41/plan.py --map tensor_map.json --expert-bits-file alloc.json -
 python3 tools/ds41/optimize_alloc.py --tables OUT --plan OUT/plan.json --resident-only --out alloc.json                # attention K after
 ```
 
-`scratch/run_conv.sh` defaults to this (`RAMFIT=1`; `RAMFIT=0` restores the old position-based plan), `launch_kamel.sh` ships
+`scratch/run_conv.sh` defaults to this (`RAMFIT=1`; `RAMFIT=0` restores the old position-based plan), the launch script ships
 `ramfit.json`. How the converter uses it: per layer, once the capture's routing file exists, `split.Coordinator.ramfit_layer` solves a
 Lagrangian per layer (`ramfit.decide_layer`: hot experts get K=3, cold K=1, dead ones 0, filling the layer budget exactly) with
 share = squared routing weights + 2 % of the mean, persists `ramfit/<unit>.json` (replayed after a restart, so experts already
