@@ -101,6 +101,23 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(serve_compat.usage(4, 2, -1)["prompt_tokens_details"], {"cached_tokens": 0})
         self.assertEqual(serve_compat.tokenize_reply([1], 8), {"count": 1, "max_model_len": 8, "tokens": [1], "token_strs": None})
 
+    def test_cache_writes_partition_the_inclusive_prompt_count(self):
+        u = serve_compat.usage(100, 10, 40, cache_write_tokens=60)
+        self.assertEqual(u, {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+                             "prompt_tokens_details": {"cached_tokens": 40, "cache_write_tokens": 60}})
+        self.assertEqual(serve_compat.usage(100, 10, 40, cache_write_tokens=100)["prompt_tokens_details"],
+                         {"cached_tokens": 40, "cache_write_tokens": 60})
+        self.assertEqual(serve_compat.usage(100, 10, 100, cache_write_tokens=50)["prompt_tokens_details"],
+                         {"cached_tokens": 100, "cache_write_tokens": 0})
+
+    def test_measured_zero_differs_from_unsupported_writes(self):
+        self.assertNotIn("cache_write_tokens", serve_compat.usage(10, 2, 4)["prompt_tokens_details"])
+        for writes in (0, -5):
+            self.assertEqual(serve_compat.usage(10, 2, 4, cache_write_tokens=writes)["prompt_tokens_details"],
+                             {"cached_tokens": 4, "cache_write_tokens": 0})
+        self.assertEqual(serve_compat.usage(10, 2, cache_write_tokens=3)["prompt_tokens_details"],
+                         {"cache_write_tokens": 3})
+
 
 def load(name: str, path: Path):
     sys.path.insert(0, str(path.parent))

@@ -484,7 +484,8 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
             return int(request_stats.get("new_tokens") or engine.count_tokens(raw))
 
         def usage(raw: str) -> dict[str, int]:
-            return serve_compat.usage(prompt_tokens, completion_tokens(raw), int(request_stats.get("cached_tokens") or 0))
+            return serve_compat.usage(prompt_tokens, completion_tokens(raw), int(request_stats.get("cached_tokens") or 0),
+                                      cache_write_tokens=request_stats.get("cache_write_tokens"))
 
         def finish_reason(raw: str, has_calls: bool, stopped: str | None) -> str:
             if parser.truncated:
@@ -751,7 +752,8 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
         def finish_and_usage(text: str, stopped: str | None) -> tuple[str, dict[str, Any]]:
             n_new = int(request_stats.get("new_tokens") or engine.count_tokens(text))
             reason = "length" if stopped is None and (request_stats.get("eos_reason") == "max_new_tokens" or n_new >= limit) else "stop"
-            return reason, serve_compat.usage(prompt_tokens, n_new, int(request_stats.get("cached_tokens") or 0))
+            return reason, serve_compat.usage(prompt_tokens, n_new, int(request_stats.get("cached_tokens") or 0),
+                                             cache_write_tokens=request_stats.get("cache_write_tokens"))
 
         hold = max((len(x) for x in job["_stop"]), default=1) - 1
 

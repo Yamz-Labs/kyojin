@@ -60,6 +60,44 @@ def fresh(model, **kw):
     return PortEngine(model, None, ctx=400, eos_id=EOS, **kw)
 
 
+@pytest.mark.parametrize("num_draft", [0, 3])
+def test_native_prompt_write_usage_plain_and_speculative(serving, num_draft):
+    cfg, model = serving
+    with T.smooth_graph():
+        eng = fresh(model, num_draft=num_draft)
+        eng.pfx = store()
+        ids = ids_of(cfg, 801, 60)
+        expected, disabled = greedy(eng, ids, 8, cache_prompt=False)
+        actual, cold = greedy(eng, ids, 8)
+        repeated, warm = greedy(eng, ids, 8)
+        assert expected == actual == repeated
+        assert disabled["cache_write_tokens"] == 0
+        assert cold["cache_write_tokens"] == len(ids)
+        assert warm["cache_write_tokens"] == 0
+        extended = ids + actual + [42, 43]
+        expected, _ = greedy(eng, extended, 8, cache_prompt=False)
+        actual, continuation = greedy(eng, extended, 8)
+        assert actual == expected
+        assert continuation["cache_write_tokens"] == len(extended) - continuation["cached_tokens"]
+
+
+def test_custom_speculative_hook_omits_unmeasured_write_usage(serving):
+    cfg, model = serving
+    eng = fresh(model, num_draft=3)
+    eng.pfx = store()
+
+    class CustomHook:
+        def __init__(self, native):
+            self.native = native
+
+        def __getattr__(self, name):
+            return getattr(self.native, name)
+
+    eng.spec = CustomHook(eng.spec)
+    _, stats = greedy(eng, ids_of(cfg, 802, 60), 8)
+    assert "cache_write_tokens" not in stats
+
+
 # ---------------------------------------------------------------------------------------------------- store
 
 

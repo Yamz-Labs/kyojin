@@ -271,7 +271,11 @@ class PrefixStore:
                 return Snapshot(dd["keys"], dd["n"], dd["kind"], dd["tensors"], dd["hidden"], dd["nbytes"])
         return None
 
-    def put(self, snap: Snapshot, persist: bool = True) -> None:
+    def put(self, snap: Snapshot, persist: bool = True) -> bool | None:
+        """Retain a snapshot: True for new RAM coverage, False for an exact replacement, None if refused.
+
+        The optional disk write is only queued here and is not part of this RAM admission result.
+        """
         if persist:
             try:
                 self.save(snap)
@@ -283,8 +287,10 @@ class PrefixStore:
             self.tick += 1
             snap.tick = self.tick
             keep = []
+            duplicate = False
             for e in self.entries:
                 if e.n == snap.n and e.keys == snap.keys:
+                    duplicate = True
                     continue                                          # same position again: replaced
                 if snap.kind == "reply" and e.kind == "reply" and e.n < snap.n and snap.keys[:e.n] == e.keys:
                     continue                                          # an older reply of the same conversation: superseded
@@ -294,6 +300,53 @@ class PrefixStore:
             while len(keep) > 1 and (len(keep) > self.max_entries or sum(e.nbytes for e in keep) > self.budget):
                 keep.pop(0)                                           # least recently used
             self.entries = keep
+            return not duplicate if any(e is snap for e in keep) else None
+
+
+class RequestPrefixStore:
+    """Per-request logical input coverage written to a retained RAM prefix store.
+
+    Reads and exact replacements establish covered positions without write credit.
+    Successful overlapping checkpoints count each input position once; reply snapshots
+    are bounded by the original prompt, excluding generated tokens. Later eviction
+    does not undo a completed write. Queued disk writes are not measured.
+    """
+
+    def __init__(self, store: PrefixStore, keys: Sequence):
+        self.store, self.keys = store, list(keys)
+        self.cache_write_tokens = 0
+        self._covered = 0
+
+    def __len__(self) -> int:
+        return len(self.store)
+
+    def nbytes(self) -> int:
+        return self.store.nbytes()
+
+    def lookup(self, keys: Sequence) -> Snapshot | None:
+        # Disk lookup may re-admit a snapshot inside the underlying store. That
+        # is restored input, not a new write by this request.
+        snap = self.store.lookup(keys)
+        if snap is not None:
+            self._record(snap, written=False)
+        return snap
+
+    def best_lcp(self, keys: Sequence) -> tuple[int, int]:
+        return self.store.best_lcp(keys)
+
+    def put(self, snap: Snapshot, persist: bool = True) -> bool | None:
+        retained = self.store.put(snap, persist=persist)
+        if retained is not None:
+            self._record(snap, written=retained)
+        return retained
+
+    def _record(self, snap: Snapshot, *, written: bool) -> None:
+        covered = min(snap.n, len(self.keys))
+        if snap.keys[:covered] != self.keys[:covered]:
+            return
+        if written:
+            self.cache_write_tokens += max(0, covered - self._covered)
+        self._covered = max(self._covered, covered)
 
 
 def concat_rows(pre: Any, new: Any, seg_len: int, win: int) -> Any:
