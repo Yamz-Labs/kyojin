@@ -87,5 +87,61 @@ class TypicalRule(unittest.TestCase):
         self.assertIsNone(ss.eligible(J()))
 
 
+class CopiedDrafts(unittest.TestCase):
+    """EXL3_SPEC_TYPICAL_LOOKUP: copied drafts keep the exact rule; model-head drafts stay relaxed."""
+    class Gen:
+        draft_ids_pinned = torch.zeros(2, 4, dtype=torch.long)
+
+    def setUp(self):
+        self.old = ss.TYPICAL_LOOKUP
+
+    def tearDown(self):
+        ss.TYPICAL_LOOKUP = self.old
+
+    def test_default_is_exact_for_copies(self):
+        self.assertFalse(ss.TYPICAL_LOOKUP)
+
+    def test_model_head_vs_copy(self):
+        g = self.Gen()
+        mtp = g.draft_ids_pinned[:, :3]            # drafter round: slice of the pinned buffer
+        copy = torch.tensor([[1, 2, 3]])           # lookup round: tensor of its own
+        for flag, want_copy in ((False, False), (True, True)):
+            ss.TYPICAL_LOOKUP = flag
+            self.assertTrue(ss.relax_allowed(g, mtp, 0))          # MTP unchanged in both modes
+            self.assertEqual(ss.relax_allowed(g, copy, 0), want_copy)
+
+    def test_mixed_rows_marked(self):
+        g = self.Gen()
+        t = torch.tensor([[1, 2], [3, 4]])
+        g.draft_copy_rows = (t, [True, False])
+        ss.TYPICAL_LOOKUP = False
+        self.assertFalse(ss.relax_allowed(g, t, 0))
+        self.assertTrue(ss.relax_allowed(g, t, 1))
+        g.draft_copy_rows = (torch.tensor([[9]]), [False, False])   # stale mark for another tensor: ignored
+        self.assertFalse(ss.relax_allowed(g, t, 1))
+
+    def test_copy_never_relaxed_end_to_end(self):
+        # the generator keeps a relaxed draft only when relax_allowed; a draft that rule 1 would keep (ok) is dropped at 0
+        p = [0.5, 0.3, 0.2] + [0.0] * (V - 3)
+        _, _, ok = ss.typical_rows(row_from_probs(p), [2], PRM_FULL, 0.09, 0.3)
+        self.assertTrue(ok[0])
+        g = self.Gen(); copy = torch.tensor([[2]])
+        ss.TYPICAL_LOOKUP = False
+        self.assertFalse(ok[0] and ss.relax_allowed(g, copy, 0))
+        ss.TYPICAL_LOOKUP = True
+        self.assertTrue(ok[0] and ss.relax_allowed(g, copy, 0))
+
+    def test_greedy_unchanged(self):
+        # greedy jobs are never eligible, so neither rule is reached whatever the flag
+        class J:
+            filters = []; forced_ids = None; return_probs = False; return_top_tokens = False; device_logit_mask = None; sequences = [1]
+            sampler = CustomSampler([SS_Argmax()])
+            class generator:
+                class tokenizer: actual_vocab_size = V
+        for flag in (False, True):
+            ss.TYPICAL_LOOKUP = flag
+            self.assertIsNone(ss.eligible(J()))
+
+
 if __name__ == "__main__":
     unittest.main()

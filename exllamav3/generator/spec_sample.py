@@ -135,6 +135,10 @@ TYP_DELTA = float(os.environ.get("EXL3_SPEC_TYPICAL_DELTA", "0.3"))
 # Read-only probe: EXL3_SPEC_PTAP=<file.jsonl> appends one line per verify round (p_draft, entropy, match per row)
 PTAP = os.environ.get("EXL3_SPEC_PTAP") or None
 # Test switch for in-server A/B: EXL3_SPEC_TYPICAL_FILE=<path>, the rule is on while the file holds "1" (re-read when its mtime changes)
+# EXL3_SPEC_TYPICAL_LOOKUP=0 (default): drafts copied from the context (n-gram / prompt lookup) keep the exact acceptance rule; the relaxed
+# rule applies to model-head drafts only (a copied draft is right by construction wherever the text repeats, so relaxing it lets a
+# sampled job re-enter its own loop). 1 = relaxed rule for every draft source.
+TYPICAL_LOOKUP = os.environ.get("EXL3_SPEC_TYPICAL_LOOKUP", "0") != "0"
 _TFILE = os.environ.get("EXL3_SPEC_TYPICAL_FILE") or None
 _tstate = [0.0, TYPICAL]
 
@@ -150,6 +154,22 @@ def typical_on() -> bool:
     except OSError:
         pass
     return _tstate[1]
+
+
+def draft_is_copy(gen, draft_tokens: torch.Tensor, row: int) -> bool:
+    """
+    True when row `row` of this round's draft was copied from the context, not produced by the model head. A drafter round returns a
+    slice of gen.draft_ids_pinned; every other draft (lookup, mixed rows) is a tensor of its own, copied by default. A policy that
+    mixes sources in one tensor says which rows are copies in gen.draft_copy_rows = (tensor, [bool per row]).
+    """
+    mark = getattr(gen, "draft_copy_rows", None)
+    if mark is not None and mark[0] is draft_tokens:
+        return bool(mark[1][row])
+    return draft_tokens.data_ptr() != gen.draft_ids_pinned.data_ptr()
+
+
+def relax_allowed(gen, draft_tokens: torch.Tensor, row: int) -> bool:
+    return TYPICAL_LOOKUP or not draft_is_copy(gen, draft_tokens, row)
 
 
 def _topk_of(prm: tuple):
