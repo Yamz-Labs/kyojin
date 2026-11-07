@@ -46,6 +46,7 @@ class Engine(Protocol):
 
         `stats` (when sessions > 1) or `self.last_stats` (sessions == 1) receives, at the end of the job:
         cached_tokens, new_tokens, prompt_tokens, time_prefill, time_generate (seconds) and optionally
+        cache_write_tokens (input positions newly retained by the prompt cache; omit when unmeasured),
         accepted_draft_tokens / rejected_draft_tokens, eos (bool). `prompt_ids` replaces the prompt text.
         A set `cancel` event ends the job at the next step."""
         ...

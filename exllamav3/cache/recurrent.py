@@ -42,6 +42,7 @@ class RecurrentCache(OrderedDict):
         self.pagetable = None
         # EXL3_NC2_ASYNC_STASH: stashes whose D2H is still in flight (see settle)
         self._pending = []
+        self._stash_futures = {}  # stash identity -> existing asynchronous finisher, for nonblocking telemetry
         self._pin_pool = {}  # (shape, dtype) -> pinned host tensors free for reuse
         # page hash -> exactness tag of the checkpoint stashed under it (Job._stash_exact); outside the stash dict, whose
         # asynchronous finisher thread is still writing to it
@@ -88,8 +89,36 @@ class RecurrentCache(OrderedDict):
         if "_ev" in stashed_state:
             if self._worker is None:
                 self._worker = ThreadPoolExecutor(1, thread_name_prefix = "rc-stash")
-            self._pending.append(self._worker.submit(self._finish, stashed_state))
+            future = self._worker.submit(self._finish, stashed_state)
+            self._pending.append(future)
+            key = id(stashed_state)
+            self._stash_futures[key] = (stashed_state, future)
+            def forget(done):
+                record = self._stash_futures.get(key)
+                if record is not None and record[1] is done:
+                    if done.cancelled() or done.exception() is not None:
+                        record[0]["_cache_write_failed"] = True
+                    self._stash_futures.pop(key, None)
+            future.add_done_callback(forget)
         return stashed_state
+
+    def on_stash_ready(self, stashed, callback):
+        """Notify telemetry after an existing stash finishes; never wait or change admission.
+
+        _finish removes _ev before cloning the host buffers, so that flag alone
+        cannot establish readiness. A failed asynchronous copy earns no credit.
+        Callbacks must not retain a job or any live model/GPU state.
+        """
+        record = self._stash_futures.get(id(stashed))
+        future = record[1] if record is not None and record[0] is stashed else None
+        if future is None:
+            if "_ev" not in stashed and not stashed.get("_cache_write_failed"):
+                callback()
+            return
+        def ready(done):
+            if not done.cancelled() and done.exception() is None:
+                callback()
+        future.add_done_callback(ready)
 
     def get(self, key, default = None):
         self.settle()

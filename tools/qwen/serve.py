@@ -761,6 +761,75 @@ def check_latched_env() -> None:
                            "point (or set the EXL3_* switches in the shell before importing): " + "; ".join(bad))
 
 
+class _RequestCacheUsage:
+    """Confirmed cache intervals across the guard's physical replacement Jobs."""
+
+    def __init__(self, prompt_tokens: int):
+        self.limit = prompt_tokens
+        self.read_tokens = None
+        self.read_ranges = []
+        self.write_ranges = []
+        self.observed = False
+        self.supported = True
+
+    def _merge(self, ranges):
+        merged = []
+        for start, end in sorted((max(0, int(a)), min(self.limit, int(b))) for a, b in ranges):
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return merged
+
+    def observe(self, job):
+        # Called on the generator driver after existing EOS/cancellation work. A
+        # scalar clipped to the original prompt cannot identify generated
+        # positions promoted into a replacement Job's physical prompt.
+        writes = getattr(job, "cache_write_ranges", None)
+        reads = getattr(job, "cache_read_ranges", None)
+        read_count = getattr(job, "cache_read_tokens", None)
+        if not self.observed:
+            self.observed = True
+            if callable(read_count):
+                self.read_tokens = max(0, min(self.limit, int(read_count())))
+            if callable(reads):
+                self.read_ranges = self._merge(reads())
+            else:
+                self.supported = False
+        if callable(writes):
+            self.write_ranges = self._merge([*self.write_ranges, *writes()])
+        else:
+            self.supported = False
+
+    def observe_all(self, jobs):
+        # An earlier guard Job's asynchronous checkpoint can finish during its
+        # replacement. Sample confirmed intervals again without waiting for it.
+        for job in jobs:
+            self.observe(job)
+
+    def apply(self, stats):
+        if self.read_tokens is not None:
+            stats["cached_tokens"] = self.read_tokens
+        if not self.observed or not self.supported:
+            stats.pop("cache_write_tokens", None)
+            return
+        pending = self.write_ranges
+        for read_start, read_end in self.read_ranges:
+            rest = []
+            for start, end in pending:
+                if end <= read_start or start >= read_end:
+                    rest.append((start, end))
+                else:
+                    if start < read_start:
+                        rest.append((start, read_start))
+                    if end > read_end:
+                        rest.append((read_end, end))
+            pending = rest
+        stats["cache_write_tokens"] = sum(end - start for start, end in pending)
+
+
 class QwenEngine:
     """Target model + MTP drafter + (optional) vision tower + one Generator."""
 
@@ -1340,6 +1409,7 @@ class QwenEngine:
         vis = ""                          # the text the client holds (Retract applied)
         gmarks: list[tuple[int, int]] = [(0, 0)]   # (len(token_ids), chars) after each event, all segments
         job_ids = ids
+        cache_usage = _RequestCacheUsage(int(ids.numel()))
 
         while True:
             max_new = max(max_tokens - generated + discount, 1)
@@ -1390,6 +1460,8 @@ class QwenEngine:
                         hit = mon.feed(toks, ev.get("text") or "")
                         if hit:
                             break
+                    if ev.get("eos"):
+                        await self._post(cache_usage.observe_all, _mine)
                     if ev.get("eos") and final_on and final_tries < FINAL_TRIES and text_loop(gate_text(vis)) \
                             and (THINK_CLOSE_TAG in vis or ev.get("eos_reason") == "max_new_tokens"
                                  or generated - discount >= max_tokens) \
@@ -1412,6 +1484,7 @@ class QwenEngine:
                                          loop_guard=fired)
                             if stats.get("time_generate") is not None:
                                 stats["time_generate"] += spent
+                        cache_usage.apply(stats)
                         return
                 if hit or redo:
                     break
@@ -1445,6 +1518,7 @@ class QwenEngine:
             if not hit:
                 return
             await self._drop(job)
+            await self._post(cache_usage.observe_all, _mine)
             fired = dict(hit, tokens_streamed=len(token_ids))
             print(f"qserve: loop guard {hit['kind']} in {hit['phase']} at {hit['at']} tokens (period {hit['period']}, "
                   f"keep {hit['cut']})", file=sys.stderr, flush=True)
@@ -1454,6 +1528,7 @@ class QwenEngine:
                               "eos_reason": "loop_guard", "token_ids": token_ids, "loop_guard": fired})
                 if logprobs is not None:
                     stats["logprobs"] = lps
+                cache_usage.apply(stats)
                 return
             # think block: keep the thinking up to the cut (on an event boundary), force the close, restart from there
             keep_tokens, keep_chars = max(m for m in marks if m[0] <= hit["cut"])
@@ -1478,6 +1553,7 @@ class QwenEngine:
                               "eos_reason": "max_new_tokens", "token_ids": token_ids, "loop_guard": fired})
                 if logprobs is not None:
                     stats["logprobs"] = lps
+                cache_usage.apply(stats)
                 return
             extra = self.torch.tensor([seg[:keep_tokens] + close_seq], dtype=ids.dtype)
             job_ids = self.torch.cat([ids, extra.to(ids.device)], dim=-1)
@@ -1670,6 +1746,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                                           images=len(job.get("images") or ()),
                                           messages=job.get("messages"), sessions=sessions, running=running)
                     first_token = False       # flipped once, so the log gets exactly one job_first_token line
+                    engine.last_stats = {}  # legacy/custom engines must not leak a previous request's optional metrics
                     try:
                         async for delta in engine.generate(
                                 job["prompt"], stats=stats, live=job.setdefault("_live", {}), max_tokens=job["max_tokens"], sampling=job["sampling"],
@@ -1832,8 +1909,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                 reason = "length"       # a guard stop cut the answer short: clients must not read it as a natural end
             else:
                 reason = "stop"
-            usage = {"prompt_tokens": prompt_tokens, "completion_tokens": n_new,
-                     "total_tokens": prompt_tokens + n_new, "prompt_tokens_details": {"cached_tokens": cache_n}}
+            usage = serve_compat.usage(prompt_tokens, n_new, cache_n,
+                                       cache_write_tokens=stats.get("cache_write_tokens"))
             timings = serve_compat.timings(prompt_tokens, cache_n, pre, gen, n_new, speculative=bool(getattr(engine, "spec_on", False)))
             if stats.get("loop_guard"):
                 timings["loop_guard"] = stats["loop_guard"]
@@ -2149,7 +2226,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             n_new = int(stats.get("new_tokens") or engine.count_tokens(text))
             n_prompt = prompt_tokens if prompt_ids is not None else int(stats.get("prompt_tokens") or prompt_tokens)
             reason = "length" if stats.get("eos_reason") in ("max_new_tokens", "loop_guard") else "stop"
-            return reason, serve_compat.usage(n_prompt, n_new, int(stats.get("cached_tokens") or 0))
+            return reason, serve_compat.usage(n_prompt, n_new, int(stats.get("cached_tokens") or 0),
+                                             cache_write_tokens=stats.get("cache_write_tokens"))
 
         out: asyncio.Queue = asyncio.Queue()
         job["_reqid"] = reqid()

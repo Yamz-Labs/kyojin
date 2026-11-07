@@ -28,6 +28,8 @@ import logging
 import time
 from ..ext import exllamav3_ext as ext
 from .loop_detect import LoopDetector
+from .cache_write import CacheWriteTracker
+import weakref
 from .sampler import Sampler, DefaultSampler
 from ..util.tensor import SeqTensor
 from ..tokenizer import MMEmbedding
@@ -256,6 +258,10 @@ class Job:
             self.sequences.append(seq)
         assert len(self.sequences) == 1, \
             "A job holds exactly one sequence (multi-sequence jobs are not supported)"
+        self._cache_writes = rq_state.get("cache_writes") or CacheWriteTracker(
+            [len(seq.sequence_ids) for seq in self.sequences])
+        self._cache_write_seen = set()
+        self._cache_write_result = None
 
         # Generation parameters
         assert max_new_tokens is None or max_new_tokens >= 1, "max_new_tokens must be >= 1, or None for no limit"
@@ -442,6 +448,110 @@ class Job:
             if seq.kv_position == len(seq.sequence_ids) - 1:
                 max_seq_len = max(max_seq_len, len(seq.sequence_ids))
         return max_seq_len
+
+    def cache_write_ranges(self, seq = 0):
+        """Confirmed logical input writes; remains valid after release/cancellation."""
+        return self._cache_writes.write_ranges(seq)
+
+    def cache_read_ranges(self, seq = 0):
+        return self._cache_writes.read_ranges(seq)
+
+    def cache_write_tokens(self):
+        return self._cache_writes.count()
+
+    def cache_read_tokens(self):
+        if self.rq_cached is not None:
+            return self.rq_cached[1]
+        return (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences)
+
+    def _cache_write_checkpoint(self, seq, end, stashed, *, key = None, tail = None):
+        """Credit only a retained checkpoint with a valid K/V anchor, once ready.
+
+        No GPU reads or waits. Async callbacks hold weak cache references and the
+        small input ledger, never the Job, model or live recurrent state.
+        """
+        index = self.sequences.index(seq)
+        tracker = self._cache_writes
+        if not tracker.pending(index):
+            return
+        tag = (index, id(stashed), end)
+        if tag in self._cache_write_seen:
+            return
+        rc = self.generator.recurrent_cache
+        pt = self.pagetable
+        if end <= 0 or end > seq.kv_position or rc is None or stashed.get("position") != end:
+            return
+        proof = ()
+        if tail is None:
+            meta = getattr(rc, "exact_meta", {}).get(key)
+            if meta is not None:
+                pages = seq.allocated_pages[meta["sig"][0] // PAGE_SIZE : end // PAGE_SIZE]
+                if meta["eid"] != id(stashed) or tuple(getattr(page, "wgen", 0) for page in pages) != meta["pw"]:
+                    return
+                proof = tuple((weakref.ref(page), getattr(page, "wgen", 0)) for page in pages)
+        self._cache_write_seen.add(tag)
+        seen = self._cache_write_seen
+        rc_ref, pt_ref = weakref.ref(rc), weakref.ref(pt)
+        entry_id = id(stashed)
+        if tail is None:
+            def credit():
+                cache, table = rc_ref(), pt_ref()
+                if cache is not None and table is not None and \
+                        id(dict.get(cache, key)) == entry_id and table.is_resumable(key) and \
+                        all(page() is not None and getattr(page(), "wgen", 0) == generation for page, generation in proof):
+                    tracker.commit(index, 0, end)
+                else:
+                    seen.discard(tag)  # an orphaned anchor can become valid after later recomputation
+        else:
+            generator_ref = weakref.ref(self.generator)
+            drafted = self.generator.draft_model is not None
+            partial_copy = not drafted or _draft_pages_shared(self.generator) or _TAIL_RING
+            tail_id, anchor = id(tail), tail["prev_hash"]
+            page_ref, rows = weakref.ref(tail["page"]), tail["ids"].shape[-1]
+            generation = getattr(tail["page"], "wgen", 0)
+            def credit():
+                generator, table = generator_ref(), pt_ref()
+                if generator is None or table is None:
+                    seen.discard(tag)
+                    return
+                found = next((entry for entries in (generator.tail_ckpts, generator.sub_ckpts)
+                              for entry in entries if id(entry) == tail_id), None)
+                page = page_ref()
+                if found is not None and page is not None and found["page"] is page and page.prev_hash == anchor and \
+                        page.kv_position >= rows and getattr(page, "wgen", 0) == generation and \
+                        (page.kv_position == PAGE_SIZE or (partial_copy and (not drafted or found.get("draft_ok", True)))) and \
+                        (anchor is None or table.is_resumable(anchor)):
+                    tracker.commit(index, 0, end)
+                else:
+                    seen.discard(tag)
+        if hasattr(rc, "on_stash_ready"):
+            rc.on_stash_ready(stashed, credit)
+        elif "_ev" not in stashed and not stashed.get("_cache_write_failed"):
+            credit()
+
+    def _cache_write_kv_commit(self, seq, start, end):
+        """Observe successful target-cache writes, not allocation/copy/replay volume."""
+        index = self.sequences.index(seq)
+        self._cache_writes.compute(index, start, end)
+        rc = self.generator.recurrent_cache
+        if rc is None:
+            # Partial pages can be copied by the next job only on this path;
+            # its matcher deliberately requires at least two valid rows.
+            retained = end
+            if not _draft_pages_shared(self.generator) or end % PAGE_SIZE == 1:
+                retained = end // PAGE_SIZE * PAGE_SIZE
+            self._cache_writes.commit(index, 0, retained)
+            return
+        if not self._cache_writes.pending(index):
+            return
+        # Only newly completed boundaries, not an ancestry scan per token.
+        # An existing orphaned checkpoint may become usable after missing K/V
+        # pages are recomputed, so inspect admission even when put was a no-op.
+        for boundary in range((start // PAGE_SIZE + 1) * PAGE_SIZE, end + 1, PAGE_SIZE):
+            page = seq.allocated_pages[boundary // PAGE_SIZE - 1]
+            entry = dict.get(rc, page.phash)
+            if entry is not None and entry.get("position") == boundary:
+                self._cache_write_checkpoint(seq, boundary, entry, key = page.phash)
 
 
     def get_input_ids_list(
@@ -702,6 +812,7 @@ class Job:
 
             # Accept new token
             seq.sequence_ids.append(next_token)
+            cache_start = seq.kv_position
             page_before = seq.kv_position // PAGE_SIZE
             seq.kv_position += 1
             pos = seq.kv_position
@@ -748,6 +859,9 @@ class Job:
                     page = seq.allocated_pages[page_after]
                     page.prev_hash = new_hash
                     page.can_revert = False
+
+            if cache_start <= self._cache_writes.limits[self.sequences.index(seq)] or page_after > page_before:
+                self._cache_write_kv_commit(seq, cache_start, seq.kv_position)
 
         # Stream output
 
@@ -847,7 +961,9 @@ class Job:
                     "time_generate": self.time_generate,
                     "cached_pages": cached[0],
                     "cached_tokens": cached[1],
+                    "cache_write_tokens": self.cache_write_tokens(),
                 })
+                self._cache_write_result = r
                 if self.generator.draft_model or self.generator.ngram_match_min:
                     r.update({
                         "accepted_draft_tokens": self.accepted_draft_tokens,
@@ -1136,6 +1252,7 @@ class Job:
             "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
             "cached": self.rq_cached if self.rq_cached is not None else (
                 self.cached_pages, self.cached_pages * PAGE_SIZE + self.cached_tokens),
+            "cache_writes": self._cache_writes,
             "sam": self.sam,
             "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
             "filters_suspended": self.filters_suspended,
@@ -1397,6 +1514,7 @@ class Job:
                     break
                 page = seq.allocated_pages[local_idx]
                 if page.kv_position == PAGE_SIZE:
+                    self._cache_writes.read(self.sequences.index(seq), seq.kv_position, (local_idx + 1) * PAGE_SIZE)
                     prefill_start = (local_idx + 1) * PAGE_SIZE
                     seq.kv_position = prefill_start
                     self.cached_pages += 1
@@ -1476,6 +1594,7 @@ class Job:
                     page.kv_position = best_match
                     page.can_revert = False
                     self.cached_tokens += best_match
+                    self._cache_writes.read(self.sequences.index(seq), prefill_start - best_match, prefill_start)
                     progress += best_match
 
             # For recurrent models, do a separate forward pass for the last page to get the latest possible checkpoint
@@ -1752,6 +1871,8 @@ class Job:
                         page.wgen = next(_PAGE_GEN)
                     page.can_revert = False
 
+                self._cache_write_kv_commit(seq, prefill_start, prefill_end)
+
                 if split_sig is not None:
                     self._stash_exact(seq, split_sig)
 
@@ -1839,6 +1960,7 @@ class Job:
 
             # Metrics
             self.cached_pages += cached_pages
+            self._cache_writes.read(self.sequences.index(seq), 0, cached_pages * PAGE_SIZE)
             self.total_pages += allocated_pages
             self.non_sequential_pages += non_sequential_pages
 
@@ -1849,6 +1971,8 @@ class Job:
                 self._tail_stash(self.sequences[0], reply = True)   # BEFORE the mtp_defer flush -> honest draft_ok
             except Exception as e:  # cleanup must not raise: a missed stash only costs a replay next turn
                 logging.warning("EXL3_TAIL_REPLY stash failed: %r", e)
+        if self._cache_write_result is not None:
+            self._cache_write_result["cache_write_tokens"] = self.cache_write_tokens()
         if self.mtp_defer:
             try:
                 self.generator._flush_mtp_defer(self, with_tail = self.mtp_defer_plain)
@@ -2106,6 +2230,7 @@ class Job:
             rc.exact_meta.pop(next(iter(rc.exact_meta)))
         self.last_recurrent_checkpoint_pos = b
         rc.metrics["split_stashes"] = rc.metrics.get("split_stashes", 0) + 1
+        self._cache_write_checkpoint(seq, b, entry, key = key)
 
 
     def maybe_stash_recurrent(self, cache, interval = None):
@@ -2134,8 +2259,14 @@ class Job:
                 if not grid and page.phash not in cache:
                     self.roll_key = page.phash
                 cache.put(page.phash, self.recurrent_state)
+                entry = dict.get(cache, page.phash)
+                if entry is not None:
+                    self._cache_write_checkpoint(seq, seq.kv_position, entry, key = page.phash)
                 return
             cache.put(page.phash, self.recurrent_state)
+            entry = dict.get(cache, page.phash)
+            if entry is not None:
+                self._cache_write_checkpoint(seq, seq.kv_position, entry, key = page.phash)
 
             # Prevent setting the same checkpoint twice in a row if prefill ends on the first page of a chunk
             self.last_recurrent_checkpoint_pos = seq.kv_position
@@ -2227,6 +2358,9 @@ class Job:
                     bk = rc.branch_keys = set()
                 bk.add(page.phash)
             rc.put(page.phash, None, stashed = stashed)
+            entry = dict.get(rc, page.phash)
+            if entry is not None:
+                self._cache_write_checkpoint(seq, pos, entry, key = page.phash)
             rc.metrics["midchunk_stashes"] = rc.metrics.get("midchunk_stashes", 0) + 1
             n += 1
         return n
@@ -2258,6 +2392,7 @@ class Job:
             "prev_hash": prev_hash, "ids": ids, "stashed": stashed, "carry": None,
             "page": seq.allocated_pages[p0], "draft_ok": not self.mtp_defer,
         })
+        self._cache_write_checkpoint(seq, pos, stashed, tail = g.sub_ckpts[-1])
         return 1
 
 
@@ -2334,6 +2469,7 @@ class Job:
                     e["carry"] = carry_now.clone()
                 g.tail_ckpts[:] = [x for x in g.tail_ckpts if x is not e]
                 g.tail_ckpts.append(e)
+                self._cache_write_checkpoint(seq, end, e["stashed"], tail = e)
                 return
         while len(g.tail_ckpts) >= g.tail_ckpt_max:     # trim before the append: the peak stays at the bound
             g.tail_ckpts.pop(0)
@@ -2351,6 +2487,7 @@ class Job:
             # EXL3_PF_DEFER: the draft K/V of this page is written after the first token, maybe never
             "draft_ok": not self.mtp_defer,
         })
+        self._cache_write_checkpoint(seq, end, stashed, tail = g.tail_ckpts[-1])
         _ttrace_end("tail checkpoint stash", t)
 
 
@@ -2461,6 +2598,7 @@ class Job:
             self._unaligned_start = True
             skipped = pos + L - start
             self.cached_tokens += skipped
+            self._cache_writes.read(self.sequences.index(seq), start, pos + L)
             lst[:] = [x for x in lst if x is not e]
             lst.append(e)
             return skipped

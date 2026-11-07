@@ -609,6 +609,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                                           images=len(body.get("_images") or ()),
                                           messages=len(body.get("messages") or ()), processing=processing)
                     first_token = False    # flipped once, so the log gets exactly one job_first_token line
+                    engine.last_stats = {}  # never reuse a previous request's optional cache measurement
                     async for delta in engine.generate(
                         body["_prompt"],
                         max_tokens=token_limit(body),
@@ -749,8 +750,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
 
         def usage(raw: str) -> dict[str, int]:
             completion_tokens = engine.count_tokens(raw)
-            return {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens}
+            return serve_compat.usage(prompt_tokens, completion_tokens, int(request_stats.get("cached_tokens") or 0),
+                                      cache_write_tokens=request_stats.get("cache_write_tokens"))
 
         def finish_for(message: dict[str, Any], raw: str) -> str:
             # A reply cut by max_tokens is "length", not "stop" (clients use it to tell a truncated answer).

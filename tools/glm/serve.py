@@ -515,6 +515,18 @@ def guard_stats(hit: dict, n_new: int) -> dict:
     return {"eos_reason": "loop_guard", "new_tokens": n_new, "loop_guard": hit}
 
 
+def job_cache_stats(job) -> dict:
+    """CPU-only snapshot after the existing job completion/cancel fence."""
+    out = {}
+    reads = getattr(job, "cache_read_tokens", None)
+    writes = getattr(job, "cache_write_tokens", None)
+    if callable(reads):
+        out["cached_tokens"] = int(reads())
+    if callable(writes):
+        out["cache_write_tokens"] = int(writes())
+    return out
+
+
 RUNAWAY_SLACK = 64   # tokens past max_tokens before a job counts as runaway (a speculative step may overshoot by its drafts)
 
 
@@ -1075,6 +1087,8 @@ class ResidentEngine:
             # a leftover job would run inside the next request.
             if generator.num_remaining_jobs():
                 generator.clear_queue()
+            if self.last_stats:
+                self.last_stats.update(job_cache_stats(job))
             if getattr(generator, "deferred_jobs", None):    # EXL3_REPLY_FIRST: release (reply-end stash) while the reply goes out
                 self._reply_first_fut = loop.run_in_executor(None, generator.flush_deferred)
 
@@ -1223,8 +1237,9 @@ class ResidentEngine:
                 for j in generator.active_jobs + generator.pending_jobs:
                     if j is job:
                         generator.cancel(j)
+                return job_cache_stats(job) if stats else {}
             if not self._driver.done():
-                await asyncio.shield(self._post(forget))
+                stats.update(await asyncio.shield(self._post(forget)))
 
     async def run_exclusive(self, fn, *args):
         """Run fn on the driver, between steps (slot save/restore; the caller has drained the requests)."""
@@ -1702,7 +1717,8 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
             return drain(request, cancel, out, writer, ping, ping_at)
 
         def usage(raw: str) -> dict[str, int]:
-            return serve_compat.usage(prompt_tokens, engine.count_tokens(raw), int(request_stats.get("cached_tokens") or 0))
+            return serve_compat.usage(prompt_tokens, engine.count_tokens(raw), int(request_stats.get("cached_tokens") or 0),
+                                      cache_write_tokens=request_stats.get("cache_write_tokens"))
 
         def finish_for(message: dict[str, Any], raw: str) -> str:
             # A reply cut by max_tokens is "length", not "stop" (clients use it to tell a truncated answer).
@@ -1979,7 +1995,8 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
         def finish_and_usage(text: str, stopped: str | None) -> tuple[str, dict[str, Any]]:
             n_new = int(request_stats.get("new_tokens") or engine.count_tokens(text))
             reason = "length" if stopped is None and (request_stats.get("eos_reason") in ("max_new_tokens", "loop_guard") or n_new >= limit) else "stop"
-            return reason, serve_compat.usage(prompt_tokens, n_new, int(request_stats.get("cached_tokens") or 0))
+            return reason, serve_compat.usage(prompt_tokens, n_new, int(request_stats.get("cached_tokens") or 0),
+                                             cache_write_tokens=request_stats.get("cache_write_tokens"))
 
         hold = max((len(x) for x in job["_stop"]), default=1) - 1
 

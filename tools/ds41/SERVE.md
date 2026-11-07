@@ -108,6 +108,27 @@ counts as omitted.
 
 Finish reasons: `stop`, `length` (budget used, or a tool call cut by the budget), `tool_calls`.
 
+### Cache-write usage
+
+See [shared prompt-cache usage](../../doc/prompt_cache_usage.md) for all model servers.
+
+Native plain and PortSpec decoding report `usage.prompt_tokens_details.cache_write_tokens`
+on both OpenAI completion endpoints, in JSON replies and the final SSE usage chunk.
+The field follows the [OpenAI Chat Completions usage schema](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
+
+It counts input-token positions newly covered by successfully retained RAM prompt
+checkpoints during the request. Overlapping checkpoints count each position once.
+Restored prefixes, exact duplicate replacements, refused saves and generated tokens
+do not add writes. A later eviction does not undo a completed write. Optional disk
+writes are asynchronous: queuing a disk write alone is not counted as a confirmed
+RAM write, and restoring a disk checkpoint counts as a read.
+
+`cached_tokens` reports reads. Both cache counts are already included in
+`prompt_tokens`; `total_tokens` remains prompt plus completion tokens. For example,
+100 prompt tokens with 40 reads and 59 writes leave one ordinary input token.
+Native caching disabled reports zero writes. Engines or custom speculative hooks
+without this measurement omit the write field rather than estimate it.
+
 ## Prompt format
 
 `ds41_chat.render_chat` ports the official encoder and is checked against it, string for string and token id for

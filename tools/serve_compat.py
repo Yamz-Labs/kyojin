@@ -3,8 +3,10 @@
 - token-id prompts for POST /v1/completions (`prompt` = [int, ...] or [[int, ...]])
 - the `cache_salt` request field
 - the POST /tokenize reply
-- the `usage` object with `prompt_tokens_details.cached_tokens`
+- the `usage` object with optional prompt cache read/write counts
 - the llama.cpp `timings` object (one shape on every server), final and progressive
+
+See doc/prompt_cache_usage.md for the model-independent cache accounting contract.
 """
 from __future__ import annotations
 
@@ -48,12 +50,25 @@ def tokenize_reply(ids: list[int], max_model_len: int | None) -> dict[str, Any]:
     return {"count": len(ids), "max_model_len": max_model_len, "tokens": ids, "token_strs": None}
 
 
-def usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int | None = None) -> dict[str, Any]:
-    """OpenAI usage object. cached_tokens is clamped to 0..prompt_tokens; None leaves `prompt_tokens_details` out."""
+def usage(prompt_tokens: int, completion_tokens: int, cached_tokens: int | None = None, *,
+          cache_write_tokens: int | None = None) -> dict[str, Any]:
+    """OpenAI usage object with disjoint prompt cache read/write counts.
+
+    Writes count input positions successfully retained during this request,
+    not checkpoint copies, output tokens or cache occupancy. None means the
+    engine does not report writes; zero means it measured none. Prompt/total
+    counts remain inclusive of both cache buckets.
+    """
     out: dict[str, Any] = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
                            "total_tokens": prompt_tokens + completion_tokens}
+    details = {}
     if cached_tokens is not None:
-        out["prompt_tokens_details"] = {"cached_tokens": max(0, min(int(cached_tokens), prompt_tokens))}
+        details["cached_tokens"] = max(0, min(int(cached_tokens), prompt_tokens))
+    if cache_write_tokens is not None:
+        room = max(0, prompt_tokens - details.get("cached_tokens", 0))
+        details["cache_write_tokens"] = max(0, min(int(cache_write_tokens), room))
+    if details:
+        out["prompt_tokens_details"] = details
     return out
 
 

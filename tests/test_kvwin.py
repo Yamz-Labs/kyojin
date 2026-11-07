@@ -664,13 +664,19 @@ def test_midchunk_checkpoint_keeps_working_with_a_ring():
     ring = types.SimpleNamespace(kvwin = True)
     gdn = types.SimpleNamespace()
     puts = []
+    class StoredCheckpoints(dict):
+        metrics = {}
+        def put(self, key, state, stashed = None):
+            puts.append((key, stashed))
+            self[key] = stashed
     page = types.SimpleNamespace(kv_position = PAGE, phash = b"h")
     fake = types.SimpleNamespace(
         sequences = [types.SimpleNamespace(allocated_pages = [page])],
         recurrent_state = types.SimpleNamespace(checkpoint_size = 7),
         generator = types.SimpleNamespace(
-            recurrent_cache = types.SimpleNamespace(put = lambda key, st, stashed = None: puts.append((key, stashed)), metrics = {}),
-            cache = types.SimpleNamespace(get_all_recurrent_layers = lambda: {(0, 0): ring, (1, 0): gdn})))
+            recurrent_cache = StoredCheckpoints(),
+            cache = types.SimpleNamespace(get_all_recurrent_layers = lambda: {(0, 0): ring, (1, 0): gdn})),
+        _cache_write_checkpoint = lambda *args, **kwargs: None)
     t = (torch.zeros(2), torch.zeros(3))
     assert Job.stash_midchunk(fake, {PAGE: {(1, 0): t}}, 0) == 1
     (key, stashed), = puts

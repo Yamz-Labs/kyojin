@@ -298,6 +298,15 @@ class PortEngine:
         located = vision.locate_spans(ids, images, self.vision_cfg.image_token_id) if images else []
         keys = vision.prompt_key(ids, located) if located else ids      # image positions carry the pixel hash
         store = self.pfx if cache_prompt else None
+        from exllamav3.dsv41.prefix_cache import PrefixStore, RequestPrefixStore
+        from exllamav3.dsv41.spec import PortSpec
+        # Custom speculative hooks may own another persistence path; do not
+        # advertise measured writes for hooks whose store flow we do not own.
+        measured_prefix = (self.spec is None or type(self.spec) is PortSpec) and (
+            store is None or type(store) is PrefixStore)
+        tracked_store = RequestPrefixStore(store, keys) if measured_prefix and store is not None else None
+        if tracked_store is not None:
+            store = tracked_store
         produced: list[int] = []                                   # every token the decode loop handed out (EOS included)
         if self.spec is None:
             from exllamav3.dsv41 import prefix_cache
@@ -356,6 +365,8 @@ class PortEngine:
         if self.spec is not None:
             stats["cached_tokens"] = self.spec.cached
             stats["prefix_lcp"] = self.spec.miss_lcp
+        if measured_prefix:
+            stats["cache_write_tokens"] = tracked_store.cache_write_tokens if tracked_store is not None else 0
         if os.environ.get("DS41_PFX_LOG") == "1":
             print(f"[prefix] prompt={len(ids)} cached={stats.get('cached_tokens', 0)} lcp_miss={stats.get('prefix_lcp', 0)} "
                   f"store={len(store) if store is not None else 0}x{(store.nbytes() >> 20) if store is not None else 0}MiB", file=sys.stderr, flush=True)

@@ -66,7 +66,8 @@ def _stash_env(sub_max, n_pages = 3):
     seq = types.SimpleNamespace(allocated_pages = [_Page(100 + i) for i in range(n_pages)],
                                 sequence_ids = types.SimpleNamespace(torch_slice = lambda a, b: ids[a:b]))
     gen = types.SimpleNamespace(sub_ckpts = [], sub_ckpt_max = sub_max)
-    return types.SimpleNamespace(generator = gen, mtp_defer = False), seq, ids
+    return types.SimpleNamespace(generator = gen, mtp_defer = False,
+                                 _cache_write_checkpoint = lambda *args, **kwargs: None), seq, ids
 
 
 def _stash(me, seq, pos, salt = 0):

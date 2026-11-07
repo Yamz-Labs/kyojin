@@ -19,6 +19,7 @@ import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools import serve_compat
 
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 TOOL_OPEN, TOOL_CLOSE = "<tool_call>", "</tool_call>"
@@ -186,8 +187,7 @@ def make_app(engine: Engine, model_id: str, template: str, defaults: dict) -> we
 
         def usage():
             c = int(stats.get("cached_tokens", 0))
-            return {"prompt_tokens": n_in, "completion_tokens": n_out, "total_tokens": n_in + n_out,
-                    "prompt_tokens_details": {"cached_tokens": c}}
+            return serve_compat.usage(n_in, n_out, c, cache_write_tokens=stats.get("cache_write_tokens"))
 
         async def collect(on_text=None):
             nonlocal text, n_out, finish
@@ -199,7 +199,7 @@ def make_app(engine: Engine, model_id: str, template: str, defaults: dict) -> we
                 if r.get("token_ids") is not None:
                     n_out += int(r["token_ids"].numel())
                 if r.get("eos"):
-                    stats.update({k: r[k] for k in ("cached_tokens", "time_prefill", "time_generate", "time_enqueued") if k in r})
+                    stats.update({k: r[k] for k in ("cached_tokens", "cache_write_tokens", "time_prefill", "time_generate", "time_enqueued") if k in r})
                     finish = "length" if r.get("eos_reason") == "max_new_tokens" else "stop"
                     break
             engine.outq.pop(ident, None)
