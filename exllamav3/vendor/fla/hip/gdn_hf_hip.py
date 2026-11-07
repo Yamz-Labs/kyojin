@@ -1,7 +1,11 @@
 # EXL3_GDN_HF (default ON on ROCm, =0 off; gate 03/11: Flash-Next 16K/32K dNLL -0.001/-0.0065, KLD 0.006, ref top-1 always in top-5; dense 27B dNLL +0.00005, KLD 1e-5; 19/20 task prompts identical; prefill +11..23 % at 8K/32K): Qwen GDN prefill recurrence with the 16-row-chunk WY kernel adapted from hipfire (gdn_hf.hip, Apache-2.0).
 # One kernel per layer replaces kkt_solve + gdn_fused_h_o (the gated norm still runs after). F16 WMMA operands with fp32 accumulation
 # (S, T, Vnew rounded to f16 per 16-row chunk): NOT bitwise equal to the Triton / gdn_fused_h chain; quality-gated (KLD).
-# Compiled with the ROCm SDK hipcc on first use (cached by source hash), launched on torch's stream like gdn_fused_h_hip.
+# gdn_hf.hip is a gfx11.5 (RDNA3.5) WMMA kernel; it is gated off on other ROCm archs before any JIT
+# compile (gfx12 needs a different builtin and fragment layout: see
+# scratch/gdn_hf_gfx12_port_20261107.patch, which was validated but dropped because it did not clear
+# the 5% prefill gate on the 9070). Compiled with the ROCm SDK hipcc on first use (cached by source
+# hash), launched on torch's stream like gdn_fused_h_hip.
 import ctypes, hashlib, os, subprocess
 import torch
 from exllamav3.util import hip_compiler
@@ -10,22 +14,85 @@ from exllamav3.util.hip_lib import load_hip_runtime
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gdn_hf.hip")
 _state = {}
 
+# gdn_hf.hip has only the RDNA3.5 (gfx11.5) WMMA path; gfx12 is refused before the
+# JIT so no compile is attempted (previously it tried the gfx11 builtin, failed, and
+# printed a warning before falling back to the Triton chain).
+_ARCHS = frozenset(("gfx1150", "gfx1151", "gfx1152"))
+_supported = {}     # device index -> bool, once per process
 
-def _load():
-    if "fn" in _state:
-        return _state["fn"]
-    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+def _device_index(device=None):
+    if device is None:
+        return torch.cuda.current_device()
+    if isinstance(device, torch.device):
+        return device.index if device.index is not None else torch.cuda.current_device()
+    return int(device)
+
+
+def _arch(device=None):
+    return torch.cuda.get_device_properties(_device_index(device)).gcnArchName.split(":")[0]
+
+
+def supported(device=None):
+    """True when this device's arch has the gdn_hf.hip gfx11.5 fragment path. Cached per device:
+    gdn_hf_ok runs once per GDN layer per prefill chunk, so re-probing get_device_properties there
+    is pure overhead (the arch cannot change after init)."""
+    if not torch.version.hip:
+        return False
+    try:
+        idx = _device_index(device)
+        ok = _supported.get(idx)
+        if ok is None:
+            ok = _supported[idx] = _arch(idx) in _ARCHS
+        return ok
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def _rocm_flags():
+    """Device-lib and sysroot flags for the JIT compiler, from the same SDK env.sh's build mode uses."""
+    sdk = hip_compiler.resolve().get("sdk")
+    flags = []
+    if sdk and os.path.isdir(sdk):
+        flags.append(f"--rocm-path={sdk}")
+        for p in (os.path.join(sdk, "lib", "llvm", "amdgcn", "bitcode"),
+                  os.path.join(sdk, "amdgcn", "bitcode")):
+            if os.path.isdir(p):
+                flags.append(f"--rocm-device-lib-path={p}")
+                break
+    return flags
+
+
+def _gcc_flag():
+    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR")
+    if not gcc:
+        try:
+            out = subprocess.run(["gcc", "-print-libgcc-file-name"], capture_output=True, text=True, timeout=10).stdout.strip()
+            gcc = os.path.dirname(out) if out else ""
+        except Exception:                               # noqa: BLE001
+            gcc = ""
+    return [f"--gcc-install-dir={gcc}"] if gcc and os.path.isdir(gcc) else []
+
+
+def _load(device=None):
+    arch = _arch(device)
+    if ("fn", arch) in _state:
+        return _state["fn", arch]
     src = open(_SRC, "rb").read()
-    flags = ["--genco", f"--offload-arch={arch}", "-O3", "-DKYO_RAW=1"]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags = ["--genco", f"--offload-arch={arch}", "-O3", "-DKYO_RAW=1", *_rocm_flags(), *_gcc_flag()]
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"gdn_hf_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         tmp = cache + f".{os.getpid()}.tmp"
-        subprocess.run([hip_compiler.hipcc(), *flags, "-o", tmp, _SRC], check=True, capture_output=True)
+        r = subprocess.run([hip_compiler.hipcc(), *flags, "-o", tmp, _SRC], capture_output=True)
+        if r.returncode != 0:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            err = (r.stderr or r.stdout or b"").decode(errors="replace").strip().splitlines()
+            raise RuntimeError(f"gdn_hf_hip: hipcc failed for {arch}:\n" + "\n".join(err[-12:]))
         os.replace(tmp, cache)
     lib = load_hip_runtime()
     torch.cuda.init()
@@ -35,7 +102,9 @@ def _load():
     if lib.hipModuleGetFunction(ctypes.byref(fn), mod, b"gated_delta_chunk_gate_wmma") != 0:
         raise RuntimeError("gdn_hf_hip: hipModuleGetFunction failed")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state.update(lib=lib, mod=mod, fn=fn)
+    _state.update(lib=lib)
+    _state["mod", arch] = mod
+    _state["fn", arch] = fn
     return fn
 
 
@@ -43,6 +112,8 @@ def gdn_hf_ok(q_raw, v, qn, kn, g, beta, initial_state):
     """q_raw, v: views of the conv output row (q at column 0, v at column 2 H K, same token pitch); qn, kn [1, T, H, 128] bf16
     contiguous (l2-normalized); g [1, T, HV] fp32 raw log decay (natural log, before the chunk cumsum); beta [1, T, HV]."""
     if os.environ.get("EXL3_GDN_HF", "1" if torch.version.hip else "0") != "1" or _state.get("fail"):
+        return False
+    if not supported(v.device):
         return False
     B, T, H, K = qn.shape
     HV, V = v.shape[2], v.shape[3]
@@ -64,7 +135,7 @@ def chunk_gdn_hf(q_raw, v, qn, kn, g, beta, scale, initial_state, output_final_s
     """Returns (o [1, T, HV, 128] bf16, final_state or None). ckpt: None, a dict or a list of <= 8 dicts {"s": fp32 [1, HV, K, V]
     contiguous, "chunk": n} (gdn_fused_h_hip contract): the state after row 64 n is written to ck["s"] and ck["ok"] set."""
     try:
-        fn = _load()
+        fn = _load(v.device)
     except Exception:
         _state["fail"] = True     # no hipcc / no module: the Triton chain for the rest of the process
         raise
