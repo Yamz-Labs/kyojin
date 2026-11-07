@@ -1,6 +1,6 @@
 import sys, types, time, importlib.util, os, torch, numpy as np
 sys.path.insert(0, "pylib")
-D = "/home/kamel/hermes-work/kyolane/src_v185/kyojin/exllamav3/foreign_quant"
+D = os.environ.get("FQ_DIR", "exllamav3/foreign_quant")
 spec = importlib.util.spec_from_file_location("fq_gap", D + "/__init__.py", submodule_search_locations=[D])
 m = importlib.util.module_from_spec(spec); sys.modules["fq_gap"] = m; spec.loader.exec_module(m)
 import fq_gap.gap_formats as gf, fq_gap.triton_gap as tg

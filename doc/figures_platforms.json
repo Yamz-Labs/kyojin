@@ -132,7 +132,7 @@
     78.5
    ]
   },
-  "source": "Kamel readme189.json, served, 1 warm-up + 1 rep (3 reps median where a cell was >5 % under), actual prompt tokens: Qwen 5392/39276/81491/147740/234772; Flint 4051/15338/31190/61543/123523/227527"
+  "source": "RTX 3090 box, readme189.json, served, 1 warm-up + 1 rep (3 reps median where a cell was >5 % under), actual prompt tokens: Qwen 5392/39276/81491/147740/234772; Flint 4051/15338/31190/61543/123523/227527"
  },
  "mac": {
   "machine": "Mac Studio M5 Ultra, 256 GB",
