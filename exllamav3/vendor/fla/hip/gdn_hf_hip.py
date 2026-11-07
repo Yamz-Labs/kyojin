@@ -49,20 +49,6 @@ def supported(device=None):
         return False
 
 
-def _rocm_flags():
-    """Device-lib and sysroot flags for the JIT compiler, from the same SDK env.sh's build mode uses."""
-    sdk = hip_compiler.resolve().get("sdk")
-    flags = []
-    if sdk and os.path.isdir(sdk):
-        flags.append(f"--rocm-path={sdk}")
-        for p in (os.path.join(sdk, "lib", "llvm", "amdgcn", "bitcode"),
-                  os.path.join(sdk, "amdgcn", "bitcode")):
-            if os.path.isdir(p):
-                flags.append(f"--rocm-device-lib-path={p}")
-                break
-    return flags
-
-
 def _gcc_flag():
     gcc = os.environ.get("EXL3_GCC_INSTALL_DIR")
     if not gcc:
@@ -79,7 +65,7 @@ def _load(device=None):
     if ("fn", arch) in _state:
         return _state["fn", arch]
     src = open(_SRC, "rb").read()
-    flags = ["--genco", f"--offload-arch={arch}", "-O3", "-DKYO_RAW=1", *_rocm_flags(), *_gcc_flag()]
+    flags = ["--genco", f"--offload-arch={arch}", "-O3", "-DKYO_RAW=1", *_gcc_flag()]
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"gdn_hf_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
