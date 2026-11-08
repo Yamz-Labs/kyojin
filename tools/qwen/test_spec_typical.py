@@ -257,5 +257,95 @@ class RepetitionAware(unittest.TestCase):
         self.assertTrue(ss.rep_refused(j, loop[10]))
 
 
+class CooldownRule(unittest.TestCase):
+    """EXL3_SPEC_TYPICAL_COOLDOWN: exact acceptance for a window after an early loop signal, doubling on re-trigger, capped."""
+    def setUp(self):
+        self.old = (ss.TYPICAL_LOOKUP, ss.REP_N, ss.REP_W, dict(ss.STATS))
+        ss.TYPICAL_LOOKUP = "rep"; ss.REP_N = 8; ss.REP_W = 512
+        for k in ("EXL3_SPEC_TYPICAL_COOLDOWN", "EXL3_SPEC_TYPICAL_REWIND"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        ss.TYPICAL_LOOKUP, ss.REP_N, ss.REP_W = self.old[:3]
+        ss.STATS.update(self.old[3])
+        for k in ("EXL3_SPEC_TYPICAL_COOLDOWN", "EXL3_SPEC_TYPICAL_REWIND"):
+            os.environ.pop(k, None)
+
+    def test_defaults_and_off(self):
+        self.assertEqual((ss.cooldown_base(), ss.rewind_max()), (2048, 3))
+        os.environ["EXL3_SPEC_TYPICAL_COOLDOWN"] = "0"; os.environ["EXL3_SPEC_TYPICAL_REWIND"] = "0"
+        self.assertEqual((ss.cooldown_base(), ss.rewind_max()), (0, 0))
+        os.environ["EXL3_SPEC_TYPICAL_COOLDOWN"] = "junk"
+        self.assertEqual(ss.cooldown_base(), 0)
+
+    def test_window_exact_length_then_relaxed(self):
+        cd = ss.Cooldown()
+        self.assertFalse(cd.armed(0))
+        self.assertTrue(cd.trigger(100, 2048))
+        self.assertTrue(cd.armed(100)); self.assertTrue(cd.armed(100 + 2047)); self.assertFalse(cd.armed(100 + 2048))
+
+    def test_doubling_cap_and_debounce(self):
+        cd = ss.Cooldown(); t0 = ss.STATS["cooldown_triggers"]
+        self.assertTrue(cd.trigger(100, 2048))
+        self.assertFalse(cd.trigger(150, 2048))             # same burst (< 64 tokens): counted once
+        self.assertEqual(cd.win, 2048)
+        self.assertTrue(cd.trigger(200, 2048)); self.assertEqual(cd.win, 4096)     # re-trigger while armed doubles
+        self.assertTrue(cd.trigger(200 + 4096 + 100, 2048)); self.assertEqual(cd.win, 8192)   # ... or within the next window
+        self.assertTrue(cd.trigger(cd.end + 10, 2048)); self.assertEqual(cd.win, 16384)
+        self.assertTrue(cd.trigger(cd.end + 10, 2048)); self.assertEqual(cd.win, 16384)       # cap
+        self.assertTrue(cd.trigger(cd.end + 3 * 16384, 2048)); self.assertEqual(cd.win, 2048)  # long quiet: back to the base window
+        self.assertEqual(ss.STATS["cooldown_triggers"], t0 + 6)
+
+    def test_cd_armed_follows_job_count(self):
+        j = FakeJob([1], list(range(10)))
+        self.assertFalse(ss.cd_armed(j))                   # no signal: no state, the relaxed path is untouched
+        j.cd = ss.Cooldown(); j.cd.trigger(j.new_tokens, 5)
+        self.assertTrue(ss.cd_armed(j))
+        for t in range(5): j.emit(t)
+        self.assertFalse(ss.cd_armed(j))
+
+    def test_rep_refusal_arms_job_and_marks_first_copy(self):
+        loop = list(range(200, 220))
+        j = FakeJob([1, 2, 3], loop + loop + loop[:10])
+        self.assertTrue(ss.rep_refused(j, loop[10]))
+        self.assertTrue(ss.cd_armed(j))
+        self.assertEqual(j.cd.win, 2048)
+        self.assertEqual(j.cd.rw_abs, 6)                   # start of the first copy of the refused 8-gram: 3 prompt tokens + offset 3
+        self.assertEqual(ss.STATS["cooldown_triggers"] - self.old[3]["cooldown_triggers"], 1)
+
+    def test_rep_refusal_rewind_off_no_mark_cooldown_off_no_state(self):
+        loop = list(range(200, 220))
+        os.environ["EXL3_SPEC_TYPICAL_REWIND"] = "0"
+        j = FakeJob([1], loop + loop + loop[:10])
+        self.assertTrue(ss.rep_refused(j, loop[10])); self.assertIsNone(j.cd.rw_abs); self.assertTrue(ss.cd_armed(j))
+        os.environ["EXL3_SPEC_TYPICAL_COOLDOWN"] = "0"
+        j = FakeJob([1], loop + loop + loop[:10])
+        self.assertTrue(ss.rep_refused(j, loop[10])); self.assertFalse(hasattr(j, "cd")); self.assertFalse(ss.cd_armed(j))
+
+    def test_no_signal_leaves_job_untouched(self):
+        j = FakeJob([1], list(range(300, 340)))
+        self.assertFalse(ss.rep_refused(j, 5))
+        self.assertFalse(hasattr(j, "cd")); self.assertFalse(ss.cd_armed(j))
+        self.assertEqual(ss.STATS, self.old[3])
+
+    def test_rep_extra_sees_the_kept_thinking(self):
+        # a rewound reply restarts with its kept thinking in the prompt: rep_extra lets the tracker still see the first copy
+        loop = list(range(200, 220))
+        kept = loop + loop[:2]
+        j = FakeJob([1, 2, 3] + kept, loop[2:10] * 0)       # no tokens generated yet by the new job
+        j.rep_extra = len(kept)
+        for t in loop[2:] + loop[:10]: j.emit(t)            # the loop comes round again
+        self.assertTrue(ss.rep_refused(j, loop[10]))
+        self.assertEqual(j.cd.rw_abs, 6)
+
+    def test_first_repeat_picks_earliest_copy(self):
+        tr = ss.RepTracker()
+        loop = list(range(200, 220))
+        seq = FakeSeq([9, 9] + loop + loop + loop[:10])
+        tr.feed(seq, len(seq))
+        self.assertEqual(tr.first_repeat(loop[10]), 5)   # 2 leading ids + offset 3
+        self.assertEqual(tr.first_repeat(999), -1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -187,6 +187,62 @@ def relax_allowed(gen, draft_tokens: torch.Tensor, row: int) -> bool:
     return TYPICAL_LOOKUP != "0" or not draft_is_copy(gen, draft_tokens, row)
 
 
+# Adaptive loop control for the relaxed rule. A loop is cheap to stop early and expensive once its span is in the context, so a job that
+# shows an early loop signal accepts by exact equality (no relaxed rule, MTP and copied drafts alike) for a window of its own generated
+# tokens, then relaxes again. Signals: a refused REP_N-gram (rep_refused), and a thinking-text line of >= 40 non-space chars seen twice
+# (tools/loopguard.LineWatch, fed by the server). A re-trigger while the window is open, or within the next window, doubles it.
+# EXL3_SPEC_TYPICAL_COOLDOWN: first window in tokens (default 2048, 0 = off, read per round); cap CD_MAX; one burst of signals counts once.
+# EXL3_SPEC_TYPICAL_REWIND: rewinds per reply (default 3, 0 = off, read per round); the server cuts the thinking back to just before the first
+# copy of the repeated span and continues from there (see Cooldown.rw_abs). The relaxed rule is never touched while no signal fires.
+CD_MAX = 16384
+CD_DEBOUNCE = 64
+STATS = {"cooldown_triggers": 0, "cooldown_tokens": 0, "rewinds": 0, "rewound_tokens": 0}   # whole process, exposed by the server
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, str(default)) or 0))
+    except ValueError:
+        return 0
+
+
+def cooldown_base() -> int:
+    return _int_env("EXL3_SPEC_TYPICAL_COOLDOWN", 2048)
+
+
+def rewind_max() -> int:
+    return _int_env("EXL3_SPEC_TYPICAL_REWIND", 3)
+
+
+class Cooldown:
+    """Per-job window state. Positions are the job's own generated-token count (job.new_tokens)."""
+
+    def __init__(self, win: int = 0, end: int = 0):
+        self.win = win        # current window (0 = never triggered)
+        self.end = end        # exact acceptance while the job's generated count is below end
+        self.last = -1        # generated count at the last trigger
+        self.rw_abs = None    # absolute sequence index where the first copy of the refused n-gram starts (the server consumes it)
+
+    def armed(self, n: int) -> bool:
+        return n < self.end
+
+    def trigger(self, n: int, base: int) -> bool:
+        """Early loop signal at generated count n. True when it counted (not a repeat of the same burst)."""
+        if self.last >= 0 and n - self.last < CD_DEBOUNCE:
+            return False
+        win = min(2 * self.win, CD_MAX) if self.win and n < self.end + self.win else base
+        self.win, self.end, self.last = win, n + win, n
+        STATS["cooldown_triggers"] += 1
+        STATS["cooldown_tokens"] += win
+        return True
+
+
+def cd_armed(job) -> bool:
+    """True while the job is inside an exact-acceptance window (flag on)."""
+    cd = getattr(job, "cd", None)
+    return cd is not None and cd.armed(job.new_tokens)
+
+
 class RepTracker:
     """
     Counts the REP_N-grams of one job's last REP_W generated tokens (a dict from n-gram to count, updated from the new tail of
@@ -226,6 +282,18 @@ class RepTracker:
             return False
         return self.counts.get(tuple(self.toks[-(REP_N - 1):]) + (d,), 0) >= REP_COUNT
 
+    def first_repeat(self, d: int) -> int:
+        """Absolute sequence index of the start of the FIRST occurrence (inside the window) of the n-gram that d would complete; -1 if none."""
+        t = self.toks
+        if len(t) < REP_N - 1:
+            return -1
+        gram = t[-(REP_N - 1):] + [d]
+        k = len(gram)
+        for i in range(len(t) - k + 1):
+            if t[i] == gram[0] and t[i:i + k] == gram:
+                return self.end - len(t) + i
+        return -1
+
 
 def rep_refused(job, d: int) -> bool:
     """
@@ -237,10 +305,19 @@ def rep_refused(job, d: int) -> bool:
     tr = getattr(job, "_rep_tracker", None)
     if tr is None:
         tr = job._rep_tracker = RepTracker()
-    tr.feed(job.sequences[0].sequence_ids, job.new_tokens)
+    tr.feed(job.sequences[0].sequence_ids, job.new_tokens + getattr(job, "rep_extra", 0))   # rep_extra: kept thinking of a rewound reply
     if tr.repeated(d):
         REP_REFUSED[0] += 1
         job.rep_refused = getattr(job, "rep_refused", 0) + 1
+        base = cooldown_base()
+        if base:                                  # the refused n-gram is an early loop signal
+            cd = getattr(job, "cd", None)
+            if cd is None:
+                cd = job.cd = Cooldown()
+            if cd.trigger(job.new_tokens, base) and rewind_max() > 0:
+                at = tr.first_repeat(d)
+                if at >= 0:
+                    cd.rw_abs = at if cd.rw_abs is None else min(cd.rw_abs, at)
         return True
     return False
 

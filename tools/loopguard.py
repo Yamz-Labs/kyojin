@@ -59,6 +59,51 @@ class LineRepeat:
         return None
 
 
+class LineWatch:
+    """Early loop signal (EXL3_SPEC_TYPICAL_COOLDOWN), a detector only: it never ends a reply. feed(text) is True when a long line (LineRepeat's
+    normalisation: stripped, >= LINE_MIN non-space chars, outside ``` fences) completes for the 2nd time within the last WINDOW chars; first_at
+    is then the char offset where the FIRST copy of that line starts (the rewind point)."""
+    WINDOW = 16384
+
+    def __init__(self):
+        self.chars = 0
+        self.line = ""
+        self.last: dict[str, int] = {}      # stripped line -> char offset where its last copy ended
+        self.first: dict[str, int] = {}     # stripped line -> char offset where the earliest copy of the current chain started
+        self.first_at: int | None = None
+        self.fence = False
+
+    def feed(self, text: str) -> bool:
+        if not text:
+            return False
+        parts = (self.line + text).split("\n")
+        pos = self.chars - len(self.line)
+        self.line = parts.pop()
+        self.chars += len(text)
+        hit = False
+        self.first_at = None
+        for p in parts:
+            beg = pos
+            pos += len(p) + 1
+            q = p.strip()
+            if q.startswith("```"):
+                self.fence = not self.fence
+                continue
+            if not self.fence and len("".join(q.split())) >= LINE_MIN:
+                if pos - self.last.get(q, -10 ** 9) <= self.WINDOW:
+                    if not hit:
+                        self.first_at = self.first.get(q, beg)
+                    hit = True
+                else:
+                    self.first[q] = beg
+                self.last[q] = pos
+        if len(self.last) > 512:
+            lim = self.chars - self.WINDOW
+            self.last = {k: v for k, v in self.last.items() if v >= lim}
+            self.first = {k: v for k, v in self.first.items() if k in self.last}
+        return hit
+
+
 def loop_guard_default() -> bool:
     return os.environ.get("EXL3_LOOP_GUARD", "1") != "0"
 

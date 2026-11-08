@@ -2189,7 +2189,7 @@ class Generator:
                                 token_logits,
                             )
                         if typ is not None and typ_relax and spec_sample.typical_on() and i < npos - 1 and typ[0][2][i] and int(next_token.view(-1)[0]) != typ[1][i] \
-                                and not spec_sample.rep_refused(job, typ[1][i]):
+                                and not spec_sample.cd_armed(job) and not spec_sample.rep_refused(job, typ[1][i]):
                             next_token = torch.full_like(next_token, typ[1][i])
                         eos, sampled_token, rq = job.receive_sample(
                             token_logits,
