@@ -1642,8 +1642,9 @@ void exl3_gemv
     bool ok = false;
     [[maybe_unused]] bool out_rotated = false;
 #if defined(USE_ROCM)
-    // gfx1200/gfx1201: the fdot2 dot core takes the dense multi-row GEMV
-    // as well as m == 1. The input Hadamard above has already produced A_had.
+    // gfx12 (RDNA4) and gfx11.5 (RDNA3.5): the shared fdot2 dot core takes the
+    // dense multi-row GEMV as well as m == 1. The input Hadamard above has
+    // already produced A_had.
     // For m == 1 the output Hadamard is fused into the dot kernel when the
     // width fits the per-device segment counters; rows > 1 store the raw
     // products and the had_r_128 below rotates the whole C as before.

@@ -72,7 +72,11 @@ def _pf_notile_ok(rows, t):
 # when its dec_ok holds, but that gate is mul1-only, so on a GLM-5.3-Flash pack (all mcg) every
 # projection here falls back to the generic path; this wiring decodes either codebook and folds
 # q_a_proj + kv_a_proj_with_mqa into one launch. EXL3_MLA_DEC=0 restores the plain forwards.
-EXL3_MLA_DEC = os.environ.get("EXL3_MLA_DEC", "1") != "0"
+# Cross-gated with the dense dec switch (quant/exl3.py: EXL3_DEC_DENSE) so EXL3_DEC_DENSE=0
+# also moves the fused dense MLA dec projections to the shared exl3_gemv route.
+EXL3_MLA_DEC = (os.environ.get("EXL3_MLA_DEC", "1") != "0"
+                and os.environ.get("EXL3_DEC", "1") != "0"
+                and os.environ.get("EXL3_DEC_DENSE", "1") != "0")
 
 # Verify batch-invariance (glm-mtp step 7): at 2..EXL3_MLA_DEC_ROWLOOP_MAX rows of an MTP verify
 # forward, run the MLA projections as one exl3_dec GEMV launch PER ROW (the exact batch-1 kernel)
@@ -113,9 +117,13 @@ def dec_proj_ok(lin) -> bool:
     inner = getattr(lin, "inner", None)
     if inner is None or not hasattr(inner, "K"):   # LinearFP16 (test models) has no EXL3 trellis
         return False
+    from .quant.exl3 import _hip_wmma_family
     k2 = inner.K * 2
     return (
         EXL3_MLA_DEC and bool(torch.version.hip) and hasattr(ext, "exl3_dec_gemv") and
+        # exl3_dec is a gfx11.5 (RDNA3.5) WMMA kernel; keep this gate consistent with
+        # LinearEXL3.dec_supported so gfx12 uses the RDNA fdot2 GEMV instead.
+        _hip_wmma_family(inner.trellis.device) == 2 and
         getattr(lin, "quant_type", None) == "exl3" and (inner.mul1 or inner.mcg) and
         int(round(k2)) in _DEC_KB2 and k2 == int(round(k2)) and
         inner.in_features % 512 == 0 and inner.out_features % 128 == 0 and

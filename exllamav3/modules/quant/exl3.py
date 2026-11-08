@@ -235,6 +235,13 @@ _hip_gemv_family_cache: dict[int, int] = {}
 # Batch-1 decode kernels (exl3_dec.cu, gfx11.5): one launch per GEMV with both Hadamard stages
 # fused. EXL3_DEC=0 disables them (falls back to exl3_gemv / reconstruct).
 EXL3_DEC = os.environ.get("EXL3_DEC", "1") != "0"
+# Dense-only switch (see doc/rdna-gemv-shared-2026-11-05.md). EXL3_DEC_DENSE=0 keeps the routed
+# MoE dec kernels but moves the dense projections to the shared exl3_gemv route: the RDNA fdot2
+# kernel, also on gfx1150/1151/1152. Pack-dependent (helps the K6 Flash-Next projections, costs
+# ~3.7% plain on the K3 27B), so it stays opt-in and is not a gfx1151 default. K7 and K8 dense
+# projections stay on dec even with the switch off: the HIP GEMV gate caps K at 6, so there is
+# no shared-route alternative for them (dec_supported applies EXL3_DEC separately).
+EXL3_DEC_DENSE = os.environ.get("EXL3_DEC_DENSE", "1") != "0"
 _DEC_KB2 = (4, 5, 6, 8, 10, 12)
 # dense projections also decode K7 (attention, linear-attention and shared-expert projections of 5 bpw packs); the routed-MoE kernels stop at K6
 _DEC_KB2_DENSE = _DEC_KB2 + (14,)
@@ -300,7 +307,8 @@ def dec_supported(inner) -> bool:
     The exl3_dec kernels are gfx11.5 (RDNA3.5) WMMA only, so the gate also pins the device to
     family 2 -- on gfx12 (RDNA4) the direct WMMA GEMV path must be used instead."""
     return (
-        EXL3_DEC and bool(torch.version.hip) and hasattr(ext, "exl3_dec_gemv") and
+        EXL3_DEC and (EXL3_DEC_DENSE or int(round(inner.K * 2)) > 12) and
+        bool(torch.version.hip) and hasattr(ext, "exl3_dec_gemv") and
         _hip_wmma_family(inner.trellis.device) == 2 and
         inner.mul1 and not inner.mcg and (
             int(round(inner.K * 2)) in _DEC_KB2_DENSE or
