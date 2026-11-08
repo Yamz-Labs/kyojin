@@ -34,12 +34,19 @@ metadata builds (`uv lock --check`, PEP 517 `get_requires`) keep working.
 ```bash
 nix build .#exllamav3      # engine wheel + gfx1151 extension
 nix build .#exllama-ext    # native extension alone (narrowed sources)
-nix build .#kyojin         # serve wrappers (qwen/glm/mimo)
+nix build .#kyojin         # serve wrappers (one per tools/*/serve.py flavor)
 nix build .#torch-rocm     # ROCm torch wheel
 nix build .#rocm-sdk       # expanded SDK tree (headers, hipcc, libhsa)
 nix build .#docker         # OCI image tarball, about 5 GB compressed
 nix run .#kyojin-serve-glm -- --help
 ```
+
+Serve flavors are discovered from `tools/*/serve.py`: adding a server
+directory adds its `kyojin-serve-<flavor>` wrapper and app, and makes the
+container entrypoint accept that flavor, with no list to keep in sync. (Flake
+sources only see tracked files, so `git add` the new directory first.) A new
+flavor's Python dependencies must already be in `pyproject.toml`, since all
+wrappers share the one locked environment.
 
 The engine package is split for CI caching: `.#exllama-ext` compiles the
 native extension from narrowed sources only (`setup.py`,
@@ -144,8 +151,8 @@ with a raised memlock limit is the usual setup for GPU inference runtimes.
 The entrypoint downloads the model into the volume on first start and skips
 the download when a pack is already there. Both flavor and repo are required
 and fail fast; there are no silent 50 GB pulls. Each flavor gets its own slot
-(`/models/qwen`, `/models/glm`, `/models/mimo`, overridable with
-`KYOJIN_MODEL_DIR`), and a marker file records which repo filled it, so
+(`/models/<flavor>`, overridable with `KYOJIN_MODEL_DIR`), and a marker file
+records which repo filled it, so
 switching repos under the same flavor errors out instead of serving a stale
 pack. Tuning cache (`~/.cache/exllamav3`) lives under `HOME`, which the
 entrypoint points at `/models/home` (override with `KYOJIN_HOME`) so a fresh
