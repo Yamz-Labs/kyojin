@@ -186,7 +186,7 @@ class CopiedDrafts(unittest.TestCase):
 class FakeSeq:
     def __init__(self, ids): self.ids = list(ids)
     def __len__(self): return len(self.ids)
-    def torch_slice(self, a, b): return torch.tensor(self.ids[a:b], dtype=torch.long)
+    def torch_slice(self, a, b): return torch.tensor([self.ids[a:b]], dtype=torch.long)   # (1, n), like the real SeqTensor
 
 
 class FakeJob:

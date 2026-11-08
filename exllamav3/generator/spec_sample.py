@@ -273,7 +273,7 @@ class RepTracker:
         else:   # first call, truncation or a long gap: rebuild from the generated tail
             lo = max(n - min(max(ngen, 0), REP_W), 0)
             self.toks, self.counts = [], {}
-        for t in (seq.torch_slice(lo, n).tolist() if n > lo else []):
+        for t in (seq.torch_slice(lo, n).reshape(-1).tolist() if n > lo else []):
             self._add(t)
         self.end = n
 
