@@ -79,6 +79,7 @@ def make_engine(model, per_iter=3):
     e = object.__new__(serve.QwenEngine)
     e.torch, e.Job, e.generator = torch, StubJob, StubGenerator(model, per_iter)
     e.tokenizer, e.eos, e.draft_model, e.spec_on, e.slot_store, e.last_stats = StubTok(), [0], None, False, None, {}
+    e.sessions = 1
     e._encode = lambda prompt, urls: (torch.tensor([[100, 101, 102]]), [])
     e._sampler = lambda s: None
     StubJob.jobs = []
@@ -266,6 +267,83 @@ class GuardEngineTests(unittest.TestCase):
     def test_real_job_accepts_seed(self):
         src = (Path(__file__).resolve().parents[2] / "exllamav3" / "generator" / "job.py").read_text()
         self.assertTrue(re.search(r"seed: int = None", src) and "random.Random(seed)" in src)
+
+
+
+class LongPeriodTests(unittest.TestCase):
+    """Long-period rule: a thinking line of >= 40 non-space characters seen 3 times (exact after strip)."""
+    LINE = "Let me check the second constraint against the board once more."
+
+    def feed(self, text, phase="think", step=7):
+        import loopguard
+        mon = loopguard.LoopMonitor(phase, None)
+        for i in range(0, len(text), step):
+            hit = mon.feed([i // step + 1000], text[i:i + step])
+            if hit:
+                return hit, i + step
+        return None, len(text)
+
+    def test_third_sighting_in_think_fires(self):
+        body = "".join(f"Step {i} reasons about case number {i * 17} in detail.\n" for i in range(5))
+        text = body + (self.LINE + "\n" + "".join(f"  fresh thought {i} about something new here.  \n" for i in range(3))) * 3
+        hit, at = self.feed(text)
+        self.assertEqual(hit["kind"], "line")
+        self.assertEqual(hit["phase"], "think")
+        self.assertLess(hit["chars"], len(text) + 1)
+
+    def test_two_sightings_short_lines_and_answers_do_not_fire(self):
+        two = (self.LINE + "\nsomething else entirely, different words here ok.\n") * 2
+        self.assertIsNone(self.feed(two)[0])
+        short = "x = compute(a, b)\n" * 20
+        self.assertIsNone(self.feed(short)[0])
+        self.assertIsNone(self.feed((self.LINE + "\n") * 5, phase="answer")[0])
+
+    def test_fenced_code_in_think_is_not_counted(self):
+        code = "```python\n" + "    result = compute_something(first_argument, second_argument)\n" * 4 + "```\n"
+        self.assertIsNone(self.feed(code)[0])
+
+    def test_real_traces(self):
+        d = os.environ.get("LOOPGUARD_TRACES")   # a directory of looping traces (loop_think.txt) and valid answers (ok_*.md)
+        if not d or not Path(d).is_dir():
+            self.skipTest("LOOPGUARD_TRACES not set")
+        loop = Path(d) / "loop_think.txt"
+        if loop.exists():
+            hit, _ = self.feed(loop.read_text(), step=4)
+            self.assertEqual(hit["kind"], "line")
+        for f in sorted(Path(d).glob("ok_*.md")):
+            self.assertIsNone(self.feed(f.read_text(), step=4)[0], f.name)
+            self.assertIsNone(self.feed(f.read_text(), phase="answer", step=4)[0], f.name)
+
+
+class OpenThinkEosTests(unittest.TestCase):
+    def test_eos_before_close_forces_close_and_answers_once(self):
+        def m(ctx, job):
+            gen = ctx[3:]
+            if CLOSE in gen:
+                return answer_after_close(ctx)
+            return 200 + len(gen) if len(gen) < 40 else 0      # the model stops inside the think block
+        text, st = collect(make_engine(m), reasoning_first=True, loop_guard=True)
+        self.assertIn("</think>", text)
+        self.assertIn("<w1000>", text)                                # the answer follows the forced close
+        self.assertEqual(st["loop_guard"]["kind"], "open_think")
+        self.assertEqual(st["eos_reason"], "stop_token")
+
+    def test_second_eos_in_think_is_not_retried(self):
+        calls = []
+        def m(ctx, job):
+            calls.append(1)
+            return 200 + len(ctx[3:]) if len(ctx[3:]) < 40 else 0
+        text, st = collect(make_engine(m), reasoning_first=True, loop_guard=True)
+        self.assertLess(len(calls), 200)
+        self.assertEqual(st["eos_reason"], "stop_token")
+
+    def test_guard_off_or_no_think_unchanged(self):
+        def m(ctx, job):
+            return 200 + len(ctx[3:]) if len(ctx[3:]) < 40 else 0
+        for kw in ({"reasoning_first": True, "loop_guard": False}, {"reasoning_first": False, "loop_guard": True}):
+            text, st = collect(make_engine(m), **kw)
+            self.assertNotIn("</think>", text)
+            self.assertNotIn("loop_guard", st)
 
 
 class MultiStubGenerator(StubGenerator):

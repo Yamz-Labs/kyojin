@@ -22,6 +22,88 @@ TEXT_WINDOW, TEXT_RATIO, TEXT_MIN_CHARS = 1000, 0.30, 200
 SPAN_TAIL, SPAN_LEN, SPAN_MIN = 3000, 50, 3
 
 
+LINE_MIN, LINE_REPEAT = 40, 3   # long-period rule (thinking only): a line of >= 40 non-space characters seen 3 times, exact after strip
+
+
+class LineRepeat:
+    """Long-period loop in a thinking block: the period rules look at <= 64 tokens and the text rule at the last 1000 characters, so a
+    loop of 20 lines (~380 tokens) slips through them. Here every complete line of at least LINE_MIN non-space characters is counted
+    (exact after strip); the LINE_REPEAT-th sighting is a loop. Lines inside a ``` fence are not counted: code repeats its own lines.
+    feed(text, tok0) -> None, or (char offset, token index) of the START of the second sighting (keep the thinking up to there: one copy
+    of the loop) and the char offset where the third one ended."""
+
+    def __init__(self):
+        self.seen: dict[str, list] = {}   # line -> [count, char offset of 2nd sighting, token index of 2nd sighting]
+        self.buf, self.buf_at, self.buf_tok, self.fence, self.n = "", 0, 0, False, 0
+
+    def feed(self, text: str, tok0: int = 0):
+        for piece in text.splitlines(keepends=True):
+            if not self.buf:
+                self.buf_at, self.buf_tok = self.n, tok0
+            self.buf += piece
+            self.n += len(piece)
+            if not piece.endswith("\n"):
+                continue
+            line, self.buf = self.buf.strip(), ""
+            if line.startswith("```"):
+                self.fence = not self.fence
+                continue
+            if self.fence or len(line.replace(" ", "").replace("\t", "")) < LINE_MIN:
+                continue
+            rec = self.seen.setdefault(line, [0, 0, 0])
+            rec[0] += 1
+            if rec[0] == 2:
+                rec[1], rec[2] = self.buf_at, self.buf_tok
+            elif rec[0] >= LINE_REPEAT:
+                return rec[1], rec[2], self.n
+        return None
+
+
+class LineWatch:
+    """Early loop signal (EXL3_SPEC_TYPICAL_COOLDOWN), a detector only: it never ends a reply. feed(text) is True when a long line (LineRepeat's
+    normalisation: stripped, >= LINE_MIN non-space chars, outside ``` fences) completes for the 2nd time within the last WINDOW chars; first_at
+    is then the char offset where the FIRST copy of that line starts (the rewind point)."""
+    WINDOW = 16384
+
+    def __init__(self):
+        self.chars = 0
+        self.line = ""
+        self.last: dict[str, int] = {}      # stripped line -> char offset where its last copy ended
+        self.first: dict[str, int] = {}     # stripped line -> char offset where the earliest copy of the current chain started
+        self.first_at: int | None = None
+        self.fence = False
+
+    def feed(self, text: str) -> bool:
+        if not text:
+            return False
+        parts = (self.line + text).split("\n")
+        pos = self.chars - len(self.line)
+        self.line = parts.pop()
+        self.chars += len(text)
+        hit = False
+        self.first_at = None
+        for p in parts:
+            beg = pos
+            pos += len(p) + 1
+            q = p.strip()
+            if q.startswith("```"):
+                self.fence = not self.fence
+                continue
+            if not self.fence and len("".join(q.split())) >= LINE_MIN:
+                if pos - self.last.get(q, -10 ** 9) <= self.WINDOW:
+                    if not hit:
+                        self.first_at = self.first.get(q, beg)
+                    hit = True
+                else:
+                    self.first[q] = beg
+                self.last[q] = pos
+        if len(self.last) > 512:
+            lim = self.chars - self.WINDOW
+            self.last = {k: v for k, v in self.last.items() if v >= lim}
+            self.first = {k: v for k, v in self.first.items() if k in self.last}
+        return hit
+
+
 def loop_guard_default() -> bool:
     return os.environ.get("EXL3_LOOP_GUARD", "1") != "0"
 
@@ -154,6 +236,7 @@ class LoopMonitor:
         self.run = [0] * (GUARD_MAX_N + 1)
         self.text = ""
         self.last_check = 0
+        self.lines = LineRepeat() if phase == "think" else None
         self.flag_from: int | None = None
         self.counter_from: int | None = None
         self._data_at, self._data = -GUARD_CHECK_EVERY, False   # data_like() of the tail, refreshed every GUARD_CHECK_EVERY tokens
@@ -191,6 +274,10 @@ class LoopMonitor:
                     if r < DATA_SUSTAIN and self.phase == "answer" and self._data_tail(i):
                         continue   # legit repetitive data: the period must hold for DATA_SUSTAIN tokens before it is a loop
                     return {"phase": self.phase, "kind": "period", "cut": max(i - r + 1, 1), "at": i + 1, "period": n}
+        if self.detect and self.lines is not None and text:
+            lh = self.lines.feed(text, len(ids) - len(tokens))
+            if lh:
+                return {"phase": "think", "kind": "line", "cut": max(lh[1], 1), "at": len(ids), "period": 0, "chars": lh[2]}
         if self.detect and len(ids) - self.last_check >= GUARD_CHECK_EVERY:
             prev, self.last_check = self.last_check, len(ids)
             if (answer_text_loop if self.phase == "answer" else text_loop)(self.text[-(SPAN_TAIL + 200):]):
