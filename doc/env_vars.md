@@ -1407,8 +1407,8 @@ Dense-only switch for the batch-1 `exl3_dec` GEMV, which fuses both Hadamard sta
 keeps the routed-MoE `dec` kernels but moves the K<=6 dense projections (and the fused dense MLA dec projections) to
 the shared `exl3_gemv` route, which is the RDNA fdot2 kernel on gfx12 and gfx11.5. K7 and opt-in K8 dense projections
 stay on `dec` even with the switch off, because the HIP GEMV gate caps K at 6 and there is no shared-route alternative.
-Pack-dependent and not a universal gfx1151 default: on the K6 Qwen3.8-Flash-Next pack it is +3.9% decode, on the K3 27B
-pack it is -3.7% plain (MTP unchanged). `EXL3_DEC=0` still disables both the dense and MoE dec kernels.
+Pack-dependent and not a universal gfx1151 default: a K6 Qwen3.8-Flash-Next pack measured +3.9% decode, a K3 Qwen 27B
+pack measured -3.7% plain (MTP unchanged). `EXL3_DEC=0` still disables both the dense and MoE dec kernels.
 
 #### `EXL3_QC_PF_MAXNREG` (default `255` for 8-bit K+V and above, else `0`)
 
