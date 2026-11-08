@@ -255,6 +255,12 @@ Prefill strategy for MLA layers: `mha` up-projects past latent tiles from the co
 and attends in MHA form (~2.8× fewer FLOPs per query-past pair); `absorbed` restores the
 single-kernel absorbed-form prefill for A/B testing.
 
+### `EXL3_MLA_DEC` (default: `1`; ROCm gfx11.5)
+
+Batch-1 MLA decode runs the qualifying projections through the fused `exl3_dec` GEMV kernels.
+`0` restores the generic `LinearEXL3.forward` path.
+The fused path is gfx11.5-only and is also turned off by `EXL3_DEC=0` or `EXL3_DEC_DENSE=0`.
+
 ### `EXL3_MLA_DEC_VALU` (default: `1` on HIP)
 
 Decode and verify rows (up to 8) of the MLA absorb and unfold run on the VALU dot2-chain kernels. The output is
@@ -1403,14 +1409,19 @@ persistent expert-group kernel.
 Slice height of the int8 decode GEMV on 4/5-bit weights: taller k-slices, about two work units per SM. `0` restores the
 former rule, `EXL3_GEMV_ROWS=<n>` forces a slice height.
 
+#### `EXL3_DEC` (default `1`; ROCm)
+
+Master switch for the batch-1 `exl3_dec` decode kernels, which fuse both Hadamard stages into one launch on gfx11.5:
+the dense GEMV, the routed-MoE kernels and the fused MLA projections. `0` disables all of them and sends each path to
+its generic fallback. For fine control `EXL3_DEC_DENSE=0` moves only the dense route off `dec` and keeps the routed-MoE kernels;
+`EXL3_MLA_DEC=0` disables only the MLA projection wiring.
+
 #### `EXL3_DEC_DENSE` (default `1`; ROCm)
 
-Dense-only switch for the batch-1 `exl3_dec` GEMV, which fuses both Hadamard stages into one launch on gfx11.5. `0`
-keeps the routed-MoE `dec` kernels but moves the K<=6 dense projections (and the fused dense MLA dec projections) to
-the shared `exl3_gemv` route, which is the RDNA fdot2 kernel on gfx12 and gfx11.5. K7 and opt-in K8 dense projections
-stay on `dec` even with the switch off, because the HIP GEMV gate caps K at 6 and there is no shared-route alternative.
-Pack-dependent and not a universal gfx1151 default: a K6 Qwen3.8-Flash-Next pack measured +3.9% decode, a K3 Qwen 27B
-pack measured -3.7% plain (MTP unchanged). `EXL3_DEC=0` still disables both the dense and MoE dec kernels.
+Turns the fused decode kernels off for the dense layers only, leaving the MoE layers on the fast path. The dense projections
+then use the general-purpose GEMV path, the RDNA fdot2 kernel on gfx12 and gfx11.5. K7 and opt-in K8 projections stay fused
+because the generic path does not cover them. Whether this helps is model-dependent: about +4% decode on a K6 Qwen3.8-Flash-Next pack,
+about -4% on a K3 Qwen 27B pack. Treat it as a per-model A/B switch rather than a new default;  `EXL3_DEC=0` turns everything off.
 
 #### `EXL3_QC_PF_MAXNREG` (default `255` for 8-bit K+V and above, else `0`)
 
