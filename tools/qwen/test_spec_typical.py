@@ -272,7 +272,7 @@ class CooldownRule(unittest.TestCase):
             os.environ.pop(k, None)
 
     def test_defaults_and_off(self):
-        self.assertEqual((ss.cooldown_base(), ss.rewind_max()), (2048, 3))
+        self.assertEqual((ss.cooldown_base(), ss.rewind_max()), (512, 3))
         os.environ["EXL3_SPEC_TYPICAL_COOLDOWN"] = "0"; os.environ["EXL3_SPEC_TYPICAL_REWIND"] = "0"
         self.assertEqual((ss.cooldown_base(), ss.rewind_max()), (0, 0))
         os.environ["EXL3_SPEC_TYPICAL_COOLDOWN"] = "junk"
@@ -309,7 +309,7 @@ class CooldownRule(unittest.TestCase):
         j = FakeJob([1, 2, 3], loop + loop + loop[:10])
         self.assertTrue(ss.rep_refused(j, loop[10]))
         self.assertTrue(ss.cd_armed(j))
-        self.assertEqual(j.cd.win, 2048)
+        self.assertEqual(j.cd.win, 512)
         self.assertEqual(j.cd.rw_abs, 6)                   # start of the first copy of the refused 8-gram: 3 prompt tokens + offset 3
         self.assertEqual(ss.STATS["cooldown_triggers"] - self.old[3]["cooldown_triggers"], 1)
 

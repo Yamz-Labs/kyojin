@@ -191,7 +191,7 @@ def relax_allowed(gen, draft_tokens: torch.Tensor, row: int) -> bool:
 # shows an early loop signal accepts by exact equality (no relaxed rule, MTP and copied drafts alike) for a window of its own generated
 # tokens, then relaxes again. Signals: a refused REP_N-gram (rep_refused), and a thinking-text line of >= 40 non-space chars seen twice
 # (tools/loopguard.LineWatch, fed by the server). A re-trigger while the window is open, or within the next window, doubles it.
-# EXL3_SPEC_TYPICAL_COOLDOWN: first window in tokens (default 2048, 0 = off, read per round); cap CD_MAX; one burst of signals counts once.
+# EXL3_SPEC_TYPICAL_COOLDOWN: first window in tokens (default 512, 0 = off, read per round); cap CD_MAX; one burst of signals counts once.
 # EXL3_SPEC_TYPICAL_REWIND: rewinds per reply (default 3, 0 = off, read per round); the server cuts the thinking back to just before the first
 # copy of the repeated span and continues from there (see Cooldown.rw_abs). The relaxed rule is never touched while no signal fires.
 CD_MAX = 16384
@@ -207,7 +207,7 @@ def _int_env(name: str, default: int) -> int:
 
 
 def cooldown_base() -> int:
-    return _int_env("EXL3_SPEC_TYPICAL_COOLDOWN", 2048)
+    return _int_env("EXL3_SPEC_TYPICAL_COOLDOWN", 512)
 
 
 def rewind_max() -> int:

@@ -93,7 +93,7 @@ class RewindTests(unittest.TestCase):
         self.assertGreaterEqual(self.d("cooldown_triggers"), 3)                # one per rewind, then the window re-triggers (doubles) before the hard guard
         for j in jobs[1:4]:
             self.assertIsNotNone(getattr(j, "cd", None))                       # exact-acceptance window carried to the new job
-            self.assertTrue(j.cd.armed(0)); self.assertGreaterEqual(j.cd.win, 2048)
+            self.assertTrue(j.cd.armed(0)); self.assertGreaterEqual(j.cd.win, 512)
         self.assertEqual([j.seed for j in jobs[:4]], [1234 + 1000003 * k for k in range(4)])   # the sampling key moves on at every rewind
         self.assertIn("loop_guard", st)                                        # after the cap the hard guard closes the think block
         self.assertEqual(st["spec_rewinds"], 3)
@@ -109,7 +109,7 @@ class RewindTests(unittest.TestCase):
         text, st = run(make(loop_in_think))
         self.assertEqual(self.d("rewinds"), 0)
         self.assertEqual(self.d("cooldown_triggers"), 2)                       # the signal still arms the window; a re-trigger (64+ tokens later) doubles it
-        self.assertEqual(StubJob.jobs[0].cd.win, 4096)
+        self.assertEqual(StubJob.jobs[0].cd.win, 1024)
         self.assertEqual(len(StubJob.jobs), 2)                    # only the hard guard's restart
         self.assertNotIn("spec_rewinds", st)
 
