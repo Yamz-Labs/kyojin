@@ -99,6 +99,56 @@ def test_key_depends_on_version(env, monkeypatch):
     assert "clang version 23" in hip_compiler.describe() and str(b) in hip_compiler.describe()
 
 
+def test_gcc_install_dir_prefers_a_valid_env_dir(env, monkeypatch, tmp_path):
+    d = tmp_path / "gcc"; d.mkdir()
+    monkeypatch.setenv("EXL3_GCC_INSTALL_DIR", str(d))
+    monkeypatch.setattr(hip_compiler.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("probed despite a valid env dir")))
+    assert hip_compiler.gcc_flags() == [f"--gcc-install-dir={d}"]
+
+
+def test_gcc_install_dir_probes_gcc_once_when_env_is_stale(env, monkeypatch, tmp_path, capsys):
+    d = tmp_path / "gcc"; d.mkdir(); (d / "libgcc.a").write_text("")
+    calls = []
+    monkeypatch.setenv("EXL3_GCC_INSTALL_DIR", str(tmp_path / "missing"))
+    monkeypatch.setattr(hip_compiler.subprocess, "run",
+                        lambda *a, **k: (calls.append(a), types.SimpleNamespace(stdout = str(d / "libgcc.a")))[1])
+    assert hip_compiler.gcc_install_dir() == str(d)
+    assert hip_compiler.gcc_install_dir() == str(d)     # cached after the first probe
+    assert len(calls) == 1
+    assert "not a directory" in capsys.readouterr().out
+
+
+def test_gcc_install_dir_scan_prefers_the_host_triple(env, monkeypatch, tmp_path):
+    root = tmp_path / "gcc"
+    old = root / "x86_64-linux-gnu" / "9"; old.mkdir(parents = True); (old / "libgcc.a").write_text("")
+    new = root / "x86_64-linux-gnu" / "13"; new.mkdir(); (new / "libgcc.a").write_text("")
+    cross = root / "aarch64-linux-gnu" / "14"; cross.mkdir(parents = True); (cross / "libgcc.a").write_text("")
+    monkeypatch.delenv("EXL3_GCC_INSTALL_DIR", raising = False)
+    monkeypatch.setattr(hip_compiler.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+    monkeypatch.setattr(hip_compiler.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(hip_compiler.glob, "glob",
+                        lambda pattern: [str(old), str(new), str(cross)] if pattern == "/usr/lib/gcc/*/*" else [])
+    assert hip_compiler.gcc_install_dir() == str(new)
+
+
+def test_gcc_install_dir_scan_falls_back_to_any_triple(env, monkeypatch, tmp_path):
+    cross = tmp_path / "gcc" / "aarch64-linux-gnu" / "14"; cross.mkdir(parents = True); (cross / "libgcc.a").write_text("")
+    monkeypatch.delenv("EXL3_GCC_INSTALL_DIR", raising = False)
+    monkeypatch.setattr(hip_compiler.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+    monkeypatch.setattr(hip_compiler.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(hip_compiler.glob, "glob", lambda pattern: [str(cross)] if pattern == "/usr/lib/gcc/*/*" else [])
+    assert hip_compiler.gcc_install_dir() == str(cross)
+
+
+def test_gcc_install_dir_none_found(env, monkeypatch):
+    monkeypatch.delenv("EXL3_GCC_INSTALL_DIR", raising = False)
+    monkeypatch.setattr(hip_compiler.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+    monkeypatch.setattr(hip_compiler.glob, "glob", lambda pattern: [])
+    assert hip_compiler.gcc_install_dir() is None
+    assert hip_compiler.gcc_flags() == []
+
+
 def test_version_recorded_once(env, monkeypatch):
     log = env / "calls.log"
     a = fake_hipcc(env / "a" / "hipcc", "clang X")
@@ -194,6 +244,7 @@ def test_every_jit_site_uses_the_resolver():
     for f in sites:
         s = (ROOT / f).read_text()
         assert "hip_compiler.hipcc()" in s and "hip_compiler.key()" in s and "EXL3_ROCM_SDK" not in s, f
+        assert "hip_compiler.gcc_flags()" in s and "EXL3_GCC_INSTALL_DIR" not in s, f
     import subprocess
     out = subprocess.run(["grep", "-rl", "--include=*.py", "-e", "--genco", str(ROOT / "exllamav3")],
                          capture_output=True, text=True).stdout.split()

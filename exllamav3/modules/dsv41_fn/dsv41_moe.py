@@ -28,9 +28,7 @@ def _compile(arch):
         src += open(os.path.join(_EXT, h), "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", f"-I{os.path.join(_DIR, 'stub')}"]
     flags += os.environ.get("DSV41_MOE_DEFS", "").split()   # experiments: -DMV_VU=3 -DEXL3_MOE_VALU_W=8
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"dsv41moe_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
