@@ -5,6 +5,7 @@ import time
 import torch
 
 from ..modules.attn import prepare_for_attn
+from ..modules.module import select_exec_device
 from ..cache.recurrent_util import prepare_for_recurrence
 from ..util.memory import (
     set_memory_fraction_reserve,
@@ -197,6 +198,7 @@ class Model_LSMixin(ABC):
                             if measure:
                                 torch.cuda.reset_peak_memory_stats(load_device)
                                 alloc_before = torch.cuda.memory_allocated(load_device)
+                            select_exec_device(module.device)
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
                             for sm in module:
@@ -319,6 +321,7 @@ class Model_LSMixin(ABC):
             params["layer_instance"] = instance
             pf = (idx, instance) == self.last_kv_module_idx_instance
             params["prefill"] = pf
+            select_exec_device(module.device)
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
             if x is None:
@@ -353,6 +356,7 @@ class Model_LSMixin(ABC):
             if span:
                 x = _span_module(module, x, params)
                 continue
+            select_exec_device(module.device)
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
         return x
@@ -395,6 +399,7 @@ def _span_module(module, x, params):
     torch.cuda.synchronize()
     _span_state["name"] = f"{module.key}[{params.get('layer_instance')}]"
     t0 = _span_state["t0"] = time.perf_counter()
+    select_exec_device(module.device)
     x = module.prepare_for_device(x, params)
     x = module.forward(x, params)
     torch.cuda.synchronize()
