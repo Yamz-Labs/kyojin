@@ -50,14 +50,25 @@ def supported(device=None):
 
 
 def _gcc_flag():
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR")
-    if not gcc:
-        try:
-            out = subprocess.run(["gcc", "-print-libgcc-file-name"], capture_output=True, text=True, timeout=10).stdout.strip()
-            gcc = os.path.dirname(out) if out else ""
-        except Exception:                               # noqa: BLE001
-            gcc = ""
-    return [f"--gcc-install-dir={gcc}"] if gcc and os.path.isdir(gcc) else []
+    """Shared GCC discovery (see hip_compiler.gcc_install_dir)."""
+    return hip_compiler.gcc_flags()
+
+
+def _compile_tail(lines, n=12):
+    """Last n lines, plus any error lines clang printed before them (its warning preamble would
+    otherwise fill the window)."""
+    if len(lines) <= n:
+        return lines
+    start = len(lines) - n
+    hits = [i for i, l in enumerate(lines[:start]) if "error:" in l or "fatal error" in l][-n:]
+    keep = sorted(set(hits) | set(range(start, len(lines))))
+    out, prev = [], None
+    for i in keep:
+        if prev is not None and i > prev + 1:
+            out.append("...")
+        out.append(lines[i])
+        prev = i
+    return out
 
 
 def _load(device=None):
@@ -78,7 +89,7 @@ def _load(device=None):
             except OSError:
                 pass
             err = (r.stderr or r.stdout or b"").decode(errors="replace").strip().splitlines()
-            raise RuntimeError(f"gdn_hf_hip: hipcc failed for {arch}:\n" + "\n".join(err[-12:]))
+            raise RuntimeError(f"gdn_hf_hip: hipcc failed for {arch}:\n" + "\n".join(_compile_tail(err)))
         os.replace(tmp, cache)
     lib = load_hip_runtime()
     torch.cuda.init()
@@ -97,6 +108,9 @@ def _load(device=None):
 def gdn_hf_ok(q_raw, v, qn, kn, g, beta, initial_state):
     """q_raw, v: views of the conv output row (q at column 0, v at column 2 H K, same token pitch); qn, kn [1, T, H, 128] bf16
     contiguous (l2-normalized); g [1, T, HV] fp32 raw log decay (natural log, before the chunk cumsum); beta [1, T, HV]."""
+    # Process-wide on purpose: a JIT/module/launch failure is treated as a toolchain/driver
+    # problem, so it also disables other gfx11.5 devices on a mixed box (gfx12 never reaches
+    # _load because supported() already refuses it).
     if os.environ.get("EXL3_GDN_HF", "1" if torch.version.hip else "0") != "1" or _state.get("fail"):
         return False
     if not supported(v.device):

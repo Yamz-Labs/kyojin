@@ -7,11 +7,12 @@ the slow build. The path and `--version` string are recorded once per process; `
 version string that the kernel cache names include, so a binary built by another compiler is never reused.
 No torch import here.
 """
-import hashlib, os, shutil, subprocess, sys, sysconfig
+import glob, hashlib, os, platform, re, shutil, subprocess, sys, sysconfig
 
 FIX_LINE = "export EXL3_ROCM_SDK=$(rocm-sdk path --root)"
 SLOW_COST = "prefill can be about 20 % slower"
 _info = {}
+_gcc = {}
 
 
 def _sdk_from_package():
@@ -83,6 +84,51 @@ def key():
     return resolve()["key"]
 
 
+def _gcc_version_key(path):
+    return tuple(int(x) for x in re.findall(r"\d+", os.path.basename(path)))
+
+
+def gcc_install_dir():
+    """GCC installation directory for clang's --gcc-install-dir, or None when there is none.
+
+    EXL3_GCC_INSTALL_DIR when it names a directory, else the GCC on PATH, else the newest GCC tree
+    installed without the driver (slim images). The scan prefers a host-triplet tree so a cross
+    compiler under /usr/lib/gcc/<triple>/<version> cannot win on version alone. Cached per process:
+    the flag is part of every kernel cache tag, and the kernel loaders call this once per arch."""
+    if "dir" in _gcc:
+        return _gcc["dir"]
+    env = os.environ.get("EXL3_GCC_INSTALL_DIR")
+    if env:
+        if os.path.isdir(env):
+            _gcc["dir"] = env
+            return env
+        if not _gcc.get("warned"):
+            _gcc["warned"] = True
+            print(f" -- EXL3_GCC_INSTALL_DIR={env!r} is not a directory; probing gcc", flush=True)
+    try:
+        out = subprocess.run(["gcc", "-print-libgcc-file-name"], capture_output=True, text=True, timeout=10).stdout.strip()
+        d = os.path.dirname(out) if out else ""
+        if d and os.path.isdir(d):
+            _gcc["dir"] = d
+            return d
+    except Exception:  # noqa: BLE001
+        pass
+    cands = []
+    for pattern in ("/usr/lib/gcc/*/*", "/usr/lib64/gcc/*/*", "/usr/lib/gcc-cross/*/*"):
+        cands += [d for d in glob.glob(pattern) if os.path.isfile(os.path.join(d, "libgcc.a"))]
+    host = platform.machine()
+    host_cands = [d for d in cands if host and host in os.path.dirname(d)]
+    found = max(host_cands or cands, key=_gcc_version_key) if cands else None
+    _gcc["dir"] = found
+    return found
+
+
+def gcc_flags():
+    """--gcc-install-dir flag for the JIT compilers, or [] when no GCC installation is found."""
+    d = gcc_install_dir()
+    return [f"--gcc-install-dir={d}"] if d else []
+
+
 def describe():
     i = resolve()
     if not i["path"]:
@@ -109,3 +155,4 @@ def report(log=print):
 
 def reset():
     _info.clear()
+    _gcc.clear()

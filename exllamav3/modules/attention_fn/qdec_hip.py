@@ -139,9 +139,7 @@ def _compile(cfg, arch):
                 VPF=int(cfg.get("vpf", False)), SMM1=int(cfg.get("smm", 0)), SCALE=repr(float(cfg["scale"])) + "f")
     extra = [f"-D{k}={v}" for k, v in defs.items()] + knob("EXL3_QDEC_HIP_FLAGS", "").split()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"] + extra
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     src = open(_SRC, "rb").read()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     path = os.path.join(_CACHE, f"qdec_hip_{arch}_{tag}.hsaco")

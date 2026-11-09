@@ -112,7 +112,7 @@ def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, 
             try:
                 return chunk_gdn_hf(q, v, qn, kn, g, beta, scale, initial_state, output_final_state, ckpt=ckpt)
             except Exception as e:
-                print(f" -- EXL3_GDN_HF failed, Triton/HIP chain for the rest of the process: {e!r}", flush=True)
+                print(f" -- EXL3_GDN_HF failed, Triton/HIP chain for the rest of the process: {e}", flush=True)
         if isinstance(ckpt, (list, tuple)) and len(ckpt) > 2:
             # the fused chain below side-writes 2 rows (the HF kernel above takes 8): keep the two deepest, the others stay unwritten
             ckpt = sorted(ckpt, key = lambda c: c["chunk"])[-2:]

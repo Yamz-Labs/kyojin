@@ -16,8 +16,7 @@ def compile_hsaco(defs="", arch="gfx1151", src_path=None):
     src_path = src_path or _SRC
     src = open(src_path, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off"] + [x if x.startswith("-") else f"-D{x}" for x in defs.split()]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc): flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"gr_mix_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):

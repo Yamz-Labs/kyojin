@@ -12,9 +12,7 @@ _FUNCS = ("ds41_sparse_attn_pf", "ds41_gather_sum", "ds41_rope_rows")
 def compile_hsaco(arch="gfx1151"):
     src = open(_SRC, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"ds41_pf_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
