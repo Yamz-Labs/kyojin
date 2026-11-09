@@ -6,6 +6,7 @@ import ctypes, hashlib, os, subprocess
 import torch
 import triton
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import GFX115_ARCHS, device_arch, device_supported, select_device
 from exllamav3.util.knobs import knob
 from exllamav3.util.hip_lib import load_hip_runtime
 
@@ -13,11 +14,20 @@ _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kda_hf.hip")
 _state = {}
 
 
-def _load(defs=""):
-    # defs: extra -D defines (experiments only, e.g. "KHF_TP=1"); one module per defines string
-    if ("fn", defs) in _state:
-        return _state["fn", defs]
-    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+def supported(device=None):
+    """kda_hf.hip is a gfx11.5 WMMA kernel; refuse other archs before any hipcc attempt."""
+    if not torch.version.hip:
+        return False
+    return device_supported(device, GFX115_ARCHS)
+
+
+def _load(defs="", device=None):
+    # defs: extra -D defines (experiments only, e.g. "KHF_TP=1"); one module per (device, defines) string
+    dev = select_device(device)
+    key = (dev, defs)
+    if key in _state:
+        return _state[key]
+    arch = device_arch(dev)
     src = open(_SRC, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off"] + [f"-D{x}" for x in defs.split()]
     flags += hip_compiler.gcc_flags()
@@ -37,15 +47,15 @@ def _load(defs=""):
         raise RuntimeError("kda_hf_hip: hipModuleGetFunction failed")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
     _state["lib"] = lib
-    _state["fn", defs] = fn
-    _state["mod", defs] = mod
+    _state[key] = fn
+    _state["mod", key] = mod
     return fn
 
 
 def kda_hf_ok(q, k, v, g, beta, initial_state, chunk_size):
     """q, k [1, T, H, 128] bf16 (l2-normalized), v [1, T, HV, 128] bf16, g [1, T, HV, 128] fp32 = 64-row-local log2 cumsum,
     beta [1, T, HV] bf16, all contiguous."""
-    if knob("EXL3_KDA_HF", "0") != "1" or _state.get("fail"):
+    if knob("EXL3_KDA_HF", "0") != "1" or _state.get("fail") or not supported(q.device):
         return False
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
@@ -64,7 +74,7 @@ def chunk_kda_hf(q, k, v, g, beta, scale, initial_state, output_final_state, ckp
         # per call) computes them in the kernel with bf16 WMMA (faster, but heavier per-token error tails on real GLM inputs)
         defs = "" if knob("EXL3_KDA_HF_DIAG", "0") == "1" else "KHF_TP=1"
     try:
-        fn = _load(defs)
+        fn = _load(defs, q.device)
     except Exception:
         _state["fail"] = True     # no hipcc / no module: the Triton/HIP chain for the rest of the process
         raise

@@ -5,6 +5,7 @@ import ctypes, hashlib, os, subprocess
 import torch
 from . import dsv41_hip as H
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import device_arch, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,10 +42,12 @@ def _compile(arch):
     return cache
 
 
-def _load():
-    if "fns" in _state:
-        return _state["fns"]
-    cache = _compile(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _load(device=None):
+    dev = select_device(device)
+    key = (dev, "")
+    if key in _state:
+        return _state[key]
+    cache = _compile(device_arch(dev))
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
@@ -57,7 +60,9 @@ def _load():
             raise RuntimeError("dsv41_moe: no function " + n)
         fns[n] = fn
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state.update(lib=lib, fns=fns, mod=mod)
+    _state.update(lib=lib)
+    _state[key] = fns
+    _state["mod", key] = mod
     return fns
 
 
@@ -69,7 +74,8 @@ class _L:
     """One launch with a prebuilt argument pack; `ptr(i, t)` re-points a tensor argument."""
 
     def __init__(self, name, grid, block, args):
-        self.fn = _load()[name]
+        device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+        self.fn = _load(device)[name]
         self.grid, self.block = tuple(grid) + (1,) * (3 - len(grid)), block
         self._keep = [a for a in args if isinstance(a, torch.Tensor)]
         self.cargs, self.params = H._pack(args)
@@ -93,6 +99,7 @@ class UnifiedMoE:
 
     def __init__(self, store, buffers, outs, H_, I_, limit, device):
         dev = torch.device(device)
+        self.device = dev
         self.store, self.outs, self.limit = store, outs, float(limit)
         E = store.num_experts
         self.G = store.num_groups
@@ -152,6 +159,7 @@ class UnifiedMoE:
             self.l_down.ptr(1, sel)
             self.l_final.ptr(1, sel).ptr(2, wh)
             self.sig = sig
+        select_device(self.device)
         s = torch.cuda.current_stream().cuda_stream
         self.l_had(s); self.l_gu(s); self.l_mid(s); self.l_down(s); self.l_final(s)
         return self.outs

@@ -3,6 +3,7 @@
 import ctypes, hashlib, os, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import device_arch, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ple_hip.hip")
@@ -32,10 +33,12 @@ def compile_hsaco(arch="gfx1151", src_path=None):
     return cache
 
 
-def _load():
-    if "fns" in _state:
-        return _state["fns"]
-    cache = compile_hsaco(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _load(device=None):
+    dev = select_device(device)
+    key = (dev, "")
+    if key in _state:
+        return _state[key]
+    cache = compile_hsaco(device_arch(dev))
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
@@ -48,12 +51,13 @@ def _load():
             raise RuntimeError("ple_hip: no function " + n)
         fns[n] = fn
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state["lib"], _state["fns"], _state["mod"] = lib, fns, mod
+    _state["lib"], _state[key], _state["mod", key] = lib, fns, mod
     return fns
 
 
 def _launch(name, grid, block, args):
-    fn = _load()[name]
+    device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+    fn = _load(device)[name]
     cargs = []
     for a in args:
         if isinstance(a, torch.Tensor):

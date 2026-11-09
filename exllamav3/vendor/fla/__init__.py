@@ -32,6 +32,12 @@ _HIP_FAIL = []  # first failure disables the HIP path for the process
 def _hip_ok(q, k, v, beta, Akk, Aqk, h0):
     if _HIP_FAIL:
         return False
+    try:
+        from .hip.kda_fused_h_hip import supported as _kda_fused_supported
+        if not _kda_fused_supported(q.device):
+            return False
+    except Exception:                                   # noqa: BLE001
+        return False
     bf = torch.bfloat16
     ts = (q, k, v, beta, Akk, Aqk)
     return (all(t.dtype == bf and t.is_contiguous() for t in ts)
