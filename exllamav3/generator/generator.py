@@ -2167,7 +2167,8 @@ class Generator:
                     typ = None
                     # EXL3_SPEC_TYPICAL_LOOKUP: arm "0" keeps copied drafts exact; default "rep" refuses the relaxed rule (rep_refused, below) for a draft that
                     # completes an n-gram the job already repeated in its own output. The probe still logs every draft.
-                    typ_relax = draft_tokens is not None and spec_sample.relax_allowed(self, draft_tokens, j)
+                    typ_relax = draft_tokens is not None and spec_sample.relax_allowed(self, draft_tokens, j) \
+                        and not (spec_sample.phase_answer_only() and spec_sample.in_think(self, job))
                     if draft_tokens is not None and spec is None and (spec_sample.typical_on() or spec_sample.PTAP) \
                             and npos > 1 and not self.dflash_draft:
                         _tp = spec_sample.eligible(job)
