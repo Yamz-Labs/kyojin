@@ -347,5 +347,52 @@ class CooldownRule(unittest.TestCase):
         self.assertEqual(tr.first_repeat(999), -1)
 
 
+
+class _Seq:
+    def __init__(self, ids): self.ids = list(ids)
+    def __len__(self): return len(self.ids)
+    def torch_slice(self, a, b): return torch.tensor(self.ids[a:b])
+
+
+class _Tok:
+    def single_id(self, t): return {"<think>": 101, "</think>": 102}[t]
+
+
+class _Job:
+    def __init__(self, ids):
+        self.sequences = [type("S", (), {})()]
+        self.sequences[0].sequence_ids = _Seq(ids)
+
+
+class TypicalPhase(unittest.TestCase):
+    def test_in_think_tracks_markers_incrementally(self):
+        gen = type("G", (), {"tokenizer": _Tok()})()
+        job = _Job([1, 2, 101, 5, 6])          # prompt ends with an open <think>
+        self.assertTrue(ss.in_think(gen, job))
+        job.sequences[0].sequence_ids.ids += [7, 102, 8]   # thinking closed: answer phase
+        self.assertFalse(ss.in_think(gen, job))
+        job.sequences[0].sequence_ids.ids += [9]
+        self.assertFalse(ss.in_think(gen, job))
+        job.sequences[0].sequence_ids.ids = [1, 2, 101, 5]  # rewound below the close: rescan
+        self.assertTrue(ss.in_think(gen, job))
+        nothink = _Job([1, 101, 102, 3])       # thinking disabled in the prompt (empty think block)
+        self.assertFalse(ss.in_think(gen, nothink))
+
+    def test_no_think_tokens_never_in_think(self):
+        class T:
+            def single_id(self, t): raise KeyError(t)
+        gen = type("G", (), {"tokenizer": T()})()
+        self.assertFalse(ss.in_think(gen, _Job([1, 2, 3])))
+
+    def test_phase_flag(self):
+        old = os.environ.pop("EXL3_SPEC_TYPICAL_PHASE", None)
+        try:
+            self.assertFalse(ss.phase_answer_only())
+            os.environ["EXL3_SPEC_TYPICAL_PHASE"] = "answer"
+            self.assertTrue(ss.phase_answer_only())
+        finally:
+            os.environ.pop("EXL3_SPEC_TYPICAL_PHASE", None)
+            if old is not None: os.environ["EXL3_SPEC_TYPICAL_PHASE"] = old
+
 if __name__ == "__main__":
     unittest.main()

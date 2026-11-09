@@ -182,6 +182,47 @@ def draft_is_copy(gen, draft_tokens: torch.Tensor, row: int) -> bool:
     return draft_tokens.data_ptr() != gen.draft_ids_pinned.data_ptr()
 
 
+# EXL3_SPEC_TYPICAL_PHASE (read per round): "answer" = the relaxed rule applies only once the job's think block is closed (drafts
+# inside thinking are verified exactly: free-text loops start there, and relaxed acceptance of copied/argmax drafts feeds them);
+# "all" (default) = the relaxed rule everywhere, as before. Same rule as the MLX engine's spec_typical_phase.
+def phase_answer_only() -> bool:
+    return os.environ.get("EXL3_SPEC_TYPICAL_PHASE", "all").strip().lower() == "answer"
+
+
+def _think_ids(gen) -> tuple:
+    ids = getattr(gen, "_typ_think_ids", None)
+    if ids is None:
+        def one(t):
+            try:
+                v = gen.tokenizer.single_id(t)
+                return v if isinstance(v, int) and v >= 0 else -1
+            except Exception:
+                return -1
+        ids = (one("<think>"), one("</think>"))
+        gen._typ_think_ids = ids
+    return ids
+
+
+def in_think(gen, job) -> bool:
+    """True while the last think marker of the job's sequence (prompt + output) is an open <think>. Incremental: reads only the new
+    tail each round (state on the job); a shorter sequence (rewind) rescans from the start. False when the model has no think tokens."""
+    o, c = _think_ids(gen)
+    if o < 0 or c < 0:
+        return False
+    seq = job.sequences[0].sequence_ids
+    n = len(seq)
+    lo, state = getattr(job, "_typ_think", (0, False))
+    if n < lo:
+        lo, state = 0, False
+    if n > lo:
+        for t in reversed(seq.torch_slice(lo, n).reshape(-1).tolist()):
+            if t == o or t == c:
+                state = t == o
+                break
+    job._typ_think = (n, state)
+    return state
+
+
 def relax_allowed(gen, draft_tokens: torch.Tensor, row: int) -> bool:
     """Source gate: False only in arm "0" for a copied draft. The repetition check (rep_refused) is separate."""
     return TYPICAL_LOOKUP != "0" or not draft_is_copy(gen, draft_tokens, row)
