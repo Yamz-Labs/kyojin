@@ -40,7 +40,7 @@ def main() -> None:
 
     import torch
     from exllamav3 import Cache, CacheLayer_quant, Config, Model
-    from exllamav3.device_map import LayerDeviceMap, print_split_table, resolve_devices
+    from exllamav3.device_map import SplitPlan, resolve_devices
 
     torch.set_grad_enabled(False)
     endcaps = args.endcaps == "on"
@@ -80,38 +80,42 @@ def main() -> None:
         return
 
     devices = resolve_devices(args.front_device)
-    text_map = LayerDeviceMap.from_model(model, args.front_layers, endcaps, devices,
-                                         component="text", front_reserve_gb=args.front_reserve_gb)
-    if not text_map.enabled:
+    plan = SplitPlan(devices, endcaps=endcaps, front_layers=args.front_layers,
+                     front_reserve_gb=args.front_reserve_gb)
+    plan.add("text", model, config=config, cache=cache, load_order=0)
+    plan.build()
+    text_map = plan.map("text")
+    if text_map is None or not text_map.enabled:
         raise SystemExit("split map is not enabled (no front device)")
-    print(f"[split] {text_map.describe()}", flush=True)
-    print(f"[split] main {devices.main} ({devices.main_arch}), "
-          f"front {devices.front} ({devices.front_arch})", flush=True)
+    plan.install_bridges()
+    plan.engage_budget()
 
     t0 = time.perf_counter()
     model.load(device_map=text_map, progressbar=True, max_chunk_size=4096)
     t_model = time.perf_counter() - t0
+    plan.record_load("text", t_model)
 
     draft = draft_cache = None
     if args.num_draft > 0:
         draft = Model.from_config(config, component="mtp")
         draft_cache = Cache(draft, max_num_tokens=args.cache_size + 4096,
                             max_history=max_history, max_batch_size=1, **qkw)
-        draft_map = LayerDeviceMap.from_model(draft, 0, endcaps, devices,
-                                              component="mtp", front_reserve_gb=args.front_reserve_gb)
-        draft_map.reserve_bytes.clear()                 # text_map owns the budget
+        plan.add("mtp", draft, config=config, cache=draft_cache, load_order=1)
         t1 = time.perf_counter()
-        draft.load(device_map=draft_map, progressbar=True, max_chunk_size=4096)
+        draft.load(device_map=plan.map("mtp"), progressbar=True, max_chunk_size=4096)
+        plan.record_load("mtp", time.perf_counter() - t1)
         print(f"[split] drafter loaded in {time.perf_counter() - t1:.1f} s", flush=True)
 
     vision = None
     if not args.no_vision:
         try:
             vision = Model.from_config(config, component="vision")
-            vdev = devices.front if endcaps else devices.main
+            plan.add("vision", vision, config=config, load_order=2)
             t1 = time.perf_counter()
-            vision.load(device=vdev, progressbar=True)
-            print(f"[split] vision loaded in {time.perf_counter() - t1:.1f} s on {vdev}", flush=True)
+            vision.load(device_map=plan.map("vision"), progressbar=True)
+            plan.record_load("vision", time.perf_counter() - t1)
+            print(f"[split] vision loaded in {time.perf_counter() - t1:.1f} s "
+                  f"on {plan.map('vision').used_devices}", flush=True)
         except Exception as exc:                        # noqa: BLE001
             print(f"[split] vision not loaded: {type(exc).__name__}: {exc}", flush=True)
             vision = None
@@ -121,8 +125,8 @@ def main() -> None:
         extra.append(("mtp", draft, draft_cache))
     if vision is not None:
         extra.append(("vision", vision, None))
-    print_split_table(model, cache, text_map, extra=extra, ctx=args.cache_size)
-    text_map.release_budget()
+    plan.report(model, cache, extra=extra, ctx=args.cache_size)
+    plan.release_budget()
 
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2
     print(f"[split] target load {t_model:.1f} s; host RSS peak {peak:.2f} GiB; "

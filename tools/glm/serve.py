@@ -721,11 +721,7 @@ class ResidentEngine:
                 front_device = front_device or "auto",
                 endcaps = bool(endcaps), front_reserve_gb = float(front_reserve_gb))
         self.split = SplitController(split_settings, logger = lambda m: print(f"serve: {m}", flush=True))
-        self.front_layers = split_settings.front_layers
-        self.endcaps = split_settings.endcaps
-        self.front_reserve_gb = split_settings.front_reserve_gb
         self.split_map = None
-        self.split_devices = self.split.devices
         if self.split.enabled:
             plan = self.split.build_plan()
             if plan is None or plan.devices.front is None:
@@ -733,11 +729,12 @@ class ResidentEngine:
             print(f"serve: layer split: {split_settings.describe()}; "
                   f"main {plan.devices.main} ({plan.devices.main_arch}), "
                   f"front {plan.devices.front} ({plan.devices.front_arch})", flush=True)
-            if isinstance(self.front_layers, int) and self.front_layers > 5 and max_ctx > 65536:
-                print("serve: warning: front layers > 5 at -c > 65536 is measured to OOM the 16 GB "
-                      "front on long prefill (gfx1201 KDA fallback workspace); use "
-                      "--front-layers 5 for long-context split runs until auto sizing accounts for "
-                      "the KDA workspace", flush=True)
+            if split_settings.auto and max_ctx > 65536:
+                # Auto-N's byte budget does not yet know the gfx12 KDA prefill
+                # workspace; keep the measured-safe long-context cap until it does.
+                plan.auto_cap = 5
+                print("serve: layer split: auto-N capped at 5 layers for -c > 65536 "
+                      "(gfx1201 KDA prefill workspace)", flush=True)
         self.tokenizer = Tokenizer.from_config(self.config)
         if os.environ.get("KYO_TOKCACHE", "8") == "0":
             self.pec = None
@@ -785,20 +782,23 @@ class ResidentEngine:
             self.split_map = self.split.map("text")
             if self.split_map is not None and not self.split_map.enabled:
                 raise ValueError("layer split requested but no usable front device (or auto-N found no layer that fits)")
+            if self.split_map is not None and self.split_map.front_layers > 5 and max_ctx > 65536:
+                print("serve: warning: front layers > 5 at -c > 65536 is measured to OOM the 16 GB "
+                      "front on long prefill (gfx1201 KDA fallback workspace); use "
+                      "--front-layers 5 for long-context split runs", flush=True)
             self.split.engage_budget()
             self.split.load("text", self.model, progressbar=False,
                             callback=startup_health.load_callback(), max_chunk_size=4096)
         else:
             self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
-        self.draft_map = None
         if num_draft > 0:
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
                                      max_history=max_history, max_batch_size=slots, **qkw)
             startup_health.stage("drafter weights")
             if self.split.enabled:
-                self.draft_map = self.split.add("mtp", self.draft_model, config=self.config,
-                                                cache=self.draft_cache, load_order=1)
+                self.split.add("mtp", self.draft_model, config=self.config,
+                               cache=self.draft_cache, load_order=1)
                 self.split.load("mtp", self.draft_model, progressbar=False,
                                 callback=startup_health.load_callback(), max_chunk_size=4096)
             else:
@@ -816,9 +816,6 @@ class ResidentEngine:
                                         getattr(self.config, "vision_end_token_id", 0),
                                         env_fingerprint=self.env_fingerprint)
         if vision:
-            self._vision_device = (self.split.devices.front
-                                   if self.split.enabled and self.endcaps
-                                   else torch.device("cuda:0"))
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
         if self.split.enabled:
@@ -944,7 +941,8 @@ class ResidentEngine:
                 self.split.load("vision", tower, progressbar=False,
                                 callback=startup_health.load_callback())
             else:
-                tower.load(device=self._vision_device, progressbar=False, callback=startup_health.load_callback())
+                tower.load(device=torch.device("cuda:0"), progressbar=False,
+                           callback=startup_health.load_callback())
         except Exception as exc:                                      # noqa: BLE001
             print(f"serve: vision tower not loaded ({type(exc).__name__}: {exc}); image input disabled", flush=True)
             return None

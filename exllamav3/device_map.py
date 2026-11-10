@@ -148,16 +148,18 @@ def component_policy(name: str, **overrides) -> ComponentPolicy:
     """Default policy for a component name; adapters may override any field."""
     key = (name or "unknown").strip().lower()
     if key == "text":
-        return ComponentPolicy(
+        defaults = dict(
             name = name, kind = "text", front_eligible = True, endcaps_front = True,
-            endcap_types = TEXT_ENDCAP_TYPES, endcap_key_suffixes = TEXT_ENDCAP_SUFFIXES,
-            **overrides)
-    if key in WHOLE_COMPONENT_KINDS:
-        return ComponentPolicy(
+            endcap_types = TEXT_ENDCAP_TYPES, endcap_key_suffixes = TEXT_ENDCAP_SUFFIXES)
+    elif key in WHOLE_COMPONENT_KINDS:
+        defaults = dict(
             name = name, kind = key, front_eligible = True, endcaps_front = True,
-            whole_component = True, **overrides)
-    return ComponentPolicy(name = name, kind = "aux", front_eligible = False,
-                           endcaps_front = False, **overrides)
+            whole_component = True)
+    else:
+        defaults = dict(name = name, kind = "aux", front_eligible = False,
+                        endcaps_front = False)
+    defaults.update(overrides)
+    return ComponentPolicy(**defaults)
 
 
 def _type_name(module) -> str:
@@ -191,7 +193,22 @@ def _module_bytes(module, stc = None) -> int:
     """
     if stc is not None and hasattr(stc, "get_tensor_sizes"):
         try:
-            return int(sum(stc.get_tensor_sizes(module.key)))
+            sizes = stc.get_tensor_sizes(module.key)
+            if sum(sizes):
+                return int(sum(sizes))
+            # HyperHead's tensors are underscore-joined (hc_head_fn) and a tied
+            # lm_head has no lm_head.* span; both need the module's own names.
+            compile_sizes = getattr(module, "get_compile_sizes", None)
+            if compile_sizes is not None:
+                sizes = compile_sizes(stc)
+                if sum(sizes):
+                    return int(sum(sizes))
+            alt = getattr(module, "alt_key", None)
+            if alt:
+                keys = alt if isinstance(alt, (list, tuple)) else (alt,)
+                total = sum(sum(stc.get_tensor_sizes(k)) for k in keys)
+                if total:
+                    return int(total)
         except Exception:                                    # noqa: BLE001 - fall back to a numel estimate
             pass
     try:
@@ -277,7 +294,6 @@ class ComponentMap:
     main_arch: str = ""
     front_arch: str | None = None
     reserve_bytes: dict[int, int] = field(default_factory = dict)
-    endcap_keys: tuple[str, ...] = ()
     front_endcap_keys: tuple[str, ...] = ()
     unknown_keys: tuple[str, ...] = ()
     size_bytes: int = 0
@@ -332,6 +348,7 @@ class ComponentMap:
         n_layers = len(layers)
         auto = front_layers in ("auto", -1) or (isinstance(front_layers, str) and front_layers.strip().lower() == "auto")
         front_layers = 0 if auto else int(front_layers)
+        endcaps = bool(endcaps and policy.endcaps_front)
         if policy.whole_component:
             # These components are endcaps in their entirety: they have no trunk
             # boundary of their own, so ENDCAPS OFF leaves them on the main device.
@@ -360,7 +377,6 @@ class ComponentMap:
             m.key for m in modules
             if getattr(m, "layer_idx", None) is None and is_front_endcap(m, policy)
         )
-        all_endcaps = tuple(m.key for m in modules if getattr(m, "layer_idx", None) is None)
         unknown = tuple(
             m.key for m in modules
             if getattr(m, "layer_idx", None) is None
@@ -381,7 +397,6 @@ class ComponentMap:
             main_arch = devices.main_arch,
             front_arch = devices.front_arch,
             reserve_bytes = reserve,
-            endcap_keys = all_endcaps,
             front_endcap_keys = front_endcaps,
             unknown_keys = unknown,
             size_bytes = int(size),
@@ -401,12 +416,6 @@ class ComponentMap:
     @property
     def enabled(self) -> bool:
         return self.front is not None and self.front_layers > 0
-
-    @property
-    def boundary(self) -> int | None:
-        if not self.enabled or self.layer_count == 0:
-            return None
-        return self.front_layers
 
     @property
     def used_devices(self) -> list[torch.device]:
@@ -441,12 +450,14 @@ class ComponentMap:
         if not self._endcap_allowed(module):
             # Unknown / auxiliary non-layer module: always safe, never moved implicitly.
             return self.main
+        if not self.policy_or_default.endcaps_front:
+            return self.main
         if self.endcaps:
             return self.front
         # ENDCAPS OFF: allowlisted prologue follows layer 0, epilogue follows the last layer.
         pos = self._positions.get(id(module), 0)
         if pos < self._first_layer_pos:
-            return self.front if self.front_layers > 0 else self.main
+            return self.front
         if pos > self._last_layer_pos:
             return self.front if self.front_layers >= self.layer_count else self.main
         return self.main
@@ -500,6 +511,7 @@ class ComponentMap:
         """Estimated front bytes for n text layers plus the policy's front endcaps."""
         n = max(0, min(n, self.layer_count))
         endcaps = self.endcaps if endcaps is None else bool(endcaps)
+        endcaps = endcaps and self.policy_or_default.endcaps_front
         cost = sum(self.layer_weight_bytes(i) for i in range(n))
         cost += sum(self.layer_cache_bytes(i) for i in range(n))
         if not endcaps:
@@ -553,6 +565,7 @@ class SplitPlan:
         front_reserve_gb: float = 1.2,
         main_reserve_gb: float = 0.0,
         preset: str = "auto",
+        auto_cap: int | None = None,
         logger = print,
     ):
         self.devices = devices
@@ -563,6 +576,7 @@ class SplitPlan:
         self.front_reserve_gb = float(front_reserve_gb)
         self.main_reserve_gb = float(main_reserve_gb)
         self.preset = (preset or "auto").strip().lower()
+        self.auto_cap = None if auto_cap is None else max(0, int(auto_cap))
         self.logger = logger
         self.maps: dict[str, ComponentMap] = {}
         self._decls: dict[str, tuple] = {}
@@ -622,6 +636,8 @@ class SplitPlan:
         text = next((k for k, d in self._decls.items() if d[3].kind == "text"), None)
         if self.auto:
             n = self._auto_n(text)
+            if self.auto_cap is not None:
+                n = min(n, self.auto_cap)
             self.front_layers = n
             self.logger(f"[split] auto-N: {n} front layer(s) "
                         f"(budget {self._auto_budget() / GIB:.2f} GiB, "
@@ -642,7 +658,18 @@ class SplitPlan:
         return self
 
     def apply_policies(self) -> None:
-        """Apply (and log) every adapter-declared unsafe env lever."""
+        """Apply (and log) the named preset and every adapter-declared unsafe env lever."""
+        if self.preset not in ("auto", "none"):
+            from .serve_split import SPLIT_PRESETS
+            preset = SPLIT_PRESETS.get(self.preset)
+            if preset is None:
+                raise ValueError(f"unknown split preset {self.preset!r}; choose one of {sorted(SPLIT_PRESETS)}")
+            for key, value in preset.items():
+                old = os.environ.get(key)
+                if old != value:
+                    self.logger(f"[split] preset {self.preset}: {key}={value}"
+                                + (f" (was {old})" if old is not None else ""))
+                os.environ[key] = value
         for name, cmap in self.maps.items():
             for key, value in cmap.policy_or_default.unsafe_env:
                 old = os.environ.get(key)
@@ -767,7 +794,8 @@ class SplitPlan:
             for key, rl in list(getattr(cache, "recurrent_layers", {}).items()):
                 idx = key[0] if isinstance(key, tuple) else key
                 expected = self._expected_layer_device(cmap, idx)
-                actual = getattr(getattr(rl, "attention", None), "device", None)
+                actual = (getattr(rl, "device", None) or
+                          getattr(getattr(rl, "module", None), "device", None))
                 if actual is not None and expected is not None and torch.device(actual) != torch.device(expected):
                     bad.append(f"recurrent layer {idx}: {actual} != {expected}")
             if bad:
@@ -847,7 +875,8 @@ def _cache_bytes(cache) -> dict[torch.device, int]:
         except Exception:                                    # noqa: BLE001 - a state type without a byte count
             pass
     for rl in list(getattr(cache, "recurrent_layers", {}).values()):
-        dev = getattr(getattr(rl, "attention", None), "device", None)
+        dev = (getattr(rl, "device", None) or
+               getattr(getattr(rl, "module", None), "device", None))
         if dev is None:
             continue
         try:

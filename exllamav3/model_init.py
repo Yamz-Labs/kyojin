@@ -340,6 +340,7 @@ def init(
     from .serve_split import parse_front_layers
     front_layers = parse_front_layers(os.environ.get("KYOJIN_FRONT_LAYERS", "0"))
     split_plan = None
+    draft_component = None
     front_map = draft_map = None
     if front_layers:
         if args.tensor_parallel or single_device or split is not None:
@@ -357,13 +358,26 @@ def init(
                                logger = lambda m: printp(not quiet, m))
         split_plan.add("text", model, config = config, cache = cache, load_order = 0)
         if draft_model is not None:
-            split_plan.add("mtp", draft_model, config = draft_config,
-                           cache = draft_cache, load_order = 1)
+            if use_mtp:
+                draft_component = "mtp"
+                split_plan.add("mtp", draft_model, config = draft_config,
+                               cache = draft_cache, load_order = 1)
+            else:
+                # A separate text drafter has its own trunk; do not treat it as a
+                # whole-component MTP and place it entirely on the front card.
+                from .device_map import ComponentPolicy
+                draft_component = "draft"
+                split_plan.add("draft", draft_model, config = draft_config,
+                               cache = draft_cache,
+                               policy = ComponentPolicy(name = "draft", kind = "aux",
+                                                        front_eligible = False,
+                                                        endcaps_front = False),
+                               front_layers = 0, load_order = 1)
         split_plan.build()
         split_plan.install_bridges()
         split_plan.engage_budget()
         front_map = split_plan.map("text")
-        draft_map = split_plan.map("mtp") if draft_model is not None else None
+        draft_map = split_plan.map(draft_component) if draft_component is not None else None
         if front_map is not None:
             printp(not quiet, f" -- layer split: {front_map.describe()}")
         if split_plan.auto:
@@ -423,9 +437,9 @@ def init(
     if split_plan is not None:
         split_plan.record_load("text", 0.0)
         if draft_model is not None:
-            split_plan.record_load("mtp", 0.0)
+            split_plan.record_load(draft_component, 0.0)
         split_plan.report(model, cache,
-                          extra=[("mtp", draft_model, draft_cache)] if draft_model is not None else [],
+                          extra=[(draft_component, draft_model, draft_cache)] if draft_model is not None else [],
                           ctx=getattr(args, "cache_size", None))
         split_plan.release_budget()
 

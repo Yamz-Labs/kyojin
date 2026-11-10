@@ -15,9 +15,9 @@ D2H leg to the H2D leg; a second event per ring slot lets the next hop reuse a p
 slot without overwriting data that the destination has not read yet.  The destination
 tensor is a fresh allocation, so the caller may keep using it after the slot cycles.
 
-``hop`` is the generic hidden-state crossing, ``hop_ids`` the loop-closure token-id
-variant, and ``hop_chunk`` the prefill-sized crossing.  All three share the same
-double-buffered channels (one channel per device pair, one slot ring per dtype).
+``hop`` is the generic hidden-state crossing and ``hop_chunk`` the prefill-sized
+crossing.  Both share the same double-buffered channels (one channel per device
+pair, one slot ring per dtype).
 
 Set ``KYOJIN_BRIDGE=0`` to fall back to ``util.device_copy.to_device``; the split then
 still runs, but every crossing is a blocking or direct copy.
@@ -80,10 +80,6 @@ class Bridge:
     def hop(self, t: torch.Tensor, dst: torch.device) -> torch.Tensor:
         """Move ``t`` to ``dst`` through pinned host staging, asynchronously."""
         return self._hop(t, dst, chunk = False)
-
-    def hop_ids(self, ids: torch.Tensor, dst: torch.device) -> torch.Tensor:
-        """The loop-closure variant: single-token / row ids cross the same bridge."""
-        return self._hop(ids, dst, chunk = False)
 
     def hop_chunk(self, t: torch.Tensor, dst: torch.device) -> torch.Tensor:
         """Prefill-sized crossing. Double-buffered like every hop; reported separately."""
@@ -179,9 +175,15 @@ def install_bridge(config, main: torch.device, front: torch.device | None) -> Br
     forward or per-block graph must not span the bridge (Phase 6 owns per-segment
     capture).
     """
-    config.split_active = True
+    split_active = front is not None and torch.device(main) != torch.device(front)
+    config.split_active = split_active
+    if not split_active:
+        return getattr(config, "device_bridge", None)
+    # Kernel-level fallbacks that must apply only in split mode (the gfx12 KDA
+    # determinant fallback) read this; split off stays on the main code path.
+    os.environ["KYOJIN_SPLIT_ACTIVE"] = "1"
     existing = getattr(config, "device_bridge", None)
-    if front is None or torch.device(main) == torch.device(front) or not bridge_enabled():
+    if not bridge_enabled():
         return existing
     if existing is not None and existing.pair == (torch.device(main), torch.device(front)):
         return existing

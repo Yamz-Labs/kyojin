@@ -25,6 +25,14 @@ import sys
 import time
 
 
+# Kept in sync with exllamav3/serve_split.py:GRAPH_ENV_OFF; the consistency test
+# asserts the key sets match so a new graph flag cannot silently bypass this gate.
+GRAPH_ENV_OFF = (
+    "EXL3_BLOCK_GRAPH", "EXL3_BLOCK_GRAPH_MLA", "EXL3_BLOCK_GRAPH_VERIFY",
+    "EXL3_BLOCK_GRAPH_DRAFT", "EXL3_BLOCK_GRAPH_ATTN", "EXL3_BLOCK_GRAPH_DEC_MOE",
+    "EXL3_CUDA_GRAPH", "EXL3_HIP_GRAPH",
+)
+
 PROMPTS = [
     "What is the capital of France? Answer in one sentence.",
     "Write a Python function that reverses a linked list, with comments.",
@@ -52,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("-m", "--model", default="/data/models/NicSir--GLM-5.3-Flash-EXL3-2.72bpw")
     p.add_argument("--baseline", action="store_true", help="single device (cuda:0), no layer split")
-    p.add_argument("--front-layers", type=int, default=6)
+    p.add_argument("--front-layers", type=int, default=None)
     p.add_argument("--front-device", default="auto")
     p.add_argument("--endcaps", choices=("on", "off"), default="on")
     p.add_argument("--front-reserve-gb", type=float, default=1.2)
@@ -70,15 +78,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compare", nargs=2, metavar=("BASE", "SPLIT"),
                    help="compare two saved runs: prompt ids and decode numbers")
     p.add_argument("--no-perf", action="store_true", help="skip the 3 decode timing prompts")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.front_layers is None:
+        # N=6 is measured to OOM the 16 GiB front above 65K (gfx1201 KDA workspace).
+        args.front_layers = 5 if args.max_ctx > 65536 else 6
+    return args
 
 
 def configure_env(args: argparse.Namespace) -> None:
     """Set everything exllamav3 reads at import time, before the first import."""
     if args.no_graphs or not args.baseline:
-        for k in ("EXL3_BLOCK_GRAPH", "EXL3_BLOCK_GRAPH_MLA", "EXL3_BLOCK_GRAPH_VERIFY",
-                  "EXL3_BLOCK_GRAPH_DRAFT", "EXL3_BLOCK_GRAPH_ATTN", "EXL3_BLOCK_GRAPH_DEC_MOE",
-                  "EXL3_CUDA_GRAPH", "EXL3_HIP_GRAPH"):
+        for k in GRAPH_ENV_OFF:
             os.environ[k] = "0"
     os.environ.setdefault("EXL3_MOE_CFG", "2")
     os.environ.setdefault("EXL3_HIP_PREFILL_MIN_ROWS", "2")
@@ -180,19 +190,22 @@ def main() -> None:
     cache = Cache(model, max_num_tokens = args.max_ctx + 4096, max_history = max_history,
                   max_batch_size = 1, **qkw)
 
-    devices = None
+    plan = None
     text_map = None
     if not args.baseline:
-        from exllamav3.device_map import LayerDeviceMap, resolve_devices
+        from exllamav3.device_map import SplitPlan, resolve_devices
         devices = resolve_devices(args.front_device)
-        text_map = LayerDeviceMap.from_model(
-            model, args.front_layers, args.endcaps == "on", devices,
-            component = "text", front_reserve_gb = args.front_reserve_gb,
+        plan = SplitPlan(
+            devices, endcaps = args.endcaps == "on", front_layers = args.front_layers,
+            front_reserve_gb = 0.0 if args.no_budget else args.front_reserve_gb,
             main_reserve_gb = args.main_reserve_gb)
-        if args.no_budget:
-            text_map.reserve_bytes.clear()
-        if args.front_layers > 0 and not text_map.enabled:
+        plan.add("text", model, config = config, cache = cache, load_order = 0)
+        plan.build()
+        text_map = plan.map("text")
+        if args.front_layers > 0 and (text_map is None or not text_map.enabled):
             raise SystemExit("split map not enabled (no front device)")
+        plan.install_bridges()
+        plan.engage_budget()
 
     t0 = time.perf_counter()
     if text_map is not None:
@@ -200,6 +213,8 @@ def main() -> None:
     else:
         model.load(device = "cuda:0", progressbar = True)
     load_s = time.perf_counter() - t0
+    if plan is not None:
+        plan.record_load("text", load_s)
 
     draft = draft_cache = None
     if args.num_draft > 0:
@@ -207,12 +222,10 @@ def main() -> None:
         draft_cache = Cache(draft, max_num_tokens = args.max_ctx + 4096, max_history = max_history,
                             max_batch_size = 1, **qkw)
         t1 = time.perf_counter()
-        if text_map is not None:
-            draft_map = LayerDeviceMap.from_model(
-                draft, 0, args.endcaps == "on", devices,
-                component = "mtp", front_reserve_gb = args.front_reserve_gb)
-            draft_map.reserve_bytes.clear()
-            draft.load(device_map = draft_map, progressbar = True, max_chunk_size = 4096)
+        if plan is not None:
+            plan.add("mtp", draft, config = config, cache = draft_cache, load_order = 1)
+            draft.load(device_map = plan.map("mtp"), progressbar = True, max_chunk_size = 4096)
+            plan.record_load("mtp", time.perf_counter() - t1)
         else:
             draft.load(device = "cuda:0", progressbar = True)
         print(f"[eval] drafter loaded in {time.perf_counter() - t1:.1f} s", flush = True)
@@ -221,19 +234,23 @@ def main() -> None:
     if not args.no_vision:
         try:
             vision = Model.from_config(config, component = "vision")
-            vdev = (devices.front if text_map is not None and args.endcaps == "on"
-                    else torch.device("cuda:0"))
-            vision.load(device = vdev, progressbar = True)
+            if plan is not None:
+                plan.add("vision", vision, config = config, load_order = 2)
+                t1 = time.perf_counter()
+                vision.load(device_map = plan.map("vision"), progressbar = True)
+                plan.record_load("vision", time.perf_counter() - t1)
+            else:
+                vision.load(device = "cuda:0", progressbar = True)
         except Exception as exc:                    # noqa: BLE001
             print(f"[eval] vision not loaded: {type(exc).__name__}: {exc}", flush = True)
             vision = None
 
-    if text_map is not None:
-        from exllamav3.device_map import print_split_table
-        print_split_table(model, cache, text_map,
-                          extra = [("mtp", draft, draft_cache)] if draft is not None else [],
-                          ctx = args.max_ctx)
-        text_map.release_budget()
+    if plan is not None:
+        extra = [("mtp", draft, draft_cache)] if draft is not None else []
+        if vision is not None:
+            extra.append(("vision", vision, None))
+        plan.report(model, cache, extra = extra, ctx = args.max_ctx)
+        plan.release_budget()
 
     GM.MTP_FUSE_CATCHUP = 2
     gen = Generator(model = model, cache = cache, tokenizer = tokenizer,

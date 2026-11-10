@@ -204,7 +204,7 @@ def chunk_kda(
     # or if hipcc/module load fails; default 3, step 12). Chunks under 512 tokens
     # keep the fla chain: the one-program-per-head fused loop is ~0.14 ms slower there (T=255 sweep).
     fuse = int(os.environ.get("EXL3_KDA_FUSE", "3")) if K <= 128 and chunk_size == 64 and T >= 512 else 0
-    if fuse and not _fused_output_stable(q.device):
+    if fuse and os.environ.get("KYOJIN_SPLIT_ACTIVE", "0") != "0" and not _fused_output_stable(q.device):
         # A layer split runs KDA on both a gfx1151 main and a gfx12 front. The fused output
         # path is not run-to-run deterministic on gfx12, and the gfx11.5 HIP kernel cannot be
         # JIT-built there (kda_fused_h_hip.supported() declines, so _hip_ok already fell back

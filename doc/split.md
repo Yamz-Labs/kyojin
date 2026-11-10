@@ -62,9 +62,10 @@ interface; combining it with the new map must error.
   cache layer must sit on the device its owning layer was mapped to.
 - Auto-N is a Stage 1 skeleton: it uses actual safetensors bytes for each layer, the
   cache/recurrent sizes for layers below N, the front endcap bytes and the reserve, with
-  a `KYOJIN_AUTON_SAFETY_GB` margin (default 0.25) for allocator slack. Components declared
-  after the target (GLM's MTP/vision) are not yet subtracted before the target load;
-  Stage 5 owns cross-component/pre-load auto sizing.
+  a `KYOJIN_AUTON_SAFETY_GB` margin (default 0.25) for allocator slack. GLM caps auto at
+  five layers for `-c > 65536` until the gfx1201 KDA prefill workspace is part of the
+  budget. Components declared after the target (GLM's MTP/vision) are not yet subtracted
+  before the target load; Stage 5 owns cross-component/pre-load auto sizing.
 - JIT HIP loaders compile per (device, defines) and launch on the tensor's device stream;
   `kda_fused_h`, `gdn_*`, `gr_mix` and `ple_hip` are gfx11.5 WMMA/CI paths and refuse other
   archs. gfx12 runs the deterministic fla chain (`EXL3_KDA_FUSE=0` forced there) — see PR C

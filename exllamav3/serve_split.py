@@ -194,12 +194,6 @@ class SplitController:
         plan.install_bridges()
         return cmap
 
-    def register_config(self, config) -> None:
-        plan = self.build_plan()
-        if plan is not None:
-            plan.register_config(config)
-            plan.install_bridges()
-
     def build(self) -> None:
         if self.plan is not None:
             self.plan.build()
@@ -228,11 +222,6 @@ class SplitController:
         model.load(device_map = cmap, **load_kwargs)
         self.plan.record_load(component, time.perf_counter() - t0)
         return True
-
-    def register_extra_components(self, components: list[tuple[str, object, object, object]]) -> None:
-        """Declare ``(name, model, config, cache)`` after the target plan exists."""
-        for name, model, config, cache in components:
-            self.add(name, model, config = config, cache = cache)
 
     def finalize(self, model, cache, extra: list[tuple[str, object, object]] | None = None,
                  ctx: int | None = None) -> None:

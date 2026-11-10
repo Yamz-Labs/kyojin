@@ -94,6 +94,15 @@ class FakeCacheLayer:
         return self.size
 
 
+class FakeRecurrent:
+    def __init__(self, size, device):
+        self.size = size
+        self.device = device
+
+    def storage_size(self):
+        return self.size
+
+
 class FakeCache:
     def __init__(self, per_layer = 0):
         self.layers = {}
@@ -192,6 +201,56 @@ def test_whole_component_places_every_module_front_only_with_endcaps(split_modul
     assert all(off.device_for(m) == torch.device("cuda", 0) for m in mtp.modules)
 
 
+def test_module_bytes_uses_compile_or_alt_key_when_prefix_is_empty(split_modules):
+    dm, _bridge, _split = split_modules
+    stc = FakeSTC({"embed_tokens": 456})
+    head = FakeModule("hc_head")
+    head.get_compile_sizes = lambda s: [123]
+    assert dm._module_bytes(head, stc) == 123
+    tied = FakeModule("lm_head")
+    tied.alt_key = "embed_tokens"
+    assert dm._module_bytes(tied, stc) == 456
+
+
+def test_policy_can_disable_endcap_front(split_modules):
+    dm, _bridge, _split = split_modules
+    model = _glm_model()
+    policy = dm.component_policy("text", endcaps_front = False)
+    cmap = dm.ComponentMap.from_model(model, 2, True, _devices(dm), component = "text", policy = policy)
+    devices = {m.key: cmap.device_for(m) for m in model.modules}
+    assert devices["hc_expand"] == torch.device("cuda", 0)
+    assert devices["model.language_model.norm"] == torch.device("cuda", 0)
+    assert devices["model.language_model.layers.0"] == torch.device("cuda", 1)
+
+
+def test_recurrent_placement_audit_reads_state_device(split_modules):
+    dm, _bridge, _split = split_modules
+    model = FakeModel([FakeModule("layer.0", layer_idx = 0)])
+    cache = FakeCache()
+    cache.recurrent_layers[(0, 0)] = FakeRecurrent(1024, torch.device("cuda", 0))
+    plan = dm.SplitPlan(_devices(dm), endcaps = True, front_layers = 1,
+                        logger = lambda *_a: None)
+    plan.add("text", model, cache = cache)
+    plan.build()
+    assert "text" in plan.audit_caches()
+
+    cache.recurrent_layers[(0, 0)] = FakeRecurrent(1024, torch.device("cuda", 1))
+    assert plan.audit_caches() == {}
+
+
+def test_auto_n_is_capped_for_long_context(split_modules, monkeypatch):
+    dm, _bridge, _split = split_modules
+    gib = dm.GIB
+    model = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
+    cfg = FakeConfig({f"layer.{i}": gib for i in range(4)})
+    monkeypatch.setattr(dm.torch.cuda, "get_device_properties", lambda dev: FakeProps(16 * gib))
+    plan = dm.SplitPlan(_devices(dm), endcaps = True, front_layers = "auto",
+                        front_reserve_gb = 1.0, auto_cap = 2, logger = lambda *_a: None)
+    plan.add("text", model, config = cfg)
+    plan.build()
+    assert plan.front_layers == 2
+
+
 def test_auto_n_uses_actual_bytes_cache_and_reserve(split_modules, monkeypatch):
     dm, _bridge, _split = split_modules
     gib = dm.GIB
@@ -246,6 +305,7 @@ def test_front_reserve_is_a_slab_not_an_allocator_cap(split_modules, monkeypatch
 def test_bridge_installs_per_config_and_is_reused(split_modules, monkeypatch):
     dm, bridge_mod, _split = split_modules
     monkeypatch.setenv("KYOJIN_BRIDGE", "1")
+    monkeypatch.setenv("KYOJIN_SPLIT_ACTIVE", "0")
     main, front = torch.device("cuda", 0), torch.device("cuda", 1)
     cfg = SimpleNamespace()
     draft_cfg = SimpleNamespace()
@@ -258,6 +318,48 @@ def test_bridge_installs_per_config_and_is_reused(split_modules, monkeypatch):
     assert b1 is b2
     assert b1 is not b3
     assert b1.pair == (main, front)
+    assert os.environ["KYOJIN_SPLIT_ACTIVE"] == "1"
+
+    single = SimpleNamespace()
+    assert bridge_mod.install_bridge(single, main, None) is None
+    assert single.split_active is False
+
+
+def test_named_preset_is_applied_by_the_plan(split_modules, monkeypatch):
+    dm, _bridge, split = split_modules
+    monkeypatch.setenv("EXL3_TEST_PRESET", "0")
+    old = split.SPLIT_PRESETS.get("glm", {})
+    split.SPLIT_PRESETS["glm"] = {"EXL3_TEST_PRESET": "1"}
+    try:
+        plan = dm.SplitPlan(_devices(dm), endcaps = True, front_layers = 1,
+                            preset = "glm", logger = lambda *_a: None)
+        plan.add("text", _glm_model())
+        plan.build()
+        assert os.environ["EXL3_TEST_PRESET"] == "1"
+    finally:
+        split.SPLIT_PRESETS["glm"] = old
+
+
+def _load_split_eval():
+    path = ROOT / "tools" / "strix_halo" / "split_eval.py"
+    spec = importlib.util.spec_from_file_location("split_eval_harness", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_harness_graph_env_matches_shared_list(split_modules):
+    _dm, _bridge, split = split_modules
+    mod = _load_split_eval()
+    assert set(mod.GRAPH_ENV_OFF) == set(split.GRAPH_ENV_OFF)
+
+
+def test_harness_default_front_layers_depends_on_context(monkeypatch):
+    mod = _load_split_eval()
+    for ctx, expected in ((131072, 5), (65536, 6)):
+        monkeypatch.setattr(sys, "argv", ["split_eval.py", "--max-ctx", str(ctx)])
+        assert mod.parse_args().front_layers == expected
 
 
 def test_adapter_unsafe_env_is_applied_and_logged(split_modules, monkeypatch):
