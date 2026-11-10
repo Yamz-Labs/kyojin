@@ -79,10 +79,10 @@ class Model_LSMixin(ABC):
     ):
         """Load every top-level module straight to the device the map assigns it.
 
-        No autosplit measuring forwards: the boundary is explicit. The front reserve caps
-        the small card while its own segment loads, then is released at the first main
-        module: on ROCm the memory-fraction cap perturbs the allocator process-wide, and
-        the main segment must not inherit it. The caller releases whatever remains after
+        No autosplit measuring forwards: the boundary is explicit. The front reserve is a
+        held device slab while its segment loads, then is dropped at the first main module
+        (the freed block stays available to the workspace without changing the allocator's
+        policy or the main segment's numerics). The caller releases whatever remains after
         the last component.
         """
         device_map.engage_budget()

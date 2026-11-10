@@ -57,7 +57,7 @@ GFX115 = arch_list.GFX115_ARCHS
 # name -> (module, load(device), arch gate)
 CASES = {
     "gr_mix_hip": (gr_mix, lambda m, d: m._load("", d), GFX115),
-    "ple_hip": (ple, lambda m, d: m._load(d), None),
+    "ple_hip": (ple, lambda m, d: m._load(d), GFX115),
     "qsa_prefill_hip": (qsa, lambda m, d: m._load("", d), GFX115),
     "ds41_pf": (ds41_pf, lambda m, d: m._fn("ds41_gather_sum", d), GFX115),
     "dsv41_hip": (dsv41_hip, lambda m, d: m._load(d), None),
@@ -69,7 +69,7 @@ CASES = {
     "kda_fused_h_hip": (kda_fused, lambda m, d: m._load("", d), GFX115),
     "kda_hf_hip": (kda_hf, lambda m, d: m._load("", d), GFX115),
 }
-SUPPORTED = {"gdn_hf", "gdn_fused_h_hip", "kda_fused_h_hip", "kda_hf_hip"}
+SUPPORTED = {"gr_mix_hip", "ple_hip", "gdn_hf", "gdn_fused_h_hip", "kda_fused_h_hip", "kda_hf_hip"}
 
 
 class FakeCuda:

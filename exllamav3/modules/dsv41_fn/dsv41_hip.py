@@ -82,8 +82,9 @@ def _go(name, g, block, params, device=None):
     if emu:
         return emu(name, g, block, params)
     fn = _load(device)[name]
+    select_device(device)
     r = _state["lib"].hipModuleLaunchKernel(fn, g[0], g[1], g[2], block, 1, 1, 0,
-                                            torch.cuda.current_stream().cuda_stream, params, None)
+                                            torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0:
         raise RuntimeError(f"dsv41_hip: launch of {name} failed ({r})")
 

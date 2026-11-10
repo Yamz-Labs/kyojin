@@ -337,24 +337,37 @@ def init(
 
     # Explicit contiguous layer split. GLM serve has its own CLI; this env-only path
     # keeps examples/chat.py and the eval tools able to exercise the split.
-    front_layers = int(os.environ.get("KYOJIN_FRONT_LAYERS", "0") or 0)
+    from .serve_split import parse_front_layers
+    front_layers = parse_front_layers(os.environ.get("KYOJIN_FRONT_LAYERS", "0"))
+    split_plan = None
     front_map = draft_map = None
     if front_layers:
         if args.tensor_parallel or single_device or split is not None:
             raise ValueError("KYOJIN_FRONT_LAYERS cannot be combined with tensor parallel, "
                              "EXL3_LOAD_DEVICE or --gpu_split")
-        from .device_map import LayerDeviceMap, print_split_table, resolve_devices
+        if os.environ.get("EXL3_LOAD_SPLIT"):
+            raise ValueError("KYOJIN_FRONT_LAYERS cannot be combined with the legacy EXL3_LOAD_SPLIT budget")
+        from .device_map import SplitPlan, resolve_devices
         devices = resolve_devices(os.environ.get("KYOJIN_FRONT_DEVICE"))
         endcaps = os.environ.get("KYOJIN_ENDCAPS", "1") != "0"
         reserve = float(os.environ.get("KYOJIN_FRONT_RESERVE_GB", "1.2"))
-        front_map = LayerDeviceMap.from_model(model, front_layers, endcaps, devices,
-                                              component="text", front_reserve_gb=reserve)
+        split_plan = SplitPlan(devices, endcaps = endcaps, front_layers = front_layers,
+                               front_reserve_gb = reserve,
+                               preset = os.environ.get("KYOJIN_SPLIT_PRESET", "auto"),
+                               logger = lambda m: printp(not quiet, m))
+        split_plan.add("text", model, config = config, cache = cache, load_order = 0)
         if draft_model is not None:
-            draft_map = LayerDeviceMap.from_model(draft_model, 0, endcaps, devices,
-                                                  component="mtp", front_reserve_gb=reserve)
-            draft_map.reserve_bytes.clear()
-        front_map.engage_budget()
-        printp(not quiet, f" -- layer split: {front_map.describe()}")
+            split_plan.add("mtp", draft_model, config = draft_config,
+                           cache = draft_cache, load_order = 1)
+        split_plan.build()
+        split_plan.install_bridges()
+        split_plan.engage_budget()
+        front_map = split_plan.map("text")
+        draft_map = split_plan.map("mtp") if draft_model is not None else None
+        if front_map is not None:
+            printp(not quiet, f" -- layer split: {front_map.describe()}")
+        if split_plan.auto:
+            printp(not quiet, f" -- layer split: auto chose {front_map.front_layers} front layer(s)")
 
     # Parallelism options
     tp_options = {
@@ -407,11 +420,14 @@ def init(
         **kwargs
     )
 
-    if front_map is not None:
-        print_split_table(model, cache, front_map,
+    if split_plan is not None:
+        split_plan.record_load("text", 0.0)
+        if draft_model is not None:
+            split_plan.record_load("mtp", 0.0)
+        split_plan.report(model, cache,
                           extra=[("mtp", draft_model, draft_cache)] if draft_model is not None else [],
                           ctx=getattr(args, "cache_size", None))
-        front_map.release_budget()
+        split_plan.release_budget()
 
     # Load tokenizer
     if load_tokenizer:

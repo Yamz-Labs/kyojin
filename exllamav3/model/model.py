@@ -504,6 +504,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             assert device is None and not reserve_per_device and not use_per_device, \
                 "device_map cannot be combined with device/reserve_per_device/use_per_device."
             assert not tensor_p, "device_map cannot be combined with tensor_p."
+            assert not os.environ.get("EXL3_LOAD_SPLIT"), \
+                "device_map cannot be combined with the legacy EXL3_LOAD_SPLIT budget"
             self._load_mapped(progressbar, device_map, self.config, self.modules, verbose,
                               callback, max_chunk_size)
             self.output_device = self.modules[-1].device

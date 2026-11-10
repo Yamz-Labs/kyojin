@@ -1,9 +1,10 @@
 # Layer-split support matrix
 
 What the contiguous layer split (`exllamav3/device_map.py`, `exllamav3/bridge.py`,
-`Model.load(device_map=...)`) can place today, per model family and per serve flavor.
-Status as of the Stage 0 rebase (2026-11-10): GLM is measured on the Strix Halo / 9070 box;
-Qwen and DSV4 entries are code inventories, not load-tested.
+`exllamav3/serve_split.py`, `Model.load(device_map=...)`) can place today, per model family
+and per serve flavor. Stage 1 (2026-11-10): the core is policy-driven, GLM is the first
+adapter, and the front reserve is a layout-neutral slab; GLM's Phase 4 gate replay is the
+measured baseline. Qwen and DSV4 entries remain code inventories, not load-tested.
 
 Legend — placement: **front** (mapped to the front eGPU), **main** (mapped to the main GPU),
 **cpu**, **host** (never enters the map: CPU/streamed by design). Stage links point at the
@@ -13,19 +14,22 @@ roadmap stage that must finish before that row is claimable.
 
 | Component | Config | Placement | Notes |
 | --- | --- | --- | --- |
-| text (`Model.from_config`) | shared | layers 0..N-1 front, N..44 main; endcaps per flag | measured N=4, N=6 at `-c 65536`; N=5 is the long-context setting until the gfx12 KDA kernel lands |
-| mtp (`component="mtp"`) | shared | all front when `--endcaps on`, else main | separate `LayerDeviceMap` (no own trunk), reserve owned by the text map |
-| vision (`component="vision"`) | shared | front when `--endcaps on`, else main | loaded with a plain `device=` argument; no bridge interaction |
+| text (`Model.from_config`) | shared | layers 0..N-1 front, N..44 main; endcaps per allowlist | measured N=4, N=6 at `-c 65536`; N=5 is the long-context setting until the gfx12 KDA kernel lands |
+| mtp (`component="mtp"`) | shared | all front when `--endcaps on`, else main | `ComponentPolicy(whole_component)` (no own trunk), reserve owned by the text map |
+| vision (`component="vision"`) | shared | all front when `--endcaps on`, else main | declared as a whole component; the same bridge/config covers it |
 | `embed_tokens` | shared | cpu (`prefer_cpu` cap) | stays host-side by design |
-| KV cache (TQ 6-bit) | built per model/cache | each cache layer follows its block | measured 0.62 GiB main / 0.12 GiB front at 65K |
-| bridge | shared config | installed by `_load_mapped` for all three components | one `Bridge` per config; split_active defuses graphs |
+| text endcaps | shared | `hc_expand`/`hc_head`/norm/lm_head front per allowlist; unknown non-layer modules main | allowlist is class/key based (`TEXT_ENDCAP_TYPES`/`TEXT_ENDCAP_SUFFIXES`), no per-model placement in core |
+| KV/recurrent cache | built per model/cache | each cache/recurrent layer follows its block | measured 0.62 GiB main / 0.12 GiB front at 65K; placement audit after load |
+| bridge | shared config | installed by `SplitPlan.install_bridges` for every config | one `Bridge` per config; split_active defuses graphs |
 
 Gate status (Stage 0 replay): N=6 65K load with MTP+vision front 13.68/13.94 GiB, plain split
-run-to-run deterministic; results appended in `docs-notes/split-log.md`.
+run-to-run deterministic; results appended in `docs-notes/split-log.md`. Stage 1 core changes
+are CPU-contract-tested and the GPU gate (N=4/6 load, plain determinism, 120K needle N=5,
+split-off regression) is the next checkpoint run.
 
 Known blockers: gfx12 fused KDA kernel (separate PR), MTP cross-device acceptance/determinism,
-endcaps currently moves every non-layer module to the front (GLM has no ngram/PLE/engram, so it
-never showed; the universal core replaces this with an allowlist — Stage 1).
+auto-N not yet subtracting components declared after the target (Stage 5), 128K determinism
+must be re-verified with the slab reserve on the box.
 
 ## Code inventory — Qwen3.8-Flash-Next (`tools/qwen/serve.py`)
 

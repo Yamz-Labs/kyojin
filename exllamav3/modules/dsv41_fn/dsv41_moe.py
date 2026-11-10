@@ -75,6 +75,7 @@ class _L:
 
     def __init__(self, name, grid, block, args):
         device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+        self.device = device
         self.fn = _load(device)[name]
         self.grid, self.block = tuple(grid) + (1,) * (3 - len(grid)), block
         self._keep = [a for a in args if isinstance(a, torch.Tensor)]
@@ -85,6 +86,7 @@ class _L:
         return self
 
     def __call__(self, stream):
+        select_device(self.device)
         r = _state["lib"].hipModuleLaunchKernel(self.fn, self.grid[0], self.grid[1], self.grid[2], self.block, 1, 1, 0,
                                                 stream, self.params, None)
         if r != 0:

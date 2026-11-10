@@ -25,6 +25,11 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
+# Shared split helper: pure stdlib at import, it loads exllamav3 lazily after SPEED_ENV.
+from kyojin_serve_split import (  # noqa: E402
+    SplitController, SplitSettings, add_split_arguments, apply_split_env, parse_front_layers,
+    settings_from_namespace,
+)
 from loopguard import AnswerTap, loop_guard_default  # noqa: E402  (answer-phase loop guard shared with the Qwen server)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
@@ -678,8 +683,9 @@ class ResidentEngine:
                  image_cache_dir: str | None = IMAGE_CACHE_DIR_DEFAULT,
                  image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB,
                  image_cache_dir_lock_s: float = IMAGE_CACHE_DIR_LOCK_S,
-                 front_layers: int = 0, front_device: str | None = None,
-                 endcaps: bool = True, front_reserve_gb: float = 1.2):
+                 front_layers: int | str = 0, front_device: str | None = None,
+                 endcaps: bool = True, front_reserve_gb: float = 1.2,
+                 split_settings: SplitSettings | None = None):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -709,28 +715,29 @@ class ResidentEngine:
         self.max_draft = num_draft
         self.config = Config.from_directory(model_path)
         self.model = Model.from_config(self.config)
-        self.front_layers = max(0, int(front_layers or 0))
-        self.front_device_arg = front_device
-        self.endcaps = bool(endcaps)
-        self.front_reserve_gb = float(front_reserve_gb)
+        if split_settings is None:
+            split_settings = SplitSettings(
+                front_layers = parse_front_layers(front_layers),
+                front_device = front_device or "auto",
+                endcaps = bool(endcaps), front_reserve_gb = float(front_reserve_gb))
+        self.split = SplitController(split_settings, logger = lambda m: print(f"serve: {m}", flush=True))
+        self.front_layers = split_settings.front_layers
+        self.endcaps = split_settings.endcaps
+        self.front_reserve_gb = split_settings.front_reserve_gb
         self.split_map = None
-        self.split_devices = None
-        if self.front_layers:
-            from exllamav3.device_map import resolve_devices, LayerDeviceMap
-            self.split_devices = resolve_devices(front_device)
-            self.split_map = LayerDeviceMap.from_model(
-                self.model, self.front_layers, self.endcaps, self.split_devices,
-                component="text", front_reserve_gb=self.front_reserve_gb)
-            if not self.split_map.enabled:
+        self.split_devices = self.split.devices
+        if self.split.enabled:
+            plan = self.split.build_plan()
+            if plan is None or plan.devices.front is None:
                 raise ValueError("layer split requested but no usable front device")
-            print(f"serve: layer split: {self.split_map.describe()}; "
-                  f"main {self.split_devices.main} ({self.split_devices.main_arch}), "
-                  f"front {self.split_devices.front} ({self.split_devices.front_arch}), "
-                  f"front reserve {self.front_reserve_gb:.2f} GiB", flush=True)
-            if self.front_layers > 5 and max_ctx > 65536:
+            print(f"serve: layer split: {split_settings.describe()}; "
+                  f"main {plan.devices.main} ({plan.devices.main_arch}), "
+                  f"front {plan.devices.front} ({plan.devices.front_arch})", flush=True)
+            if isinstance(self.front_layers, int) and self.front_layers > 5 and max_ctx > 65536:
                 print("serve: warning: front layers > 5 at -c > 65536 is measured to OOM the 16 GB "
                       "front on long prefill (gfx1201 KDA fallback workspace); use "
-                      "--front-layers 5 for long-context split runs until auto-sizing lands", flush=True)
+                      "--front-layers 5 for long-context split runs until auto sizing accounts for "
+                      "the KDA workspace", flush=True)
         self.tokenizer = Tokenizer.from_config(self.config)
         if os.environ.get("KYO_TOKCACHE", "8") == "0":
             self.pec = None
@@ -770,8 +777,16 @@ class ResidentEngine:
         kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
         jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
         startup_health.stage("target weights")
-        if self.split_map is not None:
-            self.model.load(device_map=self.split_map, progressbar=False,
+        if self.split.enabled:
+            # Auto-N needs the cache sizes and the target's actual bytes; the cache exists now.
+            self.split_map = self.split.add("text", self.model, config=self.config,
+                                            cache=self.cache, load_order=0)
+            self.split.build()
+            self.split_map = self.split.map("text")
+            if self.split_map is not None and not self.split_map.enabled:
+                raise ValueError("layer split requested but no usable front device (or auto-N found no layer that fits)")
+            self.split.engage_budget()
+            self.split.load("text", self.model, progressbar=False,
                             callback=startup_health.load_callback(), max_chunk_size=4096)
         else:
             self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
@@ -781,14 +796,11 @@ class ResidentEngine:
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
                                      max_history=max_history, max_batch_size=slots, **qkw)
             startup_health.stage("drafter weights")
-            if self.split_map is not None:
-                from exllamav3.device_map import LayerDeviceMap
-                self.draft_map = LayerDeviceMap.from_model(
-                    self.draft_model, 0, self.endcaps, self.split_devices,
-                    component="mtp", front_reserve_gb=self.front_reserve_gb)
-                self.draft_map.reserve_bytes.clear()   # the target map owns the budget
-                self.draft_model.load(device_map=self.draft_map, progressbar=False,
-                                      callback=startup_health.load_callback(), max_chunk_size=4096)
+            if self.split.enabled:
+                self.draft_map = self.split.add("mtp", self.draft_model, config=self.config,
+                                                cache=self.draft_cache, load_order=1)
+                self.split.load("mtp", self.draft_model, progressbar=False,
+                                callback=startup_health.load_callback(), max_chunk_size=4096)
             else:
                 self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         else:   # --num-draft 0: plain decode, no drafter
@@ -804,25 +816,18 @@ class ResidentEngine:
                                         getattr(self.config, "vision_end_token_id", 0),
                                         env_fingerprint=self.env_fingerprint)
         if vision:
-            self._vision_device = (self.split_devices.front
-                                   if self.split_map is not None and self.endcaps
+            self._vision_device = (self.split.devices.front
+                                   if self.split.enabled and self.endcaps
                                    else torch.device("cuda:0"))
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
-        if self.split_map is not None:
-            from exllamav3.device_map import print_split_table
+        if self.split.enabled:
             extra = []
             if self.draft_model is not None:
                 extra.append(("mtp", self.draft_model, self.draft_cache))
             if self.vision is not None:
                 extra.append(("vision", self.vision, None))
-            print_split_table(self.model, self.cache, self.split_map, extra=extra, ctx=ctx)
-            bridge = getattr(self.config, "device_bridge", None)
-            if bridge is not None:
-                print(f"serve: {bridge.describe()}", flush=True)
-            else:
-                print("serve: layer split: bridge disabled (KYOJIN_BRIDGE=0); crossings use to_device()", flush=True)
-            self.split_map.release_budget()
+            self.split.finalize(self.model, self.cache, extra=extra, ctx=ctx)
         self.vocab_size = int(self.config.vocab_size or self.tokenizer.actual_vocab_size)   # rows of the embedding table
         self.Generator = Generator
         # The loaded model and tokenizer are 1.1 M Python objects and every later gc.collect() walks them all: the Generator
@@ -934,7 +939,12 @@ class ResidentEngine:
         try:
             startup_health.stage("vision tower")
             tower = Model.from_config(self.config, component="vision")
-            tower.load(device=self._vision_device, progressbar=False, callback=startup_health.load_callback())
+            if self.split.enabled:
+                self.split.add("vision", tower, config=self.config, load_order=2)
+                self.split.load("vision", tower, progressbar=False,
+                                callback=startup_health.load_callback())
+            else:
+                tower.load(device=self._vision_device, progressbar=False, callback=startup_health.load_callback())
         except Exception as exc:                                      # noqa: BLE001
             print(f"serve: vision tower not loaded ({type(exc).__name__}: {exc}); image input disabled", flush=True)
             return None
@@ -2189,17 +2199,7 @@ def main() -> None:
     parser.add_argument("--sessions", type=int, default=1,
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
-    parser.add_argument("--front-layers", type=int, default=None,
-                        help="contiguous layer split: first N transformer layers on the front (eGPU) device; "
-                             "0 = off (default: KYOJIN_FRONT_LAYERS, else 0)")
-    parser.add_argument("--front-device", default=None,
-                        help="front device for the layer split: auto, gfx1201, cuda:N or a UUID/name substring "
-                             "(default: KYOJIN_FRONT_DEVICE, else auto)")
-    parser.add_argument("--endcaps", choices=("on", "off"), default=None,
-                        help="with a layer split, keep embedding/norm/lm_head/MTP/vision on the front device "
-                             "(default: KYOJIN_ENDCAPS, else on)")
-    parser.add_argument("--front-reserve-gb", type=float, default=None,
-                        help="VRAM to leave free on the front device for workspace (default: KYOJIN_FRONT_RESERVE_GB, else 1.2)")
+    add_split_arguments(parser)
     parser.add_argument("--kv-mode", choices=("tq", "quant", "fp16"), default="tq",
                         help="latent cache format. tq (default): TurboQuant, rotated Lloyd-Max codes + one scale per token, 6 bits unless --cache-bits says otherwise "
                              "(KL below the quant cache, same decode speed); quant: packed per-32 group scales (--cache-bits 4/5/6/8, 8 if none given); fp16: the unpacked 16-bit pages")
@@ -2245,30 +2245,9 @@ def main() -> None:
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
-    front_layers = args.front_layers if args.front_layers is not None else int(os.environ.get("KYOJIN_FRONT_LAYERS", "0") or 0)
-    front_device = args.front_device or os.environ.get("KYOJIN_FRONT_DEVICE") or "auto"
-    endcaps = (args.endcaps == "on") if args.endcaps is not None else os.environ.get("KYOJIN_ENDCAPS", "1") != "0"
-    front_reserve_gb = (args.front_reserve_gb if args.front_reserve_gb is not None
-                        else float(os.environ.get("KYOJIN_FRONT_RESERVE_GB", "1.2")))
-    if front_layers:
-        # Phase 4: split mode runs eager. A whole-forward graph cannot span the
-        # host-staged bridge between segments, and the per-block capture has no concept
-        # of a segment boundary yet. Per-segment capture is Phase 6.
-        forced = {
-            "EXL3_BLOCK_GRAPH": "0",
-            "EXL3_BLOCK_GRAPH_MLA": "0",
-            "EXL3_BLOCK_GRAPH_VERIFY": "0",
-            "EXL3_BLOCK_GRAPH_DRAFT": "0",
-            "EXL3_BLOCK_GRAPH_ATTN": "0",
-            "EXL3_BLOCK_GRAPH_DEC_MOE": "0",
-            "EXL3_CUDA_GRAPH": "0",
-            "EXL3_HIP_GRAPH": "0",
-        }
-        overridden = [f"{k}={os.environ[k]}" for k, v in forced.items()
-                      if os.environ.get(k) not in (None, "", v)]
-        os.environ.update(forced)
-        print("serve: layer split: graphs forced off for split mode (Phase 4; per-segment capture is Phase 6)"
-              + (f"; overrode {', '.join(overridden)}" if overridden else ""), flush=True)
+    split_settings = settings_from_namespace(args)
+    if split_settings.enabled:
+        apply_split_env(split_settings, logger=lambda m: print(f"serve: {m}", flush=True))
     if args.kv_mode == "fp16":
         args.cache_bits = 0
     elif args.cache_bits is None:
@@ -2329,8 +2308,7 @@ def main() -> None:
                               image_cache_format=args.image_cache_format,
                               image_cache_dir=args.image_cache_dir, image_cache_dir_max_gb=args.image_cache_dir_max_gb,
                               image_cache_dir_lock_s=args.image_cache_dir_lock_s,
-                              front_layers=front_layers, front_device=front_device,
-                              endcaps=endcaps, front_reserve_gb=front_reserve_gb)
+                              split_settings=split_settings)
         engine.row_budget = (5 if args.row_budget is None else args.row_budget) if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)
