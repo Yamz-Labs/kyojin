@@ -17,6 +17,7 @@ for _n in _PKGS:
         sys.modules[_n] = _m; _added.append(_n)
 try:
     gdn_hf = importlib.import_module("exllamav3.vendor.fla.hip.gdn_hf_hip")
+    arch_list = importlib.import_module("exllamav3.util.arch_list")
 finally:
     for _n in _added:
         sys.modules.pop(_n, None)
@@ -24,9 +25,9 @@ finally:
 
 @pytest.fixture(autouse=True)
 def _clean_state():
-    gdn_hf._supported.clear()
+    arch_list.reset_support_cache()
     yield
-    gdn_hf._supported.clear()
+    arch_list.reset_support_cache()
 
 
 def _dev(arch):

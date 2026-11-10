@@ -9,44 +9,18 @@
 import ctypes, hashlib, os, subprocess
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import GFX115_ARCHS, device_arch, device_supported, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gdn_hf.hip")
 _state = {}
 
-# gdn_hf.hip has only the RDNA3.5 (gfx11.5) WMMA path; gfx12 is refused before the
-# JIT so no compile is attempted (previously it tried the gfx11 builtin, failed, and
-# printed a warning before falling back to the Triton chain).
-_ARCHS = frozenset(("gfx1150", "gfx1151", "gfx1152"))
-_supported = {}     # device index -> bool, once per process
-
-
-def _device_index(device=None):
-    if device is None:
-        return torch.cuda.current_device()
-    if isinstance(device, torch.device):
-        return device.index if device.index is not None else torch.cuda.current_device()
-    return int(device)
-
-
-def _arch(device=None):
-    return torch.cuda.get_device_properties(_device_index(device)).gcnArchName.split(":")[0]
-
 
 def supported(device=None):
-    """True when this device's arch has the gdn_hf.hip gfx11.5 fragment path. Cached per device:
-    gdn_hf_ok runs once per GDN layer per prefill chunk, so re-probing get_device_properties there
-    is pure overhead (the arch cannot change after init)."""
+    """True when this device's arch has the gdn_hf.hip gfx11.5 fragment path (shared gate)."""
     if not torch.version.hip:
         return False
-    try:
-        idx = _device_index(device)
-        ok = _supported.get(idx)
-        if ok is None:
-            ok = _supported[idx] = _arch(idx) in _ARCHS
-        return ok
-    except Exception:                                   # noqa: BLE001
-        return False
+    return device_supported(device, GFX115_ARCHS)
 
 
 def _gcc_flag():
@@ -72,9 +46,11 @@ def _compile_tail(lines, n=12):
 
 
 def _load(device=None):
-    arch = _arch(device)
-    if ("fn", arch) in _state:
-        return _state["fn", arch]
+    dev = select_device(device)
+    key = (dev, "")
+    if key in _state:
+        return _state[key]
+    arch = device_arch(dev)
     src = open(_SRC, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-DKYO_RAW=1", *_gcc_flag()]
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
@@ -100,8 +76,8 @@ def _load(device=None):
         raise RuntimeError("gdn_hf_hip: hipModuleGetFunction failed")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
     _state.update(lib=lib)
-    _state["mod", arch] = mod
-    _state["fn", arch] = fn
+    _state["mod", key] = mod
+    _state[key] = fn
     return fn
 
 

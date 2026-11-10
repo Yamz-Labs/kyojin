@@ -3,6 +3,7 @@ Same loader model as dsv41_hip.py (hipcc genco on first use, launched on torch's
 import ctypes, os
 import torch
 from . import dsv41_hip as H
+from exllamav3.util.arch_list import device_arch, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dsv41_idx.hip")
@@ -16,10 +17,12 @@ def available(device) -> bool:
     return torch.device(device).type == "cuda" and torch.cuda.is_available() and torch.version.hip is not None
 
 
-def _load():
-    if "fns" in _state:
-        return _state["fns"]
-    cache = H.compile_hsaco(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0], src_path=_SRC)
+def _load(device=None):
+    dev = select_device(device)
+    key = (dev, "")
+    if key in _state:
+        return _state[key]
+    cache = H.compile_hsaco(device_arch(dev), src_path=_SRC)
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
@@ -32,12 +35,15 @@ def _load():
             raise RuntimeError("dsv41_idx: no function " + n)
         fns[n] = fn
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state.update(lib=lib, fns=fns, mod=mod)
+    _state.update(lib=lib)
+    _state[key] = fns
+    _state["mod", key] = mod
     return fns
 
 
 def _launch(name, grid, block, args):
-    fn = _load()[name]
+    device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+    fn = _load(device)[name]
     cargs, params = H._pack(args)
     r = _state["lib"].hipModuleLaunchKernel(fn, grid[0], grid[1], 1, block, 1, 1, 0,
                                             torch.cuda.current_stream().cuda_stream, params, None)

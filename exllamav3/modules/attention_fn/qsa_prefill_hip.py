@@ -2,6 +2,7 @@
 import ctypes, hashlib, os, re, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import device_arch, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qsa_prefill.hip")
 _state = {}
@@ -44,9 +45,11 @@ def hsaco_stats(path):
     g = lambda k: (int(re.search(k + r":\s+(\d+)", t).group(1)) if re.search(k + r":\s+(\d+)", t) else -1)
     return dict(vgpr = g(r"\.vgpr_count"), spill = g(r"\.vgpr_spill_count"), lds = g(r"\.group_segment_fixed_size"))
 
-def _load(defs = ""):
-    if defs in _state: return _state[defs]
-    cache = compile_hsaco(defs, torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _load(defs = "", device = None):
+    dev = select_device(device)
+    key = (dev, defs)
+    if key in _state: return _state[key]
+    cache = compile_hsaco(defs, device_arch(dev))
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
@@ -54,7 +57,7 @@ def _load(defs = ""):
     fn = ctypes.c_void_p()
     if lib.hipModuleGetFunction(ctypes.byref(fn), mod, b"qsa_pf") != 0: raise RuntimeError("qsa_prefill_hip: no function")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state["lib"] = lib; _state[defs] = fn; _state["mod", defs] = mod
+    _state["lib"] = lib; _state[key] = fn; _state["mod", key] = mod
     return fn
 
 def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = None, defs = ""):
@@ -71,7 +74,7 @@ def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = No
     npages = block_table.shape[-1]
     ntok = k.shape[0]
     assert v.shape[0] == ntok
-    fn = _load(defs)
+    fn = _load(defs, q.device)
     cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, k, v, block_table, indices, out)] + \
             [ctypes.c_int(x) for x in (q.stride(0), out.stride(0), bt_stride, k.stride(0), ntok, npages)] + [ctypes.c_float(sm_scale)]
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
