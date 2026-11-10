@@ -375,6 +375,8 @@ def test_adapter_unsafe_env_is_applied_and_logged(split_modules, monkeypatch):
 def test_split_settings_off_is_a_noop(split_modules, monkeypatch):
     _dm, _bridge, split = split_modules
     monkeypatch.setenv("EXL3_BLOCK_GRAPH", "1")
+    for _k in ("EXL3_PF_HC_FUSE", "EXL3_PF_GR_FUSE", "EXL3_GR_PF_FUSE"):
+        monkeypatch.setenv(_k, "1")
     off = split.SplitSettings(front_layers = 0)
     assert off.enabled is False
     assert split.apply_split_env(off) == []
@@ -384,3 +386,7 @@ def test_split_settings_off_is_a_noop(split_modules, monkeypatch):
     assert on.enabled is True and on.auto is True
     split.apply_split_env(on)
     assert os.environ["EXL3_BLOCK_GRAPH"] == "0"
+    # Deferred residual fusions cannot cross the host-staged bridge.
+    assert os.environ["EXL3_PF_HC_FUSE"] == "0"
+    assert os.environ["EXL3_PF_GR_FUSE"] == "0"
+    assert os.environ["EXL3_GR_PF_FUSE"] == "0"

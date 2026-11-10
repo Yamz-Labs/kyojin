@@ -18,6 +18,15 @@ if TYPE_CHECKING:
 
 # Split mode runs eager until per-segment capture lands (Stage 6).  A whole-forward
 # or per-block graph must never span the host-staged bridge between segments.
+# Deferred prefill residual fusions keep a pending state on the producing stream;
+    # the next block may be on the other device, beyond the bridge. Split mode runs
+    # the unfused path (same numerics, no cross-stream pending tensor).
+SPLIT_UNSAFE_ENV = {
+    "EXL3_PF_HC_FUSE": "0",
+    "EXL3_PF_GR_FUSE": "0",
+    "EXL3_GR_PF_FUSE": "0",
+}
+
 GRAPH_ENV_OFF = {
     "EXL3_BLOCK_GRAPH": "0",
     "EXL3_BLOCK_GRAPH_MLA": "0",
@@ -130,7 +139,8 @@ def apply_split_env(settings: SplitSettings, logger = print) -> list[str]:
     preset = SPLIT_PRESETS.get(settings.preset)
     if preset is None:
         raise ValueError(f"unknown split preset {settings.preset!r}; choose one of {sorted(SPLIT_PRESETS)}")
-    forced = dict(GRAPH_ENV_OFF)
+    forced = dict(SPLIT_UNSAFE_ENV)
+    forced.update(GRAPH_ENV_OFF)
     forced.update(preset)
     if settings.split_graphs == "on":
         # Stage 6 has no per-segment capture yet: honouring "on" would let a graph
@@ -139,7 +149,7 @@ def apply_split_env(settings: SplitSettings, logger = print) -> list[str]:
     overridden = [f"{k}={os.environ[k]}" for k, v in forced.items()
                   if os.environ.get(k) not in (None, "", v)]
     os.environ.update(forced)
-    logger("[split] graphs forced off for split mode (per-segment capture is Stage 6)"
+    logger("[split] graphs and deferred residual fusions forced off for split mode"
            + (f"; overrode {', '.join(overridden)}" if overridden else ""))
     return overridden
 

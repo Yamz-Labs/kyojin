@@ -113,8 +113,14 @@ class Bridge:
         slot.buf = torch.empty(numel, dtype = dtype, pin_memory = True)
         slot.cap = numel
         slot.read_valid = False
-        slot.filled = torch.cuda.Event()
-        slot.read = torch.cuda.Event()
+        # CUDA/HIP events belong to the device that records them.  The channel is
+        # directional, so create each event on its own endpoint; creating both on
+        # the ambient device fails on the first large (32K) growth with
+        # "Event device N does not match recording stream's device".
+        with torch.cuda.device(ch.src):
+            slot.filled = torch.cuda.Event()
+        with torch.cuda.device(ch.dst):
+            slot.read = torch.cuda.Event()
         self.stats["reallocs"] += 1
 
     def _hop(self, t: torch.Tensor, dst: torch.device, chunk: bool) -> torch.Tensor:
@@ -134,21 +140,24 @@ class Bridge:
         if numel > slot.cap:
             self._grow(ch, slot, t.dtype, numel)
 
-        src_stream = torch.cuda.current_stream(src)
-        dst_stream = torch.cuda.current_stream(dst)
+        with torch.cuda.device(src):
+            src_stream = torch.cuda.current_stream(src)
+        with torch.cuda.device(dst):
+            dst_stream = torch.cuda.current_stream(dst)
 
         # Reusing a host slot: the source must not overwrite it until the destination
         # finished reading it.  This is a cross-device stream wait, not a host wait.
         if slot.read_valid:
-            src_stream.wait_event(slot.read)
+            with torch.cuda.device(src):
+                src_stream.wait_event(slot.read)
 
         hb = slot.buf[:numel].view(t.shape)
 
-        with torch.cuda.stream(src_stream):
+        with torch.cuda.device(src), torch.cuda.stream(src_stream):
             hb.copy_(t, non_blocking = True)
             slot.filled.record(src_stream)
 
-        with torch.cuda.stream(dst_stream):
+        with torch.cuda.device(dst), torch.cuda.stream(dst_stream):
             dst_stream.wait_event(slot.filled)
             out = hb.to(dst, non_blocking = True)
             slot.read.record(dst_stream)

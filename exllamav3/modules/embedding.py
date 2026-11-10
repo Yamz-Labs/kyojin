@@ -223,8 +223,12 @@ class Embedding(Module):
         round-to-nearest the host conversion does for bf16 -> fp16). The rows stay cached for the MTP block (forward_device)."""
         d = y.to(device, non_blocking = True)
         if self._narrow_ev is None:
-            self._narrow_ev = torch.cuda.Event()
-        self._narrow_ev.record()
+            # The CPU embedding uploads to the first layer's device, which is the
+            # front GPU in a split; the event must belong to that device.
+            with torch.cuda.device(device):
+                self._narrow_ev = torch.cuda.Event()
+        with torch.cuda.device(device):
+            self._narrow_ev.record()
         self._dev_rows = (ids.clone(), d)        # consumed by forward_device (the MTP block), else replaced by the next chunk
         return d if d.dtype == out_dtype else d.to(out_dtype)
 
