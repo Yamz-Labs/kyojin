@@ -723,6 +723,10 @@ def maybe_graph_forward(block, x: torch.Tensor, params: dict):
     to decline (caller then runs the eager forward)."""
     if not BLOCK_GRAPH_ENABLED:
         return None  # dynamic check: the flag may be toggled mid-process for qualification
+    if getattr(getattr(block, "config", None), "split_active", False):
+        # A contiguous layer split moves the state across a host-staged bridge between
+        # segments; a per-block graph must not span that boundary.
+        return None
     runner = getattr(block, "block_graph_runner", None)
     if runner is None:
         # the verdict depends on BLOCK_GRAPH_MLA, which may be toggled mid-process: key it

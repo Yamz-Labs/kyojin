@@ -335,6 +335,27 @@ def init(
     else:
         single_device = None
 
+    # Explicit contiguous layer split. GLM serve has its own CLI; this env-only path
+    # keeps examples/chat.py and the eval tools able to exercise the split.
+    front_layers = int(os.environ.get("KYOJIN_FRONT_LAYERS", "0") or 0)
+    front_map = draft_map = None
+    if front_layers:
+        if args.tensor_parallel or single_device or split is not None:
+            raise ValueError("KYOJIN_FRONT_LAYERS cannot be combined with tensor parallel, "
+                             "EXL3_LOAD_DEVICE or --gpu_split")
+        from .device_map import LayerDeviceMap, print_split_table, resolve_devices
+        devices = resolve_devices(os.environ.get("KYOJIN_FRONT_DEVICE"))
+        endcaps = os.environ.get("KYOJIN_ENDCAPS", "1") != "0"
+        reserve = float(os.environ.get("KYOJIN_FRONT_RESERVE_GB", "1.2"))
+        front_map = LayerDeviceMap.from_model(model, front_layers, endcaps, devices,
+                                              component="text", front_reserve_gb=reserve)
+        if draft_model is not None:
+            draft_map = LayerDeviceMap.from_model(draft_model, 0, endcaps, devices,
+                                                  component="mtp", front_reserve_gb=reserve)
+            draft_map.reserve_bytes.clear()
+        front_map.engage_budget()
+        printp(not quiet, f" -- layer split: {front_map.describe()}")
+
     # Parallelism options
     tp_options = {
         "moe_tensor_split": args.tp_moe_tensor_split
@@ -359,7 +380,8 @@ def init(
     if draft_model_dir:
         printp(not quiet, f" -- Loading {draft_model_dir}")
         draft_model.load(
-            **({"device": single_device} if single_device else {"use_per_device": split}),
+            **({"device_map": draft_map} if draft_map else
+               ({"device": single_device} if single_device else {"use_per_device": split})),
             progressbar = progress,
             verbose = args.load_verbose,
             max_batch_size = args.autosplit_max_batch_size,
@@ -371,7 +393,8 @@ def init(
     # Load model
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
-        **({"device": single_device} if single_device else {"use_per_device": split}),
+        **({"device_map": front_map} if front_map else
+           ({"device": single_device} if single_device else {"use_per_device": split})),
         tensor_p = args.tensor_parallel,
         progressbar = progress,
         tp_dev_limits = tp_dev_limits,
@@ -383,6 +406,12 @@ def init(
         max_chunk_size = args.chunk_size,
         **kwargs
     )
+
+    if front_map is not None:
+        print_split_table(model, cache, front_map,
+                          extra=[("mtp", draft_model, draft_cache)] if draft_model is not None else [],
+                          ctx=getattr(args, "cache_size", None))
+        front_map.release_budget()
 
     # Load tokenizer
     if load_tokenizer:
