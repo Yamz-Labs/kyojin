@@ -127,10 +127,22 @@ All packs are EXL3 on Hugging Face: ours on [yamz-labs](https://huggingface.co/y
 
 ## Contributors
 
-Thank you to everyone who tests Kyojin on their own machine and writes precise reports. Who did what: [doc/credits.md](doc/credits.md#contributors).
+Thank you to everyone who tests Kyojin on their own machine, writes precise reports and sends pull requests. Full list: [doc/credits.md](doc/credits.md#contributors).
 
-- Code: [@felladrin](https://github.com/felladrin), [@twstagg](https://github.com/twstagg), [@resynth](https://github.com/resynth), [@razethion](https://github.com/razethion), [@MangetsuC](https://github.com/MangetsuC), [@mostlygeek](https://github.com/mostlygeek), [@zaxbysauce](https://github.com/zaxbysauce), [@thebigen01](https://github.com/thebigen01), [@nobert](https://github.com/nobert), [@Idriss091](https://github.com/Idriss091), [@JoaoFay](https://github.com/JoaoFay).
-- Reports and benchmarks: [@kamjin3086](https://github.com/kamjin3086), [@OleksKon](https://github.com/OleksKon), [@spawnax](https://github.com/spawnax), [@alanoo81](https://github.com/alanoo81), [@dturini12](https://github.com/dturini12), [@ChrisC381](https://github.com/ChrisC381), [@morrisfamily](https://github.com/morrisfamily), [@xXm-mXx](https://github.com/xXm-mXx).
+- [@resynth](https://github.com/resynth): the gfx1201 (RDNA4) bring-up and its native GEMV, the RDNA dense GEMV path on gfx1151, skinny hgemm fixes and tests, the GEMV harness, device-aware HIP JIT for GDN, and `--cache-bits 8` for GLM.
+- [@MangetsuC](https://github.com/MangetsuC): the GLM image path (an opt-in GEMM for the spatial-merge convolution, an image cache that keeps the head of a prompt, a disk image cache).
+- [@twstagg](https://github.com/twstagg): the Nix flake (dev shell, package, OCI image) and its serve fixes.
+- [@felladrin](https://github.com/felladrin): `--sessions` in the Qwen server, the GPU target lookup without rocminfo, the bench tool and its tests, the troubleshooting page and the server environment variable docs.
+- [@razethion](https://github.com/razethion): opt-in K6 and K8 fused MoE, dense K8 decode and wide launches.
+- [@thebigen01](https://github.com/thebigen01): the prefix-disk restore fix for unreachable checkpoints.
+- [@zaxbysauce](https://github.com/zaxbysauce): opt-in CK sparse prefill for MiMo on gfx1151.
+- [@nobert](https://github.com/nobert): the llama.cpp-compatible Prometheus `/metrics` endpoint.
+- [@mostlygeek](https://github.com/mostlygeek): the container build on each release.
+- [@Idriss091](https://github.com/Idriss091): the whole test suite without a GPU, and clearer qualify errors.
+- [@JoaoFay](https://github.com/JoaoFay): escaping reserved image markers in Qwen prompts.
+- Reports and benchmarks: [@ilikenwf](https://github.com/ilikenwf), [@kamjin3086](https://github.com/kamjin3086), [@OleksKon](https://github.com/OleksKon), [@spawnax](https://github.com/spawnax), [@alanoo81](https://github.com/alanoo81), [@dturini12](https://github.com/dturini12), [@ChrisC381](https://github.com/ChrisC381), [@morrisfamily](https://github.com/morrisfamily), [@xXm-mXx](https://github.com/xXm-mXx).
+
+New releases thank the authors of their pull requests in the release notes ([doc/releasing.md](doc/releasing.md)).
 
 ## Read more
 
