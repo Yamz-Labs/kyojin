@@ -1264,6 +1264,11 @@ void hgemm_gr
     Graph* graph
 )
 {
+    // Multi-device: the current device is not necessarily the tensors' device (a layer split
+    // runs kernels on two GPUs from one process). Without this guard getCurrentCUDAStream()
+    // returns the wrong device's stream and skinny's per-device scratch is allocated on the
+    // wrong device, so the kernel reads foreign pointers.
+    const at::cuda::OptionalCUDAGuard device_guard(a.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
 #if defined(USE_ROCM)
     if (skinny::try_launch(a, b, c, stream)) return;
