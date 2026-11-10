@@ -50,8 +50,7 @@ FILLER = (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("-m", "--model", default="/data/hf/hub/models--NicSir--GLM-5.3-Flash-EXL3-2.72bpw/"
-                                             "snapshots/db672fc5e61f1d61bdf6d641fb63538b80bb7613")
+    p.add_argument("-m", "--model", default="/data/models/NicSir--GLM-5.3-Flash-EXL3-2.72bpw")
     p.add_argument("--baseline", action="store_true", help="single device (cuda:0), no layer split")
     p.add_argument("--front-layers", type=int, default=6)
     p.add_argument("--front-device", default="auto")

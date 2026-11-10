@@ -4,7 +4,7 @@
 No forward pass is run.  Usage (from the repo root, after `source tools/strix_halo/env.sh`):
 
     python tools/strix_halo/split_load.py \
-        -m /data/hf/hub/models--NicSir--GLM-5.3-Flash-EXL3-2.72bpw/snapshots/db672fc5e61f1d61bdf6d641fb63538b80bb7613 \
+        -m /data/models/NicSir--GLM-5.3-Flash-EXL3-2.72bpw \
         --front-layers 4 --endcaps on -c 65536
 """
 from __future__ import annotations
