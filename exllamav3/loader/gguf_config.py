@@ -21,7 +21,7 @@ GGUF_ARCHS = {
 # ggml type id -> ForeignLinear format
 GGML_FMT = {
     2: "q4_0", 6: "q5_0", 8: "q8_0", 12: "q4_k", 13: "q5_k", 14: "q6_k", 18: "iq3_xxs", 16: "iq2_xxs",
-    20: "iq4_nl", 21: "iq3_s", 23: "iq4_xs", 39: "mxfp4", 40: "nvfp4_gguf", 0: "fp", 1: "fp",
+    20: "iq4_nl", 21: "iq3_s", 23: "iq4_xs", 11: "q3_k", 17: "iq2_xs", 22: "iq2_s", 39: "mxfp4", 40: "nvfp4_gguf", 0: "fp", 1: "fp",
 }
 
 
