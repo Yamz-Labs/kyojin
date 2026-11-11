@@ -14,7 +14,8 @@ import triton.language as tl
 
 from .triton_gap import _fp4half
 
-BN = int(os.environ.get("EXL3_MXFP4_MOE_BN", "32")  # Strix sweep 11/11: BN 16 101 -> BN 32 115 GB/s, served gpt-oss 24.4 -> 25.7 tok/s)
+# Strix sweep 11/11: BN 16 101 -> BN 32 115 GB/s, served gpt-oss 24.4 -> 25.7 tok/s
+BN = int(os.environ.get("EXL3_MXFP4_MOE_BN", "32"))
 NW = int(os.environ.get("EXL3_MXFP4_MOE_NW", "2"))
 
 
