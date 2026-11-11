@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 
 MAX_ROWS = 16
-BN, BK = 32, 128
+BN, BK = 64, 128                 # Strix 27B shapes, 1 row (fp8_tiles.py 11/11): 170-190 GB/s vs 102-162 at BN 32
 
 
 @triton.jit
