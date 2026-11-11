@@ -16,6 +16,8 @@ GGUF_ARCHS = {
     # unsloth / llama.cpp Qwen3.5-style hybrid MoE (GDN + attention, 256 experts + shared expert), served by the
     # MiniCPM-V-4.7 text class (same block family, GGUF-backed)
     "qwen35moe": ("MiniCPMV4_7ForConditionalGeneration", "qwen3_5_moe"),
+    # dense sibling (Qwen3.6-27B class): same GDN + attention blocks, plain gated MLP per layer
+    "qwen35": ("MiniCPMV4_7ForConditionalGeneration", "qwen3_5"),
 }
 
 # ggml type id -> ForeignLinear format
@@ -31,8 +33,8 @@ def hf_config(g: GGUFCollection) -> dict:
     if arch not in GGUF_ARCHS:
         raise ValueError(f"GGUF architecture {arch!r} has no standard-class mapping (have: {sorted(GGUF_ARCHS)})")
     p = arch + "."
-    if arch == "qwen35moe":
-        return _hf_config_qwen35moe(g, m)
+    if arch in ("qwen35moe", "qwen35"):
+        return _hf_config_qwen35moe(g, m, arch)
     ne = m[p + "embedding_length"]
     nq = m[p + "attention.head_count"]
     cfg = {
@@ -57,8 +59,9 @@ def hf_config(g: GGUFCollection) -> dict:
     return cfg
 
 
-def _hf_config_qwen35moe(g: GGUFCollection, m: dict) -> dict:
-    p = "qwen35moe."
+def _hf_config_qwen35moe(g: GGUFCollection, m: dict, arch: str = "qwen35moe") -> dict:
+    p = arch + "."
+    dense = arch == "qwen35"
     ssm_heads, ssm_groups, ssm_dim = m[p + "ssm.time_step_rank"], m[p + "ssm.group_count"], m[p + "ssm.state_size"]
     tc = {
         "model_type": "qwen3_5_moe_text",
@@ -74,10 +77,11 @@ def _hf_config_qwen35moe(g: GGUFCollection, m: dict) -> dict:
         "linear_key_head_dim": ssm_dim,
         "linear_value_head_dim": m[p + "ssm.inner_size"] // ssm_heads,
         "hidden_act": "silu",
-        "moe_intermediate_size": m[p + "expert_feed_forward_length"],
-        "num_experts": m[p + "expert_count"],
-        "num_experts_per_tok": m[p + "expert_used_count"],
-        "shared_expert_intermediate_size": m[p + "expert_shared_feed_forward_length"],
+        **({"intermediate_size": m[p + "feed_forward_length"]} if dense else {
+            "moe_intermediate_size": m[p + "expert_feed_forward_length"],
+            "num_experts": m[p + "expert_count"],
+            "num_experts_per_tok": m[p + "expert_used_count"],
+            "shared_expert_intermediate_size": m[p + "expert_shared_feed_forward_length"]}),
         "rms_norm_eps": m[p + "attention.layer_norm_rms_epsilon"],
         "vocab_size": g.infos["token_embd.weight"][1][1],
         "max_position_embeddings": m[p + "context_length"],
@@ -85,7 +89,7 @@ def _hf_config_qwen35moe(g: GGUFCollection, m: dict) -> dict:
         "partial_rotary_factor": m[p + "rope.dimension_count"] / m[p + "attention.key_length"],
     }
     return {"architectures": ["MiniCPMV4_7ForConditionalGeneration"], "model_type": "qwen3_5_moe",
-            "gguf_arch": "qwen35moe", "tie_word_embeddings": "output.weight" not in g.infos, "text_config": tc}
+            "gguf_arch": arch, "tie_word_embeddings": "output.weight" not in g.infos, "text_config": tc}
 
 
 def name_map(cfg: dict) -> dict:

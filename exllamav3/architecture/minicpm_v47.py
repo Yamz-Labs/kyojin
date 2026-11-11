@@ -106,9 +106,12 @@ class MiniCPMV47Config(Config):
         self.linear_key_head_dim = self.read_cfg(int, pfx("linear_key_head_dim"), 128)
         self.linear_value_head_dim = self.read_cfg(int, pfx("linear_value_head_dim"), 128)
         self.assert_cfg(str, pfx("hidden_act"), "silu", True)
-        self.moe_intermediate_size = self.read_cfg(int, pfx("moe_intermediate_size"), no_default)
-        self.num_experts = self.read_cfg(int, pfx("num_experts"), no_default)
-        self.num_experts_per_tok = self.read_cfg(int, pfx("num_experts_per_tok"), no_default)
+        # dense variant (gguf qwen35): intermediate_size and no experts; the MoE fields stay None
+        self.intermediate_size = self.read_cfg(int, pfx("intermediate_size"), None)
+        moe_def = None if self.intermediate_size else no_default
+        self.moe_intermediate_size = self.read_cfg(int, pfx("moe_intermediate_size"), moe_def)
+        self.num_experts = self.read_cfg(int, pfx("num_experts"), moe_def)
+        self.num_experts_per_tok = self.read_cfg(int, pfx("num_experts_per_tok"), moe_def)
         self.shared_expert_intermediate_size = self.read_cfg(
             int, pfx("shared_expert_intermediate_size"), 512)
         self.rms_norm_eps = self.read_cfg(float, pfx("rms_norm_eps"), no_default)
@@ -358,6 +361,16 @@ class MiniCPMV47TextModel(Model):
 
     @staticmethod
     def _moe(config, L, G, H):
+        if config.num_experts is None:          # dense block (gguf qwen35): one gated MLP
+            I = config.intermediate_size
+            mlp = GatedMLP(
+                config=config, key=f"{L}.mlp", hidden_size=H, intermediate_size=I,
+                qmap="block.mlp", interm_dtype=torch.half, out_dtype=torch.float, select_hq_bits=2,
+                gates=[_fl(config, f"{G}.ffn_gate", H, I)], ups=[_fl(config, f"{G}.ffn_up", H, I)],
+                downs=[_fl(config, f"{G}.ffn_down", I, H, out_dtype=torch.float)])
+            for m in mlp.gates + mlp.ups + mlp.downs:
+                mlp.register_submodule(m)
+            return mlp
         I = config.moe_intermediate_size
         E = config.num_experts
         if MCPM_FOREIGN:

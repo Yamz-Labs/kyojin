@@ -28,3 +28,14 @@ r = torch.zeros((1, K), device="cuda", dtype=torch.float); se = torch.zeros((1, 
 g = torch.sigmoid((x.to(torch.float) @ gw.to(torch.float)))
 print("gate fold + cast      %.0f us" % T(lambda: (r + se.to(torch.float) * g).to(torch.half)))
 print("gate dtype", gw.dtype, tuple(gw.shape))
+sels = [torch.randperm(m.num_experts)[:S].view(1, S).cuda() for _ in range(64)]
+it = [0]
+def gk():
+    s_ = sels[it[0] % 64]; it[0] += 1
+    m._forward_foreign_grouped_kq(x, x.view(1, K), s_, wts, {}, None, None)
+print("grouped kq, random experts per call %.0f us" % T(gk, 640))
+def gk_other_layers():
+    s_ = sels[it[0] % 64]; it[0] += 1
+    mm = mlps[it[0] % len(mlps)]
+    mm._forward_foreign_grouped_kq(x, x.view(1, K), s_, wts, {}, None, None)
+print("grouped kq, random experts + rotating layer %.0f us" % T(gk_other_layers, 640))
