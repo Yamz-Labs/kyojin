@@ -16,7 +16,8 @@ FUSED = {"iq3_xxs": 0, "iq3_s": 1, "iq2_xs": 2, "iq2_s": 3, "q3_k": 4}
 _BB = {"iq3_xxs": 98, "iq3_s": 110, "iq2_xs": 74, "iq2_s": 82, "q3_k": 110}
 MAX_ROWS = 16
 BN = int(os.environ.get("EXL3_IQ_BN", "16"))
-NW = int(os.environ.get("EXL3_IQ_NW", "2"))
+# Strix tile sweep 11/11 (iq_tiles.py): nw 1 iq2_s +8 %, iq3_s +13 % at R1; served UD-IQ2_M 15.4 -> 17.3 tok/s
+NW = int(os.environ.get("EXL3_IQ_NW", "1"))
 _TABS: dict = {}
 
 
