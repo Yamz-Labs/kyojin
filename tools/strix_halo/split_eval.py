@@ -87,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--perf-tokens", type=int, default=256)
     p.add_argument("--perf-reps", type=int, default=1)
     p.add_argument("--needle-depth", type=int, default=0, help="run one needle probe at this many prompt tokens")
+    p.add_argument("--bench-depth", type=int, default=0,
+                   help="also decode --perf-tokens at this prompt depth and report prefill/decode/acceptance")
     p.add_argument("--out", default=None, help="write the full JSON here")
     p.add_argument("--compare", nargs=2, metavar=("BASE", "SPLIT"),
                    help="compare two saved runs: prompt ids and decode numbers")
@@ -272,6 +274,16 @@ def main() -> None:
         plan.report(model, cache, extra = extra, ctx = args.max_ctx)
         plan.release_budget()
 
+    devs = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+    after_load = {str(d): round(torch.cuda.memory_allocated(d) / 2**30, 2) for d in devs}
+    device_info = {}
+    for i, d in enumerate(devs):
+        p = torch.cuda.get_device_properties(i)
+        device_info[str(d)] = {
+            "name": p.name, "arch": getattr(p, "gcnArchName", ""),
+            "total_gib": round(p.total_memory / 2**30, 2),
+        }
+
     GM.MTP_FUSE_CATCHUP = 2
     gen = Generator(model = model, cache = cache, tokenizer = tokenizer,
                     draft_model = draft, draft_cache = draft_cache,
@@ -282,11 +294,17 @@ def main() -> None:
         "mode": "baseline" if args.baseline else "split",
         "model": args.model,
         "part0_layers": None if args.baseline else args.part0_layers,
+        "part0_device": None if args.baseline else args.part0_device,
+        "part1_device": None if args.baseline else args.part1_device,
+        "part0_reserve_gb": None if args.baseline else args.part0_reserve_gb,
         "endcaps": None if args.baseline else args.endcaps,
         "ctx": args.max_ctx,
+        "cache_tokens": args.max_ctx + 4096,
         "num_draft": args.num_draft,
         "graphs_off": args.no_graphs or not args.baseline,
         "load_s": load_s,
+        "devices": device_info,
+        "after_load_gib": after_load,
         "prompts": [],
         "perf": [],
     }
@@ -329,6 +347,34 @@ def main() -> None:
         }
         print(f"[eval] needle depth {ids.numel()}: {'FOUND' if found else 'MISSING'}"
               f" (ttft {r['ttft_s']:.1f} s) text={r['text'][:120]!r}", flush = True)
+
+    if args.bench_depth > 0:
+        ids, _ = build_needle(min(args.bench_depth, args.max_ctx - 1024), tokenizer)
+        r = run_job(gen, Job, ids, args.perf_tokens)
+        tps = (r["tokens"] - 1) / r["decode_s"] if r["decode_s"] and r["tokens"] > 1 else None
+        acc, rej = r["accepted"], r["rejected"]
+        result["long"] = {
+            "depth": int(ids.numel()), "ttft_s": r["ttft_s"], "tokens": r["tokens"],
+            "decode_s": r["decode_s"], "decode_tps": tps,
+            "accepted": acc, "rejected": rej,
+            "acceptance": round(100 * acc / (acc + rej), 2) if acc + rej else None,
+            "text": r["text"],
+        }
+        if r["ttft_s"] is None or tps is None:
+            print(f"[eval] long depth {ids.numel()}: incomplete run "
+                  f"({r['tokens']} tokens, ttft={r['ttft_s']}, decode_tps={tps}, "
+                  f"accept {acc}/{rej})", flush = True)
+        else:
+            print(f"[eval] long depth {ids.numel()}: ttft {r['ttft_s']:.1f} s, "
+                  f"prefill {ids.numel() / r['ttft_s']:.2f} t/s, decode {tps:.2f} t/s, "
+                  f"accept {acc}/{rej}", flush = True)
+
+    for d in devs:
+        result["devices"][str(d)].update({
+            "allocated_gib": round(torch.cuda.memory_allocated(d) / 2**30, 2),
+            "peak_gib": round(torch.cuda.max_memory_allocated(d) / 2**30, 2),
+            "reserved_gib": round(torch.cuda.memory_reserved(d) / 2**30, 2),
+        })
 
     bridge = getattr(config, "device_bridge", None)
     if bridge is not None:

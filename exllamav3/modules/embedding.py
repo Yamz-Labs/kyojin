@@ -33,6 +33,7 @@ class Embedding(Module):
         self.hidden_size = hidden_size
         self.out_dtype = out_dtype
         self._pinned_staging = {}
+        self._narrow_ev_device = None
         self._numel = vocab_size * hidden_size
         self.normalize = normalize
         self.multiplier = multiplier
@@ -212,6 +213,7 @@ class Embedding(Module):
             buf = torch.empty((n, self.hidden_size), dtype = w.dtype, pin_memory = True)
             self._narrow_buf = buf
             self._narrow_ev = None
+            self._narrow_ev_device = None
         y = buf[:n]
         torch.index_select(w, 0, ids.reshape(-1), out = y)
         if self.multiplier != 1.0:
@@ -222,12 +224,15 @@ class Embedding(Module):
         """Upload the pinned 16-bit rows without blocking the host and widen on the device (exact for bf16/fp16 -> fp32, the same
         round-to-nearest the host conversion does for bf16 -> fp16). The rows stay cached for the MTP block (forward_device)."""
         d = y.to(device, non_blocking = True)
-        if self._narrow_ev is None:
-            # The CPU embedding uploads to the first layer's device, which is the
-            # front GPU in a split; the event must belong to that device.
-            with torch.cuda.device(device):
+        # A CPU-resident embedding is shared by the target's first layer and the MTP
+        # block, which a split places on different devices.  The event belongs to the
+        # stream it is recorded on, so recreate it when the upload device changes.
+        d_device = torch.device(device)
+        if getattr(self, "_narrow_ev", None) is None or getattr(self, "_narrow_ev_device", None) != d_device:
+            with torch.cuda.device(d_device):
                 self._narrow_ev = torch.cuda.Event()
-        with torch.cuda.device(device):
+            self._narrow_ev_device = d_device
+        with torch.cuda.device(d_device):
             self._narrow_ev.record()
         self._dev_rows = (ids.clone(), d)        # consumed by forward_device (the MTP block), else replaced by the next chunk
         return d if d.dtype == out_dtype else d.to(out_dtype)
