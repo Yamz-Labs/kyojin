@@ -27,7 +27,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 # Shared split helper: pure stdlib at import, it loads exllamav3 lazily after SPEED_ENV.
 from kyojin_serve_split import (  # noqa: E402
-    SplitController, SplitSettings, add_split_arguments, apply_split_env, parse_front_layers,
+    SplitController, SplitSettings, add_split_arguments, apply_split_env, parse_part0_layers,
     settings_from_namespace,
 )
 from loopguard import AnswerTap, loop_guard_default  # noqa: E402  (answer-phase loop guard shared with the Qwen server)
@@ -53,17 +53,17 @@ EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
 EH_SIDECAR_IN_PACK = "mtp_eh_proj.st"
 # GLM adapter tuning, deliberately outside the split core: on RDNA4 (gfx12) the
 # split runs the deterministic fla KDA chain, whose long-context prefill workspace
-# is not yet part of auto-N.  Measured on a 16 GB gfx12 front card.  This is a
-# property of this adapter/front pair, not of the split; explicit --front-layers
+# is not yet part of auto-N.  Measured on a 16 GB gfx12 part0 card.  This is a
+# property of this adapter/part0 pair, not of the split; explicit --part0-layers
 # always wins.
 GLM_LONG_CTX = 65536
 GLM_LONG_CTX_AUTO_CAP = 5
 
 
-def _glm_small_kda_front(front_arch: str | None) -> bool:
-    """True when this front runs the deterministic split KDA chain."""
+def _glm_small_kda_part0(part0_arch: str | None) -> bool:
+    """True when this part0 device runs the deterministic split KDA chain."""
     from exllamav3.util.arch_list import kda_fused_output_unstable
-    return kda_fused_output_unstable(front_arch)
+    return kda_fused_output_unstable(part0_arch)
 
 
 # --sessions > 1 (several requests decode in one step): plain steps take the R-row exact paths (union MoE on the device table, R-row
@@ -698,9 +698,9 @@ class ResidentEngine:
                  image_cache_dir: str | None = IMAGE_CACHE_DIR_DEFAULT,
                  image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB,
                  image_cache_dir_lock_s: float = IMAGE_CACHE_DIR_LOCK_S,
-                 front_layers: int | str = 0, front_device: str | None = None,
-                 main_device: str | None = None,
-                 endcaps: bool = True, front_reserve_gb: float = 1.2,
+                 part0_layers: int | str = 0, part0_device: str | None = None,
+                 part1_device: str | None = None,
+                 endcaps: bool = True, part0_reserve_gb: float = 1.2,
                  split_settings: SplitSettings | None = None):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
@@ -733,30 +733,30 @@ class ResidentEngine:
         self.model = Model.from_config(self.config)
         if split_settings is None:
             split_settings = SplitSettings(
-                front_layers = parse_front_layers(front_layers),
-                front_device = front_device or "auto",
-                main_device = main_device or "auto",
-                endcaps = bool(endcaps), front_reserve_gb = float(front_reserve_gb))
+                part0_layers = parse_part0_layers(part0_layers),
+                part0_device = part0_device or "auto",
+                part1_device = part1_device or "auto",
+                endcaps = bool(endcaps), part0_reserve_gb = float(part0_reserve_gb))
         self.split = SplitController(split_settings, logger = lambda m: print(f"serve: {m}", flush=True))
         self.split_map = None
         if self.split.enabled:
             plan = self.split.build_plan()
-            if plan is None or plan.devices.front is None:
-                raise ValueError("layer split requested but no usable front device")
+            if plan is None or plan.devices.part0 is None:
+                raise ValueError("layer split requested but no usable part0 device")
             print(f"serve: layer split: {split_settings.describe()}; "
-                  f"main {plan.devices.main} ({plan.devices.main_arch}), "
-                  f"front {plan.devices.front} ({plan.devices.front_arch})", flush=True)
+                  f"part1 {plan.devices.part1} ({plan.devices.part1_arch}), "
+                  f"part0 {plan.devices.part0} ({plan.devices.part0_arch})", flush=True)
             if split_settings.auto:
-                if _glm_small_kda_front(plan.devices.front_arch) and max_ctx > GLM_LONG_CTX:
+                if _glm_small_kda_part0(plan.devices.part0_arch) and max_ctx > GLM_LONG_CTX:
                     # Auto-N's byte budget does not yet know the split KDA prefill
                     # workspace; keep the measured-safe long-context cap until it does.
                     plan.auto_cap = GLM_LONG_CTX_AUTO_CAP
                     print(f"serve: layer split: auto-N capped at {GLM_LONG_CTX_AUTO_CAP} layers for "
-                          f"-c > {GLM_LONG_CTX} on this gfx12 front: the split KDA prefill workspace "
-                          "is not in the byte budget (adapter tuning; pass --front-layers N to "
+                          f"-c > {GLM_LONG_CTX} on this gfx12 part0: the split KDA prefill workspace "
+                          "is not in the byte budget (adapter tuning; pass --part0-layers N to "
                           "override)", flush=True)
                 else:
-                    print("serve: layer split: auto-N uncapped (front does not need the split "
+                    print("serve: layer split: auto-N uncapped (part0 does not need the split "
                           "KDA long-context reserve)", flush=True)
         self.tokenizer = Tokenizer.from_config(self.config)
         if os.environ.get("KYO_TOKCACHE", "8") == "0":
@@ -804,16 +804,16 @@ class ResidentEngine:
             self.split.build()
             self.split_map = self.split.map("text")
             if self.split_map is not None and not self.split_map.enabled:
-                raise ValueError("layer split requested but no usable front device (or auto-N found no layer that fits)")
+                raise ValueError("layer split requested but no usable part0 device (or auto-N found no layer that fits)")
             if split_settings.auto and self.split_map is not None:
-                print(f"serve: layer split: auto-N chose {self.split_map.front_layers} front layer(s) "
+                print(f"serve: layer split: auto-N chose {self.split_map.part0_layers} part0 layer(s) "
                       f"for -c {ctx}", flush=True)
-            if (self.split_map is not None and self.split_map.front_layers > GLM_LONG_CTX_AUTO_CAP
+            if (self.split_map is not None and self.split_map.part0_layers > GLM_LONG_CTX_AUTO_CAP
                     and max_ctx > GLM_LONG_CTX
-                    and _glm_small_kda_front(plan.devices.front_arch)):
-                print(f"serve: warning: front layers > {GLM_LONG_CTX_AUTO_CAP} at -c > {GLM_LONG_CTX} "
-                      "is measured to OOM a 16 GB gfx12 front on long prefill (split KDA fallback "
-                      f"workspace); use --front-layers {GLM_LONG_CTX_AUTO_CAP} for long-context split runs",
+                    and _glm_small_kda_part0(plan.devices.part0_arch)):
+                print(f"serve: warning: part0 layers > {GLM_LONG_CTX_AUTO_CAP} at -c > {GLM_LONG_CTX} "
+                      "is measured to OOM a 16 GB gfx12 part0 on long prefill (split KDA fallback "
+                      f"workspace); use --part0-layers {GLM_LONG_CTX_AUTO_CAP} for long-context split runs",
                       flush=True)
             self.split.engage_budget()
             self.split.load("text", self.model, progressbar=False,

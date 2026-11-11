@@ -4,36 +4,38 @@ from __future__ import annotations
 Contiguous layer split: resolve the two devices, declare per-component policies and
 map model modules to them.
 
-Devices are selected by position, never by architecture.  ``main`` defaults to
-``cuda:0``; ``front`` defaults to the only other visible device when exactly two
-devices are present.  A front-only selector keeps working when it lands on
-``cuda:0``: main auto then takes the other device.  Either position accepts
-``cuda:N``, ``gfxXXXX``, a device UUID or a device-name substring, and either
-device may serve either position.  ``cuda:N`` is the torch index after
-``HIP_VISIBLE_DEVICES``, not the ``rocm-smi`` index.  More than two visible devices
-require an explicit selector.
+``part0`` is the first part of the layer stack (the first ``part0_layers``
+transformer layers plus its endcaps); ``part1`` is the rest of the component.
+Devices are selected by position, never by architecture: ``part1`` defaults to
+``cuda:0`` and ``part0`` to the only other visible device when exactly two are
+present.  A part0-only selector keeps working when it lands on ``cuda:0``: part1
+auto then takes the other device.  Either position accepts ``cuda:N``,
+``gfxXXXX``, a device UUID or a device-name substring, and either device may
+serve either part.  ``cuda:N`` is the torch index after ``HIP_VISIBLE_DEVICES``,
+not the ``rocm-smi`` index.  More than two visible devices require an explicit
+selector.
 
 The map itself is deliberately independent of the architecture: modules carrying a
-``layer_idx`` are transformer layers and are assigned to the front device for
-indices ``0 .. front_layers - 1`` and to the main device for the rest.  Modules
-without a ``layer_idx`` are endcaps (embedding, hyper-connection drivers, final
-norm, lm_head, and the separate MTP/vision components).
+``layer_idx`` are transformer layers and are assigned to ``part0`` for indices
+``0 .. part0_layers - 1`` and to ``part1`` for the rest.  Modules without a
+``layer_idx`` are endcaps (embedding, hyper-connection drivers, final norm,
+lm_head, and the separate MTP/vision components).
 
 The universal core separates *policy* from *placement*:
 
-- ``ComponentPolicy`` says whether a component may use the front device and which
+- ``ComponentPolicy`` says whether a component may use ``part0`` and which
   non-layer modules are safe to move there.  The text prologue/epilogue allowlist
   is norm/hc/lm_head-like modules only; anything the policy does not recognise is
-  an unknown non-layer module and stays on the main device.
+  an unknown non-layer module and stays on ``part1``.
 - ``ComponentMap`` resolves the contiguous boundary for one component.
 - ``SplitPlan`` owns every component of a process (target, MTP, vision, extra),
-  the front reserve, auto-N and the load/placement audit.  Adapters declare their
+  the part0 reserve, auto-N and the load/placement audit.  Adapters declare their
   components; the core contains no model-specific placement logic.
 
-Endcaps ON puts the allowlisted text endcaps on the front device.  ENDCAPS OFF
-lets the allowlisted prologue follow layer 0 and the epilogue follow the last
-layer.  ``prefer_cpu`` modules, such as the GLM token embedding, always stay on
-the CPU: their upload path is part of the embedding design, not a tile to move.
+Endcaps ON puts the allowlisted text endcaps on ``part0``.  ENDCAPS OFF lets the
+allowlisted prologue follow layer 0 and the epilogue follow the last layer.
+``prefer_cpu`` modules, such as the GLM token embedding, always stay on the CPU:
+their upload path is part of the embedding design, not a tile to move.
 """
 
 import os
@@ -45,15 +47,15 @@ from .util.arch_list import device_arch
 
 GIB = 1024 ** 3
 
-# Default load-time slab on the front device.  A tuning value, not an architecture
-# assumption: size it to the front card.  Stage 5 derives it from the device total.
-DEFAULT_FRONT_RESERVE_GB = 1.2
-DEFAULT_MAIN_DEVICE = "auto"
-DEFAULT_FRONT_DEVICE = "auto"
+# Default load-time slab on the part0 device.  A tuning value, not an architecture
+# assumption: size it to the part0 card.  Stage 5 derives it from the device total.
+DEFAULT_PART0_RESERVE_GB = 1.2
+DEFAULT_PART1_DEVICE = "auto"
+DEFAULT_PART0_DEVICE = "auto"
 
-# Text prologue/epilogue modules that are safe to place on the front device.  The
-# list is by class name and key suffix, not by model: an adapter can extend it in
-# its ComponentPolicy.  Modules outside this list default to the main device.
+# Text prologue/epilogue modules that are safe to place on part0.  The list is by
+# class name and key suffix, not by model: an adapter can extend it in its
+# ComponentPolicy.  Modules outside this list default to part1.
 TEXT_ENDCAP_TYPES = frozenset((
     "RMSNorm", "GatedRMSNorm", "LayerNorm", "HyperHead", "ExpandStreams",
 ))
@@ -103,10 +105,10 @@ class DeviceInfo:
 
 @dataclass(frozen = True)
 class Devices:
-    main: torch.device
-    front: torch.device | None
-    main_arch: str
-    front_arch: str | None
+    part1: torch.device
+    part0: torch.device | None
+    part1_arch: str
+    part0_arch: str | None
     inventory: tuple[DeviceInfo, ...] = ()
 
 
@@ -170,18 +172,18 @@ def _select_device(req: str, role: str, infos: list[DeviceInfo], env_name: str) 
 
 
 def resolve_devices(
-    front: str | None = None,
-    main: str | None = None,
+    part0: str | None = None,
+    part1: str | None = None,
     devices: list[DeviceInfo] | None = None,
 ) -> Devices:
-    """Resolve the front/main pair by position, never by architecture.
+    """Resolve the part0/part1 pair by position, never by architecture.
 
-    ``main`` (or KYOJIN_MAIN_DEVICE) defaults to ``auto`` = ``cuda:0``.  ``front``
-    (or KYOJIN_FRONT_DEVICE) defaults to the only other visible device when exactly
+    ``part1`` (or KYOJIN_PART1_DEVICE) defaults to ``auto`` = ``cuda:0``.  ``part0``
+    (or KYOJIN_PART0_DEVICE) defaults to the only other visible device when exactly
     two are visible; with one device the split cannot run, and with more than two an
-    explicit selector is required.  If the front is explicit and occupies ``cuda:0``
-    while main is ``auto`` with exactly two devices visible, main takes the other
-    device so a front-only selector keeps working.  Both selectors accept
+    explicit selector is required.  If part0 is explicit and occupies ``cuda:0``
+    while part1 is ``auto`` with exactly two devices visible, part1 takes the other
+    device so a part0-only selector keeps working.  Both selectors accept
     ``cuda:N``, ``gfxXXXX``, a device UUID or a device-name substring; either
     position may be either device.
 
@@ -192,48 +194,48 @@ def resolve_devices(
     if len(infos) < 2:
         raise RuntimeError(
             f"layer split needs two devices; visible: {_format_inventory(infos)}. "
-            "Unset KYOJIN_FRONT_LAYERS / --front-layers to run on one device.")
+            "Unset KYOJIN_PART0_LAYERS / --part0-layers to run on one device.")
 
-    main_req = main if main is not None else os.environ.get("KYOJIN_MAIN_DEVICE", DEFAULT_MAIN_DEVICE)
-    front_req = front if front is not None else os.environ.get("KYOJIN_FRONT_DEVICE", DEFAULT_FRONT_DEVICE)
-    main_req = (main_req or DEFAULT_MAIN_DEVICE).strip().lower()
-    front_req = (front_req or DEFAULT_FRONT_DEVICE).strip().lower()
-    main_auto = main_req in ("", "auto")
+    part1_req = part1 if part1 is not None else os.environ.get("KYOJIN_PART1_DEVICE", DEFAULT_PART1_DEVICE)
+    part0_req = part0 if part0 is not None else os.environ.get("KYOJIN_PART0_DEVICE", DEFAULT_PART0_DEVICE)
+    part1_req = (part1_req or DEFAULT_PART1_DEVICE).strip().lower()
+    part0_req = (part0_req or DEFAULT_PART0_DEVICE).strip().lower()
+    part1_auto = part1_req in ("", "auto")
 
-    if main_auto:
-        main_i = min(d.index for d in infos)
+    if part1_auto:
+        part1_i = min(d.index for d in infos)
     else:
-        main_i = _select_device(main_req, "main", infos, "KYOJIN_MAIN_DEVICE")
+        part1_i = _select_device(part1_req, "part1", infos, "KYOJIN_PART1_DEVICE")
 
-    if front_req in ("", "auto"):
+    if part0_req in ("", "auto"):
         if len(infos) != 2:
             raise RuntimeError(
-                f"front device is 'auto' but {len(infos)} devices are visible; set "
-                f"KYOJIN_FRONT_DEVICE (or --front-device) to one of: {_format_inventory(infos)}")
-        front_i = next(d.index for d in infos if d.index != main_i)
+                f"part0 device is 'auto' but {len(infos)} devices are visible; set "
+                f"KYOJIN_PART0_DEVICE (or --part0-device) to one of: {_format_inventory(infos)}")
+        part0_i = next(d.index for d in infos if d.index != part1_i)
     else:
-        front_i = _select_device(front_req, "front", infos, "KYOJIN_FRONT_DEVICE")
-        if main_auto and front_i == main_i:
-            # An explicit front selector must keep working when it lands on cuda:0:
-            # main auto takes the only other device.  With more devices the choice
-            # is ambiguous, so ask for the main selector instead of guessing.
+        part0_i = _select_device(part0_req, "part0", infos, "KYOJIN_PART0_DEVICE")
+        if part1_auto and part0_i == part1_i:
+            # An explicit part0 selector must keep working when it lands on cuda:0:
+            # part1 auto takes the only other device.  With more devices the choice
+            # is ambiguous, so ask for the part1 selector instead of guessing.
             if len(infos) == 2:
-                main_i = next(d.index for d in infos if d.index != front_i)
+                part1_i = next(d.index for d in infos if d.index != part0_i)
             else:
                 raise RuntimeError(
-                    f"main device is 'auto' (cuda:{main_i}) and equals the explicit front; "
-                    f"with {len(infos)} devices visible set KYOJIN_MAIN_DEVICE (or --main-device)")
+                    f"part1 device is 'auto' (cuda:{part1_i}) and equals the explicit part0; "
+                    f"with {len(infos)} devices visible set KYOJIN_PART1_DEVICE (or --part1-device)")
 
-    if front_i == main_i:
-        raise RuntimeError(f"layer split main and front resolve to the same device "
-                           f"(cuda:{main_i}); choose a different --front-device/--main-device")
+    if part0_i == part1_i:
+        raise RuntimeError(f"layer split part0 and part1 resolve to the same device "
+                           f"(cuda:{part1_i}); choose a different --part0-device/--part1-device")
     by_index = {d.index: d for d in infos}
-    main_info, front_info = by_index[main_i], by_index[front_i]
+    part1_info, part0_info = by_index[part1_i], by_index[part0_i]
     return Devices(
-        main = torch.device("cuda", main_i),
-        front = torch.device("cuda", front_i),
-        main_arch = main_info.arch or "",
-        front_arch = front_info.arch or "",
+        part1 = torch.device("cuda", part1_i),
+        part0 = torch.device("cuda", part0_i),
+        part1_arch = part1_info.arch or "",
+        part0_arch = part0_info.arch or "",
         inventory = tuple(infos),
     )
 
@@ -248,22 +250,22 @@ class ComponentPolicy:
 
     ``kind`` is one of ``text``, ``mtp``, ``vision``, ``draft``, ``aux`` or
     ``unknown``.  Whole-component kinds (MTP/vision/draft) put every module on
-    the front when endcaps are on, because they have no trunk boundary of their
-    own.  Auxiliary components never visit the front implicitly.
+    part0 when endcaps are on, because they have no trunk boundary of their own.
+    Auxiliary components never visit part0 implicitly.
     """
 
     name: str
     kind: str = "aux"
-    front_eligible: bool = False
-    endcaps_front: bool = True
+    part0_eligible: bool = False
+    endcaps_part0: bool = True
     whole_component: bool = False
     endcap_types: frozenset[str] = frozenset()
     endcap_key_suffixes: tuple[str, ...] = ()
     arch_gate: frozenset[str] | None = None
     unsafe_env: tuple[tuple[str, str], ...] = ()
 
-    def allows_front(self, arch: str | None) -> bool:
-        if not self.front_eligible or arch is None:
+    def allows_part0(self, arch: str | None) -> bool:
+        if not self.part0_eligible or arch is None:
             return False
         return self.arch_gate is None or arch in self.arch_gate
 
@@ -273,15 +275,15 @@ def component_policy(name: str, **overrides) -> ComponentPolicy:
     key = (name or "unknown").strip().lower()
     if key == "text":
         defaults = dict(
-            name = name, kind = "text", front_eligible = True, endcaps_front = True,
+            name = name, kind = "text", part0_eligible = True, endcaps_part0 = True,
             endcap_types = TEXT_ENDCAP_TYPES, endcap_key_suffixes = TEXT_ENDCAP_SUFFIXES)
     elif key in WHOLE_COMPONENT_KINDS:
         defaults = dict(
-            name = name, kind = key, front_eligible = True, endcaps_front = True,
+            name = name, kind = key, part0_eligible = True, endcaps_part0 = True,
             whole_component = True)
     else:
-        defaults = dict(name = name, kind = "aux", front_eligible = False,
-                        endcaps_front = False)
+        defaults = dict(name = name, kind = "aux", part0_eligible = False,
+                        endcaps_part0 = False)
     defaults.update(overrides)
     return ComponentPolicy(**defaults)
 
@@ -297,8 +299,8 @@ def _key_matches(key: str, suffixes) -> bool:
     return False
 
 
-def is_front_endcap(module, policy: ComponentPolicy) -> bool:
-    """True for a non-layer module the text policy allows on the front device."""
+def is_part0_endcap(module, policy: ComponentPolicy) -> bool:
+    """True for a non-layer module the text policy allows on part0."""
     if getattr(module, "caps", {}).get("prefer_cpu"):
         return False
     if getattr(module, "caps", {}).get("logits_output"):
@@ -403,22 +405,22 @@ class ComponentMap:
 
     ``reserve_bytes`` is a per-device *slab* held for the duration of the load,
     not a process-wide allocator cap: a cap changes the ROCm allocator's layout
-    and perturbs the main device's kernel choices (measured at 128K), while a
+    and perturbs the part1 device's kernel choices (measured at 128K), while a
     slab only removes bytes from the pool and releases them without changing the
     allocator's policy.
     """
 
-    main: torch.device
-    front: torch.device | None
-    front_layers: int
+    part1: torch.device
+    part0: torch.device | None
+    part0_layers: int
     endcaps: bool
     component: str = "text"
     layer_count: int = 0
     policy: ComponentPolicy | None = None
-    main_arch: str = ""
-    front_arch: str | None = None
+    part1_arch: str = ""
+    part0_arch: str | None = None
     reserve_bytes: dict[int, int] = field(default_factory = dict)
-    front_endcap_keys: tuple[str, ...] = ()
+    part0_endcap_keys: tuple[str, ...] = ()
     unknown_keys: tuple[str, ...] = ()
     size_bytes: int = 0
     load_order: int = 0
@@ -436,33 +438,33 @@ class ComponentMap:
     def from_model(
         cls,
         model,
-        front_layers: int,
+        part0_layers: int,
         endcaps: bool,
         devices: Devices,
         component: str = "text",
-        front_reserve_gb: float = DEFAULT_FRONT_RESERVE_GB,
-        main_reserve_gb: float = 0.0,
+        part0_reserve_gb: float = DEFAULT_PART0_RESERVE_GB,
+        part1_reserve_gb: float = 0.0,
         config = None,
         cache = None,
         policy: ComponentPolicy | None = None,
         load_order: int = 0,
     ) -> "ComponentMap":
         policy = policy or component_policy(component)
-        return cls.from_policy(model, front_layers, endcaps, devices, policy,
-                               front_reserve_gb = front_reserve_gb,
-                               main_reserve_gb = main_reserve_gb,
+        return cls.from_policy(model, part0_layers, endcaps, devices, policy,
+                               part0_reserve_gb = part0_reserve_gb,
+                               part1_reserve_gb = part1_reserve_gb,
                                config = config, cache = cache, load_order = load_order)
 
     @classmethod
     def from_policy(
         cls,
         model,
-        front_layers: int | str,
+        part0_layers: int | str,
         endcaps: bool,
         devices: Devices,
         policy: ComponentPolicy,
-        front_reserve_gb: float = DEFAULT_FRONT_RESERVE_GB,
-        main_reserve_gb: float = 0.0,
+        part0_reserve_gb: float = DEFAULT_PART0_RESERVE_GB,
+        part1_reserve_gb: float = 0.0,
         config = None,
         cache = None,
         load_order: int = 0,
@@ -470,58 +472,58 @@ class ComponentMap:
         modules = list(model.modules)
         layers = [m for m in modules if getattr(m, "layer_idx", None) is not None]
         n_layers = len(layers)
-        auto = front_layers in ("auto", -1) or (isinstance(front_layers, str) and front_layers.strip().lower() == "auto")
-        front_layers = 0 if auto else int(front_layers)
-        endcaps = bool(endcaps and policy.endcaps_front)
+        auto = part0_layers in ("auto", -1) or (isinstance(part0_layers, str) and part0_layers.strip().lower() == "auto")
+        part0_layers = 0 if auto else int(part0_layers)
+        endcaps = bool(endcaps and policy.endcaps_part0)
         if policy.whole_component:
             # These components are endcaps in their entirety: they have no trunk
-            # boundary of their own, so ENDCAPS OFF leaves them on the main device.
-            front_layers = n_layers if endcaps else 0
-        front_layers = max(0, min(int(front_layers), n_layers))
-        if devices.front is None or not policy.allows_front(devices.front_arch):
-            front_layers = 0
+            # boundary of their own, so ENDCAPS OFF leaves them on part1.
+            part0_layers = n_layers if endcaps else 0
+        part0_layers = max(0, min(int(part0_layers), n_layers))
+        if devices.part0 is None or not policy.allows_part0(devices.part0_arch):
+            part0_layers = 0
         positions = {id(m): i for i, m in enumerate(modules)}
         first = positions[id(layers[0])] if layers else 0
         last = positions[id(layers[-1])] if layers else -1
         stc = getattr(config, "stc", None) if config is not None else None
 
-        # The front reserve caps the small card while its weights load.  It is released
-        # before the first main module (see Model._load_mapped): the main device has ample
-        # headroom and is never capped.  A component other than the budget owner clears
-        # reserve_bytes after construction (SplitPlan does this).
+        # The part0 reserve caps the small card while its weights load.  It is released
+        # before the first part1 module (see Model._load_mapped): the part1 device has
+        # ample headroom and is never capped.  A component other than the budget owner
+        # clears reserve_bytes after construction (SplitPlan does this).
         reserve: dict[int, int] = {}
-        if devices.front is not None and front_layers > 0 and front_reserve_gb > 0:
-            reserve[devices.front.index] = max(0, int(front_reserve_gb * GIB))
-        if devices.main is not None and main_reserve_gb > 0:
-            reserve[devices.main.index] = max(0, int(main_reserve_gb * GIB))
+        if devices.part0 is not None and part0_layers > 0 and part0_reserve_gb > 0:
+            reserve[devices.part0.index] = max(0, int(part0_reserve_gb * GIB))
+        if devices.part1 is not None and part1_reserve_gb > 0:
+            reserve[devices.part1.index] = max(0, int(part1_reserve_gb * GIB))
 
         layer_bytes = _layer_bytes(model, stc)
         cache_by_layer = _cache_bytes_by_layer(cache)
-        front_endcaps = tuple(
+        part0_endcaps = tuple(
             m.key for m in modules
-            if getattr(m, "layer_idx", None) is None and is_front_endcap(m, policy)
+            if getattr(m, "layer_idx", None) is None and is_part0_endcap(m, policy)
         )
         unknown = tuple(
             m.key for m in modules
             if getattr(m, "layer_idx", None) is None
             and not getattr(m, "caps", {}).get("prefer_cpu")
-            and not is_front_endcap(m, policy)
+            and not is_part0_endcap(m, policy)
         )
         size = (sum(layer_bytes.values()) +
                 sum(_module_bytes(m, stc) for m in modules if getattr(m, "layer_idx", None) is None))
 
         return cls(
-            main = devices.main,
-            front = devices.front,
-            front_layers = front_layers,
-            endcaps = bool(endcaps) and front_layers > 0,
+            part1 = devices.part1,
+            part0 = devices.part0,
+            part0_layers = part0_layers,
+            endcaps = bool(endcaps) and part0_layers > 0,
             component = policy.name,
             layer_count = n_layers,
             policy = policy,
-            main_arch = devices.main_arch,
-            front_arch = devices.front_arch,
+            part1_arch = devices.part1_arch,
+            part0_arch = devices.part0_arch,
             reserve_bytes = reserve,
-            front_endcap_keys = front_endcaps,
+            part0_endcap_keys = part0_endcaps,
             unknown_keys = unknown,
             size_bytes = int(size),
             load_order = load_order,
@@ -539,13 +541,13 @@ class ComponentMap:
 
     @property
     def enabled(self) -> bool:
-        return self.front is not None and self.front_layers > 0
+        return self.part0 is not None and self.part0_layers > 0
 
     @property
     def used_devices(self) -> list[torch.device]:
-        out = [self.main]
-        if self.enabled and self.front is not None:
-            out.append(self.front)
+        out = [self.part1]
+        if self.enabled and self.part0 is not None:
+            out.append(self.part0)
         return out
 
     @property
@@ -553,7 +555,7 @@ class ComponentMap:
         return self.policy or component_policy(self.component)
 
     def _endcap_allowed(self, module) -> bool:
-        return is_front_endcap(module, self.policy_or_default)
+        return is_part0_endcap(module, self.policy_or_default)
 
     def device_for(self, module) -> torch.device:
         if getattr(module, "caps", {}).get("prefer_cpu"):
@@ -561,35 +563,35 @@ class ComponentMap:
         idx = getattr(module, "layer_idx", None)
         if idx is not None:
             if not self.enabled:
-                return self.main
+                return self.part1
             if self.policy_or_default.whole_component:
-                return self.front
-            return self.front if idx < self.front_layers else self.main
+                return self.part0
+            return self.part0 if idx < self.part0_layers else self.part1
         if not self.enabled:
-            return self.main
+            return self.part1
         if self.policy_or_default.whole_component:
             # MTP/vision/draft have no trunk boundary: all their modules share the
             # component's endcaps verdict.
-            return self.front if self.endcaps else self.main
+            return self.part0 if self.endcaps else self.part1
         if not self._endcap_allowed(module):
             # Unknown / auxiliary non-layer module: always safe, never moved implicitly.
-            return self.main
-        if not self.policy_or_default.endcaps_front:
-            return self.main
+            return self.part1
+        if not self.policy_or_default.endcaps_part0:
+            return self.part1
         if self.endcaps:
-            return self.front
+            return self.part0
         # ENDCAPS OFF: allowlisted prologue follows layer 0, epilogue follows the last layer.
         pos = self._positions.get(id(module), 0)
         if pos < self._first_layer_pos:
-            return self.front
+            return self.part0
         if pos > self._last_layer_pos:
-            return self.front if self.front_layers >= self.layer_count else self.main
-        return self.main
+            return self.part0 if self.part0_layers >= self.layer_count else self.part1
+        return self.part1
 
     # -- load-time budget --------------------------------------------------
 
     def engage_budget(self) -> None:
-        """Hold the front reserve as a slab (never a process-wide allocator cap)."""
+        """Hold the part0 reserve as a slab (never a process-wide allocator cap)."""
         if getattr(self, "_budget_engaged", False):
             return
         for i, reserve in self.reserve_bytes.items():
@@ -606,18 +608,18 @@ class ComponentMap:
                       flush = True)
         self._budget_engaged = True
 
-    def release_front_budget(self) -> None:
-        """Release the front slab before the first main module loads.
+    def release_part0_budget(self) -> None:
+        """Release the part0 slab before the first part1 module loads.
 
         The slab is dropped; the caching allocator keeps the freed block for the
         forward workspace, so the headroom is preserved without a cap.
         """
         if not getattr(self, "_budget_engaged", False):
             return
-        if self.front is None:
+        if self.part0 is None:
             return
-        self._reserve_slabs.pop(self.front.index, None)
-        self._budget_engaged = any(i != self.front.index and r > 0 for i, r in self.reserve_bytes.items())
+        self._reserve_slabs.pop(self.part0.index, None)
+        self._budget_engaged = any(i != self.part0.index and r > 0 for i, r in self.reserve_bytes.items())
 
     def release_budget(self) -> None:
         self._reserve_slabs.clear()
@@ -631,11 +633,11 @@ class ComponentMap:
     def layer_cache_bytes(self, idx: int) -> int:
         return int(self._cache_by_layer.get(idx, 0))
 
-    def front_cost(self, n: int, endcaps: bool | None = None) -> int:
-        """Estimated front bytes for n text layers plus the policy's front endcaps."""
+    def part0_cost(self, n: int, endcaps: bool | None = None) -> int:
+        """Estimated part0 bytes for n text layers plus the policy's part0 endcaps."""
         n = max(0, min(n, self.layer_count))
         endcaps = self.endcaps if endcaps is None else bool(endcaps)
-        endcaps = endcaps and self.policy_or_default.endcaps_front
+        endcaps = endcaps and self.policy_or_default.endcaps_part0
         cost = sum(self.layer_weight_bytes(i) for i in range(n))
         cost += sum(self.layer_cache_bytes(i) for i in range(n))
         if not endcaps:
@@ -645,14 +647,14 @@ class ComponentMap:
             return cost + sum(_module_bytes(m, stc)
                               for m in self._module_refs if getattr(m, "layer_idx", None) is None
                               and not getattr(m, "caps", {}).get("prefer_cpu"))
-        allowed = set(self.front_endcap_keys)
+        allowed = set(self.part0_endcap_keys)
         return cost + sum(_module_bytes(m, stc) for m in self._module_refs if m.key in allowed)
 
     def describe(self) -> str:
-        parts = [f"{self.component}: layers 0..{self.front_layers - 1} front, "
-                 f"{self.front_layers}..{self.layer_count - 1} main"]
+        parts = [f"{self.component}: layers 0..{self.part0_layers - 1} part0, "
+                 f"{self.part0_layers}..{self.layer_count - 1} part1"]
         if self.endcaps:
-            parts.append(f"endcaps front ({len(self.front_endcap_keys)} modules)")
+            parts.append(f"endcaps part0 ({len(self.part0_endcap_keys)} modules)")
         else:
             parts.append("endcaps follow neighbours")
         return "; ".join(parts)
@@ -670,7 +672,7 @@ LayerDeviceMap = ComponentMap
 class ComponentLoad:
     component: str
     seconds: float
-    front_layers: int
+    part0_layers: int
     layer_count: int
     device_map: ComponentMap | None
     weight_bytes: int = 0
@@ -685,20 +687,20 @@ class SplitPlan:
         self,
         devices: Devices,
         endcaps: bool = True,
-        front_layers: int | str = 0,
-        front_reserve_gb: float = DEFAULT_FRONT_RESERVE_GB,
-        main_reserve_gb: float = 0.0,
+        part0_layers: int | str = 0,
+        part0_reserve_gb: float = DEFAULT_PART0_RESERVE_GB,
+        part1_reserve_gb: float = 0.0,
         preset: str = "auto",
         auto_cap: int | None = None,
         logger = print,
     ):
         self.devices = devices
         self.endcaps = bool(endcaps)
-        self.requested_front_layers = front_layers
-        self.auto = isinstance(front_layers, str) and front_layers.strip().lower() == "auto" or front_layers == -1
-        self.front_layers = 0 if self.auto else max(0, int(front_layers or 0))
-        self.front_reserve_gb = float(front_reserve_gb)
-        self.main_reserve_gb = float(main_reserve_gb)
+        self.requested_part0_layers = part0_layers
+        self.auto = isinstance(part0_layers, str) and part0_layers.strip().lower() == "auto" or part0_layers == -1
+        self.part0_layers = 0 if self.auto else max(0, int(part0_layers or 0))
+        self.part0_reserve_gb = float(part0_reserve_gb)
+        self.part1_reserve_gb = float(part1_reserve_gb)
         self.preset = (preset or "auto").strip().lower()
         self.auto_cap = None if auto_cap is None else max(0, int(auto_cap))
         self.logger = logger
@@ -720,19 +722,19 @@ class SplitPlan:
         config = None,
         cache = None,
         policy: ComponentPolicy | None = None,
-        front_layers: int | str | None = None,
+        part0_layers: int | str | None = None,
         load_order: int | None = None,
     ) -> ComponentMap:
         was_built = self._built
         policy = policy or component_policy(component)
-        layer = self.requested_front_layers if front_layers is None else front_layers
+        layer = self.requested_part0_layers if part0_layers is None else part0_layers
         self._decls[component] = (model, config, cache, policy, layer, load_order)
         if config is not None:
             self.register_config(config)
         cmap = ComponentMap.from_policy(
             model, layer, self.endcaps, self.devices, policy,
-            front_reserve_gb = self.front_reserve_gb,
-            main_reserve_gb = self.main_reserve_gb,
+            part0_reserve_gb = self.part0_reserve_gb,
+            part1_reserve_gb = self.part1_reserve_gb,
             config = config, cache = cache,
             load_order = load_order if load_order is not None else len(self._decls),
         )
@@ -762,17 +764,17 @@ class SplitPlan:
             n = self._auto_n(text)
             if self.auto_cap is not None:
                 n = min(n, self.auto_cap)
-            self.front_layers = n
-            self.logger(f"[split] auto-N: {n} front layer(s) "
+            self.part0_layers = n
+            self.logger(f"[split] auto-N: {n} part0 layer(s) "
                         f"(budget {self._auto_budget() / GIB:.2f} GiB, "
-                        f"reserve {self.front_reserve_gb:.2f} GiB tuning slab)")
+                        f"reserve {self.part0_reserve_gb:.2f} GiB tuning slab)")
         for name, (model, config, cache, policy, layer, load_order) in self._decls.items():
             if self.auto and policy.kind == "text":
-                layer = self.front_layers
+                layer = self.part0_layers
             self.maps[name] = ComponentMap.from_policy(
                 model, layer, self.endcaps, self.devices, policy,
-                front_reserve_gb = self.front_reserve_gb,
-                main_reserve_gb = self.main_reserve_gb,
+                part0_reserve_gb = self.part0_reserve_gb,
+                part1_reserve_gb = self.part1_reserve_gb,
                 config = config, cache = cache,
                 load_order = load_order if load_order is not None else 0,
             )
@@ -811,13 +813,13 @@ class SplitPlan:
                 cmap.reserve_bytes.clear()
 
     def _auto_budget(self) -> int:
-        if self.devices.front is None:
+        if self.devices.part0 is None:
             return 0
-        total = int(torch.cuda.get_device_properties(self.devices.front).total_memory)
+        total = int(torch.cuda.get_device_properties(self.devices.part0).total_memory)
         # Allocator slack, not an architecture rule; Stage 5 replaces it with measured
         # load/forward headroom.
         safety = int(float(os.environ.get("KYOJIN_AUTON_SAFETY_GB", "0.25")) * GIB)
-        return max(0, total - int(self.front_reserve_gb * GIB) - safety)
+        return max(0, total - int(self.part0_reserve_gb * GIB) - safety)
 
     def _auto_n(self, text: str | None) -> int:
         if text is None or text not in self.maps:
@@ -833,10 +835,10 @@ class SplitPlan:
             if name != text and m.enabled and m.policy_or_default.whole_component and self.endcaps)
         for n in range(cmap.layer_count, -1, -1):
             if self.endcaps:
-                cost = other + cmap.front_cost(n, self.endcaps)
+                cost = other + cmap.part0_cost(n, self.endcaps)
             else:
-                # Prologue follows layer 0; epilogue only when every layer is front.
-                cost = other + cmap.front_cost(n, self.endcaps)
+                # Prologue follows layer 0; epilogue only when every layer is part0.
+                cost = other + cmap.part0_cost(n, self.endcaps)
                 if n > 0:
                     cost += self._prologue_bytes(cmap)
                 if n >= cmap.layer_count:
@@ -849,7 +851,7 @@ class SplitPlan:
         stc = getattr(cmap.config, "stc", None)
         out = 0
         for m in cmap._module_refs:
-            if getattr(m, "layer_idx", None) is not None or not is_front_endcap(m, cmap.policy_or_default):
+            if getattr(m, "layer_idx", None) is not None or not is_part0_endcap(m, cmap.policy_or_default):
                 continue
             if cmap._positions.get(id(m), 0) < cmap._first_layer_pos:
                 out += _module_bytes(m, stc)
@@ -859,7 +861,7 @@ class SplitPlan:
         stc = getattr(cmap.config, "stc", None)
         out = 0
         for m in cmap._module_refs:
-            if getattr(m, "layer_idx", None) is not None or not is_front_endcap(m, cmap.policy_or_default):
+            if getattr(m, "layer_idx", None) is not None or not is_part0_endcap(m, cmap.policy_or_default):
                 continue
             if cmap._positions.get(id(m), 0) > cmap._last_layer_pos:
                 out += _module_bytes(m, stc)
@@ -876,7 +878,7 @@ class SplitPlan:
 
     def engage_budget(self) -> None:
         # One reserve for the whole load sequence (target + drafter + vision).  After
-        # the owner releases the slab at its first main module, a later component must
+        # the owner releases the slab at its first part1 module, a later component must
         # not allocate a second one.
         if self._budget_engaged_once:
             return
@@ -890,7 +892,7 @@ class SplitPlan:
             return
         from .bridge import install_bridge
         for config in self.configs:
-            install_bridge(config, self.devices.main, self.devices.front)
+            install_bridge(config, part1 = self.devices.part1, part0 = self.devices.part0)
 
     def record_load(self, component: str, seconds: float, warnings = ()) -> None:
         cmap = self.maps.get(component)
@@ -899,7 +901,7 @@ class SplitPlan:
         cache_bytes = _cache_bytes_for(cmap.cache, cmap.layer_count)
         self.records.append(ComponentLoad(
             component = component, seconds = float(seconds),
-            front_layers = cmap.front_layers, layer_count = cmap.layer_count,
+            part0_layers = cmap.part0_layers, layer_count = cmap.layer_count,
             device_map = cmap, weight_bytes = int(cmap.size_bytes),
             cache_bytes = cache_bytes, warnings = tuple(warnings)))
 
@@ -932,10 +934,10 @@ class SplitPlan:
     @staticmethod
     def _expected_layer_device(cmap: ComponentMap, idx: int):
         if not cmap.enabled:
-            return cmap.main
+            return cmap.part1
         if cmap.policy_or_default.whole_component:
-            return cmap.front if cmap.endcaps else cmap.main
-        return cmap.front if idx < cmap.front_layers else cmap.main
+            return cmap.part0 if cmap.endcaps else cmap.part1
+        return cmap.part0 if idx < cmap.part0_layers else cmap.part1
 
     def report(self, model, cache, extra: list[tuple[str, object, object]] | None = None,
                ctx: int | None = None) -> None:
@@ -947,7 +949,7 @@ class SplitPlan:
         self.print_component_table()
         for name, cmap in self.maps.items():
             if cmap.unknown_keys and cmap.policy_or_default.kind == "text":
-                self.logger(f"[split] {name}: unknown non-layer modules kept on the main device: "
+                self.logger(f"[split] {name}: unknown non-layer modules kept on the part1 device: "
                             f"{', '.join(cmap.unknown_keys)}")
         issues = self.audit_caches()
         for name, bad in issues.items():
@@ -970,10 +972,10 @@ class SplitPlan:
             d = r.device_map
             if d is None:
                 continue
-            front = f"0..{r.front_layers - 1}" if r.front_layers else "-"
-            main = f"{r.front_layers}..{r.layer_count - 1}" if r.layer_count else "-"
-            self.logger(f"[split]   {r.component:7s} {r.seconds:7.1f}s  front {front:>10s}  "
-                        f"main {main:>10s}  weights {r.weight_bytes / GIB:7.2f} GiB  "
+            part0 = f"0..{r.part0_layers - 1}" if r.part0_layers else "-"
+            part1 = f"{r.part0_layers}..{r.layer_count - 1}" if r.layer_count else "-"
+            self.logger(f"[split]   {r.component:7s} {r.seconds:7.1f}s  part0 {part0:>10s}  "
+                        f"part1 {part1:>10s}  weights {r.weight_bytes / GIB:7.2f} GiB  "
                         f"cache {r.cache_bytes / GIB:6.2f} GiB  devices "
                         f"{', '.join(str(x) for x in d.used_devices)}")
             for w in r.warnings:
@@ -1045,14 +1047,14 @@ def print_split_table(
         weights = allocated - cache_bytes
         print(f"[split] {str(dev):9s} weights {_gib(weights)}  cache {_gib(cache_bytes)}  "
               f"allocated {_gib(allocated)}  peak {_gib(peak)}", flush = True)
-    if device_map.front is not None:
+    if device_map.part0 is not None:
         try:
-            p = torch.cuda.get_device_properties(device_map.front)
+            p = torch.cuda.get_device_properties(device_map.part0)
             total = p.total_memory
         except Exception:                                    # noqa: BLE001
             total = 0
-        reserve = device_map.reserve_bytes.get(device_map.front.index, 0)
-        print(f"[split] front {str(device_map.front)} {device_map.front_arch}: "
+        reserve = device_map.reserve_bytes.get(device_map.part0.index, 0)
+        print(f"[split] part0 {str(device_map.part0)} {device_map.part0_arch}: "
               f"{total / GIB:.2f} GiB total, reserve {reserve / GIB:.2f} GiB, "
               f"budget {(total - reserve) / GIB:.2f} GiB", flush = True)
     cpu = [m.key for m in model.modules if getattr(m, "caps", {}).get("prefer_cpu")]

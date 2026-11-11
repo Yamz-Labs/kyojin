@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """Async host-staged bridge for the contiguous layer split.
 
-The front and main devices may be any two supported ROCm devices in either
-position.  On the measured mixed configuration (RX 9070 front over USB4 + Strix
-Halo main) there is no working, fast peer path: a direct device-to-device copy on
+The part0 and part1 devices may be any two supported ROCm devices in either
+position.  On the measured mixed configuration (RX 9070 as part0 over USB4 +
+Strix Halo as part1) there is no working, fast peer path: a direct device-to-device copy on
 that link class is both slow (under 1 GB/s observed on the 9070 side) and
 asymmetric.  Every segment crossing therefore goes through pinned host memory:
 
@@ -54,9 +54,9 @@ class _Channel:
 
 class Bridge:
 
-    def __init__(self, main: torch.device, front: torch.device):
-        self.main = torch.device(main)
-        self.front = torch.device(front)
+    def __init__(self, *, part1: torch.device, part0: torch.device):
+        self.part1 = torch.device(part1)
+        self.part0 = torch.device(part0)
         self.channels: dict[tuple[int, int], _Channel] = {}
         self.stats = {"hops": 0, "bytes": 0, "chunk_hops": 0, "chunk_bytes": 0, "reallocs": 0}
 
@@ -64,10 +64,10 @@ class Bridge:
 
     @property
     def pair(self) -> tuple[torch.device, torch.device]:
-        return self.main, self.front
+        return self.part1, self.part0
 
     def describe(self) -> str:
-        return (f"host-staged async bridge {self.main} <-> {self.front} "
+        return (f"host-staged async bridge {self.part1} <-> {self.part0} "
                 f"(pinned slots x{_ROUND})")
 
     def summary(self) -> str:
@@ -177,7 +177,7 @@ def bridge_enabled() -> bool:
     return os.environ.get("KYOJIN_BRIDGE", "1") != "0"
 
 
-def install_bridge(config, main: torch.device, front: torch.device | None) -> Bridge | None:
+def install_bridge(config, *, part1: torch.device, part0: torch.device | None) -> Bridge | None:
     """Attach the bridge to a config and mark the model as split.
 
     The config is shared by the target, the drafter and the vision tower, so one call
@@ -185,18 +185,18 @@ def install_bridge(config, main: torch.device, front: torch.device | None) -> Br
     forward or per-block graph must not span the bridge (Phase 6 owns per-segment
     capture).
     """
-    split_active = front is not None and torch.device(main) != torch.device(front)
+    split_active = part0 is not None and torch.device(part1) != torch.device(part0)
     config.split_active = split_active
     if not split_active:
         return getattr(config, "device_bridge", None)
     # Kernel-level fallbacks that must apply only in split mode (the gfx12 KDA
-    # determinant fallback) read this; split off stays on the main code path.
+    # determinant fallback) read this; split off stays on the default code path.
     os.environ["KYOJIN_SPLIT_ACTIVE"] = "1"
     existing = getattr(config, "device_bridge", None)
     if not bridge_enabled():
         return existing
-    if existing is not None and existing.pair == (torch.device(main), torch.device(front)):
+    if existing is not None and existing.pair == (torch.device(part1), torch.device(part0)):
         return existing
-    bridge = Bridge(main, front)
+    bridge = Bridge(part1 = part1, part0 = part0)
     config.device_bridge = bridge
     return bridge

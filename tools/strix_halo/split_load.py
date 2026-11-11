@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Phase 3 loader gate: load the GLM pack across two devices and print the table.
 
-No forward pass is run.  Either device may be the front or the main one; select
-them with --main-device/--front-device (cuda:N, gfxXXXX, UUID or name).
+No forward pass is run.  Either device may serve part0 or part1; select them with
+--part1-device/--part0-device (cuda:N, gfxXXXX, UUID or name).
 Usage (from the repo root, after `source tools/strix_halo/env.sh`):
 
     python tools/strix_halo/split_load.py \
         -m /data/models/NicSir--GLM-5.3-Flash-EXL3-2.72bpw \
-        --front-layers 4 --endcaps on -c 65536
+        --part0-layers 4 --endcaps on -c 65536
 """
 from __future__ import annotations
 
@@ -30,15 +30,15 @@ def mem_available_gib() -> float:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("-m", "--model", required=True)
-    p.add_argument("--front-layers", type=int, default=4)
-    p.add_argument("--main-device", default="auto")
-    p.add_argument("--front-device", default="auto")
+    p.add_argument("--part0-layers", type=int, default=4)
+    p.add_argument("--part1-device", default="auto")
+    p.add_argument("--part0-device", default="auto")
     p.add_argument("--endcaps", choices=("on", "off"), default="on")
-    p.add_argument("--front-reserve-gb", type=float, default=1.2)
+    p.add_argument("--part0-reserve-gb", type=float, default=1.2)
     p.add_argument("-c", "--cache-size", type=int, default=65536)
     p.add_argument("--num-draft", type=int, default=2)
     p.add_argument("--no-vision", action="store_true")
-    p.add_argument("--baseline", action="store_true", help="load everything on the main device, for the host-RAM comparison")
+    p.add_argument("--baseline", action="store_true", help="load everything on cuda:0, for the host-RAM comparison")
     args = p.parse_args()
 
     import torch
@@ -75,21 +75,21 @@ def main() -> None:
             except Exception as exc:                    # noqa: BLE001
                 print(f"[baseline] vision not loaded: {type(exc).__name__}: {exc}", flush=True)
         print(f"[baseline] load {time.perf_counter() - t0:.1f} s; "
-              f"main allocated {torch.cuda.memory_allocated(torch.device('cuda:0')) / 2**30:.2f} GiB; "
+              f"cuda:0 allocated {torch.cuda.memory_allocated(torch.device('cuda:0')) / 2**30:.2f} GiB; "
               f"peak {torch.cuda.max_memory_allocated(torch.device('cuda:0')) / 2**30:.2f} GiB", flush=True)
         peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024 ** 2
         print(f"[baseline] host RSS peak {peak:.2f} GiB; "
               f"MemAvailable {host_before:.1f} -> {mem_available_gib():.1f} GiB", flush=True)
         return
 
-    devices = resolve_devices(args.front_device, args.main_device)
-    plan = SplitPlan(devices, endcaps=endcaps, front_layers=args.front_layers,
-                     front_reserve_gb=args.front_reserve_gb)
+    devices = resolve_devices(args.part0_device, args.part1_device)
+    plan = SplitPlan(devices, endcaps=endcaps, part0_layers=args.part0_layers,
+                     part0_reserve_gb=args.part0_reserve_gb)
     plan.add("text", model, config=config, cache=cache, load_order=0)
     plan.build()
     text_map = plan.map("text")
     if text_map is None or not text_map.enabled:
-        raise SystemExit("split map is not enabled (no front device)")
+        raise SystemExit("split map is not enabled (no part0 device)")
     plan.install_bridges()
     plan.engage_budget()
 

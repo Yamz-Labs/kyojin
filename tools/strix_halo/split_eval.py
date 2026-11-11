@@ -6,9 +6,9 @@ baseline (--baseline), saves the greedy token ids to JSON, and optionally compar
 saved runs token-for-token.  It also measures decode t/s under --num-draft and can run a
 long-context needle probe.
 
-The split works on any two supported devices; use --main-device/--front-device to put
-either device in either position.  The context-dependent --front-layers default is
-harness tuning for a small front card, not a property of the split; pass --front-layers
+The split works on any two supported devices; use --part1-device/--part0-device to put
+either device in either position.  The context-dependent --part0-layers default is
+harness tuning for a small part0 card, not a property of the split; pass --part0-layers
 to choose N explicitly.
 
 Usage (from the repo root, after `source tools/strix_halo/env.sh`):
@@ -65,19 +65,19 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("-m", "--model", default="/data/models/NicSir--GLM-5.3-Flash-EXL3-2.72bpw")
     p.add_argument("--baseline", action="store_true", help="single device (cuda:0), no layer split")
-    p.add_argument("--front-layers", type=int, default=None)
-    p.add_argument("--main-device", default="auto")
-    p.add_argument("--front-device", default="auto")
+    p.add_argument("--part0-layers", type=int, default=None)
+    p.add_argument("--part1-device", default="auto")
+    p.add_argument("--part0-device", default="auto")
     p.add_argument("--long-ctx-threshold", type=int, default=65536,
-                   help="context above which the harness default front-layer count changes")
-    p.add_argument("--long-ctx-front-layers", type=int, default=5,
+                   help="context above which the harness default part0-layer count changes")
+    p.add_argument("--long-ctx-part0-layers", type=int, default=5,
                    help="harness default for contexts above --long-ctx-threshold; measured on a "
-                        "small front card, not a property of the split")
-    p.add_argument("--short-ctx-front-layers", type=int, default=6,
+                        "small part0 card, not a property of the split")
+    p.add_argument("--short-ctx-part0-layers", type=int, default=6,
                    help="harness default at or below --long-ctx-threshold")
     p.add_argument("--endcaps", choices=("on", "off"), default="on")
-    p.add_argument("--front-reserve-gb", type=float, default=1.2)
-    p.add_argument("--main-reserve-gb", type=float, default=0.0)
+    p.add_argument("--part0-reserve-gb", type=float, default=1.2)
+    p.add_argument("--part1-reserve-gb", type=float, default=0.0)
     p.add_argument("-c", "--max-ctx", type=int, default=131072)
     p.add_argument("--num-draft", type=int, default=2)
     p.add_argument("--no-vision", action="store_true")
@@ -92,12 +92,12 @@ def parse_args() -> argparse.Namespace:
                    help="compare two saved runs: prompt ids and decode numbers")
     p.add_argument("--no-perf", action="store_true", help="skip the 3 decode timing prompts")
     args = p.parse_args()
-    args.front_layers_defaulted = args.front_layers is None
-    if args.front_layers is None:
-        # Harness tuning for memory, not a split property: a small front card cannot
+    args.part0_layers_defaulted = args.part0_layers is None
+    if args.part0_layers is None:
+        # Harness tuning for memory, not a split property: a small part0 card cannot
         # hold N=6 plus the long-context workspace.  Both values are explicit flags.
-        args.front_layers = (args.long_ctx_front_layers if args.max_ctx > args.long_ctx_threshold
-                             else args.short_ctx_front_layers)
+        args.part0_layers = (args.long_ctx_part0_layers if args.max_ctx > args.long_ctx_threshold
+                             else args.short_ctx_part0_layers)
     return args
 
 
@@ -182,10 +182,10 @@ def build_needle(depth: int, tokenizer):
 
 def main() -> None:
     args = parse_args()
-    if args.front_layers_defaulted and not args.baseline:
-        print(f"[harness] no --front-layers given: using N={args.front_layers} at -c "
+    if args.part0_layers_defaulted and not args.baseline:
+        print(f"[harness] no --part0-layers given: using N={args.part0_layers} at -c "
               f"{args.max_ctx} (harness tuning, not a split property; override with "
-              f"--front-layers N or --long-ctx-front-layers N)", flush=True)
+              f"--part0-layers N or --long-ctx-part0-layers N)", flush=True)
     if args.compare:
         compare(args.compare[0], args.compare[1])
         return
@@ -214,16 +214,16 @@ def main() -> None:
     text_map = None
     if not args.baseline:
         from exllamav3.device_map import SplitPlan, resolve_devices
-        devices = resolve_devices(args.front_device, args.main_device)
+        devices = resolve_devices(args.part0_device, args.part1_device)
         plan = SplitPlan(
-            devices, endcaps = args.endcaps == "on", front_layers = args.front_layers,
-            front_reserve_gb = 0.0 if args.no_budget else args.front_reserve_gb,
-            main_reserve_gb = args.main_reserve_gb)
+            devices, endcaps = args.endcaps == "on", part0_layers = args.part0_layers,
+            part0_reserve_gb = 0.0 if args.no_budget else args.part0_reserve_gb,
+            part1_reserve_gb = args.part1_reserve_gb)
         plan.add("text", model, config = config, cache = cache, load_order = 0)
         plan.build()
         text_map = plan.map("text")
-        if args.front_layers > 0 and (text_map is None or not text_map.enabled):
-            raise SystemExit("split map not enabled (no front device)")
+        if args.part0_layers > 0 and (text_map is None or not text_map.enabled):
+            raise SystemExit("split map not enabled (no part0 device)")
         plan.install_bridges()
         plan.engage_budget()
 
@@ -281,7 +281,7 @@ def main() -> None:
     result = {
         "mode": "baseline" if args.baseline else "split",
         "model": args.model,
-        "front_layers": None if args.baseline else args.front_layers,
+        "part0_layers": None if args.baseline else args.part0_layers,
         "endcaps": None if args.baseline else args.endcaps,
         "ctx": args.max_ctx,
         "num_draft": args.num_draft,

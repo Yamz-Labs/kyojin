@@ -79,22 +79,22 @@ class Model_LSMixin(ABC):
     ):
         """Load every top-level module straight to the device the map assigns it.
 
-        No autosplit measuring forwards: the boundary is explicit. The front reserve is a
-        held device slab while its segment loads, then is dropped at the first main module
+        No autosplit measuring forwards: the boundary is explicit. The part0 reserve is a
+        held device slab while its segment loads, then is dropped at the first part1 module
         (the freed block stays available to the workspace without changing the allocator's
-        policy or the main segment's numerics). The caller releases whatever remains after
+        policy or the part1 segment's numerics). The caller releases whatever remains after
         the last component.
         """
         device_map.engage_budget()
         pin_all = config.infer_params.vision_pinned and getattr(self, "component", "text") == "vision"
-        front_released = not device_map.enabled
+        part0_released = not device_map.enabled
         with ProgressBar(f"Loading (split)" if progressbar else None, len(modules)) as progress:
             for idx, module in enumerate(modules):
                 if callback: callback(idx, len(modules))
                 dev = device_map.device_for(module)
-                if not front_released and dev == device_map.main:
-                    device_map.release_front_budget()
-                    front_released = True
+                if not part0_released and dev == device_map.part1:
+                    device_map.release_part0_budget()
+                    part0_released = True
                 defer = module.can_defer_load()
                 if defer:
                     # Pinned modules leave the arena alone (see _load_single)
@@ -117,7 +117,7 @@ class Model_LSMixin(ABC):
         # shares it.
         if device_map.enabled:
             from ..bridge import install_bridge
-            bridge = install_bridge(config, device_map.main, device_map.front)
+            bridge = install_bridge(config, part1 = device_map.part1, part0 = device_map.part0)
             if bridge is not None and verbose:
                 print(f" -- split: {bridge.describe()}")
 

@@ -337,24 +337,24 @@ def init(
 
     # Explicit contiguous layer split. GLM serve has its own CLI; this env-only path
     # keeps examples/chat.py and the eval tools able to exercise the split.
-    from .serve_split import parse_front_layers
-    front_layers = parse_front_layers(os.environ.get("KYOJIN_FRONT_LAYERS", "0"))
+    from .serve_split import parse_part0_layers
+    part0_layers = parse_part0_layers(os.environ.get("KYOJIN_PART0_LAYERS", "0"))
     split_plan = None
     draft_component = None
-    front_map = draft_map = None
-    if front_layers:
+    text_map = draft_map = None
+    if part0_layers:
         if args.tensor_parallel or single_device or split is not None:
-            raise ValueError("KYOJIN_FRONT_LAYERS cannot be combined with tensor parallel, "
+            raise ValueError("KYOJIN_PART0_LAYERS cannot be combined with tensor parallel, "
                              "EXL3_LOAD_DEVICE or --gpu_split")
         if os.environ.get("EXL3_LOAD_SPLIT"):
-            raise ValueError("KYOJIN_FRONT_LAYERS cannot be combined with the legacy EXL3_LOAD_SPLIT budget")
+            raise ValueError("KYOJIN_PART0_LAYERS cannot be combined with the legacy EXL3_LOAD_SPLIT budget")
         from .device_map import SplitPlan, resolve_devices
-        devices = resolve_devices(os.environ.get("KYOJIN_FRONT_DEVICE"),
-                                  os.environ.get("KYOJIN_MAIN_DEVICE"))
+        devices = resolve_devices(os.environ.get("KYOJIN_PART0_DEVICE"),
+                                  os.environ.get("KYOJIN_PART1_DEVICE"))
         endcaps = os.environ.get("KYOJIN_ENDCAPS", "1") != "0"
-        reserve = float(os.environ.get("KYOJIN_FRONT_RESERVE_GB", "1.2"))
-        split_plan = SplitPlan(devices, endcaps = endcaps, front_layers = front_layers,
-                               front_reserve_gb = reserve,
+        reserve = float(os.environ.get("KYOJIN_PART0_RESERVE_GB", "1.2"))
+        split_plan = SplitPlan(devices, endcaps = endcaps, part0_layers = part0_layers,
+                               part0_reserve_gb = reserve,
                                preset = os.environ.get("KYOJIN_SPLIT_PRESET", "auto"),
                                logger = lambda m: printp(not quiet, m))
         split_plan.add("text", model, config = config, cache = cache, load_order = 0)
@@ -365,24 +365,24 @@ def init(
                                cache = draft_cache, load_order = 1)
             else:
                 # A separate text drafter has its own trunk; do not treat it as a
-                # whole-component MTP and place it entirely on the front card.
+                # whole-component MTP and place it entirely on the part0 card.
                 from .device_map import ComponentPolicy
                 draft_component = "draft"
                 split_plan.add("draft", draft_model, config = draft_config,
                                cache = draft_cache,
                                policy = ComponentPolicy(name = "draft", kind = "aux",
-                                                        front_eligible = False,
-                                                        endcaps_front = False),
-                               front_layers = 0, load_order = 1)
+                                                        part0_eligible = False,
+                                                        endcaps_part0 = False),
+                               part0_layers = 0, load_order = 1)
         split_plan.build()
         split_plan.install_bridges()
         split_plan.engage_budget()
-        front_map = split_plan.map("text")
+        text_map = split_plan.map("text")
         draft_map = split_plan.map(draft_component) if draft_component is not None else None
-        if front_map is not None:
-            printp(not quiet, f" -- layer split: {front_map.describe()}")
+        if text_map is not None:
+            printp(not quiet, f" -- layer split: {text_map.describe()}")
         if split_plan.auto:
-            printp(not quiet, f" -- layer split: auto chose {front_map.front_layers} front layer(s)")
+            printp(not quiet, f" -- layer split: auto chose {text_map.part0_layers} part0 layer(s)")
 
     # Parallelism options
     tp_options = {
@@ -421,7 +421,7 @@ def init(
     # Load model
     printp(not quiet, f" -- Loading {args.model_dir}")
     model.load(
-        **({"device_map": front_map} if front_map else
+        **({"device_map": text_map} if text_map else
            ({"device": single_device} if single_device else {"use_per_device": split})),
         tensor_p = args.tensor_parallel,
         progressbar = progress,
