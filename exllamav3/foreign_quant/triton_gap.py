@@ -13,6 +13,10 @@ import triton.language as tl
 FUSED = {"q4_0": 0, "iq4_nl": 1, "mxfp4": 2, "q5_0": 3}
 _BB = {"q4_0": 18, "iq4_nl": 18, "mxfp4": 17, "q5_0": 22}
 MAX_ROWS = 16
+# 32-blocks per loop iteration (static unroll): Strix sweep 11/11 (gap_nb.py, 17408 x 5120) q4_0 NB 8 141 -> 181 GB/s, q5_0 NB 4 156 -> 192;
+# iq4_nl / mxfp4 lose or gain < 5 %: 1. EXL3_GAP_NB forces one value for every format (A/B).
+_NB = {"q4_0": 8, "q5_0": 4} if getattr(__import__("torch").version, "hip", None) else {}
+GAP_NB = int(__import__("os").environ.get("EXL3_GAP_NB", "0"))
 # (BN, num_warps) per format, from a 3090 sweep at N=12288, K=4096, 4 rows
 _CFG = {"q4_0": (32, 1), "q5_0": (32, 1), "mxfp4": (32, 1), "iq4_nl": (16, 1)}
 # Strix Halo (gfx1151) sweep 11/11 (gap_tiles.py, 17408 x 5120, R1 / R4): q4_0 117 -> 136-139 GB/s at (16, 1), q5_0 133 -> 152-156 at (64, 4)
@@ -40,7 +44,7 @@ def _fp4half(q):
 
 
 @triton.jit
-def _gemv32(x_ptr, w_ptr, o_ptr, R, K, N, FMT: tl.constexpr, BB: tl.constexpr, BN: tl.constexpr, RP: tl.constexpr):
+def _gemv32(x_ptr, w_ptr, o_ptr, R, K, N, FMT: tl.constexpr, BB: tl.constexpr, BN: tl.constexpr, RP: tl.constexpr, NB: tl.constexpr = 1):
     pid = tl.program_id(0)
     Kb = K // 32
     rn = pid * BN + tl.arange(0, BN)
@@ -48,7 +52,9 @@ def _gemv32(x_ptr, w_ptr, o_ptr, R, K, N, FMT: tl.constexpr, BB: tl.constexpr, B
     j = tl.arange(0, 16)
     acc = tl.zeros((RP, BN), dtype=tl.float32)
     row = rn.to(tl.int64) * (Kb * BB)
-    for kb in range(0, Kb):
+    for kb0 in range(0, Kb, NB):
+      for t in tl.static_range(NB):
+        kb = kb0 + t
         base = row + kb * BB
         if FMT == 2:
             e = tl.load(w_ptr + base).to(tl.float32)
@@ -101,5 +107,7 @@ def gemv(fmt: str, x: torch.Tensor, raw: torch.Tensor, out: torch.Tensor | None 
     if out is None:
         out = torch.empty((R, N), dtype=torch.float16, device=x.device)
     RP = 16
-    _gemv32[(N // BN,)](x, raw, out, R, K, N, FUSED[fmt], _BB[fmt], BN, RP, num_warps=num_warps)
+    nb = GAP_NB or _NB.get(fmt, 1)
+    nb = nb if (K // 32) % nb == 0 else 1
+    _gemv32[(N // BN,)](x, raw, out, R, K, N, FUSED[fmt], _BB[fmt], BN, RP, nb, num_warps=num_warps)
     return out
