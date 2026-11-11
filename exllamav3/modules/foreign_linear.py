@@ -25,6 +25,8 @@ from .module import Module
 from ..ext import exllamav3_ext as ext
 from ..foreign_quant.gap_formats import dequant as gap_dequant
 from ..foreign_quant import triton_gap
+from ..foreign_quant import triton_rows
+_ROWS_TRITON = os.environ.get("BOLT_FQ_ROWS_TRITON", "1") != "0"
 
 FUSED_ROWS_MAX = 16
 _FUSED = os.environ.get("BOLT_FQ_FUSED", "1") != "0"
@@ -215,7 +217,13 @@ class ForeignLinear(Module):
         if not flat.is_contiguous():
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
-        if (
+        if _ROWS_TRITON and flat.dtype == torch.half and triton_rows.supported(self.format, R, K):
+            # 2..16 rows (verify / multi-user): weights read once for all rows (the fq_gemv kernels re-read them per row)
+            out = triton_rows.gemv(self.format, flat, self.packed.reshape(self.out_features, -1), self.scales.reshape(self.out_features, -1)
+                                   if self.scales is not None else None, self.global_scale if self.global_scale is not None else 1.0)
+            if out.dtype != dtype:
+                out = out.to(dtype)
+        elif (
             _GAP_FUSED and self.format in _GAP_FORMATS and flat.dtype == torch.half
             and triton_gap.supported(self.format, R, K, self.out_features)
         ):
