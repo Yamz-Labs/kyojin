@@ -64,7 +64,9 @@ class Qwen4ExpConfig(Qwen3_5VLMoeBaseConfig):
         # Gated-residual hyper-connections
         self.hc_mult = self.read_cfg(int, pfx("hc_count"), 4)
 
-        # QSA indexer
+        # QSA indexer.
+        # Split caveat: the gfx12 QSA sparse top-k path has an illegal-access report on
+        # gfx1201; keep QSA cache pages off part0 until that kernel is fixed.
         self.indexer_n_heads = self.read_cfg(int, pfx("indexer_n_heads"), no_default)
         self.indexer_kv_heads = self.read_cfg(int, pfx("indexer_kv_heads"), 1)
         self.indexer_head_dim = self.read_cfg(int, pfx("indexer_head_dim"), no_default)
