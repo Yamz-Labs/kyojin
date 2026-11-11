@@ -41,7 +41,7 @@ otherwise; they are measurements, not assumptions of the interface.
 | `--part0-layers auto\|N` | `KYOJIN_PART0_LAYERS` | first N transformer layers on `part0`; 0 = off |
 | `--part1-device auto\|cuda:N\|gfxXXXX\|uuid\|name` | `KYOJIN_PART1_DEVICE` | `part1` device selection (`auto` = `cuda:0`) |
 | `--part0-device auto\|cuda:N\|gfxXXXX\|uuid\|name` | `KYOJIN_PART0_DEVICE` | `part0` device selection (`auto` = the only other device when two are visible; otherwise a selector is required) |
-| `--endcaps on\|off` | `KYOJIN_ENDCAPS` | move the text allowlist (norm/hc/lm_head-like) and whole MTP/vision components to `part0` (default on) |
+| `--endcaps on\|off` | `KYOJIN_ENDCAPS` | move the text allowlist (norm/hc/lm_head-like) and the whole MTP/vision component (all non-CPU modules) to `part0` (default on) |
 | `--part0-reserve-gb` | `KYOJIN_PART0_RESERVE_GB` | VRAM held as a load-time slab on `part0` for workspace (default 1.2; a tuning value, size it to the card) |
 | `--split-preset auto\|glm\|qwen\|ds41\|none` | `KYOJIN_SPLIT_PRESET` | per-model unsafe-env preset slot; GLM needs none today |
 | `--split-graphs auto\|on\|off` | — | per-segment capture (Stage 6); split forces graphs off until then |
@@ -88,7 +88,11 @@ new map must error.
 - Graphs: split mode declines whole-forward, lag-1, `prepare_inputs` and per-block captures
   (`split_active`). Per-segment capture is Stage 6.
 - Per-component load table and a cache/recurrent placement audit print after load: every
-  cache layer must sit on the device its owning layer was mapped to.
+  cache layer must sit on the device its owning layer was mapped to. The table's `devices`
+  column lists the devices that actually hold tensors, not the configured part0/part1 pair;
+  an empty range prints `-`. CPU-resident modules (the shared embedding) are reported
+  separately, so a whole MTP/vision component with endcaps on shows `part1 -` and only
+  part0 in `devices`.
 - Auto-N is a Stage 1 skeleton: it uses actual safetensors bytes for each layer, the
   cache/recurrent sizes for layers below N, the part0 endcap bytes and the reserve, with
   a `KYOJIN_AUTON_SAFETY_GB` margin (default 0.25) for allocator slack. Adapter tuning

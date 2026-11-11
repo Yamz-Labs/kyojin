@@ -551,6 +551,23 @@ class ComponentMap:
         return out
 
     @property
+    def placed_devices(self) -> list[torch.device]:
+        """Devices that actually hold tensors for this component.
+
+        ``used_devices`` is the configured part1/part0 pair; a whole component with
+        endcaps on has no tensors on part1 even though that pair still contains it.
+        CPU-resident modules (the shared embedding) are reported separately.
+        """
+        out: list[torch.device] = []
+        for module in self._module_refs:
+            if getattr(module, "caps", {}).get("prefer_cpu"):
+                continue
+            device = self.device_for(module)
+            if device.type == "cuda" and device not in out:
+                out.append(device)
+        return sorted(out, key = lambda d: d.index or 0)
+
+    @property
     def policy_or_default(self) -> ComponentPolicy:
         return self.policy or component_policy(self.component)
 
@@ -973,11 +990,12 @@ class SplitPlan:
             if d is None:
                 continue
             part0 = f"0..{r.part0_layers - 1}" if r.part0_layers else "-"
-            part1 = f"{r.part0_layers}..{r.layer_count - 1}" if r.layer_count else "-"
+            part1 = (f"{r.part0_layers}..{r.layer_count - 1}"
+                     if r.part0_layers < r.layer_count else "-")
+            placed = ", ".join(str(x) for x in d.placed_devices) or "-"
             self.logger(f"[split]   {r.component:7s} {r.seconds:7.1f}s  part0 {part0:>10s}  "
                         f"part1 {part1:>10s}  weights {r.weight_bytes / GIB:7.2f} GiB  "
-                        f"cache {r.cache_bytes / GIB:6.2f} GiB  devices "
-                        f"{', '.join(str(x) for x in d.used_devices)}")
+                        f"cache {r.cache_bytes / GIB:6.2f} GiB  devices {placed}")
             for w in r.warnings:
                 self.logger(f"[split]     warning: {w}")
 

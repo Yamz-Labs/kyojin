@@ -118,7 +118,7 @@ def main() -> None:
             vision.load(device_map=plan.map("vision"), progressbar=True)
             plan.record_load("vision", time.perf_counter() - t1)
             print(f"[split] vision loaded in {time.perf_counter() - t1:.1f} s "
-                  f"on {plan.map('vision').used_devices}", flush=True)
+                  f"on {plan.map('vision').placed_devices}", flush=True)
         except Exception as exc:                        # noqa: BLE001
             print(f"[split] vision not loaded: {type(exc).__name__}: {exc}", flush=True)
             vision = None

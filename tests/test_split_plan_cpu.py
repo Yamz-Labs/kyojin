@@ -221,6 +221,21 @@ def test_whole_component_places_every_module_part0_only_with_endcaps(split_modul
     assert all(off.device_for(m) == torch.device("cuda", 0) for m in mtp.modules)
 
 
+def test_whole_component_reports_only_placed_devices(split_modules):
+    dm, _bridge, _split = split_modules
+    mtp = FakeModel([
+        FakeModule("mtp.embed", caps = {"prefer_cpu": True}),
+        FakeModule("mtp.pre", caps = {}),
+        FakeModule("mtp.block.0", layer_idx = 0),
+        FakeModule("mtp.head", caps = {}),
+    ])
+    on = dm.ComponentMap.from_model(mtp, 0, True, _devices(dm), component = "mtp")
+    off = dm.ComponentMap.from_model(mtp, 0, False, _devices(dm), component = "mtp")
+    assert on.placed_devices == [torch.device("cuda", 1)]
+    assert off.placed_devices == [torch.device("cuda", 0)]
+    assert torch.device("cpu") not in on.placed_devices + off.placed_devices
+
+
 def test_module_bytes_uses_compile_or_alt_key_when_prefix_is_empty(split_modules):
     dm, _bridge, _split = split_modules
     stc = FakeSTC({"embed_tokens": 456})
