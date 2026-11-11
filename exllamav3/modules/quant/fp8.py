@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 MAX_ROWS = 16
+MOE_BN = 8                        # grouped expert GEMV (moe_tiles.py 11/11, Qwen3-30B-A3B shapes, 8 slots): 79 / 185 GB/s vs 66 / 146 at BN 64
 BN, BK = 64, 128                 # Strix 27B shapes, 1 row (fp8_tiles.py 11/11): 170-190 GB/s vs 102-162 at BN 32
 
 
@@ -38,6 +39,44 @@ def _gemv_fp8(x_ptr, q_ptr, s_ptr, y_ptr, R, K, N, S_COLS, GRID: tl.constexpr, B
     if not GRID:
         acc = acc * tl.load(s_ptr + rn, mask=mn, other=0.0)[None, :]
     tl.store(y_ptr + rr[:, None] * N + rn[None, :], acc, mask=mr[:, None] & mn[None, :])
+
+
+@triton.jit
+def _gemv_fp8_moe(x_ptr, qtab, stab, sel_ptr, y_ptr, K, N, S_COLS, XDIV, GRID: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
+                  BN: tl.constexpr, BK: tl.constexpr):
+    """Grouped decode GEMV over routed experts: program (tile, slot) computes y[slot, tile] = x[slot // XDIV] . W[sel[slot]]^T,
+    the expert's bytes and scales found through pointer tables (qtab / stab int64 = data_ptr of each expert)."""
+    pid = tl.program_id(0)
+    slot = tl.program_id(1)
+    e = tl.load(sel_ptr + slot).to(tl.int64)
+    q_ptr = tl.load(qtab + e).to(tl.pointer_type(tl.uint8))
+    s_ptr = tl.load(stab + e).to(tl.pointer_type(tl.float32))
+    xr = x_ptr + (slot // XDIV).to(tl.int64) * K
+    rn = pid * BN + tl.arange(0, BN)
+    mn = rn < N
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        rk = k0 + tl.arange(0, BK)
+        mk = rk < K
+        b = tl.load(q_ptr + rn[:, None].to(tl.int64) * K + rk[None, :], mask=mn[:, None] & mk[None, :], other=0).to(tl.int16)
+        h = ((((b & 0x80) << 8) | ((b & 0x7F) << 7)).to(tl.float16, bitcast=True) * 256.0).to(tl.float32)
+        xv = tl.load(xr + rk, mask=mk, other=0.0).to(tl.float32)
+        part = tl.sum(h * xv[None, :], axis=1)
+        if GRID:
+            part = part * tl.load(s_ptr + ((pid * BN) // BO) * S_COLS + k0 // BI)
+        acc += part
+    if not GRID:
+        acc = acc * tl.load(s_ptr + rn, mask=mn, other=0.0)
+    tl.store(y_ptr + slot.to(tl.int64) * N + rn, acc, mask=mn)
+
+
+def moe_gemv(x, qtab, stab, sel, N, K, grid, block, xdiv, s_cols):
+    """x half [rows, K]; sel int [slots] (expert of each slot); input row of slot = slot // xdiv -> float32 [slots, N]."""
+    S = sel.numel()
+    y = torch.empty((S, N), dtype=torch.float32, device=x.device)
+    _gemv_fp8_moe[(triton.cdiv(N, MOE_BN), S)](x, qtab, stab, sel, y, K, N, s_cols, xdiv, GRID=grid, BO=block[0], BI=block[1],
+                                               BN=MOE_BN, BK=BK, num_warps=2)
+    return y
 
 
 def gemv(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, grid: bool, block: tuple[int, int]) -> torch.Tensor:
