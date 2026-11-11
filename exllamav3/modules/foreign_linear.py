@@ -24,6 +24,7 @@ import torch
 from .module import Module
 from ..ext import exllamav3_ext as ext
 from ..foreign_quant.gap_formats import dequant as gap_dequant
+from ..foreign_quant import triton_iq
 from ..foreign_quant import triton_gap
 from ..foreign_quant import triton_rows
 _ROWS_TRITON = os.environ.get("BOLT_FQ_ROWS_TRITON", "1") != "0"
@@ -221,6 +222,13 @@ class ForeignLinear(Module):
             # 2..16 rows (verify / multi-user): weights read once for all rows (the fq_gemv kernels re-read them per row)
             out = triton_rows.gemv(self.format, flat, self.packed.reshape(self.out_features, -1), self.scales.reshape(self.out_features, -1)
                                    if self.scales is not None else None, self.global_scale if self.global_scale is not None else 1.0)
+            if out.dtype != dtype:
+                out = out.to(dtype)
+        elif (
+            self.format in triton_iq.FUSED and flat.dtype == torch.half and triton_iq.supported(self.format, R, K, self.out_features)
+        ):
+            # IQ3_XXS / IQ3_S / IQ2_XS / IQ2_S / Q3_K decode rows: fused Triton decode of the stored blocks (EXL3_IQ_FUSED=0: torch dequant)
+            out = triton_iq.gemv(self.format, flat, self.packed)
             if out.dtype != dtype:
                 out = out.to(dtype)
         elif (
