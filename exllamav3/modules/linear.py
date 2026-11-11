@@ -201,6 +201,38 @@ class Linear(Module):
         return self.apply_fp8_scales_(weight, scale_inv)
 
 
+    def load_fp8_stored_(self, key: str, dev, has_scale: bool, has_scale_inv: bool) -> bool:
+        """FP8 E4M3 linear kept as stored (quant_type "fp8", modules/quant/fp8.py): one byte per weight instead of the fp16 dequant.
+        Per-row / per-tensor weight_scale or the weight_scale_inv block grid. EXL3_FP8_STORED=0 restores the fp16 dequant."""
+        if os.environ.get("EXL3_FP8_STORED", "1") == "0" or self.is_sliced or self.weight_scale != 1.0 or not (has_scale or has_scale_inv):
+            return False
+        stc = self.config.stc
+        w = stc.get_tensor(key + ".weight", dev, no_defer = True)
+        if w.dtype != torch.float8_e4m3fn or tuple(w.shape) != (self.out_features, self.in_features):
+            return False
+        s = stc.get_tensor(key + (".weight_scale" if has_scale else ".weight_scale_inv"), dev, no_defer = True)
+        s = (s.float() - 127.0).exp2() if s.dtype == torch.uint8 else s.float()
+        N, K = w.shape
+        from .quant.fp8 import LinearFP8, ok as fp8_ok
+        if s.numel() == 1:
+            s, grid, block = s.reshape(1).expand(N).contiguous(), False, (1, 1)
+        elif s.dim() == 1 or (s.dim() == 2 and s.shape == (N, 1)):
+            s, grid, block = s.reshape(N).contiguous(), False, (1, 1)
+        elif s.dim() == 2:
+            qb = self.quant_block_()
+            block = (_scale_block(N, s.shape[0], qb[0] if qb else None), _scale_block(K, s.shape[1], qb[1] if qb else None))
+            grid = True
+            if not fp8_ok(N, K, grid, block):
+                return False
+        else:
+            return False
+        bias = stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, no_defer = True)
+        self.used_alt_key = key == self.alt_key
+        self.inner = LinearFP8(K, N, w.view(torch.uint8), s, grid, block, bias, self.out_dtype, key = self.key)
+        self.quant_type = "fp8"
+        return True
+
+
     # NVFP4: packed e2m1 (U8 [out, in/2], low nibble first) x E4M3 scale per 16 inputs x one fp32 global scale.
     # ModelOpt: weight / weight_scale / weight_scale_2 (multiplier); compressed-tensors: weight_packed /
     # weight_scale / weight_global_scale (divisor). Returns (out, in) fp16 in checkpoint orientation, or None.
@@ -302,6 +334,8 @@ class Linear(Module):
                         scale_inv = (scale_inv.float() - 127.0).exp2()
                     if scale is not None and scale.dtype == torch.uint8:
                         scale = (scale.float() - 127.0).exp2()
+                    if self.load_fp8_stored_(key, dev, scale is not None, scale_inv is not None):
+                        return True
                     no_defer = self.no_defer_load or scale is not None or scale_inv is not None or self.weight_scale != 1.0
                     weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
                     bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)
