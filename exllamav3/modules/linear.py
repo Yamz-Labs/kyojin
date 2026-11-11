@@ -69,6 +69,34 @@ def apply_scale_grid(w: torch.Tensor, scale: torch.Tensor, block: tuple | None =
     return w * full
 
 
+
+class _ForeignInner:
+    """Linear inner over a ForeignLinear payload (NVFP4 served as stored): the ForeignLinear kernels, Linear's interface."""
+
+    def __init__(self, fl, bias):
+        self.fl, self.bias = fl, bias
+        self.in_features, self.out_features = fl.in_features, fl.out_features
+        self.bc = None
+        self._pinned_store = None
+        self.swap_device = None
+
+    def unload(self):
+        pass
+
+    def get_tensors(self, key):
+        return self.fl.get_tensors()
+
+    def get_weight_tensor(self):
+        return self.fl._dequant_rows(0, self.out_features).T
+
+    def get_bias_tensor(self):
+        return self.bias
+
+    def forward(self, x, params, out_dtype = None):
+        y = self.fl.forward(x, params, out_dtype)
+        return y + self.bias if self.bias is not None else y
+
+
 class Linear(Module):
 
     def __init__(
@@ -201,6 +229,40 @@ class Linear(Module):
         return self.apply_fp8_scales_(weight, scale_inv)
 
 
+    def load_nvfp4_stored_(self, key: str, dev) -> bool:
+        """NVFP4 linear (ModelOpt weight / weight_scale / weight_scale_2, or compressed-tensors weight_packed / weight_scale /
+        weight_global_scale divisor) kept as stored: the ForeignLinear nvfp4 kernels (fq_gemv_nvfp4 <= 16 rows) instead of the
+        fp16 dequant. quant_type "nvfp4". EXL3_NVFP4_STORED=0 restores the fp16 dequant."""
+        if os.environ.get("EXL3_NVFP4_STORED", "1") == "0" or self.is_sliced or self.weight_scale != 1.0 or self.alt_key and key == self.alt_key:
+            return False
+        stc = self.config.stc
+        if not isinstance(key, str) or not stc.has_tensor(key + ".weight_scale"):
+            return False
+        ws = stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+        if ws is None or ws.dtype != torch.float8_e4m3fn or ws.dim() != 2:
+            return False
+        g = stc.get_tensor(key + ".weight_scale_2", dev, optional = True, no_defer = True)
+        inv = g is None
+        if inv:
+            g = stc.get_tensor(key + ".weight_global_scale", dev, optional = True, no_defer = True)
+        if g is None:
+            return False
+        wname = ".weight_packed" if stc.has_tensor(key + ".weight_packed") else ".weight"
+        packed = stc.get_tensor(key + wname, dev, no_defer = True).contiguous().view(torch.uint8)
+        N, K = self.out_features, self.in_features
+        if tuple(packed.shape) != (N, K // 2) or tuple(ws.shape) != (N, K // 16) or K % 512:
+            return False
+        from .foreign_linear import ForeignLinear
+        fl = ForeignLinear(self.config, self.key, K, N, "nvfp4", out_dtype = self.out_dtype)
+        fl.packed, fl.scales = packed, ws.contiguous().view(torch.uint8)
+        gv = float(g.float().reshape(-1)[0].item())
+        fl.global_scale = 1.0 / gv if inv else gv
+        bias = stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, no_defer = True)
+        self.used_alt_key = key == self.alt_key
+        self.inner = _ForeignInner(fl, bias)
+        self.quant_type = "nvfp4"
+        return True
+
     def load_fp8_stored_(self, key: str, dev, has_scale: bool, has_scale_inv: bool) -> bool:
         """FP8 E4M3 linear kept as stored (quant_type "fp8", modules/quant/fp8.py): one byte per weight instead of the fp16 dequant.
         Per-row / per-tensor weight_scale or the weight_scale_inv block grid. EXL3_FP8_STORED=0 restores the fp16 dequant."""
@@ -298,6 +360,8 @@ class Linear(Module):
                 dev = "cpu" if self.is_sliced else self.device
                 pad1 = (self.out_features,) if not self.is_sliced else None
                 pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
+                if self.load_nvfp4_stored_(key, dev):
+                    return True
                 scale_q = self.config.stc.get_tensor(key + ".scale", dev, optional = True, no_defer = True)
                 nv = self.dequant_nvfp4_(key, dev) if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale") else None
                 if nv is None and scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
