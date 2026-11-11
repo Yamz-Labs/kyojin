@@ -2,7 +2,7 @@
 
 One program = BN output rows; the K loop walks 32-element units (8 per 256 block): each unit is decoded into a (BN, 32) fp16 tile
 (grid / sign tables gathered from small device tables) and multiplied with tl.dot against up to 16 activation rows. Values equal
-gap_formats.dequant (the torch reference) up to the fp32 accumulation order. Formats: FMT 0 iq3_xxs, 1 iq3_s, 2 iq2_xs, 3 iq2_s, 4 q3_k.
+gap_formats.dequant (the torch reference) up to the fp32 accumulation order. Formats: FMT 0 iq3_xxs, 1 iq3_s, 2 iq2_xs, 3 iq2_s, 4 q3_k, 5 iq2_xxs (rows 2..16 only: the C++ GEMV serves 1 row).
 """
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
-FUSED = {"iq3_xxs": 0, "iq3_s": 1, "iq2_xs": 2, "iq2_s": 3, "q3_k": 4}
-_BB = {"iq3_xxs": 98, "iq3_s": 110, "iq2_xs": 74, "iq2_s": 82, "q3_k": 110}
+FUSED = {"iq3_xxs": 0, "iq3_s": 1, "iq2_xs": 2, "iq2_s": 3, "q3_k": 4, "iq2_xxs": 5, "q2_k": 6}
+_BB = {"iq3_xxs": 98, "iq3_s": 110, "iq2_xs": 74, "iq2_s": 82, "q3_k": 110, "iq2_xxs": 66, "q2_k": 84}
 MAX_ROWS = 16
 BN = int(os.environ.get("EXL3_IQ_BN", "16"))
 # Strix tile sweep 11/11 (iq_tiles.py): nw 1 iq2_s +8 %, iq3_s +13 % at R1; served UD-IQ2_M 15.4 -> 17.3 tok/s
@@ -33,7 +33,8 @@ def _tabs(device):
         u8 = lambda b: torch.frombuffer(bytearray(b), dtype=torch.uint8)
         _TABS[key] = (u8(IQ3_XXS_GRID).to(device), u8(IQ3_S_GRID).to(device), u8(KSIGNS).to(device),
                       torch.from_numpy(iq2_grid("xs").copy()).reshape(-1).to(device),
-                      torch.from_numpy(iq2_grid("s").copy()).reshape(-1).to(device))
+                      torch.from_numpy(iq2_grid("s").copy()).reshape(-1).to(device),
+                      torch.from_numpy(iq2_grid("xxs").copy()).reshape(-1).to(device))
     return _TABS[key]
 
 
@@ -43,7 +44,7 @@ def _b(p, off, m):
 
 
 @triton.jit
-def _gemv_iq(x_ptr, w_ptr, o_ptr, t3x, t3s, tks, t2x, t2s, R, K, N, FMT: tl.constexpr, BB: tl.constexpr, BN: tl.constexpr,
+def _gemv_iq(x_ptr, w_ptr, o_ptr, t3x, t3s, tks, t2x, t2s, t2xx, R, K, N, FMT: tl.constexpr, BB: tl.constexpr, BN: tl.constexpr,
              RP: tl.constexpr, NB: tl.constexpr = 1):
     pid = tl.program_id(0)
     rn = pid * BN + tl.arange(0, BN)
@@ -61,6 +62,8 @@ def _gemv_iq(x_ptr, w_ptr, o_ptr, t3x, t3s, tks, t2x, t2s, R, K, N, FMT: tl.cons
         b2 = blk[:, None]
         if FMT == 4:
             d = _h(tl.load(w_ptr + blk + 108, mask=mn, other=0), tl.load(w_ptr + blk + 109, mask=mn, other=0))
+        elif FMT == 6:
+            d = _h(tl.load(w_ptr + blk + 80, mask=mn, other=0), tl.load(w_ptr + blk + 81, mask=mn, other=0))
         else:
             d = _h(tl.load(w_ptr + blk, mask=mn, other=0), tl.load(w_ptr + blk + 1, mask=mn, other=0))
         d2 = d[:, None]
@@ -96,6 +99,23 @@ def _gemv_iq(x_ptr, w_ptr, o_ptr, t3x, t3s, tks, t2x, t2s, R, K, N, FMT: tl.cons
             sg = (_b(w_ptr, b2 + 34 + 4 * ib + l, m2) >> (e % 8)) & 1
             sc = (_b(w_ptr, blk + 74 + ib, mn)[:, None] >> (4 * (l // 2))) & 15
             w = d2 * (0.5 + sc.to(tl.float32)) * 0.25 * g * (1.0 - 2.0 * sg.to(tl.float32))
+        elif FMT == 5:    # iq2_xxs: per 32-unit 8 bytes @2 + 8 ib: 4 x 8-bit grid idx, then uint32 (4 x 7-bit sign idx | 4-bit scale << 28)
+            l = e // 8
+            idx = _b(w_ptr, b2 + 2 + 8 * ib + l, m2)
+            g = tl.load(t2xx + idx * 8 + e % 8).to(tl.float32)
+            aw = blk + 6 + 8 * ib
+            aux = _b(w_ptr, aw, mn) | (_b(w_ptr, aw + 1, mn) << 8) | (_b(w_ptr, aw + 2, mn) << 16) | (_b(w_ptr, aw + 3, mn) << 24)
+            db = d * (0.5 + ((aux >> 28) & 15).to(tl.float32)) * 0.25
+            sidx = (aux[:, None] >> (7 * l)) & 127
+            sg = (tl.load(tks + sidx).to(tl.int32) >> (e % 8)) & 1
+            w = db[:, None] * g * (1.0 - 2.0 * sg.to(tl.float32))
+        elif FMT == 6:    # q2_k: scales[16] @0, qs[64] @16, d @80, dmin @82; unit ib = 32 * (4 * n + j)
+            n2 = ib // 4
+            j = ib % 4
+            q = (_b(w_ptr, b2 + 16 + 32 * n2 + e, m2) >> (2 * j)) & 3
+            sc = _b(w_ptr, b2 + 8 * n2 + 2 * j + e // 16, m2)
+            dm = _h(tl.load(w_ptr + blk + 82, mask=mn, other=0), tl.load(w_ptr + blk + 83, mask=mn, other=0))
+            w = d2 * (sc & 15).to(tl.float32) * q.to(tl.float32) - dm[:, None] * (sc >> 4).to(tl.float32)
         else:             # q3_k: hmask[32] @0, qs[64] @32, scales[12] @96, d @108; unit ib = 32 * (4 * hh + j)
             hh = ib // 4
             j = ib % 4
@@ -122,7 +142,10 @@ def _h(lo, hi):
 
 
 def supported(fmt: str, rows: int, k: int, n: int) -> bool:
-    return fmt in FUSED and 1 <= rows <= MAX_ROWS and k % 256 == 0 and os.environ.get("EXL3_IQ_FUSED", "1") != "0"
+    # iq2_xxs: every width comes here. The C++ fq_gemv_iq2_xxs returns wrong rows on real GGUF blocks (rel 1.5 vs its own dequant,
+    # Qwen3-8B-UD-IQ2_XXS up_proj) and its header scratch covers K <= 8192 only.
+    lo = 1
+    return fmt in FUSED and lo <= rows <= MAX_ROWS and k % 256 == 0 and os.environ.get("EXL3_IQ_FUSED", "1") != "0"
 
 
 def gemv(fmt: str, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
@@ -131,8 +154,8 @@ def gemv(fmt: str, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
     N = raw.shape[0]
     assert R <= MAX_ROWS and K % 256 == 0 and raw.shape[1] == K // 256 * _BB[fmt]
     out = torch.empty((R, N), dtype=torch.float16, device=x.device)
-    t3x, t3s, tks, t2x, t2s = _tabs(x.device)
+    t3x, t3s, tks, t2x, t2s, t2xx = _tabs(x.device)
     nb = NB or _NB.get(fmt, 1)
     nb = nb if (K // 32) % nb == 0 else 1
-    _gemv_iq[(triton.cdiv(N, BN),)](x, raw, out, t3x, t3s, tks, t2x, t2s, R, K, N, FUSED[fmt], _BB[fmt], BN, 16, nb, num_warps=NW)
+    _gemv_iq[(triton.cdiv(N, BN),)](x, raw, out, t3x, t3s, tks, t2x, t2s, t2xx, R, K, N, FUSED[fmt], _BB[fmt], BN, 16, nb, num_warps=NW)
     return out

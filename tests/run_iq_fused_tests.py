@@ -3,10 +3,10 @@ import time, torch, numpy as np
 from exllamav3.loader.gguf_collection import GGUFCollection
 from exllamav3.foreign_quant.gap_formats import dequant
 from exllamav3.foreign_quant import triton_iq as TI
-TY = {18: "iq3_xxs", 21: "iq3_s", 17: "iq2_xs", 22: "iq2_s", 11: "q3_k"}
-BB = {"iq3_xxs": 98, "iq3_s": 110, "iq2_xs": 74, "iq2_s": 82, "q3_k": 110}
+TY = {18: "iq3_xxs", 21: "iq3_s", 17: "iq2_xs", 22: "iq2_s", 11: "q3_k", 10: "q2_k"}
+BB = {"iq3_xxs": 98, "iq3_s": 110, "iq2_xs": 74, "iq2_s": 82, "q3_k": 110, "q2_k": 84, "iq2_xxs": 66}
 got = {}
-for m in ("iq3xxs", "iq2m"):
+for m in ("iq3xxs", "iq2m", "iq2xxs"):
     g = GGUFCollection(f"/home/yaniss/models/foreign/q3_8b_{m}_cfg/model.gguf")
     for k, (ty, dims, off) in g.infos.items():
         f = TY.get(ty)

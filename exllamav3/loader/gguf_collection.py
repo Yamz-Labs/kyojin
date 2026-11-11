@@ -29,7 +29,7 @@ GGML_BBS = {
 # (elements, bytes) per block of the formats served by gap_formats / fq_gemv_q8_0 (32- and 64-element blocks)
 GGML_BLK = {t: (256, bb) for t, bb in GGML_BBS.items()}
 GGML_BLK.update({2: (32, 18), 6: (32, 22), 8: (32, 34), 20: (32, 18), 18: (256, 98), 21: (256, 110),
-                 39: (32, 17), 40: (64, 36), 11: (256, 110), 17: (256, 74), 22: (256, 82)})
+                 39: (32, 17), 40: (64, 36), 11: (256, 110), 17: (256, 74), 22: (256, 82), 10: (256, 84), 16: (256, 66)})
 GGML_QUANT = set(GGML_BLK.keys())
 
 _META_SZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}

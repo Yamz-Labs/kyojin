@@ -11,9 +11,9 @@ import torch
 from .gguf_tables import IQ3_S_GRID, IQ3_XXS_GRID, IQ4_NL_VALUES, KSIGNS
 
 # name -> (elements per block, bytes per block)
-BLOCKS = {"q8_0": (32, 34), "q4_0": (32, 18), "q5_0": (32, 22), "iq4_nl": (32, 18), "iq3_xxs": (256, 98), "iq3_s": (256, 110), "iq2_xs": (256, 74), "iq2_s": (256, 82), "q3_k": (256, 110),
+BLOCKS = {"q8_0": (32, 34), "q4_0": (32, 18), "q5_0": (32, 22), "iq4_nl": (32, 18), "iq3_xxs": (256, 98), "iq3_s": (256, 110), "iq2_xs": (256, 74), "iq2_s": (256, 82), "q3_k": (256, 110), "q2_k": (256, 84),
           "mxfp4": (32, 17), "nvfp4_gguf": (64, 36)}
-GGML_TYPE_IDS = {"q8_0": 8, "q4_0": 2, "q5_0": 6, "iq3_xxs": 18, "iq4_nl": 20, "iq3_s": 21, "mxfp4": 39, "nvfp4_gguf": 40, "iq2_xs": 17, "iq2_s": 22, "q3_k": 11}
+GGML_TYPE_IDS = {"q8_0": 8, "q4_0": 2, "q5_0": 6, "iq3_xxs": 18, "iq4_nl": 20, "iq3_s": 21, "mxfp4": 39, "nvfp4_gguf": 40, "iq2_xs": 17, "iq2_s": 22, "q3_k": 11, "q2_k": 10}
 # MXFP4 / NVFP4 nibble -> value in half units (the scale carries the other factor 0.5)
 _FP4_HALF = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
@@ -81,6 +81,11 @@ def dequant(fmt: str, raw: torch.Tensor) -> torch.Tensor:
         qs = b[:, 4:36].reshape(nb, 4, 8)
         v = _table("fp4", raw.device)[torch.cat([qs & 15, qs >> 4], dim=2).long()]         # [nb, 4, 16]
         return (sc.unsqueeze(-1) * v).reshape(n, -1).half()
+    if fmt == "q2_k":       # [scales 16 (low 4 scale, high 4 min)][qs 64][d fp16][dmin fp16] (ggml dequantize_row_q2_K)
+        d, dm = _f16(b[:, 80:82]).unsqueeze(-1), _f16(b[:, 82:84]).unsqueeze(-1)       # [nb, 1, 1, 1]
+        sc = b[:, 0:16].long().reshape(nb, 2, 4, 2).repeat_interleave(16, dim=3)          # [nb, n, j, 32]: scale of 16-weight half
+        q = (b[:, 16:80].long().reshape(nb, 2, 1, 32) >> (2 * torch.arange(4, device=raw.device)).reshape(1, 1, 4, 1)) & 3
+        return (d.unsqueeze(-1) * (sc & 15).float() * q.float() - dm.unsqueeze(-1) * (sc >> 4).float()).reshape(n, -1).half()
     if fmt == "q3_k":       # [hmask 32][qs 64][scales 12][d fp16] (ggml dequantize_row_q3_K)
         d = _f16(b[:, 108:110])                                 # [nb, 1]
         hm = b[:, 0:32].long()
