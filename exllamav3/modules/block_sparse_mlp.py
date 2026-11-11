@@ -1909,7 +1909,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.shared_experts is not None:
             se = self.shared_experts.forward(x, params)
             if self.shared_gate is not None:
-                gt = torch.sigmoid((x.to(torch.float) @ self.shared_gate.inner.weight.to(torch.float)))
+                gt = self._shgate_hip(x)
                 final_hidden_states = final_hidden_states + se.to(torch.float).view(final_hidden_states.shape) * gt.view(*final_hidden_states.shape[:-1], -1)
             else:
                 final_hidden_states = final_hidden_states + se.to(torch.float).view(final_hidden_states.shape)
@@ -1983,7 +1983,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             se = self.shared_experts.forward(x, se_params)
             if self.shared_gate is not None and torch.version.hip:
                 # ROCm add_sigmoid_gate_proj takes a float shared-expert output: same math in torch
-                g = torch.sigmoid((x.to(torch.float) @ self.shared_gate.inner.weight.to(torch.float)))
+                g = self._shgate_hip(x)
                 final_hidden_states = final_hidden_states + se.to(torch.float) * g
             elif self.shared_gate is not None:
                 ext.add_sigmoid_gate_proj(se, x, final_hidden_states,
@@ -1993,6 +1993,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
+
+    def _shgate_hip(self, x):
+        """sigmoid(x . w_gate) for the shared expert gate: a (1, K) x (K, 1) fp32 matmul costs ~64 us on ROCm (hipBLAS GEMV), an
+        elementwise product + row sum over a cached fp32 row ~14 us (Strix, K 2048). EXL3_SHGATE_MULSUM=0 restores the matmul."""
+        w = self.shared_gate.inner.weight
+        if os.environ.get("EXL3_SHGATE_MULSUM", "1") == "0" or w.dim() != 2 or w.shape[1] != 1:
+            return torch.sigmoid((x.to(torch.float) @ w.to(torch.float)))
+        wr = getattr(self, "_shgate_row", None)
+        if wr is None or wr.device != w.device or wr.numel() != w.numel():
+            wr = w.to(torch.float).reshape(-1).contiguous()
+            self._shgate_row = wr
+        return torch.sigmoid((x.to(torch.float) * wr).sum(-1, keepdim = True))
 
     def _forward_foreign_shared(self, x, params):
         """Fused dense shared-expert up+relu2 (fq_mlp.cu) + ForeignLinear
