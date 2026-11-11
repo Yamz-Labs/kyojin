@@ -6,16 +6,16 @@ from exllamav3.foreign_quant import triton_rows as TR
 ok = bad = 0
 N, K = 640, 2048
 g = torch.Generator().manual_seed(3)
-for fmt in ("q8_0", "nvfp4", "q4_k", "q6_k"):
+for fmt in ("q8_0", "nvfp4", "q4_k", "q6_k", "q5_k", "iq4_xs"):
     fl = ForeignLinear(None, "x", K, N, fmt)
     if fmt == "q8_0":
         q = torch.randint(-127, 128, (N, K // 32, 32), dtype=torch.int8, generator=g)
         d = (torch.rand((N, K // 32, 1), generator=g) * 1e-2 + 1e-3).half()
         fl.packed = torch.cat([d.view(torch.uint8), q.view(torch.uint8)], dim=2).reshape(N, -1).cuda()
-    elif fmt in ("q4_k", "q6_k"):
-        bb = 144 if fmt == "q4_k" else 210
+    elif fmt in ("q4_k", "q6_k", "q5_k", "iq4_xs"):
+        bb = {"q4_k": 144, "q6_k": 210, "q5_k": 176, "iq4_xs": 136}[fmt]
         pk = torch.randint(0, 256, (N, K // 256, bb), dtype=torch.uint8, generator=g)
-        dpos = [0, 2] if fmt == "q4_k" else [208]
+        dpos = {"q4_k": [0, 2], "q5_k": [0, 2], "q6_k": [208], "iq4_xs": [0]}[fmt]
         for o in dpos:                                                  # finite small fp16 d / dmin
             pk[:, :, o] = torch.randint(0, 256, (N, K // 256), dtype=torch.uint8, generator=g); pk[:, :, o + 1] = 0x14
         fl.packed = pk.reshape(N, -1).cuda()

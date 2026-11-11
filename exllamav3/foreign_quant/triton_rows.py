@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-FORMATS = ("q8_0", "nvfp4", "q4_k", "q6_k")
+FORMATS = ("q8_0", "nvfp4", "q4_k", "q6_k", "q5_k", "iq4_xs")
 MAX_ROWS = 16
 BN, BK = 32, 64
 
@@ -74,7 +74,7 @@ def _h16(lo, hi):
 
 
 @triton.jit
-def _rows_q4_k(x_ptr, p_ptr, y_ptr, R, K, N, BN: tl.constexpr, RP: tl.constexpr):
+def _rows_q4_k(x_ptr, p_ptr, y_ptr, R, K, N, BN: tl.constexpr, RP: tl.constexpr, Q5: tl.constexpr = False):
     """Q4_K super-block 144 B / 256: d, dmin (fp16), 12 B of 6-bit scales / mins, 128 B of nibbles (64-chunk i: low = sub 2i, high = sub 2i+1)."""
     pid = tl.program_id(0)
     rn = pid * BN + tl.arange(0, BN)
@@ -82,10 +82,12 @@ def _rows_q4_k(x_ptr, p_ptr, y_ptr, R, K, N, BN: tl.constexpr, RP: tl.constexpr)
     rr = tl.arange(0, RP)
     mr = rr < R
     l = tl.arange(0, 32)
-    row = p_ptr + rn.to(tl.int64) * ((K // 256) * 144)
+    BB: tl.constexpr = 176 if Q5 else 144
+    QS: tl.constexpr = 48 if Q5 else 16
+    row = p_ptr + rn.to(tl.int64) * ((K // 256) * BB)
     acc = tl.zeros((RP, BN), dtype=tl.float32)
     for k0 in range(0, K, 64):
-        b = row + (k0 // 256) * 144
+        b = row + (k0 // 256) * BB
         i = (k0 % 256) // 64
         d = _h16(tl.load(b, mask=mn, other=0), tl.load(b + 1, mask=mn, other=0))
         dm = _h16(tl.load(b + 2, mask=mn, other=0), tl.load(b + 3, mask=mn, other=0))
@@ -100,8 +102,11 @@ def _rows_q4_k(x_ptr, p_ptr, y_ptr, R, K, N, BN: tl.constexpr, RP: tl.constexpr)
                 a = tl.load(sb + j + 4, mask=mn, other=0).to(tl.int32)
                 sc = (a & 15) | ((tl.load(sb + j - 4, mask=mn, other=0).to(tl.int32) >> 6) << 4)
                 m = (a >> 4) | ((tl.load(sb + j, mask=mn, other=0).to(tl.int32) >> 6) << 4)
-            q = tl.load(b[:, None] + 16 + 32 * i + l[None, :], mask=mn[:, None], other=0).to(tl.int32)
+            q = tl.load(b[:, None] + QS + 32 * i + l[None, :], mask=mn[:, None], other=0).to(tl.int32)
             q = (q >> (4 * h)) & 15
+            if Q5:
+                qh = tl.load(b[:, None] + 16 + l[None, :], mask=mn[:, None], other=0).to(tl.int32)
+                q = q | (((qh >> (2 * i + h)) & 1) << 4)
             w = (q.to(tl.float32) * (d * sc.to(tl.float32))[:, None] - (dm * m.to(tl.float32))[:, None]).to(tl.float16)
             xv = tl.load(x_ptr + rr[:, None] * K + (k0 + 32 * h + l)[None, :], mask=mr[:, None], other=0.0)
             acc += tl.dot(xv, tl.trans(w), out_dtype=tl.float32)
@@ -137,8 +142,46 @@ def _rows_q6_k(x_ptr, p_ptr, y_ptr, R, K, N, BN: tl.constexpr, RP: tl.constexpr)
     tl.store(y_ptr + rr[:, None] * N + rn[None, :], acc, mask=mr[:, None] & mn[None, :])
 
 
+@triton.jit
+def _rows_iq4_xs(x_ptr, p_ptr, kv_ptr, y_ptr, R, K, N, BN: tl.constexpr, RP: tl.constexpr):
+    """IQ4_XS super-block 136 B / 256: d fp16, scales_h u16, scales_l[4], qs[128] (sub-block ib: 16 B, low nibbles = first 16, high = next 16)."""
+    pid = tl.program_id(0)
+    rn = pid * BN + tl.arange(0, BN)
+    mn = rn < N
+    rr = tl.arange(0, RP)
+    mr = rr < R
+    l = tl.arange(0, 16)
+    row = p_ptr + rn.to(tl.int64) * ((K // 256) * 136)
+    acc = tl.zeros((RP, BN), dtype=tl.float32)
+    for k0 in range(0, K, 32):
+        b = row + (k0 // 256) * 136
+        ib = (k0 % 256) // 32
+        d = _h16(tl.load(b, mask=mn, other=0), tl.load(b + 1, mask=mn, other=0))
+        sh = tl.load(b + 2, mask=mn, other=0).to(tl.int32) | (tl.load(b + 3, mask=mn, other=0).to(tl.int32) << 8)
+        sl = tl.load(b + 4 + ib // 2, mask=mn, other=0).to(tl.int32)
+        ls = ((sl >> (4 * (ib % 2))) & 15) | (((sh >> (2 * ib)) & 3) << 4)
+        dl = d * (ls - 32).to(tl.float32)
+        q = tl.load(b[:, None] + 8 + 16 * ib + l[None, :], mask=mn[:, None], other=0).to(tl.int32)
+        for h in tl.static_range(2):
+            v = tl.load(kv_ptr + ((q >> (4 * h)) & 15))
+            w = (v * dl[:, None]).to(tl.float16)
+            xv = tl.load(x_ptr + rr[:, None] * K + (k0 + 16 * h + l)[None, :], mask=mr[:, None], other=0.0)
+            acc += tl.dot(xv, tl.trans(w), out_dtype=tl.float32)
+    tl.store(y_ptr + rr[:, None] * N + rn[None, :], acc, mask=mr[:, None] & mn[None, :])
+
+
+_KV = {}
+
+
+def _kvalues(dev):
+    t = _KV.get(dev)
+    if t is None:
+        t = _KV[dev] = torch.tensor([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=torch.float32, device=dev)
+    return t
+
+
 def supported(fmt: str, R: int, K: int) -> bool:
-    return fmt in FORMATS and 2 <= R <= MAX_ROWS and K % (256 if fmt.endswith("_k") else BK) == 0
+    return fmt in FORMATS and 2 <= R <= MAX_ROWS and K % (256 if fmt.endswith("_k") or fmt == "iq4_xs" else BK) == 0
 
 
 def gemv(fmt: str, x: torch.Tensor, packed: torch.Tensor, scales=None, global_scale: float = 1.0) -> torch.Tensor:
@@ -151,6 +194,10 @@ def gemv(fmt: str, x: torch.Tensor, packed: torch.Tensor, scales=None, global_sc
         _rows_q8_0[grid](x, packed, y, R, K, N, BN=BN, BK=BK, RP=16, num_warps=4)
     elif fmt == "q4_k":
         _rows_q4_k[grid](x, packed, y, R, K, N, BN=BN, RP=16, num_warps=4)
+    elif fmt == "q5_k":
+        _rows_q4_k[grid](x, packed, y, R, K, N, BN=BN, RP=16, Q5=True, num_warps=4)
+    elif fmt == "iq4_xs":
+        _rows_iq4_xs[grid](x, packed, _kvalues(x.device), y, R, K, N, BN=BN, RP=16, num_warps=4)
     elif fmt == "q6_k":
         _rows_q6_k[grid](x, packed, y, R, K, N, BN=BN, RP=16, num_warps=4)
     else:
