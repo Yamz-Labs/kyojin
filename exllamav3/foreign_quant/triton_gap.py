@@ -15,6 +15,9 @@ _BB = {"q4_0": 18, "iq4_nl": 18, "mxfp4": 17, "q5_0": 22}
 MAX_ROWS = 16
 # (BN, num_warps) per format, from a 3090 sweep at N=12288, K=4096, 4 rows
 _CFG = {"q4_0": (32, 1), "q5_0": (32, 1), "mxfp4": (32, 1), "iq4_nl": (16, 1)}
+# Strix Halo (gfx1151) sweep 11/11 (gap_tiles.py, 17408 x 5120, R1 / R4): q4_0 117 -> 136-139 GB/s at (16, 1), q5_0 133 -> 152-156 at (64, 4)
+if getattr(__import__("torch").version, "hip", None) and __import__("os").environ.get("EXL3_GAP_HIP_CFG", "1") != "0":
+    _CFG.update({"q4_0": (16, 1), "q5_0": (64, 4), "iq4_nl": (64, 2)})
 
 
 @triton.jit
