@@ -15,8 +15,7 @@ DeepSeek-V4.1-Flash adapters are staged; Flint and Mimo use the generic model pa
                     host-staged crossings
 
 `part0` and `part1` are positions in the layer order, not device indices. Either physical
-device can serve either part. Older revisions call the parts `front`/`main`; current flags
-and environment names use `part0`/`part1` only.
+device can serve either part.
 
 Every tensor that crosses the split goes through an asynchronous host-staged bridge:
 
