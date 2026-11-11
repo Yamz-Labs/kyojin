@@ -41,6 +41,15 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return w.view(blocks.shape[0], -1).half()
 
 
+def _mxfp4_to_gguf(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """OpenAI MXFP4 (N, G, 16) blocks (byte j = elements 2j | 2j+1 << 4) + (N, G) E8M0 scales -> GGUF MXFP4 rows (N, G * 17):
+    per 32-block the E8M0 byte then 16 bytes with element j in the low nibble and element j + 16 in the high one (ggml block_mxfp4)."""
+    b = blocks.to(torch.uint8)
+    e = torch.stack((b & 0x0F, b >> 4), dim = -1).view(b.shape[0], b.shape[1], 32)     # elements in order
+    q = e[..., :16] | (e[..., 16:] << 4)
+    return torch.cat((scales.to(torch.uint8).unsqueeze(-1), q), dim = -1).reshape(b.shape[0], -1).contiguous()
+
+
 def _scale_block(n: int, s: int, block: int | None) -> int:
     """Block length along an axis of n elements covered by s scales (config block first, else exact division)."""
     if block and -(-n // block) == s:
@@ -508,6 +517,22 @@ class Linear(Module):
                 scales = scales[sl].contiguous()
                 if bias is not None:
                     bias = bias[sl].contiguous()
+            if os.environ.get("EXL3_MXFP4_STORED", "1") != "0" and self.weight_scale == 1.0 and not self.is_sliced \
+                    and blocks.shape[0] <= self.out_features and blocks.shape[1] * 32 <= self.in_features and self.in_features % 32 == 0:
+                # kept as stored: the ForeignLinear mxfp4 kernels (GGUF block layout, same E8M0 bytes) instead of the fp16 dequant.
+                # The engine pads both dims to 128 (gpt-oss 2880 -> 2944): zero blocks / zero rows (weight 0, bias 0) fill the pad.
+                from .foreign_linear import ForeignLinear
+                pk = _mxfp4_to_gguf(blocks, scales)
+                Kb, Kp = blocks.shape[1], self.in_features // 32
+                if Kp > Kb:
+                    pk = torch.cat((pk, torch.zeros((pk.shape[0], (Kp - Kb) * 17), dtype = torch.uint8, device = pk.device)), dim = 1)
+                if self.out_features > pk.shape[0]:
+                    pk = torch.cat((pk, torch.zeros((self.out_features - pk.shape[0], pk.shape[1]), dtype = torch.uint8, device = pk.device)), dim = 0)
+                fl = ForeignLinear(self.config, self.key, self.in_features, self.out_features, "mxfp4", out_dtype = self.out_dtype)
+                fl.packed = pk.contiguous()
+                self.inner = _ForeignInner(fl, self.pad_out(bias).half() if bias is not None else None)
+                self.quant_type = "mxfp4"
+                return True
             weight = _mxfp4_dequant(blocks, scales)
             weight = weight.T.contiguous()
             weight = self.pad_out(weight)
