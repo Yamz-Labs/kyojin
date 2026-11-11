@@ -18,6 +18,9 @@ MAX_ROWS = 16
 BN = int(os.environ.get("EXL3_IQ_BN", "16"))
 # Strix tile sweep 11/11 (iq_tiles.py): nw 1 iq2_s +8 %, iq3_s +13 % at R1; served UD-IQ2_M 15.4 -> 17.3 tok/s
 NW = int(os.environ.get("EXL3_IQ_NW", "1"))
+NB = int(os.environ.get("EXL3_IQ_NB", "0"))     # 32-units per loop iteration (static unroll); 0 = per-format default below
+# Strix sweep 11/11 (iq_tiles.py, R1): iq3_xxs NB 4 68 -> 92 GB/s, iq2_s NB 4 61 -> 69, iq3_s NB 2 114 -> 124
+_NB = {"iq3_xxs": 4, "iq2_s": 4, "iq3_s": 2}
 _TABS: dict = {}
 
 
@@ -41,7 +44,7 @@ def _b(p, off, m):
 
 @triton.jit
 def _gemv_iq(x_ptr, w_ptr, o_ptr, t3x, t3s, tks, t2x, t2s, R, K, N, FMT: tl.constexpr, BB: tl.constexpr, BN: tl.constexpr,
-             RP: tl.constexpr):
+             RP: tl.constexpr, NB: tl.constexpr = 1):
     pid = tl.program_id(0)
     rn = pid * BN + tl.arange(0, BN)
     mn = rn < N
@@ -50,7 +53,9 @@ def _gemv_iq(x_ptr, w_ptr, o_ptr, t3x, t3s, tks, t2x, t2s, R, K, N, FMT: tl.cons
     e = tl.arange(0, 32)[None, :]
     acc = tl.zeros((RP, BN), dtype=tl.float32)
     row = rn.to(tl.int64) * ((K // 256) * BB)
-    for u in range(0, K // 32):
+    for u0 in range(0, K // 32, NB):
+      for t_ in tl.static_range(NB):
+        u = u0 + t_
         blk = row + (u // 8) * BB
         ib = u % 8
         b2 = blk[:, None]
@@ -127,5 +132,7 @@ def gemv(fmt: str, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
     assert R <= MAX_ROWS and K % 256 == 0 and raw.shape[1] == K // 256 * _BB[fmt]
     out = torch.empty((R, N), dtype=torch.float16, device=x.device)
     t3x, t3s, tks, t2x, t2s = _tabs(x.device)
-    _gemv_iq[(triton.cdiv(N, BN),)](x, raw, out, t3x, t3s, tks, t2x, t2s, R, K, N, FUSED[fmt], _BB[fmt], BN, 16, num_warps=NW)
+    nb = NB or _NB.get(fmt, 1)
+    nb = nb if (K // 32) % nb == 0 else 1
+    _gemv_iq[(triton.cdiv(N, BN),)](x, raw, out, t3x, t3s, tks, t2x, t2s, R, K, N, FUSED[fmt], _BB[fmt], BN, 16, nb, num_warps=NW)
     return out

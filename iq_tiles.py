@@ -30,9 +30,9 @@ if len(sys.argv) > 1 and sys.argv[1] == "one":
     sys.exit(0)
 
 res = {}
-for bn in (8, 16, 32, 64):
-    for nw in (1, 2, 4):
-        env = dict(os.environ, EXL3_IQ_BN=str(bn), EXL3_IQ_NW=str(nw))
+CFGS = [(16, 1, n) for n in (1, 2, 4)]
+for bn, nw, nbv in CFGS:
+        env = dict(os.environ, EXL3_IQ_BN=str(bn), EXL3_IQ_NW=str(nw), EXL3_IQ_NB=str(nbv))
         r = subprocess.run([sys.executable, "-u", __file__, "one"], env=env, capture_output=True, text=True, timeout=300)
         line = [l for l in r.stdout.splitlines() if l.startswith("RES")]
         if not line:
@@ -40,9 +40,9 @@ for bn in (8, 16, 32, 64):
             continue
         for kv in line[0].split()[1:]:
             f, v = kv.split(":")
-            res.setdefault(f, []).append((float(v), bn, nw))
-        print(bn, nw, line[0], flush=True)
+            res.setdefault(f, []).append((float(v), bn, nbv))
+        print(bn, nw, "NB", nbv, line[0], flush=True)
 for f, v in sorted(res.items()):
     v.sort(reverse=True)
-    cur = [x for x in v if x[1] == 16 and x[2] == 2]
-    print(f"{f:8s} best {v[:3]}  current (16, 2) -> {cur[0][0] if cur else 'n/a'} GB/s")
+    cur = [x for x in v if x[2] == 1]
+    print(f"{f:8s} best (GB/s, BN, NB) {v[:3]}  NB 1 -> {cur[0][0] if cur else 'n/a'} GB/s")
