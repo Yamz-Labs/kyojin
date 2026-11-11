@@ -180,12 +180,16 @@ model that fits the visible device (use the layer-split sibling for larger packs
 ```sh
 # Whole-model chat-path coherence gate: 8 prompts x greedy/default, EOS, production
 # loop guard and 20-gram repetition checks.
-HIP_VISIBLE_DEVICES=1 python tools/strix_halo/coherence_suite.py -m <model> -n 192
+python tools/strix_halo/coherence_suite.py -m <model> -n 192
 
 # Per-shape GEMV timings and one streaming pass over every linear; --gemm A/Bs
 # ext.exl3_gemm when the tree exports it.
-HIP_VISIBLE_DEVICES=1 python tools/strix_halo/gemv_perf_ab.py -m <model> --mode both --gemm
+python tools/strix_halo/gemv_perf_ab.py -m <model> --mode both --gemm
 ```
+
+On the single-gfx1151 target no device variable is needed. With several GPUs
+visible, set `HIP_VISIBLE_DEVICES` to the index whose `gcnArchName` matches; the
+enumeration order is a driver/boot property, so do not hardcode an index.
 
 `tests/hip_gemv_logits_oracle.py` is the forced fallback-vs-GEMV logits oracle.
 `EXL3_ORACLE_STEPS` sets the trace length (default 16); `EXL3_ORACLE_FREE=1` adds the
