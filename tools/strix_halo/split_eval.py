@@ -6,6 +6,11 @@ baseline (--baseline), saves the greedy token ids to JSON, and optionally compar
 saved runs token-for-token.  It also measures decode t/s under --num-draft and can run a
 long-context needle probe.
 
+The split works on any two supported devices; use --main-device/--front-device to put
+either device in either position.  The context-dependent --front-layers default is
+harness tuning for a small front card, not a property of the split; pass --front-layers
+to choose N explicitly.
+
 Usage (from the repo root, after `source tools/strix_halo/env.sh`):
 
     python tools/strix_halo/split_eval.py -m <pack> --out /tmp/split.json
@@ -61,7 +66,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-m", "--model", default="/data/models/NicSir--GLM-5.3-Flash-EXL3-2.72bpw")
     p.add_argument("--baseline", action="store_true", help="single device (cuda:0), no layer split")
     p.add_argument("--front-layers", type=int, default=None)
+    p.add_argument("--main-device", default="auto")
     p.add_argument("--front-device", default="auto")
+    p.add_argument("--long-ctx-threshold", type=int, default=65536,
+                   help="context above which the harness default front-layer count changes")
+    p.add_argument("--long-ctx-front-layers", type=int, default=5,
+                   help="harness default for contexts above --long-ctx-threshold; measured on a "
+                        "small front card, not a property of the split")
+    p.add_argument("--short-ctx-front-layers", type=int, default=6,
+                   help="harness default at or below --long-ctx-threshold")
     p.add_argument("--endcaps", choices=("on", "off"), default="on")
     p.add_argument("--front-reserve-gb", type=float, default=1.2)
     p.add_argument("--main-reserve-gb", type=float, default=0.0)
@@ -79,9 +92,12 @@ def parse_args() -> argparse.Namespace:
                    help="compare two saved runs: prompt ids and decode numbers")
     p.add_argument("--no-perf", action="store_true", help="skip the 3 decode timing prompts")
     args = p.parse_args()
+    args.front_layers_defaulted = args.front_layers is None
     if args.front_layers is None:
-        # N=6 is measured to OOM the 16 GiB front above 65K (gfx1201 KDA workspace).
-        args.front_layers = 5 if args.max_ctx > 65536 else 6
+        # Harness tuning for memory, not a split property: a small front card cannot
+        # hold N=6 plus the long-context workspace.  Both values are explicit flags.
+        args.front_layers = (args.long_ctx_front_layers if args.max_ctx > args.long_ctx_threshold
+                             else args.short_ctx_front_layers)
     return args
 
 
@@ -166,6 +182,10 @@ def build_needle(depth: int, tokenizer):
 
 def main() -> None:
     args = parse_args()
+    if args.front_layers_defaulted and not args.baseline:
+        print(f"[harness] no --front-layers given: using N={args.front_layers} at -c "
+              f"{args.max_ctx} (harness tuning, not a split property; override with "
+              f"--front-layers N or --long-ctx-front-layers N)", flush=True)
     if args.compare:
         compare(args.compare[0], args.compare[1])
         return
@@ -194,7 +214,7 @@ def main() -> None:
     text_map = None
     if not args.baseline:
         from exllamav3.device_map import SplitPlan, resolve_devices
-        devices = resolve_devices(args.front_device)
+        devices = resolve_devices(args.front_device, args.main_device)
         plan = SplitPlan(
             devices, endcaps = args.endcaps == "on", front_layers = args.front_layers,
             front_reserve_gb = 0.0 if args.no_budget else args.front_reserve_gb,

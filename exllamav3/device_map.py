@@ -4,7 +4,16 @@ from __future__ import annotations
 Contiguous layer split: resolve the two devices, declare per-component policies and
 map model modules to them.
 
-The map is deliberately independent of the architecture: modules carrying a
+Devices are selected by position, never by architecture.  ``main`` defaults to
+``cuda:0``; ``front`` defaults to the only other visible device when exactly two
+devices are present.  A front-only selector keeps working when it lands on
+``cuda:0``: main auto then takes the other device.  Either position accepts
+``cuda:N``, ``gfxXXXX``, a device UUID or a device-name substring, and either
+device may serve either position.  ``cuda:N`` is the torch index after
+``HIP_VISIBLE_DEVICES``, not the ``rocm-smi`` index.  More than two visible devices
+require an explicit selector.
+
+The map itself is deliberately independent of the architecture: modules carrying a
 ``layer_idx`` are transformer layers and are assigned to the front device for
 indices ``0 .. front_layers - 1`` and to the main device for the rest.  Modules
 without a ``layer_idx`` are endcaps (embedding, hyper-connection drivers, final
@@ -36,6 +45,12 @@ from .util.arch_list import device_arch
 
 GIB = 1024 ** 3
 
+# Default load-time slab on the front device.  A tuning value, not an architecture
+# assumption: size it to the front card.  Stage 5 derives it from the device total.
+DEFAULT_FRONT_RESERVE_GB = 1.2
+DEFAULT_MAIN_DEVICE = "auto"
+DEFAULT_FRONT_DEVICE = "auto"
+
 # Text prologue/epilogue modules that are safe to place on the front device.  The
 # list is by class name and key suffix, not by model: an adapter can extend it in
 # its ComponentPolicy.  Modules outside this list default to the main device.
@@ -64,53 +79,162 @@ def _device_uuid(index: int) -> str:
 
 
 @dataclass(frozen = True)
+class DeviceInfo:
+    """One visible device as the selector sees it.
+
+    ``arch`` is a ROCm arch name when the runtime exposes one; an unknown or
+    non-ROCm device keeps an empty string so selection by ``cuda:N``/name still
+    works.  The inventory is injectable so selection tests need no GPU.
+    """
+
+    index: int
+    name: str = ""
+    arch: str = ""
+    uuid: str = ""
+
+    def describe(self) -> str:
+        parts = [f"cuda:{self.index}"]
+        if self.arch:
+            parts.append(self.arch)
+        if self.name:
+            parts.append(self.name)
+        return " ".join(parts)
+
+
+@dataclass(frozen = True)
 class Devices:
     main: torch.device
     front: torch.device | None
     main_arch: str
     front_arch: str | None
+    inventory: tuple[DeviceInfo, ...] = ()
 
 
-def resolve_devices(front: str | None = None) -> Devices:
-    """Resolve main/front by architecture.
+def _device_info(index: int) -> DeviceInfo:
+    name = ""
+    try:
+        name = torch.cuda.get_device_name(index)
+    except Exception:                                        # noqa: BLE001 - inventory is best effort
+        pass
+    try:
+        arch = _arch_of(index)
+    except Exception:                                        # noqa: BLE001 - selection does not need an arch
+        arch = ""
+    try:
+        uuid = _device_uuid(index)
+    except Exception:                                        # noqa: BLE001
+        uuid = ""
+    return DeviceInfo(index = index, name = name, arch = arch, uuid = uuid)
 
-    ``front`` (or KYOJIN_FRONT_DEVICE) accepts ``auto``, ``gfx1201``, ``cuda:N``
-    or a device UUID / name substring.  Auto selects the first gfx120/gfx12
-    device that is not the gfx1151 main device.
-    """
+
+def probe_devices() -> list[DeviceInfo]:
+    """Inventory the visible devices; the only GPU-dependent step in selection."""
     if not torch.cuda.is_available():
-        raise RuntimeError("layer split requires a HIP/CUDA device")
-    n = torch.cuda.device_count()
-    arch = {i: _arch_of(i) for i in range(n)}
-    main_i = next((i for i, a in arch.items() if a == "gfx1151"), 0)
-    req = (front if front is not None else os.environ.get("KYOJIN_FRONT_DEVICE", "auto") or "auto").strip().lower()
+        raise RuntimeError("layer split requires two HIP/CUDA devices")
+    return [_device_info(i) for i in range(torch.cuda.device_count())]
 
-    if req in ("", "auto"):
-        front_i = next((i for i, a in arch.items() if a.startswith("gfx12") and i != main_i), None)
-    elif req.startswith("cuda:"):
-        front_i = int(req.split(":", 1)[1])
-        if front_i < 0 or front_i >= n:
-            raise RuntimeError(f"KYOJIN_FRONT_DEVICE={req}: no such device")
-    elif req.startswith("gfx"):
-        front_i = next((i for i, a in arch.items() if a == req), None)
+
+def _format_inventory(infos: list[DeviceInfo]) -> str:
+    return ", ".join(d.describe() for d in infos) or "none"
+
+
+def _select_device(req: str, role: str, infos: list[DeviceInfo], env_name: str) -> int:
+    req = (req or "").strip().lower()
+    indexes = {d.index for d in infos}
+    if req.startswith("cuda:"):
+        try:
+            index = int(req.split(":", 1)[1])
+        except ValueError as exc:
+            raise RuntimeError(f"{role} device selector {req!r} is not a valid cuda:N") from exc
+        if index not in indexes:
+            raise RuntimeError(f"{role} device {req!r}: no such device; available: "
+                               f"{_format_inventory(infos)}")
+        return index
+    if req.startswith("gfx"):
+        matches = [d.index for d in infos if (d.arch or "").lower() == req]
     else:
         key = req.replace("-", "")
-        front_i = next((i for i in range(n)
-                        if key and (key in _device_uuid(i) or req in torch.cuda.get_device_properties(i).name.lower())), None)
+        matches = [
+            d.index for d in infos
+            if (key and key in (d.uuid or "").lower().replace("-", ""))
+            or (req and req in (d.name or "").lower())
+        ]
+    if len(matches) > 1:
+        raise RuntimeError(f"{role} device {req!r} matched several devices; use cuda:N or "
+                           f"a more specific selector; available: {_format_inventory(infos)}")
+    if not matches:
+        raise RuntimeError(f"{role} device {req!r} did not match any device; available: "
+                           f"{_format_inventory(infos)}. Set {env_name}=cuda:N "
+                           f"(or gfxXXXX/uuid/name).")
+    return matches[0]
 
-    if front_i is None:
+
+def resolve_devices(
+    front: str | None = None,
+    main: str | None = None,
+    devices: list[DeviceInfo] | None = None,
+) -> Devices:
+    """Resolve the front/main pair by position, never by architecture.
+
+    ``main`` (or KYOJIN_MAIN_DEVICE) defaults to ``auto`` = ``cuda:0``.  ``front``
+    (or KYOJIN_FRONT_DEVICE) defaults to the only other visible device when exactly
+    two are visible; with one device the split cannot run, and with more than two an
+    explicit selector is required.  If the front is explicit and occupies ``cuda:0``
+    while main is ``auto`` with exactly two devices visible, main takes the other
+    device so a front-only selector keeps working.  Both selectors accept
+    ``cuda:N``, ``gfxXXXX``, a device UUID or a device-name substring; either
+    position may be either device.
+
+    ``devices`` injects a synthetic inventory; production callers omit it and probe
+    the runtime.  Selection itself does not depend on an architecture.
+    """
+    infos = list(devices) if devices is not None else probe_devices()
+    if len(infos) < 2:
         raise RuntimeError(
-            f"layer split requested but no front device matched {req!r}; "
-            f"devices: {[(i, a) for i, a in arch.items()]}. "
-            "Set KYOJIN_FRONT_DEVICE=gfx1201 (or cuda:N)."
-        )
+            f"layer split needs two devices; visible: {_format_inventory(infos)}. "
+            "Unset KYOJIN_FRONT_LAYERS / --front-layers to run on one device.")
+
+    main_req = main if main is not None else os.environ.get("KYOJIN_MAIN_DEVICE", DEFAULT_MAIN_DEVICE)
+    front_req = front if front is not None else os.environ.get("KYOJIN_FRONT_DEVICE", DEFAULT_FRONT_DEVICE)
+    main_req = (main_req or DEFAULT_MAIN_DEVICE).strip().lower()
+    front_req = (front_req or DEFAULT_FRONT_DEVICE).strip().lower()
+    main_auto = main_req in ("", "auto")
+
+    if main_auto:
+        main_i = min(d.index for d in infos)
+    else:
+        main_i = _select_device(main_req, "main", infos, "KYOJIN_MAIN_DEVICE")
+
+    if front_req in ("", "auto"):
+        if len(infos) != 2:
+            raise RuntimeError(
+                f"front device is 'auto' but {len(infos)} devices are visible; set "
+                f"KYOJIN_FRONT_DEVICE (or --front-device) to one of: {_format_inventory(infos)}")
+        front_i = next(d.index for d in infos if d.index != main_i)
+    else:
+        front_i = _select_device(front_req, "front", infos, "KYOJIN_FRONT_DEVICE")
+        if main_auto and front_i == main_i:
+            # An explicit front selector must keep working when it lands on cuda:0:
+            # main auto takes the only other device.  With more devices the choice
+            # is ambiguous, so ask for the main selector instead of guessing.
+            if len(infos) == 2:
+                main_i = next(d.index for d in infos if d.index != front_i)
+            else:
+                raise RuntimeError(
+                    f"main device is 'auto' (cuda:{main_i}) and equals the explicit front; "
+                    f"with {len(infos)} devices visible set KYOJIN_MAIN_DEVICE (or --main-device)")
+
     if front_i == main_i:
-        raise RuntimeError("layer split front device resolves to the main device")
+        raise RuntimeError(f"layer split main and front resolve to the same device "
+                           f"(cuda:{main_i}); choose a different --front-device/--main-device")
+    by_index = {d.index: d for d in infos}
+    main_info, front_info = by_index[main_i], by_index[front_i]
     return Devices(
         main = torch.device("cuda", main_i),
         front = torch.device("cuda", front_i),
-        main_arch = arch[main_i],
-        front_arch = arch[front_i],
+        main_arch = main_info.arch or "",
+        front_arch = front_info.arch or "",
+        inventory = tuple(infos),
     )
 
 
@@ -316,7 +440,7 @@ class ComponentMap:
         endcaps: bool,
         devices: Devices,
         component: str = "text",
-        front_reserve_gb: float = 1.2,
+        front_reserve_gb: float = DEFAULT_FRONT_RESERVE_GB,
         main_reserve_gb: float = 0.0,
         config = None,
         cache = None,
@@ -337,7 +461,7 @@ class ComponentMap:
         endcaps: bool,
         devices: Devices,
         policy: ComponentPolicy,
-        front_reserve_gb: float = 1.2,
+        front_reserve_gb: float = DEFAULT_FRONT_RESERVE_GB,
         main_reserve_gb: float = 0.0,
         config = None,
         cache = None,
@@ -562,7 +686,7 @@ class SplitPlan:
         devices: Devices,
         endcaps: bool = True,
         front_layers: int | str = 0,
-        front_reserve_gb: float = 1.2,
+        front_reserve_gb: float = DEFAULT_FRONT_RESERVE_GB,
         main_reserve_gb: float = 0.0,
         preset: str = "auto",
         auto_cap: int | None = None,
@@ -641,7 +765,7 @@ class SplitPlan:
             self.front_layers = n
             self.logger(f"[split] auto-N: {n} front layer(s) "
                         f"(budget {self._auto_budget() / GIB:.2f} GiB, "
-                        f"reserve {self.front_reserve_gb:.2f} GiB)")
+                        f"reserve {self.front_reserve_gb:.2f} GiB tuning slab)")
         for name, (model, config, cache, policy, layer, load_order) in self._decls.items():
             if self.auto and policy.kind == "text":
                 layer = self.front_layers
@@ -690,6 +814,8 @@ class SplitPlan:
         if self.devices.front is None:
             return 0
         total = int(torch.cuda.get_device_properties(self.devices.front).total_memory)
+        # Allocator slack, not an architecture rule; Stage 5 replaces it with measured
+        # load/forward headroom.
         safety = int(float(os.environ.get("KYOJIN_AUTON_SAFETY_GB", "0.25")) * GIB)
         return max(0, total - int(self.front_reserve_gb * GIB) - safety)
 

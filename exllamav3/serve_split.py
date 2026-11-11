@@ -3,8 +3,14 @@ from __future__ import annotations
 """Shared serve-side helper for the contiguous layer split.
 
 Adapters (``tools/glm`` first, then Qwen/DSV4) parse the same flags, resolve the
-same devices and hand their components to ``SplitPlan``.  No placement logic
-lives here: a component is declared with a name and, optionally, a policy.
+same devices and hand their components to ``SplitPlan``.  No placement logic or
+hardware-specific default lives here: a component is declared with a name and,
+optionally, a policy.  Devices are chosen by position (``cuda:N``, ``gfxXXXX``,
+UUID or name); either device may be the front or the main one.
+
+This module stays pure stdlib at import: adapters must be able to apply their
+serving environment before ``exllamav3`` (and therefore torch) is imported, so the
+exllamav3 imports are deliberately deferred to call time.
 """
 
 import argparse
@@ -15,6 +21,10 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from exllamav3.device_map import ComponentMap, ComponentPolicy, SplitPlan
+
+# Load-time slab held on the front device.  A tuning value, not a hardware rule:
+# size it to the front card (Stage 5 derives it from the device total).
+DEFAULT_FRONT_RESERVE_GB = 1.2
 
 # Split mode runs eager until per-segment capture lands (Stage 6).  A whole-forward
 # or per-block graph must never span the host-staged bridge between segments.
@@ -69,8 +79,9 @@ def parse_front_layers(value) -> int | str:
 class SplitSettings:
     front_layers: int | str = 0
     front_device: str = "auto"
+    main_device: str = "auto"
     endcaps: bool = True
-    front_reserve_gb: float = 1.2
+    front_reserve_gb: float = DEFAULT_FRONT_RESERVE_GB
     preset: str = "auto"
     split_graphs: str = "auto"
 
@@ -83,7 +94,8 @@ class SplitSettings:
         return self.front_layers == "auto"
 
     def describe(self) -> str:
-        return (f"front_layers={self.front_layers} front_device={self.front_device} "
+        return (f"front_layers={self.front_layers} main_device={self.main_device} "
+                f"front_device={self.front_device} "
                 f"endcaps={'on' if self.endcaps else 'off'} "
                 f"reserve={self.front_reserve_gb:.2f}GiB preset={self.preset} "
                 f"graphs={self.split_graphs}")
@@ -93,15 +105,20 @@ def add_split_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--front-layers", default = None,
                         help = "contiguous layer split: first N transformer layers on the front device; "
                                "auto = fit from actual bytes; 0 = off (default: KYOJIN_FRONT_LAYERS, else 0)")
+    parser.add_argument("--main-device", default = None,
+                        help = "main device: auto, gfxXXXX, cuda:N or a UUID/name substring "
+                               "(default: KYOJIN_MAIN_DEVICE, else auto = cuda:0)")
     parser.add_argument("--front-device", default = None,
-                        help = "front device: auto, gfx1201, cuda:N or a UUID/name substring "
-                               "(default: KYOJIN_FRONT_DEVICE, else auto)")
+                        help = "front device: auto, gfxXXXX, cuda:N or a UUID/name substring "
+                               "(default: KYOJIN_FRONT_DEVICE, else auto = the only other device). "
+                               "cuda:N is the torch index after HIP_VISIBLE_DEVICES; either device "
+                               "may be the front or the main one")
     parser.add_argument("--endcaps", choices = ("on", "off"), default = None,
                         help = "with a layer split, keep allowlisted embedding/norm/lm_head/MTP/vision "
                                "modules on the front device (default: KYOJIN_ENDCAPS, else on)")
     parser.add_argument("--front-reserve-gb", type = float, default = None,
-                        help = "VRAM held as a load-time slab on the front device for workspace "
-                               "(default: KYOJIN_FRONT_RESERVE_GB, else 1.2)")
+                        help = "VRAM held as a load-time slab on the front device for workspace; a "
+                               "tuning value, not a hardware rule (default: KYOJIN_FRONT_RESERVE_GB, else 1.2)")
     parser.add_argument("--split-preset", choices = tuple(SPLIT_PRESETS), default = None,
                         help = "per-model split preset (default: KYOJIN_SPLIT_PRESET, else auto)")
     parser.add_argument("--split-graphs", choices = ("auto", "on", "off"), default = None,
@@ -121,9 +138,10 @@ def settings_from_namespace(args) -> SplitSettings:
     graphs = getattr(args, "split_graphs", None) or "auto"
     reserve = getattr(args, "front_reserve_gb", None)
     if reserve is None:
-        reserve = float(os.environ.get("KYOJIN_FRONT_RESERVE_GB", "1.2"))
+        reserve = float(os.environ.get("KYOJIN_FRONT_RESERVE_GB", str(DEFAULT_FRONT_RESERVE_GB)))
     return SplitSettings(
         front_layers = parse_front_layers(raw),
+        main_device = getattr(args, "main_device", None) or os.environ.get("KYOJIN_MAIN_DEVICE") or "auto",
         front_device = getattr(args, "front_device", None) or os.environ.get("KYOJIN_FRONT_DEVICE") or "auto",
         endcaps = bool(endcaps),
         front_reserve_gb = float(reserve),
@@ -169,7 +187,7 @@ class SplitController:
         self.plan = None
         if settings.enabled:
             from exllamav3.device_map import resolve_devices
-            self.devices = resolve_devices(settings.front_device)
+            self.devices = resolve_devices(settings.front_device, settings.main_device)
 
     @property
     def enabled(self) -> bool:

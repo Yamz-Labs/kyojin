@@ -126,6 +126,26 @@ def _devices(dm):
     )
 
 
+def _infos(dm, *pairs):
+    """Synthetic device inventory: (arch, optional name/uuid) per device index."""
+    out = []
+    for i, item in enumerate(pairs):
+        if isinstance(item, str):
+            arch, name, uuid = item, f"device-{i}", ""
+        else:
+            arch = item[0]
+            name = item[1] if len(item) > 1 else f"device-{i}"
+            uuid = item[2] if len(item) > 2 else ""
+        out.append(dm.DeviceInfo(index = i, name = name, arch = arch, uuid = uuid))
+    return out
+
+
+@pytest.fixture
+def clean_split_env(monkeypatch):
+    for key in ("KYOJIN_FRONT_DEVICE", "KYOJIN_MAIN_DEVICE", "KYOJIN_FRONT_LAYERS", "KYOJIN_ENDCAPS"):
+        monkeypatch.delenv(key, raising = False)
+
+
 def _glm_model():
     embedding = FakeModule("model.language_model.embed_tokens", caps = {"prefer_cpu": True})
     expand = FakeModule("hc_expand")
@@ -340,6 +360,145 @@ def test_named_preset_is_applied_by_the_plan(split_modules, monkeypatch):
         split.SPLIT_PRESETS["glm"] = old
 
 
+@pytest.mark.parametrize("archs", [
+    ("gfx1100", "gfx1101"),                 # RDNA3
+    ("gfx1150", "gfx1151"),                 # RDNA3.5
+    ("gfx1200", "gfx1201"),                 # RDNA4
+    ("gfx1151", "gfx1100"),                 # mixed, reversed
+    ("gfx1201", "gfx1201"),                 # same arch
+    ("gfx1100", "gfx1100"),
+    ("", "sm_90"),                          # unknown / CUDA-style names: selection only
+])
+def test_auto_selection_is_positional_and_arch_independent(split_modules, clean_split_env, archs):
+    dm, _bridge, _split = split_modules
+    devices = dm.resolve_devices(devices = _infos(dm, *archs))
+    assert devices.main == torch.device("cuda", 0)
+    assert devices.front == torch.device("cuda", 1)
+    assert devices.main_arch == archs[0] and devices.front_arch == archs[1]
+    assert [d.index for d in devices.inventory] == [0, 1]
+
+
+def test_explicit_selectors_support_both_positions(split_modules, clean_split_env):
+    dm, _bridge, _split = split_modules
+    infos = _infos(dm, "gfx1151", "gfx1201")
+
+    mixed = dm.resolve_devices("cuda:1", "cuda:0", devices = infos)
+    assert (mixed.main_arch, mixed.front_arch) == ("gfx1151", "gfx1201")
+
+    reversed_pair = dm.resolve_devices("gfx1151", "gfx1201", devices = infos)
+    assert reversed_pair.main == torch.device("cuda", 1)
+    assert reversed_pair.front == torch.device("cuda", 0)
+    assert (reversed_pair.main_arch, reversed_pair.front_arch) == ("gfx1201", "gfx1151")
+
+    by_name_uuid = dm.resolve_devices("device-1", "device-0", devices = infos)
+    assert by_name_uuid.main == torch.device("cuda", 0)
+    assert by_name_uuid.front == torch.device("cuda", 1)
+
+
+def test_explicit_front_with_auto_main_uses_the_other_device(split_modules, clean_split_env):
+    dm, _bridge, _split = split_modules
+    infos = _infos(dm, "gfx1151", "gfx1201")
+
+    by_index = dm.resolve_devices("cuda:0", devices = infos)
+    assert by_index.main == torch.device("cuda", 1)
+    assert by_index.front == torch.device("cuda", 0)
+
+    by_arch = dm.resolve_devices("gfx1151", devices = infos)
+    assert by_arch.main == torch.device("cuda", 1)
+    assert by_arch.front == torch.device("cuda", 0)
+
+    many = _infos(dm, "gfx1100", "gfx1151", "gfx1201")
+    with pytest.raises(RuntimeError, match = "set KYOJIN_MAIN_DEVICE"):
+        dm.resolve_devices("cuda:0", devices = many)
+
+
+def test_uuid_and_name_substring_selectors(split_modules, clean_split_env):
+    dm, _bridge, _split = split_modules
+    infos = _infos(
+        dm,
+        ("gfx1201", "AMD Radeon RX 9070 XT", "aa-bb-cc"),
+        ("gfx1151", "AMD Radeon 8060S", "dd-ee-ff"),
+    )
+    dev = dm.resolve_devices("aa-bb-cc", "8060s", devices = infos)
+    assert dev.main == torch.device("cuda", 1)
+    assert dev.front == torch.device("cuda", 0)
+
+
+def test_main_device_env_is_honoured(split_modules, clean_split_env, monkeypatch):
+    dm, _bridge, _split = split_modules
+    monkeypatch.setenv("KYOJIN_MAIN_DEVICE", "cuda:1")
+    dev = dm.resolve_devices(devices = _infos(dm, "gfx1151", "gfx1201"))
+    assert dev.main == torch.device("cuda", 1)
+    assert dev.front == torch.device("cuda", 0)
+
+
+def test_one_device_fails_clearly(split_modules, clean_split_env):
+    dm, _bridge, _split = split_modules
+    with pytest.raises(RuntimeError, match = "two devices"):
+        dm.resolve_devices(devices = _infos(dm, "gfx1151"))
+
+
+def test_three_devices_require_an_explicit_front(split_modules, clean_split_env):
+    dm, _bridge, _split = split_modules
+    infos = _infos(dm, "gfx1100", "gfx1151", "gfx1201")
+    with pytest.raises(RuntimeError, match = "3 devices.*--front-device"):
+        dm.resolve_devices(devices = infos)
+    dev = dm.resolve_devices("cuda:2", "cuda:1", devices = infos)
+    assert dev.main == torch.device("cuda", 1)
+    assert dev.front == torch.device("cuda", 2)
+
+
+def test_same_device_and_bad_selectors_fail_clearly(split_modules, clean_split_env):
+    dm, _bridge, _split = split_modules
+    infos = _infos(dm, "gfx1151", "gfx1201")
+    with pytest.raises(RuntimeError, match = "same device"):
+        dm.resolve_devices("cuda:0", "cuda:0", devices = infos)
+    with pytest.raises(RuntimeError, match = "no such device"):
+        dm.resolve_devices("cuda:9", devices = infos)
+    with pytest.raises(RuntimeError, match = "did not match any device"):
+        dm.resolve_devices("gfx9999", devices = infos)
+
+
+def test_settings_parse_main_device_and_keep_split_off_off(split_modules, clean_split_env, monkeypatch):
+    dm, _bridge, split = split_modules
+    monkeypatch.setenv("KYOJIN_MAIN_DEVICE", "cuda:1")
+    args = SimpleNamespace(front_layers = None, front_device = None, main_device = None,
+                           endcaps = None, split_preset = None, split_graphs = None,
+                           front_reserve_gb = None)
+    settings = split.settings_from_namespace(args)
+    assert settings.main_device == "cuda:1"
+    assert settings.enabled is False
+
+    args.main_device = "gfx1100"
+    args.front_device = "gfx1151"
+    args.front_layers = "2"
+    settings = split.settings_from_namespace(args)
+    assert (settings.main_device, settings.front_device) == ("gfx1100", "gfx1151")
+    assert settings.enabled is True
+
+
+def test_split_off_does_not_touch_device_selection(split_modules, monkeypatch):
+    dm, _bridge, split = split_modules
+
+    def boom(*_a, **_k):
+        pytest.fail("split off must not enumerate or resolve devices")
+
+    monkeypatch.setattr(dm, "resolve_devices", boom)
+    controller = split.SplitController(split.SplitSettings(front_layers = 0,
+                                                           main_device = "cuda:9",
+                                                           front_device = "cuda:9"),
+                                       logger = lambda *_a: None)
+    assert controller.devices is None
+    assert controller.plan is None
+
+
+def test_split_core_and_help_name_no_hardware(split_modules):
+    for rel in ("exllamav3/device_map.py", "exllamav3/serve_split.py"):
+        text = (ROOT / rel).read_text()
+        for name in ("gfx1151", "gfx1201", "gfx1100", "9070", "8060S", "Strix", "eGPU", "iGPU", "USB4"):
+            assert name not in text, f"{rel} still names {name}"
+
+
 def _load_split_eval():
     path = ROOT / "tools" / "strix_halo" / "split_eval.py"
     spec = importlib.util.spec_from_file_location("split_eval_harness", path)
@@ -360,6 +519,16 @@ def test_harness_default_front_layers_depends_on_context(monkeypatch):
     for ctx, expected in ((131072, 5), (65536, 6)):
         monkeypatch.setattr(sys, "argv", ["split_eval.py", "--max-ctx", str(ctx)])
         assert mod.parse_args().front_layers == expected
+
+
+def test_harness_front_layers_are_explicit_flags(monkeypatch):
+    mod = _load_split_eval()
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--max-ctx", "131072", "--front-layers", "7"])
+    assert mod.parse_args().front_layers == 7
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--max-ctx", "131072",
+                                      "--long-ctx-front-layers", "3"])
+    args = mod.parse_args()
+    assert args.front_layers == 3 and args.front_layers_defaulted is True
 
 
 def test_adapter_unsafe_env_is_applied_and_logged(split_modules, monkeypatch):

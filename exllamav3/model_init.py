@@ -349,7 +349,8 @@ def init(
         if os.environ.get("EXL3_LOAD_SPLIT"):
             raise ValueError("KYOJIN_FRONT_LAYERS cannot be combined with the legacy EXL3_LOAD_SPLIT budget")
         from .device_map import SplitPlan, resolve_devices
-        devices = resolve_devices(os.environ.get("KYOJIN_FRONT_DEVICE"))
+        devices = resolve_devices(os.environ.get("KYOJIN_FRONT_DEVICE"),
+                                  os.environ.get("KYOJIN_MAIN_DEVICE"))
         endcaps = os.environ.get("KYOJIN_ENDCAPS", "1") != "0"
         reserve = float(os.environ.get("KYOJIN_FRONT_RESERVE_GB", "1.2"))
         split_plan = SplitPlan(devices, endcaps = endcaps, front_layers = front_layers,

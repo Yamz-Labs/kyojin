@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Phase 3 loader gate: load the GLM pack across iGPU + eGPU and print the table.
+"""Phase 3 loader gate: load the GLM pack across two devices and print the table.
 
-No forward pass is run.  Usage (from the repo root, after `source tools/strix_halo/env.sh`):
+No forward pass is run.  Either device may be the front or the main one; select
+them with --main-device/--front-device (cuda:N, gfxXXXX, UUID or name).
+Usage (from the repo root, after `source tools/strix_halo/env.sh`):
 
     python tools/strix_halo/split_load.py \
         -m /data/models/NicSir--GLM-5.3-Flash-EXL3-2.72bpw \
@@ -29,6 +31,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("-m", "--model", required=True)
     p.add_argument("--front-layers", type=int, default=4)
+    p.add_argument("--main-device", default="auto")
     p.add_argument("--front-device", default="auto")
     p.add_argument("--endcaps", choices=("on", "off"), default="on")
     p.add_argument("--front-reserve-gb", type=float, default=1.2)
@@ -79,7 +82,7 @@ def main() -> None:
               f"MemAvailable {host_before:.1f} -> {mem_available_gib():.1f} GiB", flush=True)
         return
 
-    devices = resolve_devices(args.front_device)
+    devices = resolve_devices(args.front_device, args.main_device)
     plan = SplitPlan(devices, endcaps=endcaps, front_layers=args.front_layers,
                      front_reserve_gb=args.front_reserve_gb)
     plan.add("text", model, config=config, cache=cache, load_order=0)

@@ -2,13 +2,19 @@
 
 What the contiguous layer split (`exllamav3/device_map.py`, `exllamav3/bridge.py`,
 `exllamav3/serve_split.py`, `Model.load(device_map=...)`) can place today, per model family
-and per serve flavor. Stage 1 (2026-11-10): the core is policy-driven, GLM is the first
-adapter, and the front reserve is a layout-neutral slab; GLM's Phase 4 gate replay is the
-measured baseline. Qwen and DSV4 entries remain code inventories, not load-tested.
+and per serve flavor. Stage 1.5 (2026-11-10): the core is policy-driven, devices are
+selected by position rather than architecture, GLM is the first adapter, and the front
+reserve is a layout-neutral slab; GLM's Phase 4 gate replay is the measured baseline.
+Qwen and DSV4 entries remain code inventories, not load-tested.
 
-Legend — placement: **front** (mapped to the front eGPU), **main** (mapped to the main GPU),
-**cpu**, **host** (never enters the map: CPU/streamed by design). Stage links point at the
-roadmap stage that must finish before that row is claimable.
+Legend — placement: **front** (mapped to the front device), **main** (mapped to the main
+device), **cpu**, **host** (never enters the map: CPU/streamed by design). Stage links
+point at the roadmap stage that must finish before that row is claimable.
+
+**Measured configuration.** RX 9070 (gfx1201, 15.92 GiB) over USB4 as the front and a
+118 GiB Strix Halo iGPU (gfx1151) as the main. Numbers below and in
+`docs-notes/split-log.md` are measurements from that pair; the interface does not assume
+either architecture or role.
 
 ## Measured — GLM-5.3-Flash (`tools/glm/serve.py`, `tools/strix_halo/split_*`)
 
@@ -23,13 +29,14 @@ roadmap stage that must finish before that row is claimable.
 | bridge | shared config | installed by `SplitPlan.install_bridges` for every config | one `Bridge` per config; split_active defuses graphs |
 
 Gate status (Stage 0 replay): N=6 65K load with MTP+vision front 13.68/13.94 GiB, plain split
-run-to-run deterministic; results appended in `docs-notes/split-log.md`. Stage 1 core changes
-are CPU-contract-tested and the GPU gate (N=4/6 load, plain determinism, 120K needle N=5,
-split-off regression) is the next checkpoint run.
+run-to-run deterministic; results appended in `docs-notes/split-log.md`. Stage 1.5 selection
+changes are CPU-tested; the GPU gate (N=4/6 load in both device positions, plain determinism,
+120K needle N=5, split-off regression) is the next checkpoint run.
 
 Known blockers: gfx12 fused KDA kernel (separate PR), MTP cross-device acceptance/determinism,
 auto-N not yet subtracting components declared after the target (Stage 5), 128K determinism
-must be re-verified with the slab reserve on the box.
+must be re-verified with the slab reserve on the box. GLM's auto-N long-context cap applies
+only on a gfx12 front (adapter tuning, not a split rule).
 
 ## Code inventory — Qwen3.8-Flash-Next (`tools/qwen/serve.py`)
 

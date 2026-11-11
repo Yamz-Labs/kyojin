@@ -51,6 +51,21 @@ EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
 # Name inside the model folder. Not *.safetensors, so the weight loader never indexes it as model weights
 # (same layout trick as uncensor_direction.st); the file is a normal safetensors file.
 EH_SIDECAR_IN_PACK = "mtp_eh_proj.st"
+# GLM adapter tuning, deliberately outside the split core: on RDNA4 (gfx12) the
+# split runs the deterministic fla KDA chain, whose long-context prefill workspace
+# is not yet part of auto-N.  Measured on a 16 GB gfx12 front card.  This is a
+# property of this adapter/front pair, not of the split; explicit --front-layers
+# always wins.
+GLM_LONG_CTX = 65536
+GLM_LONG_CTX_AUTO_CAP = 5
+
+
+def _glm_small_kda_front(front_arch: str | None) -> bool:
+    """True when this front runs the deterministic split KDA chain."""
+    from exllamav3.util.arch_list import kda_fused_output_unstable
+    return kda_fused_output_unstable(front_arch)
+
+
 # --sessions > 1 (several requests decode in one step): plain steps take the R-row exact paths (union MoE on the device table, R-row
 # GEMV, batched router) instead of per-expert eager loops, and 2..8-row verify blocks replay as graphs. Box 4 requests, same prompts:
 # plain 26.1 -> 40.7 tok/s aggregate, speculative 38.1 -> 42.5; one request alone and speculative text equal to the solo run unchanged.
@@ -684,6 +699,7 @@ class ResidentEngine:
                  image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB,
                  image_cache_dir_lock_s: float = IMAGE_CACHE_DIR_LOCK_S,
                  front_layers: int | str = 0, front_device: str | None = None,
+                 main_device: str | None = None,
                  endcaps: bool = True, front_reserve_gb: float = 1.2,
                  split_settings: SplitSettings | None = None):
         import torch
@@ -719,6 +735,7 @@ class ResidentEngine:
             split_settings = SplitSettings(
                 front_layers = parse_front_layers(front_layers),
                 front_device = front_device or "auto",
+                main_device = main_device or "auto",
                 endcaps = bool(endcaps), front_reserve_gb = float(front_reserve_gb))
         self.split = SplitController(split_settings, logger = lambda m: print(f"serve: {m}", flush=True))
         self.split_map = None
@@ -729,12 +746,18 @@ class ResidentEngine:
             print(f"serve: layer split: {split_settings.describe()}; "
                   f"main {plan.devices.main} ({plan.devices.main_arch}), "
                   f"front {plan.devices.front} ({plan.devices.front_arch})", flush=True)
-            if split_settings.auto and max_ctx > 65536:
-                # Auto-N's byte budget does not yet know the gfx12 KDA prefill
-                # workspace; keep the measured-safe long-context cap until it does.
-                plan.auto_cap = 5
-                print("serve: layer split: auto-N capped at 5 layers for -c > 65536 "
-                      "(gfx1201 KDA prefill workspace)", flush=True)
+            if split_settings.auto:
+                if _glm_small_kda_front(plan.devices.front_arch) and max_ctx > GLM_LONG_CTX:
+                    # Auto-N's byte budget does not yet know the split KDA prefill
+                    # workspace; keep the measured-safe long-context cap until it does.
+                    plan.auto_cap = GLM_LONG_CTX_AUTO_CAP
+                    print(f"serve: layer split: auto-N capped at {GLM_LONG_CTX_AUTO_CAP} layers for "
+                          f"-c > {GLM_LONG_CTX} on this gfx12 front: the split KDA prefill workspace "
+                          "is not in the byte budget (adapter tuning; pass --front-layers N to "
+                          "override)", flush=True)
+                else:
+                    print("serve: layer split: auto-N uncapped (front does not need the split "
+                          "KDA long-context reserve)", flush=True)
         self.tokenizer = Tokenizer.from_config(self.config)
         if os.environ.get("KYO_TOKCACHE", "8") == "0":
             self.pec = None
@@ -782,10 +805,16 @@ class ResidentEngine:
             self.split_map = self.split.map("text")
             if self.split_map is not None and not self.split_map.enabled:
                 raise ValueError("layer split requested but no usable front device (or auto-N found no layer that fits)")
-            if self.split_map is not None and self.split_map.front_layers > 5 and max_ctx > 65536:
-                print("serve: warning: front layers > 5 at -c > 65536 is measured to OOM the 16 GB "
-                      "front on long prefill (gfx1201 KDA fallback workspace); use "
-                      "--front-layers 5 for long-context split runs", flush=True)
+            if split_settings.auto and self.split_map is not None:
+                print(f"serve: layer split: auto-N chose {self.split_map.front_layers} front layer(s) "
+                      f"for -c {ctx}", flush=True)
+            if (self.split_map is not None and self.split_map.front_layers > GLM_LONG_CTX_AUTO_CAP
+                    and max_ctx > GLM_LONG_CTX
+                    and _glm_small_kda_front(plan.devices.front_arch)):
+                print(f"serve: warning: front layers > {GLM_LONG_CTX_AUTO_CAP} at -c > {GLM_LONG_CTX} "
+                      "is measured to OOM a 16 GB gfx12 front on long prefill (split KDA fallback "
+                      f"workspace); use --front-layers {GLM_LONG_CTX_AUTO_CAP} for long-context split runs",
+                      flush=True)
             self.split.engage_budget()
             self.split.load("text", self.model, progressbar=False,
                             callback=startup_health.load_callback(), max_chunk_size=4096)

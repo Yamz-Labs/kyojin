@@ -2,10 +2,11 @@ from __future__ import annotations
 
 """Async host-staged bridge for the contiguous layer split.
 
-The iGPU (gfx1151) and the eGPU (gfx1201) have no working, fast peer path: a direct
-device-to-device copy on this link class is both slow (under 1 GB/s observed on the
-9070 side) and asymmetric.  Every segment crossing therefore goes through pinned host
-memory:
+The front and main devices may be any two supported ROCm devices in either
+position.  On the measured mixed configuration (RX 9070 front over USB4 + Strix
+Halo main) there is no working, fast peer path: a direct device-to-device copy on
+that link class is both slow (under 1 GB/s observed on the 9070 side) and
+asymmetric.  Every segment crossing therefore goes through pinned host memory:
 
     src tensor --D2H--> pinned slot --H2D--> dst tensor
 
