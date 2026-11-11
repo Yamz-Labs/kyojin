@@ -1833,11 +1833,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         sel = selected_experts.reshape(-1).to(torch.int32).contiguous()
         sc_gu = self.gates[0].inner.s.shape[1] if grid else 1
         sc_d = self.downs[0].inner.s.shape[1] if grid else 1
-        g = F8.moe_gemv(h, gq, gs, sel, I, K, grid, block, S, sc_gu)
-        u = F8.moe_gemv(h, uq, us, sel, I, K, grid, block, S, sc_gu)
-        a = (torch.nn.functional.silu(g) * u).half()
-        d = F8.moe_gemv(a, dq, ds, sel, K, I, grid, block, 1, sc_d)
-        routed = (d.view(R, S, K) * routing_weights.reshape(R, S, 1).float()).sum(1)
+        if os.environ.get("EXL3_FP8_MOE_FUSED", "1") != "0":                 # 2 launches: gate|up, then down with SwiGLU staging + weighted fold
+            routed = F8.moe_fused(h, (gq, gs, uq, us, dq, ds), sel, routing_weights.reshape(-1).contiguous(), I, K, grid, block, S, sc_gu, sc_d)
+        else:
+            g = F8.moe_gemv(h, gq, gs, sel, I, K, grid, block, S, sc_gu)
+            u = F8.moe_gemv(h, uq, us, sel, I, K, grid, block, S, sc_gu)
+            a = (torch.nn.functional.silu(g) * u).half()
+            d = F8.moe_gemv(a, dq, ds, sel, K, I, grid, block, 1, sc_d)
+            routed = (d.view(R, S, K) * routing_weights.reshape(R, S, 1).float()).sum(1)
         final_hidden_states = routed.view(x.shape) if R > 1 else routed
         if self.shared_experts is not None:
             se = self.shared_experts.forward(x, params)

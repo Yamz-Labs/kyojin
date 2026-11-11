@@ -79,6 +79,85 @@ def moe_gemv(x, qtab, stab, sel, N, K, grid, block, xdiv, s_cols):
     return y
 
 
+@triton.jit
+def _fp8_moe_gu(x_ptr, gq, gs, uq, us, sel_ptr, y_ptr, K, N, S_COLS, XDIV, GRID: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
+                BN: tl.constexpr, BK: tl.constexpr):
+    """gate and up of every routed slot in ONE launch: tiles [0, T) are gate, [T, 2T) up; y [slots, 2N] fp32 (gate | up)."""
+    pid = tl.program_id(0)
+    slot = tl.program_id(1)
+    T = tl.cdiv(N, BN)
+    is_up = pid >= T
+    tile = pid - T * is_up.to(tl.int32)
+    e = tl.load(sel_ptr + slot).to(tl.int64)
+    q_ptr = tl.where(is_up, tl.load(uq + e), tl.load(gq + e)).to(tl.pointer_type(tl.uint8))
+    s_ptr = tl.where(is_up, tl.load(us + e), tl.load(gs + e)).to(tl.pointer_type(tl.float32))
+    xr = x_ptr + (slot // XDIV).to(tl.int64) * K
+    rn = tile * BN + tl.arange(0, BN)
+    mn = rn < N
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        rk = k0 + tl.arange(0, BK)
+        mk = rk < K
+        b = tl.load(q_ptr + rn[:, None].to(tl.int64) * K + rk[None, :], mask=mn[:, None] & mk[None, :], other=0).to(tl.int16)
+        h = ((((b & 0x80) << 8) | ((b & 0x7F) << 7)).to(tl.float16, bitcast=True) * 256.0).to(tl.float32)
+        xv = tl.load(xr + rk, mask=mk, other=0.0).to(tl.float32)
+        part = tl.sum(h * xv[None, :], axis=1)
+        if GRID:
+            part = part * tl.load(s_ptr + ((tile * BN) // BO) * S_COLS + k0 // BI)
+        acc += part
+    if not GRID:
+        acc = acc * tl.load(s_ptr + rn, mask=mn, other=0.0)
+    tl.store(y_ptr + slot.to(tl.int64) * (2 * N) + N * is_up.to(tl.int64) + rn, acc, mask=mn)
+
+
+@triton.jit
+def _fp8_moe_down(gu_ptr, dq, ds, sel_ptr, w_ptr, y_ptr, I, N, S_COLS, S, GRID: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
+                  BN: tl.constexpr, BK: tl.constexpr):
+    """down projection of the S slots of row r with silu(gate) * up staged on the fly and the routing-weighted fold: y [R, N] fp32."""
+    pid = tl.program_id(0)
+    r = tl.program_id(1)
+    rn = pid * BN + tl.arange(0, BN)
+    mn = rn < N
+    out = tl.zeros((BN,), dtype=tl.float32)
+    for j in range(0, S):
+        slot = r * S + j
+        e = tl.load(sel_ptr + slot).to(tl.int64)
+        wt = tl.load(w_ptr + slot).to(tl.float32)
+        q_ptr = tl.load(dq + e).to(tl.pointer_type(tl.uint8))
+        s_ptr = tl.load(ds + e).to(tl.pointer_type(tl.float32))
+        gr = gu_ptr + slot.to(tl.int64) * (2 * I)
+        acc = tl.zeros((BN,), dtype=tl.float32)
+        for k0 in range(0, I, BK):
+            rk = k0 + tl.arange(0, BK)
+            mk = rk < I
+            g = tl.load(gr + rk, mask=mk, other=0.0)
+            u = tl.load(gr + I + rk, mask=mk, other=0.0)
+            a = (g / (1.0 + tl.exp(-g)) * u).to(tl.float16).to(tl.float32)      # same fp16 rounding of the activation as the torch path
+            b = tl.load(q_ptr + rn[:, None].to(tl.int64) * I + rk[None, :], mask=mn[:, None] & mk[None, :], other=0).to(tl.int16)
+            h = ((((b & 0x80) << 8) | ((b & 0x7F) << 7)).to(tl.float16, bitcast=True) * 256.0).to(tl.float32)
+            part = tl.sum(h * a[None, :], axis=1)
+            if GRID:
+                part = part * tl.load(s_ptr + ((pid * BN) // BO) * S_COLS + k0 // BI)
+            acc += part
+        if not GRID:
+            acc = acc * tl.load(s_ptr + rn, mask=mn, other=0.0)
+        out += wt * acc
+    tl.store(y_ptr + r.to(tl.int64) * N + rn, out, mask=mn)
+
+
+def moe_fused(h, tabs, sel, wts, I, K, grid, block, S, sc_gu, sc_d):
+    """Routed sum of a SwiGLU FP8 MoE layer in two launches: h half [R, K], sel / wts [R * S] -> float32 [R, K]."""
+    gq, gs, uq, us, dq, ds = tabs
+    R = h.shape[0]
+    gu = torch.empty((R * S, 2 * I), dtype=torch.float32, device=h.device)
+    _fp8_moe_gu[(2 * triton.cdiv(I, MOE_BN), R * S)](h, gq, gs, uq, us, sel, gu, K, I, sc_gu, S, GRID=grid, BO=block[0], BI=block[1],
+                                                     BN=MOE_BN, BK=BK, num_warps=2)
+    y = torch.empty((R, K), dtype=torch.float32, device=h.device)
+    _fp8_moe_down[(triton.cdiv(K, MOE_BN), R)](gu, dq, ds, sel, wts, y, I, K, sc_d, S, GRID=grid, BO=block[0], BI=block[1],
+                                               BN=MOE_BN, BK=BK, num_warps=2)
+    return y
+
+
 def gemv(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, grid: bool, block: tuple[int, int]) -> torch.Tensor:
     """x half [R, K] (R <= MAX_ROWS), q uint8 [N, K], s float32 [N] (per row) or [ceil(N/bo), ceil(K/bi)] (grid) -> float32 [R, N]."""
     R, K = x.shape
