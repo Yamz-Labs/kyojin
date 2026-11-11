@@ -364,6 +364,23 @@ def test_bridge_installs_per_config_and_is_reused(split_modules, monkeypatch):
     assert single.split_active is False
 
 
+def test_disabled_bridge_forces_host_bounce(split_modules, monkeypatch):
+    _dm, bridge_mod, _split = split_modules
+    from exllamav3.util import device_copy
+
+    monkeypatch.setenv("KYOJIN_BRIDGE", "0")
+    old = device_copy.FORCED
+    device_copy.FORCED = None
+    try:
+        cfg = SimpleNamespace()
+        assert bridge_mod.install_bridge(
+            cfg, part1 = torch.device("cuda", 0), part0 = torch.device("cuda", 1)) is None
+        assert cfg.split_active is True
+        assert device_copy.FORCED is True
+    finally:
+        device_copy.FORCED = old
+
+
 def test_named_preset_is_applied_by_the_plan(split_modules, monkeypatch):
     dm, _bridge, split = split_modules
     monkeypatch.setenv("EXL3_TEST_PRESET", "0")

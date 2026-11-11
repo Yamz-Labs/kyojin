@@ -194,6 +194,12 @@ def install_bridge(config, *, part1: torch.device, part0: torch.device | None) -
     os.environ["KYOJIN_SPLIT_ACTIVE"] = "1"
     existing = getattr(config, "device_bridge", None)
     if not bridge_enabled():
+        # The direct P2P fallback can poison the context on links that only pretend to
+        # support peer copies.  With the bridge explicitly disabled, keep the fallback
+        # safe by forcing a host bounce; an explicit EXLLAMA_NO_P2P_COPY still wins.
+        from .util import device_copy
+        if device_copy.FORCED is None:
+            device_copy.FORCED = True
         return existing
     if existing is not None and existing.pair == (torch.device(part1), torch.device(part0)):
         return existing

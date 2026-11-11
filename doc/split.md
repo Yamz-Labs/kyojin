@@ -23,7 +23,10 @@ device may serve either part. Earlier revisions, the roadmap and
 
 Both legs are enqueued on the two devices' own compute streams; the host never blocks. The
 destination tensor is a fresh allocation, so callers may keep using it after the slot cycles.
-`KYOJIN_BRIDGE=0` falls back to `to_device` (split still runs, crossings block).
+`KYOJIN_BRIDGE=0` falls back to `to_device` (split still runs, crossings block). With the
+bridge disabled, cross-device moves are forced through host memory (a blocking bounce), so
+the fallback does not probe or use the direct peer path; an explicit
+`EXLLAMA_NO_P2P_COPY` still wins.
 
 Devices are not tied to a role. Either device may serve `part0` or `part1`, and the split
 is not restricted to a particular architecture pair. Kernel support remains per-arch: the

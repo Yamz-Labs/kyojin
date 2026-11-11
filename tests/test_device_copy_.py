@@ -61,6 +61,40 @@ to_device(y, d0)
 assert dc._verdicts == {(1, 0): False, (0, 1): True}, dc._verdicts
 dc._probe_direct = orig_probe
 
+# 2c. a probe that raises is a bounce verdict, not a crash on the first real move
+reset()
+class _RaisingTensor:
+    def to(self, *_args, **_kwargs):
+        raise RuntimeError("hipErrorInvalidValue")
+
+orig_rand = dc.torch.rand
+dc.torch.rand = lambda *_args, **_kwargs: _RaisingTensor()
+try:
+    z = to_device(x, d1)
+finally:
+    dc.torch.rand = orig_rand
+assert torch.equal(x.cpu(), z.cpu())
+assert dc._verdicts == {(0, 1): True, (1, 0): True}, dc._verdicts
+assert dc.stats == {"probes": 1, "bounced": 1, "direct": 0}, dc.stats
+
+# 2d. a direct copy that raises after a passed probe is retried and cached as bounce
+reset()
+dc.FORCED = False
+class _DirectFail:
+    device = torch.device("cuda", 0)
+
+    def to(self, _device, non_blocking = False):
+        raise RuntimeError("hipErrorInvalidValue")
+
+    def cpu(self):
+        return torch.ones(8, dtype = torch.float32)
+
+out = to_device(_DirectFail(), d1)
+assert out.device == d1
+assert dc._verdicts == {(0, 1): True, (1, 0): True}, dc._verdicts
+assert dc.stats == {"probes": 0, "bounced": 1, "direct": 0}, dc.stats
+dc.FORCED = None
+
 # 3. the real probe agrees with the verdict recorded in 1
 reset()
 fwd_ok, bwd_ok = dc._probe_direct(d0, d1)
