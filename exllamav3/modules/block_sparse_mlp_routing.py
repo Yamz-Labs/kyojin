@@ -207,8 +207,21 @@ def _hip_router_buffers(cfg, rows):
         cfg.routing_weights_gfx12[:rows],
     )
 
+def _router_logits(cfg, y):
+    """y @ gate. On ROCm a decode-row fp16 matmul against the (H, E) gate is a hipBLAS GEMV at ~41 us (Strix, 2048 x 256); an
+    elementwise product with a cached fp32 (E, H) copy + row sum is ~18 us, rounded to fp16 like the matmul output so the stable
+    sort below sees the same dtype. Rows <= 16 on HIP only; EXL3_ROUTER_MULSUM=0 restores the matmul."""
+    if (torch.version.hip and y.dim() == 2 and y.shape[0] <= 16 and y.is_cuda and os.environ.get("EXL3_ROUTER_MULSUM", "1") != "0"):
+        gt = getattr(cfg, "_gate_tf", None)
+        if gt is None or gt.device != y.device:
+            gt = cfg.gate_tensor.T.float().contiguous()
+            cfg._gate_tf = gt
+        return (y.float().unsqueeze(1) * gt.unsqueeze(0)).sum(-1).half()
+    return torch.matmul(_pad_rows(y), cfg.gate_tensor)
+
+
 def _routing_std_torch(cfg, y, params, include_bias = False):
-    router_logits = torch.matmul(_pad_rows(y), cfg.gate_tensor)
+    router_logits = _router_logits(cfg, y)
     # EXL3_ROUTER_TOPK (default 1, read per call): prefill rows select top-k with one Triton pass (router_topk.py)
     # instead of the stable sort below over all experts; same ids, same values into the same softmax
     if (router_logits.dim() == 2 and router_logits.shape[0] > 16 and router_logits.is_cuda and router_logits.stride(1) == 1
