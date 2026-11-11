@@ -1807,6 +1807,70 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         return g0.grid, g0.block
 
+    def _mxfp4_grouped_ok(self, y):
+        """gpt-oss routed experts kept as stored MXFP4 (Linear.inner = _ForeignInner over ForeignLinear 'mxfp4'), plain layer.
+        EXL3_MXFP4_MOE_GROUPED=0 disables."""
+        if os.environ.get("EXL3_MXFP4_MOE_GROUPED", "1") == "0" or not self.gated or self.activation_fn not in ("swiglu_oai", "silu"):
+            return False
+        if self.latent_in is not None or self.latent_out is not None or getattr(self, "tier", None) is not None or getattr(self, "cpu_offload", False):
+            return False
+        if getattr(self, "cpu_split_first", None) is not None or self.routing_device is not None or self.tp_reduce or self.tp_mode is not None:
+            return False
+        if self.alt_residual_channel or self.routed_post_norm is not None or self.shared_experts_post_norm is not None:
+            return False
+        if self.router_pre_norm is not None or self.routed_pre_norm is not None:
+            return False
+        if y.dtype != torch.half:
+            return False
+        if len(self.gates) != self.num_experts or len(self.ups) != self.num_experts or len(self.downs) != self.num_experts:
+            return False
+        for m in self.gates + self.ups + self.downs:
+            fl = getattr(getattr(m, "inner", None), "fl", None)
+            if fl is None or getattr(fl, "format", None) != "mxfp4" or fl.packed is None or not fl.packed.is_contiguous():
+                return False
+        return True
+
+    def _forward_mxfp4_grouped(self, x, y, selected_experts, routing_weights, params, out_dtype, eshape):
+        """Grouped MXFP4 MoE decode: gate, up, down of every (row, expert) slot in one launch each (biases in-kernel),
+        the layer's own activation (swiglu_oai clamp for gpt-oss), weighted fold per row."""
+        if not self._mxfp4_grouped_ok(y):
+            return None
+        from ..foreign_quant import triton_moe_mxfp4 as MX
+        S = self.num_experts_per_tok
+        R = y.shape[0] if y.dim() == 2 else y.reshape(-1, y.shape[-1]).shape[0]
+        if R > FQ_GROUPED_MAX_ROWS or selected_experts.numel() != R * S:
+            return None
+        h = y.reshape(R, -1).contiguous()
+        dev = h.device
+        H = h.shape[1]
+        K = self.gates[0].inner.fl.in_features          # experts padded to 128 (gpt-oss 2880 -> 2944): zero-extend the input
+        if K != H:
+            h = torch.nn.functional.pad(h, (0, K - H)).contiguous()
+        I = self.gates[0].inner.fl.out_features
+        tbl = getattr(self, "_mx_ptrs", None)
+        if tbl is None or tbl[0] != self.gates[0].inner.fl.packed.data_ptr() or tbl[1] != dev:
+            mk = lambda ms: torch.tensor([m.inner.fl.packed.data_ptr() for m in ms], dtype=torch.int64, device=dev)
+            mb = lambda ms: torch.tensor([m.inner.bias.data_ptr() for m in ms], dtype=torch.int64, device=dev) \
+                if all(m.inner.bias is not None for m in ms) else None
+            tbl = (self.gates[0].inner.fl.packed.data_ptr(), dev, mk(self.gates), mb(self.gates), mk(self.ups), mb(self.ups),
+                   mk(self.downs), mb(self.downs))
+            self._mx_ptrs = tbl
+        _, _, gw, gb, uw, ub, dw, db = tbl
+        sel = selected_experts.reshape(-1).to(torch.int32).contiguous()
+        g = MX.moe_gemv(h, gw, gb, sel, I, K, S).half()
+        u = MX.moe_gemv(h, uw, ub, sel, I, K, S).half()
+        a = torch.empty_like(g)
+        self.activation_fn_call(g, u, a, self.act_limit)
+        d = MX.moe_gemv(a, dw, db, sel, self.downs[0].inner.fl.out_features, I, 1)
+        routed = (d.view(R, S, -1)[..., :H] * routing_weights.reshape(R, S, 1).float()).sum(1)
+        final_hidden_states = routed.view(x.shape)
+        if self.shared_experts is not None:
+            se = self.shared_experts.forward(x, params)
+            final_hidden_states = final_hidden_states + se.to(torch.float).view(final_hidden_states.shape)
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states
+
     def _forward_fp8_grouped(self, x, y, selected_experts, routing_weights, params, out_dtype, eshape):
         """Grouped FP8 MoE decode (R <= FQ_GROUPED_MAX_ROWS rows): gate and up of every (row, expert) slot in one launch each,
         SiLU * up in torch, down in one launch, weighted fold per row; then the shared expert as the KQ grouped path does."""
@@ -2234,6 +2298,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if bsz <= FQ_GROUPED_MAX_ROWS and not params.get("activate_all_experts") and \
                 not params.get("reconstruct") and not params.get("autosplit_measure"):
             grouped = self._forward_fp8_grouped(
+                x, y, selected_experts, routing_weights, params, out_dtype, eshape)
+            if grouped is not None:
+                return grouped
+            grouped = self._forward_mxfp4_grouped(
                 x, y, selected_experts, routing_weights, params, out_dtype, eshape)
             if grouped is not None:
                 return grouped
