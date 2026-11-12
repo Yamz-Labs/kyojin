@@ -1868,7 +1868,8 @@ class GatedDeltaNet(Module):
                 _kd2 = 2 * self.k_dim
                 _q = _mq[..., :self.k_dim]
                 _k = _mq[..., self.k_dim:_kd2]
-                _mq = torch.cat([_q, _q, _k, _k, _mq[..., _kd2:]], dim=-1)
+                _r = self.num_v_heads // self.num_k_heads             # 2 on the 35B-A3B, 3 on the dense 27B (48 v / 16 k)
+                _mq = torch.cat([_q] * _r + [_k] * _r + [_mq[..., _kd2:]], dim=-1)
                 _nk, _kd = self.num_v_heads, self.v_dim
             core_attn_out = gated_delta_rule_fn(
                 mixed_qkv = _mq,
