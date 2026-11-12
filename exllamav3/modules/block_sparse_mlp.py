@@ -1984,7 +1984,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             se_params = {**params, "moe_valu": True} if _MOE_VALU else params
             se = self.shared_experts.forward(x, se_params)
             if self.shared_gate is not None and torch.version.hip and _SHGATE_FUSE and R <= 16 and \
-                    se.dtype == torch.half and x.dtype == torch.half and se.is_contiguous() and x.is_contiguous() and \
+                    se.dtype in (torch.half, torch.float) and x.dtype == torch.half and se.is_contiguous() and x.is_contiguous() and \
                     self.shared_gate.inner.weight.dim() == 2 and self.shared_gate.inner.weight.shape[1] == 1:
                 # shared-expert gate tail in one launch (triton_shgate.py): routed + float(se) * sigmoid(x . w_gate), in place
                 wr = getattr(self, "_shgate_row", None)
