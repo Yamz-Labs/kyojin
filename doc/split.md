@@ -30,6 +30,28 @@ Measured configuration: an RX 9070 (`gfx1201`, 15.92 GiB) over USB4 as `part0` a
 118 GiB Strix Halo iGPU (`gfx1151`) as `part1`. The numbers below are measurements from
 that pair, not assumptions of the interface.
 
+### Measured results
+
+GLM-5.3-Flash, MTP on, one long summary prompt per depth, 128 decode tokens (500K uses
+64). These are measured values for the configuration above; they are not targets.
+
+| Context | Arm | Prefill t/s | Decode t/s | Acceptance |
+| --- | --- | --- | --- | --- |
+| 8K | split, N=4 | 448 | 23.58 | 62.3% |
+| 8K | single device | 330 | 24.42 | 70.8% |
+| 32K | split, N=4 | 495 | 25.15 | 70.8% |
+| 32K | single device | 386 | 24.82 | 73.1% |
+| 128K | split, N=4 | 495 | 25.12 | 70.8% |
+| 128K | single device | 391 | 23.24 | 62.3% |
+| 500K | split, N=5 | 446 | 28.84 | 78.0% |
+
+Prefill is consistently faster on the split because the first 4-5 layers run on the
+`part0` card. Decode is within a few percent either way. At 500K the split fits: the
+load-time peaks are 10.75 GiB on `part0` and 100.2 GiB on `part1`. A single 118 GiB
+device did not have headroom for the same context on this pair, so the split's benefit
+there is capacity, not only speed. Acceptance samples are 50-114 drafted tokens per arm; treat the differences
+as overlapping intervals rather than a trend.
+
 ## Quick start
 
 The GLM server and the split harnesses accept the flags below. The environment-only path
@@ -118,9 +140,25 @@ defect.
   the passkey prompt is too short for an acceptance comparison. `--vision-image` encodes
   one image through the split vision tower; the harness sets `EXL3_CONV_GEMM=1` as the
   safe gfx12 spatial-merge fallback.
+- `--kld-corpus PATH --kld-slices N --kld-len L --kld-out FILE` teacher-forces corpus
+  slices and `--kld-compare BASE SPLIT` reports KLD both ways, top-1 agreement and PPL.
+  The short battery also reports programmatic task checks. Use these for split-on quality:
+  a mixed-architecture pair is not bitwise.
+- `tools/strix_halo/split_sessions_smoke.py` sends N concurrent requests at a running
+  server and checks that every response succeeds and that the requests overlap.
 
 ## Known limitations
 
+- Split-on is deterministic run-to-run, but it is **not bitwise** equal to a single
+  device on a mixed-architecture pair. Measured on GLM, N=4: 4/6 short greedy prompts
+  identical, task checks 5/6 vs 4/6, PPL 9.374 vs 9.401 and KLD 2.08e-2 with 94.52%
+  top-1 agreement over 1022 positions. The distributions and task accuracy are
+  unchanged; a few near-tie argmax positions flip. Use KLD/task metrics for split-on.
+- At 500K context the split fits the measured pair (`part0` 10.75 GiB, `part1` 100.2 GiB
+  load-time peak). A single 118 GiB device did not have headroom for the same context
+  there; size for capacity, not only speed.
+- Concurrent serving is smoke-tested at 4 sessions with MTP on (4/4 responses overlap,
+  no queue or slot error). A heavier mixed chat/image/tool workload is future work.
 - MTP on the split is deterministic at 8K/32K/128K with N=4 in the measured
   configuration (two independent runs: 6/6 greedy prompts and identical long-prompt ids).
   The earlier N=6 128K battery used short prompts; N=6 long prefill OOMs a 16 GB part0,

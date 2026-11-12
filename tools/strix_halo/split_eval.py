@@ -17,6 +17,12 @@ Usage (from the repo root, after `source tools/strix_halo/env.sh`):
     python tools/strix_halo/split_eval.py -m <pack> --baseline --no-graphs --out /tmp/base.json
     python tools/strix_halo/split_eval.py --compare /tmp/base.json /tmp/split.json
     python tools/strix_halo/split_eval.py -m <pack> --needle-depth 120000 --out /tmp/needle.json
+    python tools/strix_halo/split_eval.py -m <pack> --kld-corpus /path/corpus.txt --kld-out /tmp/A.kld
+    python tools/strix_halo/split_eval.py --kld-compare /tmp/A.kld /tmp/B.kld
+
+The short battery also scores programmatic task checks, and the split/one-device
+comparison reports them.  --kld-out teacher-forces corpus slices through
+Model.forward; --kld-compare reports KLD in both directions, top-1 agreement and PPL.
 
 The split run forces the graph paths off before exllamav3 is imported (Phase 4 owns
 correctness; per-segment capture is Phase 6).
@@ -26,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 
@@ -109,6 +116,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bench-acceptance", action="store_true",
                    help="run all long-form summary instructions at --bench-depth and report the "
                         "aggregate draft acceptance with a 95%% interval")
+    p.add_argument("--kld-corpus", default=os.environ.get("KYOJIN_KLD_CORPUS"),
+                   help="plain-text corpus for --kld-out (or set KYOJIN_KLD_CORPUS)")
+    p.add_argument("--kld-slices", type=int, default=2, help="corpus slices for --kld-out")
+    p.add_argument("--kld-len", type=int, default=512, help="tokens per KLD slice")
+    p.add_argument("--kld-out", default=None,
+                   help="teacher-force the corpus and save log-probs/PPL for --kld-compare")
+    p.add_argument("--kld-compare", nargs=2, metavar=("BASE", "SPLIT"),
+                   help="compare two --kld-out files: KLD both directions, top-1 agreement, PPL")
     p.add_argument("--out", default=None, help="write the full JSON here")
     p.add_argument("--compare", nargs=2, metavar=("BASE", "SPLIT"),
                    help="compare two saved runs: prompt ids and decode numbers")
@@ -118,6 +133,10 @@ def parse_args() -> argparse.Namespace:
         p.error("--bench-acceptance needs --bench-depth N (the prompt depth to measure)")
     if args.vision_image and args.no_vision:
         p.error("--vision-image needs the vision tower; remove --no-vision")
+    if args.kld_out and not args.kld_corpus:
+        p.error("--kld-out needs --kld-corpus (a plain-text file) or KYOJIN_KLD_CORPUS")
+    if args.kld_out and (args.kld_slices < 1 or args.kld_len < 2):
+        p.error("--kld-slices must be >= 1 and --kld-len >= 2")
     args.part0_layers_defaulted = args.part0_layers is None
     if args.part0_layers is None:
         # Harness tuning for memory, not a split property: a small part0 card cannot
@@ -237,6 +256,107 @@ def acceptance_ci95(accepted: int, rejected: int) -> list[float] | None:
     return [round(max(0.0, center - half) * 100.0, 2), round(min(1.0, center + half) * 100.0, 2)]
 
 
+def score_task(index: int, text: str) -> dict:
+    """Coarse programmatic check for the short battery: task accuracy, not just id equality.
+
+    Greedy ids already show determinism; this adds a signal that a run is still *correct*
+    when a mixed-architecture pair legitimately diverges token-for-token.
+    """
+    t = (text or "").lower()
+    expected, passed = "", False
+    if index == 0:                                  # capital of France
+        expected, passed = "paris", "paris" in t
+    elif index == 1:                                # reverse a linked list
+        expected, passed = "def + next", "def " in t and "next" in t
+    elif index == 2:                                # why the sky is blue
+        expected, passed = "scatter/rayleigh", any(w in t for w in ("scatter", "rayleigh", "wavelength"))
+    elif index == 3:                                # five primes between 50 and 100
+        expected = ">=3 primes 50-100"
+        primes = re.findall(r"\b(?:53|59|61|67|71|73|79|83|89|97)\b", t)
+        passed = len(set(primes)) >= 3
+    elif index == 4:                                # 14:35 -> 17:20 is 2 h 45 min
+        expected = "2 h 45 min"
+        passed = bool(re.search(
+            r"\b2\s*(?:h|hrs?|hours?)\s*(?:and\s*)?45\b|\b2:45\b|two hours (?:and )?forty[- ]five", t))
+    elif index == 5:                                # Romeo and Juliet
+        expected, passed = "verona/love", "verona" in t or ("love" in t and ("famil" in t or "feud" in t))
+    return {"task": index, "expected": expected, "passed": bool(passed)}
+
+
+def kld_stats(lp_a, lp_b) -> dict:
+    """Compare two (positions, vocab) log-probability matrices.
+
+    Returns mean KLD in both directions, top-1 agreement and the positions compared.  The
+    first argument is the reference (baseline) arm.
+    """
+    import torch
+    n = min(int(lp_a.shape[0]), int(lp_b.shape[0]))
+    if n <= 0:
+        return {"positions": 0}
+    a = lp_a[:n].float()
+    b = lp_b[:n].float()
+    return {
+        "positions": n,
+        "kld_base_to_split": float((a.exp() * (a - b)).sum(-1).mean()),
+        "kld_split_to_base": float((b.exp() * (b - a)).sum(-1).mean()),
+        "top1_agreement_pct": float((a.argmax(-1) == b.argmax(-1)).float().mean() * 100.0),
+    }
+
+
+def corpus_ids(path: str, tokenizer, need: int):
+    """At least ``need`` ids from a plain-text corpus (repeats the text if it is short)."""
+    text = open(path, encoding="utf8", errors="replace").read()
+    ids = tokenizer.encode(text, encode_special_tokens = False).flatten()
+    if ids.numel() < need:
+        reps = need // max(1, ids.numel()) + 1
+        ids = ids.repeat(reps)
+    return ids
+
+
+def run_kld(model, ids):
+    """One cacheless teacher-forced forward; returns per-position log-probs and mean NLL."""
+    import torch
+    logits = model.forward(ids.unsqueeze(0), {"attn_mode": "flash_attn_nc"})
+    lp = torch.log_softmax(logits[0].float(), -1)
+    n = min(lp.shape[0] - 1, ids.numel() - 1)
+    tgt = ids[1:1 + n].to(lp.device)
+    nll = float(-lp[:n].gather(1, tgt[:, None]).sum())
+    return lp[:n].half().cpu(), nll, n
+
+
+def kld_compare(base_path: str, split_path: str) -> None:
+    """Report KLD/PPL from two --kld-out files (baseline first)."""
+    import torch
+    base = torch.load(base_path, map_location = "cpu", weights_only = True)
+    split = torch.load(split_path, map_location = "cpu", weights_only = True)
+    if base.get("ids") != split.get("ids"):
+        raise SystemExit("KLD files do not use the same corpus slices")
+    scored = kld_pos = 0
+    kld_ab = kld_ba = agree = 0.0
+    nll_a = nll_b = 0.0
+    for i, (la, lb) in enumerate(zip(base["logprobs"], split["logprobs"])):
+        st = kld_stats(la, lb)
+        n = st["positions"]
+        if n == 0:
+            continue
+        kld_ab += st["kld_base_to_split"] * n
+        kld_ba += st["kld_split_to_base"] * n
+        agree += st["top1_agreement_pct"] * n
+        kld_pos += n
+        nll_a += base["nll"][i]
+        nll_b += split["nll"][i]
+        scored += base["scored"][i]
+        print(f"[kld] slice {i}: KLD {st['kld_base_to_split']:.3e} / {st['kld_split_to_base']:.3e} "
+              f"(base|split, split|base), top1 {st['top1_agreement_pct']:.2f}%", flush = True)
+    if kld_pos == 0 or scored == 0:
+        raise SystemExit("KLD files have no scored positions")
+    import math
+    print(f"[kld] KLD mean {kld_ab / kld_pos:.3e} (base|split) / {kld_ba / kld_pos:.3e} (split|base); "
+          f"top1 agreement {agree / kld_pos:.2f}%; "
+          f"PPL base {math.exp(nll_a / scored):.4f}, split {math.exp(nll_b / scored):.4f} "
+          f"({kld_pos} positions)", flush = True)
+
+
 def main() -> None:
     args = parse_args()
     if args.part0_layers_defaulted and not args.baseline:
@@ -245,6 +365,9 @@ def main() -> None:
               f"--part0-layers N or --long-ctx-part0-layers N)", flush=True)
     if args.compare:
         compare(args.compare[0], args.compare[1])
+        return
+    if args.kld_compare:
+        kld_compare(args.kld_compare[0], args.kld_compare[1])
         return
 
     configure_env(args)
@@ -387,16 +510,22 @@ def main() -> None:
               f"first {times[0]:.2f} s, second {times[1]:.2f} s, "
               f"embeddings {tuple(emb.embeddings.shape)} on {emb.embeddings.device}", flush = True)
 
-    for prompt in PROMPTS:
+    for i, prompt in enumerate(PROMPTS):
         ids = ids_of(prompt, tokenizer)
         r = run_job(gen, Job, ids, args.tokens)
         r["prompt"] = prompt
         r["prompt_tokens"] = int(ids.numel())
+        r["task_check"] = score_task(i, r["text"])
         result["prompts"].append(r)
         print(f"[eval] {prompt[:44]!r}: {r['tokens']} tokens"
               + (f", ttft {r['ttft_s']:.2f} s" if r["ttft_s"] else "")
               + (f", decode {r['tokens'] / r['decode_s']:.2f} t/s"
-                 if r["decode_s"] and r["tokens"] > 1 else ""), flush = True)
+                 if r["decode_s"] and r["tokens"] > 1 else "")
+              + (f", task {'PASS' if r['task_check']['passed'] else 'FAIL'}"
+                 if r["task_check"]["expected"] else ""), flush = True)
+    checks = [p["task_check"] for p in result["prompts"]]
+    result["tasks"] = {"passed": sum(t["passed"] for t in checks), "total": len(checks)}
+    print(f"[eval] tasks {result['tasks']['passed']}/{result['tasks']['total']} passed", flush = True)
 
     if not args.no_perf:
         for i, prompt in enumerate(PERF_PROMPTS):
@@ -494,6 +623,39 @@ def main() -> None:
                       f"prefill {ids.numel() / r['ttft_s']:.2f} t/s, decode {tps:.2f} t/s, "
                       f"accept {acc}/{rej}", flush = True)
 
+    if args.kld_out:
+        import math
+        need = args.kld_slices * args.kld_len + 4096
+        all_ids = corpus_ids(args.kld_corpus, tokenizer, need)
+        scored = kld_pos = 0
+        nll_sum = 0.0
+        entries = []
+        start = min(4096, max(0, all_ids.numel() - args.kld_slices * (args.kld_len + 37)))
+        for s in range(args.kld_slices):
+            off = start + s * (args.kld_len + 37)
+            ids = all_ids[off:off + args.kld_len].clone()
+            lp, nll, n = run_kld(model, ids)
+            entries.append({"ids": ids.tolist(), "logprobs": lp, "nll": nll, "scored": n})
+            nll_sum += nll
+            scored += n
+            print(f"[kld] slice {s}: {n} positions, NLL mean {nll / max(1, n):.4f}, "
+                  f"PPL {math.exp(nll / max(1, n)):.4f}", flush = True)
+        payload = {
+            "model": args.model, "mode": result["mode"],
+            "corpus": args.kld_corpus, "slices": args.kld_slices, "len": args.kld_len,
+            "ids": [e["ids"] for e in entries], "nll": [e["nll"] for e in entries],
+            "scored": [e["scored"] for e in entries],
+            "logprobs": [e["logprobs"] for e in entries],
+        }
+        torch.save(payload, args.kld_out)
+        result["kld"] = {
+            "corpus": args.kld_corpus, "slices": args.kld_slices, "len": args.kld_len,
+            "out": args.kld_out, "scored": scored,
+            "ppl": math.exp(nll_sum / scored) if scored else None,
+        }
+        print(f"[kld] wrote {args.kld_out}: PPL {result['kld']['ppl']:.4f} "
+              f"({scored} positions)", flush = True)
+
     for d in devs:
         result["devices"][str(d)].update({
             "allocated_gib": round(torch.cuda.memory_allocated(d) / 2**30, 2),
@@ -531,6 +693,10 @@ def compare(base_path: str, split_path: str) -> None:
             print(f"[compare]   first divergence at {d}: "
                   f"{a[d:d + 8]} vs {b[d:d + 8]}")
     print(f"[compare] {same}/{n} greedy prompts identical")
+    for label, run in (("base", base), ("split", split)):
+        if "tasks" in run:
+            t = run["tasks"]
+            print(f"[compare] tasks {label}: {t['passed']}/{t['total']} passed")
     if base.get("perf") and split.get("perf"):
         for i, (a, b) in enumerate(zip(base["perf"], split["perf"])):
             if a.get("decode_tps") and b.get("decode_tps"):
