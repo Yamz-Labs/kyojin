@@ -28,6 +28,10 @@ from ..foreign_quant import triton_iq
 from ..foreign_quant import triton_gap
 from ..foreign_quant import triton_rows
 _ROWS_TRITON = os.environ.get("BOLT_FQ_ROWS_TRITON", "1") != "0"
+# Q8_0 rows 2..16 on CUDA: the Triton _rows_q8_0 kernel (tuned on Strix Halo) takes 172 us per launch on the 3090 (330 launches per step = 57 ms of an
+# 87 ms N8 step on the 35B-A3B UD-Q4_K_XL, 75 % of device time); the C++ q8_1 GEMV (fq_gemv_q8_0) takes 70-80 us. HIP keeps the Triton kernel.
+# BOLT_FQ_ROWS_TRITON_Q8=1 restores it on CUDA (A/B).
+_ROWS_TRITON_Q8 = os.environ.get("BOLT_FQ_ROWS_TRITON_Q8", "0" if (torch.version.cuda and not torch.version.hip) else "1") != "0"
 
 FUSED_ROWS_MAX = 16
 _FUSED = os.environ.get("BOLT_FQ_FUSED", "1") != "0"
@@ -221,7 +225,8 @@ class ForeignLinear(Module):
         if not flat.is_contiguous():
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
-        if _ROWS_TRITON and flat.dtype == torch.half and triton_rows.supported(self.format, R, K):
+        if (_ROWS_TRITON and flat.dtype == torch.half and (_ROWS_TRITON_Q8 or self.format != "q8_0")
+                and triton_rows.supported(self.format, R, K)):
             # 2..16 rows (verify / multi-user): weights read once for all rows (the fq_gemv kernels re-read them per row)
             out = triton_rows.gemv(self.format, flat, self.packed.reshape(self.out_features, -1), self.scales.reshape(self.out_features, -1)
                                    if self.scales is not None else None, self.global_scale if self.global_scale is not None else 1.0)
