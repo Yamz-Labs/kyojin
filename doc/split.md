@@ -49,8 +49,9 @@ Prefill is consistently faster on the split because the first 4-5 layers run on 
 `part0` card. Decode is within a few percent either way. At 500K the split fits: the
 load-time peaks are 10.75 GiB on `part0` and 100.2 GiB on `part1`. A single 118 GiB
 device did not have headroom for the same context on this pair, so the split's benefit
-there is capacity, not only speed. Acceptance samples are 50-114 drafted tokens per arm; treat the differences
-as overlapping intervals rather than a trend.
+there is capacity, not only speed. Acceptance samples are 50-114 drafted tokens per arm;
+treat the differences as overlapping intervals rather than a trend. Stage 2a's longer
+256-token acceptance run measured 64.6% split vs 66.0% single-device at 8K.
 
 ## Quick start
 
@@ -107,14 +108,14 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
   module. Size it to the part0 card.
 - Split mode runs eager. Whole-forward and per-block graphs are disabled; per-segment
   capture is not implemented yet.
-- Use `util/memguard.py` when loading near the limit.  It help save you from the dreaded OOM but slight adverse 
-  performance effects have been noted (to be investigated further.)
+- Use `util/memguard.py` when loading near the limit. It helps avoid OOMs, but slight
+  adverse performance effects have been noted (to be investigated).
 
 ## Model support
 
 | Model | Status | Notes |
 | --- | --- | --- |
-| GLM-5.3-Flash | measured | text, MTP and vision; on a 16 GiB `gfx12` `part0`, N=6 at ≤65K and N=5 for long context |
+| GLM-5.3-Flash | measured | text, MTP and vision; on a 16 GiB `gfx12` `part0`, N=6 fits short context (MTP off), N=4 is the 128K MTP setting, and N=5 fits 500K |
 | Qwen3.8-Flash-Next | staged, not load-tested | QSA/GDN/PLE components; separate dflash drafter config; QSA `gfx12` caveat below |
 | DeepSeek-V4.1-Flash | staged | uses the DSV4 engine, not `Model.load` |
 | Flint, Mimo | best effort | generic `Model` path; no dedicated adapter |
@@ -162,10 +163,10 @@ defect.
 - MTP on the split is deterministic at 8K/32K/128K with N=4 in the measured
   configuration (two independent runs: 6/6 greedy prompts and identical long-prompt ids).
   The earlier N=6 128K battery used short prompts; N=6 long prefill OOMs a 16 GB part0,
-  so N=4 is the long-context MTP configuration. Use `--num-draft 0` for configs outside
-  this measured set.
-- Per-segment graphs are not implemented. Split runs eager and pays about 0.95x decode on
-  GLM with MTP.
+  so N=4 is the 128K MTP configuration and the 500K capacity run used N=5. Use
+  `--num-draft 0` for configs outside this measured set.
+- Per-segment graphs are not implemented. Split runs eager; measured GLM decode is -3.4%
+  at 8K and +1.3% to +8.1% at 32K/128K versus single device with MTP on.
 - Auto-N uses text bytes, cache and text endcaps, but does not yet subtract components
   declared after the target load (MTP/vision). Leave headroom or set N explicitly.
 - Qwen QSA sparse attention has an illegal-access report in the `gfx12` top-k path on
