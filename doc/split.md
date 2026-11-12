@@ -15,8 +15,8 @@ DeepSeek-V4.1-Flash adapters are staged; Flint and Mimo use the generic model pa
                     host-staged crossings
 
 `part0` and `part1` are positions in the layer order, not device indices. Either physical
-device can serve either part. Older revisions call the parts `front`/`main`; current flags
-and environment names use `part0`/`part1` only.
+device can serve either part; MTP-on in the reverse orientation has a current JIT
+limitation, noted under Known limitations.
 
 Every tensor that crosses the split goes through an asynchronous host-staged bridge:
 
@@ -86,10 +86,8 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
   module. Size it to the part0 card.
 - Split mode runs eager. Whole-forward and per-block graphs are disabled; per-segment
   capture is not implemented yet.
-- On unified-memory devices, the device total reported by torch is not all usable. The
-  iGPU shares host RAM with the OS, so leave several GiB for the OS, page cache and prefill
-  workspace. The measured 118 GiB iGPU has about 113 GiB usable for weights plus cache; the
-  16 GiB 9070 has about 15.4 GiB usable. Use `util/memguard.py` when loading near the limit.
+- Use `util/memguard.py` when loading near the limit.  It help save you from the dreaded OOM but slight adverse 
+  performance effects have been noted (to be investigated further.)
 
 ## Model support
 
@@ -125,5 +123,9 @@ defect.
   declared after the target load (MTP/vision). Leave headroom or set N explicitly.
 - Qwen QSA sparse attention has an illegal-access report in the `gfx12` top-k path on
   `gfx1201`; keep QSA cache pages off `part0` until that kernel is fixed.
+- Reverse orientation with MTP on currently fails on the eGPU + iGPU device order with a
+  Triton `no kernel image is available` error when the MTP block lands on the eGPU.
+  Forward split is unaffected. Treat either-device MTP-on placement as requiring this JIT
+  fix; MTP-off reverse placement is validated.
 - Same-architecture and RDNA3/3.5 pairs are selection-tested only until such hardware is
   available.
