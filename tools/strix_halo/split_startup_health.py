@@ -22,11 +22,15 @@ import time
 import urllib.error
 import urllib.request
 
+# A dedicated direct opener: the localhost poll must not honor http_proxy/https_proxy,
+# which would let an environment proxy intercept or spoof the health trace.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def read_health(port: int):
     url = f"http://127.0.0.1:{port}/health"
     try:
-        with urllib.request.urlopen(url, timeout = 2) as r:
+        with _OPENER.open(url, timeout = 2) as r:
             return r.status, json.loads(r.read())
     except urllib.error.HTTPError as exc:
         # The early listener answers 503 with a JSON "loading" body; urlopen raises on
@@ -90,8 +94,9 @@ def main() -> None:
             json.dump({"elapsed_s": elapsed, "stages": stages, "trace": trace,
                        "final": final, "expected": expected, "missing": missing}, f, indent = 1)
         print(f"[health] wrote {args.out}", flush = True)
-    if final is None:
-        raise SystemExit("health trace did not reach a finished state")
+    if final is None or final.get("status") != "ok":
+        status = final.get("status") if final else None
+        raise SystemExit(f"health trace finished with status {status!r}")
     if missing:
         raise SystemExit(f"health trace missing stage(s): {missing}")
 
