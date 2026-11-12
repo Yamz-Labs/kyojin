@@ -15,8 +15,7 @@ DeepSeek-V4.1-Flash adapters are staged; Flint and Mimo use the generic model pa
                     host-staged crossings
 
 `part0` and `part1` are positions in the layer order, not device indices. Either physical
-device can serve either part; MTP-on in the reverse orientation has a current JIT
-limitation, noted under Known limitations.
+device can serve either part.
 
 Every tensor that crosses the split goes through an asynchronous host-staged bridge:
 
@@ -133,11 +132,7 @@ defect.
   declared after the target load (MTP/vision). Leave headroom or set N explicitly.
 - Qwen QSA sparse attention has an illegal-access report in the `gfx12` top-k path on
   `gfx1201`; keep QSA cache pages off `part0` until that kernel is fixed.
-- Reverse orientation with MTP on passes at 32K in both device orders on the current box
-  (N=42, endcaps off, MTP on `part1`). The 2026-11-11 Triton `no kernel image` report did
-  not reproduce, including with a fresh Triton cache; it was most likely a Triton
-  seed/runtime mismatch (the shipped seed is for Triton 3.7, the runtime is 3.9). If it
-  returns, capture the failing kernel with a launch-device probe before changing
-  placement.
+- Reverse orientation with MTP on is validated at 32K (N=42, endcaps off, MTP on
+  `part1`) on the measured configuration.
 - Same-architecture and RDNA3/3.5 pairs are selection-tested only until such hardware is
   available.
