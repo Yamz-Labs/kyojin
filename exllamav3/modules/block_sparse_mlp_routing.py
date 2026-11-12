@@ -88,6 +88,8 @@ class RoutingCFG:
 _HIP_ROUTER_HIDDEN = 2560
 _HIP_ROUTER_EXPERTS = 512
 _HIP_ROUTER_TOP_K = 10
+# (hidden, experts, top-k) shapes the fused HIP decode router serves (routing_std_gfx12.cu ROUTER_SHAPE list)
+_HIP_ROUTER_SHAPES = {(2560, 512, 10), (2048, 256, 8)}
 _HIP_ROUTER_MAX_ROWS = 16
 
 
@@ -153,12 +155,11 @@ def _hip_router_device_supported(device):
 def _hip_router_config_supported(cfg):
     gate = cfg.gate_tensor
     return (
-        cfg.num_experts == _HIP_ROUTER_EXPERTS and
-        cfg.num_experts_per_tok == _HIP_ROUTER_TOP_K and
+        (gate.shape[0], cfg.num_experts, cfg.num_experts_per_tok) in _HIP_ROUTER_SHAPES and
         cfg.per_expert_scale is None and
         cfg.router_bias is None and
         gate.dtype == torch.half and gate.is_contiguous() and
-        tuple(gate.shape) == (_HIP_ROUTER_HIDDEN, _HIP_ROUTER_EXPERTS) and
+        tuple(gate.shape) == (gate.shape[0], cfg.num_experts) and
         _hip_router_device_supported(gate.device)
     )
 
@@ -169,7 +170,7 @@ def _hip_router_call_supported(bsz, cfg, y, params):
         1 <= bsz <= _HIP_ROUTER_MAX_ROWS and not params.get("activate_all_experts") and
         _hip_router_config_supported(cfg) and
         y.dtype == torch.half and y.is_contiguous() and
-        tuple(y.shape) == (bsz, _HIP_ROUTER_HIDDEN)
+        tuple(y.shape) == (bsz, cfg.gate_tensor.shape[0])
     )
 
 
@@ -190,11 +191,11 @@ def _prepare_hip_router_buffers(cfg):
         # needing separate buffers for speculative streams.
         device = cfg.gate_tensor.device
         cfg.router_logits_gfx12 = torch.empty(
-            (_HIP_ROUTER_MAX_ROWS, _HIP_ROUTER_EXPERTS), device = device, dtype = torch.half)
+            (_HIP_ROUTER_MAX_ROWS, cfg.num_experts), device = device, dtype = torch.half)
         cfg.selected_experts_gfx12 = torch.empty(
-            (_HIP_ROUTER_MAX_ROWS, _HIP_ROUTER_TOP_K), device = device, dtype = torch.long)
+            (_HIP_ROUTER_MAX_ROWS, cfg.num_experts_per_tok), device = device, dtype = torch.long)
         cfg.routing_weights_gfx12 = torch.empty(
-            (_HIP_ROUTER_MAX_ROWS, _HIP_ROUTER_TOP_K), device = device, dtype = torch.half)
+            (_HIP_ROUTER_MAX_ROWS, cfg.num_experts_per_tok), device = device, dtype = torch.half)
 
 
 def _hip_router_buffers(cfg, rows):

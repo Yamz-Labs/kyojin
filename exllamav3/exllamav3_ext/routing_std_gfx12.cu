@@ -18,9 +18,7 @@ namespace {
 
 constexpr int WAVE_SIZE = 32;
 constexpr int GEMV_WAVES = 8;
-constexpr int ROUTER_HIDDEN = 2560;
-constexpr int ROUTER_EXPERTS = 512;
-constexpr int ROUTER_TOP_K = 10;
+// Supported (hidden, experts, top-k) decode shapes: see routing_std_gfx12_bsz1 below and _HIP_ROUTER_SHAPES in block_sparse_mlp_routing.py
 constexpr int MAX_ROUTER_ROWS = 16;
 constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
 
@@ -64,6 +62,7 @@ float wave_reduce_sum(float value)
     return __shfl(value, 0, WAVE_SIZE);
 }
 
+template <int ROUTER_HIDDEN, int ROUTER_EXPERTS>
 __global__ __launch_bounds__(GEMV_WAVES * WAVE_SIZE)
 void routing_gemv_gfx12_bsz1_kernel
 (
@@ -98,9 +97,10 @@ void routing_gemv_gfx12_bsz1_kernel
     if (lane == 0) scores[expert] = __float2half_rn(sum);
 }
 
-// This is the standard routing top-k reduction from routing.cu, specialized to the
-// validated E=512/K=10 wave32 decode shape. Each wave first contributes its ten best
-// candidates; wave 0 then selects and normalizes the global ten in descending order.
+// This is the standard routing top-k reduction from routing.cu for wave32 decode shapes
+// (E a multiple of 32, E / 32 * K candidates). Each wave first contributes its K best
+// candidates; wave 0 then selects and normalizes the global K in descending order.
+template <int ROUTER_EXPERTS, int ROUTER_TOP_K>
 __global__ __launch_bounds__(ROUTER_EXPERTS)
 void routing_std_topk_gfx12_bsz1_kernel
 (
@@ -111,6 +111,7 @@ void routing_std_topk_gfx12_bsz1_kernel
 {
     constexpr int NUM_WAVES = ROUTER_EXPERTS / WAVE_SIZE;
     constexpr int NUM_CANDIDATES = NUM_WAVES * ROUTER_TOP_K;
+    static_assert(ROUTER_EXPERTS % WAVE_SIZE == 0 && NUM_WAVES <= WAVE_SIZE && ROUTER_TOP_K < WAVE_SIZE, "router shape");
 
     __shared__ float candidates_key[NUM_CANDIDATES];
     __shared__ int candidates_idx[NUM_CANDIDATES];
@@ -158,7 +159,7 @@ void routing_std_topk_gfx12_bsz1_kernel
     }
     __syncthreads();
 
-    // 160 candidates are compacted to 50, then 20, then the final ten. The fixed
+    // Candidates are compacted wave by wave (E=512/K=10: 160 -> 50 -> 20 -> the final ten). The fixed
     // bounds avoid dynamic masks and shifts and preserve routing.cu's candidate order.
     int num_candidates = NUM_CANDIDATES;
     while (num_candidates > WAVE_SIZE)
@@ -292,29 +293,31 @@ void routing_std_gfx12_bsz1
     const int64_t rows = hidden.size(0);
     TORCH_CHECK(rows > 0 && rows <= MAX_ROUTER_ROWS,
                 "routing_std_gfx12_bsz1 supports 1 through ", MAX_ROUTER_ROWS, " rows");
-    check_tensor(hidden, hidden.device(), at::kHalf, {rows, ROUTER_HIDDEN}, "hidden", 16);
-    check_tensor(gate_t, hidden.device(), at::kHalf,
-                 {ROUTER_EXPERTS, ROUTER_HIDDEN}, "gate_t", 16);
-    check_tensor(scores, hidden.device(), at::kHalf, {rows, ROUTER_EXPERTS}, "scores", 16);
-    check_tensor(topk_indices, hidden.device(), at::kLong,
-                 {rows, ROUTER_TOP_K}, "topk_indices", 16);
-    check_tensor(topk_weights, hidden.device(), at::kHalf,
-                 {rows, ROUTER_TOP_K}, "topk_weights", 16);
+    TORCH_CHECK(hidden.dim() == 2 && gate_t.dim() == 2 && topk_indices.dim() == 2,
+                "routing_std_gfx12_bsz1: 2D tensors expected");
+    const int64_t H = hidden.size(1), E = gate_t.size(0), K = topk_indices.size(1);
+    check_tensor(hidden, hidden.device(), at::kHalf, {rows, H}, "hidden", 16);
+    check_tensor(gate_t, hidden.device(), at::kHalf, {E, H}, "gate_t", 16);
+    check_tensor(scores, hidden.device(), at::kHalf, {rows, E}, "scores", 16);
+    check_tensor(topk_indices, hidden.device(), at::kLong, {rows, K}, "topk_indices", 16);
+    check_tensor(topk_weights, hidden.device(), at::kHalf, {rows, K}, "topk_weights", 16);
 
     hipStream_t stream = at::cuda::getCurrentCUDAStream(device).stream();
-    routing_gemv_gfx12_bsz1_kernel<<<dim3(ROUTER_EXPERTS / GEMV_WAVES, rows),
-                                     GEMV_WAVES * WAVE_SIZE, 0, stream>>>
-    (
-        reinterpret_cast<const half*>(hidden.data_ptr()),
-        reinterpret_cast<const half*>(gate_t.data_ptr()),
-        reinterpret_cast<half*>(scores.data_ptr())
-    );
-    routing_std_topk_gfx12_bsz1_kernel<<<rows, ROUTER_EXPERTS, 0, stream>>>
-    (
-        reinterpret_cast<const half*>(scores.data_ptr()),
-        reinterpret_cast<int64_t*>(topk_indices.data_ptr()),
-        reinterpret_cast<half*>(topk_weights.data_ptr())
-    );
+    const half* h = reinterpret_cast<const half*>(hidden.data_ptr());
+    const half* g = reinterpret_cast<const half*>(gate_t.data_ptr());
+    half* sc = reinterpret_cast<half*>(scores.data_ptr());
+    int64_t* ti = reinterpret_cast<int64_t*>(topk_indices.data_ptr());
+    half* tw = reinterpret_cast<half*>(topk_weights.data_ptr());
+    #define ROUTER_SHAPE(HH, EE, KK) \
+        if (H == HH && E == EE && K == KK) \
+        { \
+            routing_gemv_gfx12_bsz1_kernel<HH, EE><<<dim3(EE / GEMV_WAVES, rows), GEMV_WAVES * WAVE_SIZE, 0, stream>>>(h, g, sc); \
+            routing_std_topk_gfx12_bsz1_kernel<EE, KK><<<rows, EE, 0, stream>>>(sc, ti, tw); \
+        } else
+    ROUTER_SHAPE(2560, 512, 10)      // Qwen3.8-Flash-Next
+    ROUTER_SHAPE(2048, 256, 8)       // Qwen3.6-35B-A3B (GGUF and EXL3 packs)
+    TORCH_CHECK(false, "routing_std_gfx12_bsz1: unsupported router shape ", H, " x ", E, " top-", K);
+    #undef ROUTER_SHAPE
     cuda_check(hipPeekAtLastError());
 }
 

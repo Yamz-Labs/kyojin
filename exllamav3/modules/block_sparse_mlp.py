@@ -25,7 +25,7 @@ from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
-    _HIP_ROUTER_HIDDEN, _HIP_ROUTER_EXPERTS, _HIP_ROUTER_TOP_K,
+    _HIP_ROUTER_HIDDEN, _HIP_ROUTER_EXPERTS, _HIP_ROUTER_TOP_K, _HIP_ROUTER_SHAPES,
     _HIP_GROUPED_MAX_ROWS, _HIP_PREFILL_MIN_ROWS, _HIP_PREFILL_MAX_ROWS, _HIP_PREFILL_MAX_EXPERT_ROWS,
     _hip_grouped_rows_eligible, _hip_prefill_rows_eligible, _prepare_hip_router_gate_t, _MOE_VALU,
 )
@@ -203,6 +203,10 @@ def _aligned_expert_layout(flat: torch.Tensor, num_tokens: int, top_k: int, num_
     sel_flat[torch.where(odd == 1, pad_slot, torch.full_like(pad_slot, total))] = \
         torch.arange(nseg, device = dev) // nc
     return order[:total], sel_flat[:total], dummy_tokens
+
+
+# EXL3_SHGATE_FUSE (default 1): the KQ grouped decode path runs the shared-expert gate tail in one Triton launch
+_SHGATE_FUSE = os.environ.get("EXL3_SHGATE_FUSE", "1") != "0"
 
 
 @dataclass
@@ -424,9 +428,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # source must therefore be filled before deferred loading completes.
                 no_defer_load = bool(
                     torch.version.hip and router_type == "std" and
-                    hidden_size == _HIP_ROUTER_HIDDEN and
-                    num_experts == _HIP_ROUTER_EXPERTS and
-                    num_experts_per_tok == _HIP_ROUTER_TOP_K and
+                    (hidden_size, num_experts, num_experts_per_tok) in _HIP_ROUTER_SHAPES and
                     key_per_expert_scale is None and interm_div == 1.0
                 ),
             )
@@ -1981,7 +1983,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.shared_experts is not None:
             se_params = {**params, "moe_valu": True} if _MOE_VALU else params
             se = self.shared_experts.forward(x, se_params)
-            if self.shared_gate is not None and torch.version.hip:
+            if self.shared_gate is not None and torch.version.hip and _SHGATE_FUSE and R <= 16 and \
+                    se.dtype == torch.half and x.dtype == torch.half and se.is_contiguous() and x.is_contiguous() and \
+                    self.shared_gate.inner.weight.dim() == 2 and self.shared_gate.inner.weight.shape[1] == 1:
+                # shared-expert gate tail in one launch (triton_shgate.py): routed + float(se) * sigmoid(x . w_gate), in place
+                wr = getattr(self, "_shgate_row", None)
+                w = self.shared_gate.inner.weight
+                if wr is None or wr.device != w.device or wr.numel() != w.numel():
+                    wr = w.to(torch.float).reshape(-1).contiguous()
+                    self._shgate_row = wr
+                from ..foreign_quant.triton_shgate import shgate_tail_
+                shgate_tail_(routed_v, se.reshape(R, K), x.reshape(R, K), wr)
+            elif self.shared_gate is not None and torch.version.hip:
                 # ROCm add_sigmoid_gate_proj takes a float shared-expert output: same math in torch
                 g = self._shgate_hip(x)
                 final_hidden_states = final_hidden_states + se.to(torch.float) * g
