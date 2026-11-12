@@ -53,6 +53,11 @@ there is capacity, not only speed. Acceptance samples are 50-114 drafted tokens 
 treat the differences as overlapping intervals rather than a trend. Stage 2a's longer
 256-token acceptance run measured 64.6% split vs 66.0% single-device at 8K.
 
+Auto-N measured at 8K: MTP+vision chose N=5, MTP only N=6, vision only N=7. At 32K,
+MTP+vision chose N=5 under the 2 GiB default and matched manual N=5 on placement, peaks
+and n-gram-off greedy text. The 32K safety boundary is 1.0 GiB -> N=6 (warm-up OOM),
+1.5 GiB -> N=5; the default is 2 GiB.
+
 ## Quick start
 
 The GLM server and the split harnesses accept the flags below. The environment-only path
@@ -147,6 +152,8 @@ defect.
   a mixed-architecture pair is not bitwise.
 - `tools/strix_halo/split_sessions_smoke.py` sends N concurrent requests at a running
   server and checks that every response succeeds and that the requests overlap.
+- `tools/strix_halo/split_startup_health.py` polls `/health` during load and checks the
+  stage trace; run it with and without `--no-vision` and with `--num-draft 0`.
 
 ## Known limitations
 
@@ -167,8 +174,12 @@ defect.
   `--num-draft 0` for configs outside this measured set.
 - Per-segment graphs are not implemented. Split runs eager; measured GLM decode is -3.4%
   at 8K and +1.3% to +8.1% at 32K/128K versus single device with MTP on.
-- Auto-N uses text bytes, cache and text endcaps, but does not yet subtract components
-  declared after the target load (MTP/vision). Leave headroom or set N explicitly.
+- Auto-N subtracts the MTP drafter and vision tower when the adapter predeclares them
+  before load (the GLM server does). The default 2 GiB safety covers the measured 32K
+  MTP+vision warm-up (1 GiB still chose N=6 and OOMed; 1.5/2/3 GiB chose N=5), but it is
+  a fixed stopgap. Stage 5 sizes the forward workspace from the context and cache so
+  short context can use more part0 layers and long context reserves more;
+  `KYOJIN_AUTON_SAFETY_GB` remains the override.
 - Qwen QSA sparse attention has an illegal-access report in the `gfx12` top-k path on
   `gfx1201`; keep QSA cache pages off `part0` until that kernel is fixed.
 - Reverse orientation with MTP on is validated at 32K (N=42, endcaps off, MTP on

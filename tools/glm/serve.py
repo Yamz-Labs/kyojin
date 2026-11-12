@@ -796,6 +796,30 @@ class ResidentEngine:
         tune_cache.install_pack(model_path)   # <pack>/tuning: GEMM autotune winners from qualify --stage autotune
         kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
         jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
+        # Auto-N must see every whole component that will share part0 before it picks N.
+        # Model.from_config builds the module trees only (no weights) and Cache allocates
+        # when its model loads.  Declaring MTP/vision here, instead of after build(), is
+        # what makes auto-N subtract the drafter and vision tower from the part0 budget.
+        draft_model = draft_cache = None
+        if num_draft > 0:
+            draft_model = Model.from_config(self.config, component="mtp")
+            draft_cache = Cache(draft_model, max_num_tokens=ctx + 4096,
+                                max_history=max_history, max_batch_size=slots, **qkw)
+            if self.split.enabled:
+                self.split.add("mtp", draft_model, config=self.config,
+                               cache=draft_cache, load_order=1)
+        vision_tower = None
+        vision_error = None
+        if vision:
+            try:
+                vision_tower = Model.from_config(self.config, component="vision")
+            except Exception as exc:                    # noqa: BLE001 - a pack without vision is optional
+                vision_error = exc
+            else:
+                if self.split.enabled:
+                    # A placement/sizing error is a split error, not a missing tower: let it
+                    # fail startup rather than leave a partial SplitPlan declaration behind.
+                    self.split.add("vision", vision_tower, config=self.config, load_order=2)
         startup_health.stage("target weights")
         if self.split.enabled:
             # Auto-N needs the cache sizes and the target's actual bytes; the cache exists now.
@@ -821,13 +845,10 @@ class ResidentEngine:
         else:
             self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         if num_draft > 0:
-            self.draft_model = Model.from_config(self.config, component="mtp")
-            self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
-                                     max_history=max_history, max_batch_size=slots, **qkw)
+            self.draft_model = draft_model
+            self.draft_cache = draft_cache
             startup_health.stage("drafter weights")
             if self.split.enabled:
-                self.split.add("mtp", self.draft_model, config=self.config,
-                               cache=self.draft_cache, load_order=1)
                 self.split.load("mtp", self.draft_model, progressbar=False,
                                 callback=startup_health.load_callback(), max_chunk_size=4096)
             else:
@@ -844,8 +865,11 @@ class ResidentEngine:
                                         getattr(self.config, "vision_start_token_id", 0),
                                         getattr(self.config, "vision_end_token_id", 0),
                                         env_fingerprint=self.env_fingerprint)
-        if vision:
-            self.vision = self._load_vision()
+        if vision and vision_error is None:
+            self.vision = self._load_vision(vision_tower)
+        elif vision_error is not None:
+            print(f"serve: vision tower not loaded ({type(vision_error).__name__}: {vision_error}); image input disabled",
+                  flush=True)
         self.supports_vision = self.vision is not None
         if self.split.enabled:
             extra = []
@@ -958,15 +982,17 @@ class ResidentEngine:
         else:
             await asyncio.get_running_loop().run_in_executor(None, self._rebuild_generator)
 
-    def _load_vision(self):
+    def _load_vision(self, tower = None):
         """The vision tower (model.visual.*, fp16) next to the text model; None, with a log line, when the pack has none."""
         from exllamav3 import Model
         t0 = time.perf_counter()
         try:
             startup_health.stage("vision tower")
-            tower = Model.from_config(self.config, component="vision")
+            if tower is None:
+                tower = Model.from_config(self.config, component="vision")
             if self.split.enabled:
-                self.split.add("vision", tower, config=self.config, load_order=2)
+                if self.split.map("vision") is None:
+                    self.split.add("vision", tower, config=self.config, load_order=2)
                 self.split.load("vision", tower, progressbar=False,
                                 callback=startup_health.load_callback())
             else:
@@ -2319,7 +2345,9 @@ def main() -> None:
     apply_draft2s_default(args.model)
     warm = os.environ.get("EXL3_SERVE_WARMUP", "1") != "0"
     tune = warm and os.environ["EXL3_DENSE_GEMM_TUNE"] != "0" and float(os.environ.get("EXL3_SERVE_DTUNE_PRIME_S", "600")) > 0
-    stages = ["target weights", "drafter weights"] + ([] if args.no_vision else ["vision tower"]) + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else [])
+    stages = (["target weights"] + (["drafter weights"] if args.num_draft > 0 else [])
+              + ([] if args.no_vision else ["vision tower"])
+              + (["warm-up"] if warm else []) + (["dense GEMM tuning"] if tune else []))
     startup_health.check_model_dir("serve", args.model, ("config.json",))
     # A start with the dense GEMM tuning already cached is much shorter than the first one: keep their timings apart.
     startup_health.start("glm", stages, args.host, args.port, routes=ROUTES,

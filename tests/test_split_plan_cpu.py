@@ -278,6 +278,7 @@ def test_auto_n_is_capped_for_long_context(split_modules, monkeypatch):
     gib = dm.GIB
     model = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
     cfg = FakeConfig({f"layer.{i}": gib for i in range(4)})
+    monkeypatch.setenv("KYOJIN_AUTON_SAFETY_GB", "0.25")
     monkeypatch.setattr(dm.torch.cuda, "get_device_properties", lambda dev: FakeProps(16 * gib))
     plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
                         part0_reserve_gb = 1.0, auto_cap = 2, logger = lambda *_a: None)
@@ -296,6 +297,7 @@ def test_auto_n_uses_actual_bytes_cache_and_reserve(split_modules, monkeypatch):
     ] + [FakeModule("final_norm")])
     cfg = FakeConfig(sizes)
     cache = FakeCache(per_layer = gib // 5)                    # 0.2 GiB per layer, only 16 keys exist
+    monkeypatch.setenv("KYOJIN_AUTON_SAFETY_GB", "0.25")       # pin the arithmetic below
     monkeypatch.setattr(dm.torch.cuda, "get_device_properties", lambda dev: FakeProps(6 * gib))
 
     plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
@@ -313,6 +315,55 @@ def test_auto_n_uses_actual_bytes_cache_and_reserve(split_modules, monkeypatch):
     plan_off.add("text", model, config = cfg, cache = cache)
     plan_off.build()
     assert plan_off.part0_layers == 3
+
+
+def test_auto_n_subtracts_a_predeclared_whole_component(split_modules, monkeypatch):
+    """MTP/vision are declared before build() so auto-N can subtract them from part0."""
+    dm, _bridge, _split = split_modules
+    gib = dm.GIB
+    text = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
+    text_cfg = FakeConfig({f"layer.{i}": gib for i in range(4)})
+    mtp = FakeModel([FakeModule("mtp.block.0", layer_idx = 0), FakeModule("mtp.head")])
+    mtp_cfg = FakeConfig({"mtp.block.0": 2 * gib, "mtp.head": gib // 2})
+    mtp_cache = FakeCache()
+    mtp_cache.layers[(0, 0)] = FakeCacheLayer(3 * gib // 4)     # one 0.75 GiB drafter layer
+    monkeypatch.setenv("KYOJIN_AUTON_SAFETY_GB", "0.25")        # pin the arithmetic below
+    monkeypatch.setattr(dm.torch.cuda, "get_device_properties", lambda dev: FakeProps(6 * gib))
+
+    # Budget 6 - 1 reserve - 0.25 safety = 4.75 GiB: text alone fits all 4 layers.
+    plain = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
+                         part0_reserve_gb = 1.0, logger = lambda *_a: None)
+    plain.add("text", text, config = text_cfg)
+    plain.build()
+    assert plain.part0_layers == 4
+
+    # The 2.5 GiB drafter is a whole component on part0 with endcaps on, so the text
+    # map can only use 4.75 - 2.5 = 2.25 GiB -> N=2.
+    with_mtp = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
+                            part0_reserve_gb = 1.0, logger = lambda *_a: None)
+    with_mtp.add("mtp", mtp, config = mtp_cfg)
+    with_mtp.add("text", text, config = text_cfg)
+    with_mtp.build()
+    assert with_mtp.part0_layers == 2
+    assert with_mtp.map("mtp").part0_layers == 1
+
+    # The drafter cache is part of the same footprint: 2.5 GiB weights + 0.75 GiB cache
+    # leaves 1.5 GiB -> N=1.  A test with weights only would miss that second term.
+    with_cache = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
+                              part0_reserve_gb = 1.0, logger = lambda *_a: None)
+    with_cache.add("mtp", mtp, config = mtp_cfg, cache = mtp_cache)
+    with_cache.add("text", text, config = text_cfg)
+    with_cache.build()
+    assert with_cache.part0_layers == 1
+
+    # Endcaps off puts the drafter on part1, so it does not consume the text budget.
+    off = dm.SplitPlan(_devices(dm), endcaps = False, part0_layers = "auto",
+                       part0_reserve_gb = 1.0, logger = lambda *_a: None)
+    off.add("mtp", mtp, config = mtp_cfg)
+    off.add("text", text, config = text_cfg)
+    off.build()
+    assert off.part0_layers == 4
+    assert not off.map("mtp").enabled
 
 
 def test_part0_reserve_is_a_slab_not_an_allocator_cap(split_modules, monkeypatch):
