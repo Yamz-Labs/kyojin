@@ -79,6 +79,11 @@ __device__ __forceinline__ int fq_dp4a(int a, int b, int c)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
     return __dp4a(a, b, c);
+#elif defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+      defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1200__) || defined(__gfx1201__))
+    // RDNA3 / RDNA3.5 / RDNA4: v_dot4_i32_iu8, signed x signed, no clamp (same call as llama.cpp ggml-cuda/common.cuh
+    // ggml_cuda_dp4a, MIT). Exact integer dot: same results as the scalar arm below, which the compiler only sometimes fused.
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #else
     const int8_t* a8 = reinterpret_cast<const int8_t*>(&a);
     const int8_t* b8 = reinterpret_cast<const int8_t*>(&b);
