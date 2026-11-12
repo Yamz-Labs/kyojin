@@ -207,6 +207,30 @@ def dequant_q4_K_bulk(raw: np.ndarray) -> np.ndarray:
     return y.astype(np.float16)
 
 
+def dequant_q6_K_bulk(raw: np.ndarray) -> np.ndarray:
+    """Vectorized Q6_K dequant: raw uint8 [nb, 210] -> float16 [nb, 256].
+
+    Same math as dequant_q6_K_block (ql low/high nibbles + 2 bits of qh, minus 32,
+    times d * the int8 scale of each 16), no per-block Python (Q6_K embedding tables).
+    """
+    raw = np.ascontiguousarray(raw).reshape(-1, 210)
+    nb = raw.shape[0]
+    d = raw[:, 208:210].copy().view(np.float16).astype(np.float32).reshape(nb)
+    sc = raw[:, 192:208].copy().view(np.int8).astype(np.float32)
+    y = np.empty((nb, 256), dtype=np.float32)
+    for n in range(2):
+        ql = raw[:, n * 64:n * 64 + 64].astype(np.int32)
+        qh = raw[:, 128 + n * 32:128 + n * 32 + 32].astype(np.int32)
+        q = (np.bitwise_or(np.bitwise_and(ql[:, 0:32], 0xF), np.left_shift(np.bitwise_and(qh, 3), 4)),
+             np.bitwise_or(np.bitwise_and(ql[:, 32:64], 0xF), np.left_shift(np.bitwise_and(np.right_shift(qh, 2), 3), 4)),
+             np.bitwise_or(np.right_shift(ql[:, 0:32], 4), np.left_shift(np.bitwise_and(np.right_shift(qh, 4), 3), 4)),
+             np.bitwise_or(np.right_shift(ql[:, 32:64], 4), np.left_shift(np.bitwise_and(np.right_shift(qh, 6), 3), 4)))
+        for j in range(4):
+            s16 = np.repeat(sc[:, n * 8 + 2 * j:n * 8 + 2 * j + 2], 16, axis=1)   # l // 16 picks scale 2j or 2j + 1
+            y[:, n * 128 + 32 * j:n * 128 + 32 * j + 32] = d[:, None] * s16 * (q[j] - 32)
+    return y.astype(np.float16)
+
+
 def quantize_q8_1_row(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """ggml quantize_q8_1: per-32 amax/127, round-half-away, returns (q, d, s)."""
     x = np.asarray(x, dtype=np.float32)

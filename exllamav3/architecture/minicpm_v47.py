@@ -156,10 +156,10 @@ class MiniCPMV47Config(Config):
     def _load_embedding_override(self):
         # token_embd dequantized to fp16 once (~1 GB) and served as an
         # in-memory override under the engine key (vectorized numpy, no
-        # per-block Python). Format-generic (IQ4_XS / Q4_K).
-        from ..foreign_quant.k_quants import dequant_iq4_xs_bulk, dequant_q4_K_bulk
+        # per-block Python). Format-generic (IQ4_XS / Q4_K / Q6_K / Q8_0).
+        from ..foreign_quant.k_quants import dequant_iq4_xs_bulk, dequant_q4_K_bulk, dequant_q6_K_bulk
         ty, dims, off = self.gguf.infos["token_embd.weight"]
-        bbs = {23: 136, 12: 144, 8: 34}
+        bbs = {23: 136, 12: 144, 14: 210, 8: 34}
         assert ty in bbs, f"token_embd type {ty}"
         bb = bbs[ty]
         K, N = dims[0], dims[1]
@@ -173,7 +173,7 @@ class MiniCPMV47Config(Config):
         assert K % 256 == 0
         raw = self.gguf._pread(off, N * (K // 256) * bb).reshape(N, (K // 256) * bb)
         nb = N * (K // 256)
-        bulk = dequant_iq4_xs_bulk if ty == 23 else dequant_q4_K_bulk
+        bulk = {23: dequant_iq4_xs_bulk, 12: dequant_q4_K_bulk, 14: dequant_q6_K_bulk}[ty]
         w = bulk(raw.reshape(nb, bb)).reshape(N, K)
         self.gguf.new_tensors = {
             f"{P}.embed_tokens.weight": torch.from_numpy(np.ascontiguousarray(w))}
