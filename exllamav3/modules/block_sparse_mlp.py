@@ -62,6 +62,9 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 # rows runs as job-aligned slices of at most MAX_BSZN rows (each slice is the exact 2..8 row call, rows are independent in an MoE block).
 # ROCm only (the CUDA fused kernels have their own COOP_ROWS); EXL3_ROW_INV_MAX_ROWS=8 restores the single-call cap.
 UNION_ROWS = max(MAX_BSZN, ROW_INV_MAX_ROWS) if torch.version.hip else MAX_BSZN
+# EXL3_MOE_UNION_BATCH=1: the R-row union decode also serves plain multi-user decode steps (2..8 rows), not only DFlash verify. Without it a
+# HIP build with no exl3_mgemm / exl3_moe (Strix) runs every multi-row decode step through the per-expert torch loop.
+_UNION_BATCH = os.environ.get("EXL3_MOE_UNION_BATCH", "0") != "0"
 # Rows (users / session slots) the grouped KQ MoE kernel takes in one call: top-8 x 32 rows = 256 assignments; above it the
 # per-expert / prefill paths amortize each expert over its rows. MCPM_FQ_GROUPED_MAX_ROWS=1 is the old batch-1-only gate.
 FQ_GROUPED_MAX_ROWS = int(os.environ.get("MCPM_FQ_GROUPED_MAX_ROWS", "32"))
@@ -2321,7 +2324,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             1 < bsz <= UNION_ROWS and self.support_dec_moe and self.tp_mode is None and
             not (_MOE_VALU and self.support_hip_grouped and bsz <= 8) and
             hasattr(ext, "exl3_dec_moe_union") and
-            (union_dev or union_v2 or os.environ.get("EXL3_DEC_MOE_UNION", "0") != "0") and params.get("dflash_verify") and
+            (union_dev or union_v2 or os.environ.get("EXL3_DEC_MOE_UNION", "0") != "0") and
+            (params.get("dflash_verify") or (_UNION_BATCH and x.dim() >= 3 and x.shape[-2] == 1)) and   # batch flag: decode steps only (prefill tails keep their path)
             y.dtype == torch.half and y.is_contiguous() and
             selected_experts.dtype == torch.long and routing_weights.dtype == torch.half and
             tuple(selected_experts.shape) == (bsz, self.num_experts_per_tok) and
