@@ -49,6 +49,7 @@ void fq_gemv_q4_k_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_gemv_q5_k_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_gemv_q6_k_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_gemv_iq4_xs_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
+void fq_gemv_iq3_xxs_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 // q8_1-activation grouped MoE for KQ/IQ4_XS SwiGLU experts (fq_moe_kq.cu):
 // gate/up/down_ptrs = per-expert base addresses (E int64);
 // strides are per-row bytes; partial = [S, K] float scratch.

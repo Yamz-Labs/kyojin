@@ -49,8 +49,10 @@ __global__ void fq_gemv_kq_kernel(const uint8_t* __restrict__ aqb,
             acc = fq_dot_q5_k_q8(wr, aq, K, tid, nt);
         else if constexpr (FMT == 2)
             acc = fq_dot_q6_k_q8(wr, aq, K, tid, nt);
-        else
+        else if constexpr (FMT == 3)
             acc = fq_dot_iq4_xs_q8(wr, aq, K, tid, nt);
+        else
+            acc = fq_dot_iq3_xxs_q8(wr, aq, K, tid, nt);
     }
     red[tid] = acc;
     __syncthreads();
@@ -131,4 +133,9 @@ void fq_gemv_q6_k_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out)
 void fq_gemv_iq4_xs_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out)
 {
     fq_gemv_kq_launch<3, 32>(qb, packed, out, FQ_IQ4_XS_BYTES);
+}
+
+void fq_gemv_iq3_xxs_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out)
+{
+    fq_gemv_kq_launch<4, 32>(qb, packed, out, FQ_IQ3_XXS_BYTES);
 }
