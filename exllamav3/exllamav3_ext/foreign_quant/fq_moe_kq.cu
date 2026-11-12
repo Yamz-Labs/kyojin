@@ -5,7 +5,7 @@
 // epilogue (MiniCPM MoE is SwiGLU, unlike Bolt's gateless latent MoE).
 // h [1, K] is quantized once; the [S, I] act scratch is quantized per slot
 // row for the down dots. FMT selects the dot (0 = Q4_K, 1 = Q5_K,
-// 2 = Q6_K, 3 = IQ4_XS). Portable (no PTX/shuffles).
+// 2 = Q6_K, 3 = IQ4_XS, 4 = IQ3_XXS, 5 = IQ2_S). Portable (no PTX/shuffles).
 #include <cuda_fp16.h>
 #include <map>
 #include <torch/extension.h>
@@ -65,10 +65,20 @@ __global__ void fq_moe_kq_upgate_kernel(const uint8_t* __restrict__ aqb,
             g = fq_dot_q6_k_q8(gr, aq, K, lane, FQ_GEMV_LANES);
             u = fq_dot_q6_k_q8(ur, aq, K, lane, FQ_GEMV_LANES);
         }
-        else
+        else if constexpr (FMT == 3)
         {
             g = fq_dot_iq4_xs_q8(gr, aq, K, lane, FQ_GEMV_LANES);
             u = fq_dot_iq4_xs_q8(ur, aq, K, lane, FQ_GEMV_LANES);
+        }
+        else if constexpr (FMT == 4)
+        {
+            g = fq_dot_iq3_xxs_q8(gr, aq, K, lane, FQ_GEMV_LANES);
+            u = fq_dot_iq3_xxs_q8(ur, aq, K, lane, FQ_GEMV_LANES);
+        }
+        else
+        {
+            g = fq_dot_iq2_s_q8(gr, aq, K, lane, FQ_GEMV_LANES);
+            u = fq_dot_iq2_s_q8(ur, aq, K, lane, FQ_GEMV_LANES);
         }
     }
     // Two reductions in one shared row: red[2*tid] = g, red[2*tid+1] = u.
@@ -126,8 +136,12 @@ __global__ void fq_moe_kq_down_kernel(const uint8_t* __restrict__ aqb,
             p = fq_dot_q5_k_q8(dr, aq, I, lane, FQ_GEMV_LANES);
         else if constexpr (FMT == 2)
             p = fq_dot_q6_k_q8(dr, aq, I, lane, FQ_GEMV_LANES);
-        else
+        else if constexpr (FMT == 3)
             p = fq_dot_iq4_xs_q8(dr, aq, I, lane, FQ_GEMV_LANES);
+        else if constexpr (FMT == 4)
+            p = fq_dot_iq3_xxs_q8(dr, aq, I, lane, FQ_GEMV_LANES);
+        else
+            p = fq_dot_iq2_s_q8(dr, aq, I, lane, FQ_GEMV_LANES);
     }
     red[threadIdx.x] = p;
     __syncthreads();
@@ -270,7 +284,7 @@ void fq_moe_iq4xs_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor w
                                 FQ_IQ4_XS_BYTES, partial, out);
 }
 
-static const int64_t kFmtBytes[4] = {FQ_Q4_K_BYTES, FQ_Q5_K_BYTES, FQ_Q6_K_BYTES, FQ_IQ4_XS_BYTES};
+static const int64_t kFmtBytes[6] = {FQ_Q4_K_BYTES, FQ_Q5_K_BYTES, FQ_Q6_K_BYTES, FQ_IQ4_XS_BYTES, FQ_IQ3_XXS_BYTES, FQ_IQ2_S_BYTES};
 
 template <int FU>
 static void fq_moe_kq_dispatch_d(int fd, torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
@@ -284,11 +298,13 @@ static void fq_moe_kq_dispatch_d(int fd, torch::Tensor h, torch::Tensor sel, tor
         case 1: fq_moe_kq_grouped_launch<FU, 1>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[1], partial, out); break;
         case 2: fq_moe_kq_grouped_launch<FU, 2>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[2], partial, out); break;
         case 3: fq_moe_kq_grouped_launch<FU, 3>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[3], partial, out); break;
+        case 4: fq_moe_kq_grouped_launch<FU, 4>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[4], partial, out); break;
+        case 5: fq_moe_kq_grouped_launch<FU, 5>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[5], partial, out); break;
         default: TORCH_CHECK(false, "fq_moe_kq: bad down format ", fd);
     }
 }
 
-// Mixed per-projection formats (unsloth UD: gate/up Q4_K + down Q5_K). fmt ids: 0 q4_k, 1 q5_k, 2 q6_k, 3 iq4_xs.
+// Mixed per-projection formats (unsloth UD: gate/up Q4_K + down Q5_K). fmt ids: 0 q4_k, 1 q5_k, 2 q6_k, 3 iq4_xs, 4 iq3_xxs, 5 iq2_s.
 void fq_moe_kq_grouped_mixed_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
                                 torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
                                 torch::Tensor down_ptrs,
@@ -302,6 +318,8 @@ void fq_moe_kq_grouped_mixed_q8(torch::Tensor h, torch::Tensor sel, torch::Tenso
         case 1: fq_moe_kq_dispatch_d<1>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
         case 2: fq_moe_kq_dispatch_d<2>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
         case 3: fq_moe_kq_dispatch_d<3>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
+        case 4: fq_moe_kq_dispatch_d<4>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
+        case 5: fq_moe_kq_dispatch_d<5>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
         default: TORCH_CHECK(false, "fq_moe_kq: bad gate/up format ", fmt_ug);
     }
 }

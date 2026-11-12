@@ -209,6 +209,9 @@ def _aligned_expert_layout(flat: torch.Tensor, num_tokens: int, top_k: int, num_
 _SHGATE_FUSE = os.environ.get("EXL3_SHGATE_FUSE", "1") != "0"
 
 
+# MCPM_FQ_MOE_IQ (default 1): IQ3_XXS / IQ2_S experts take the grouped q8_1 decode MoE (fq_moe_kq.cu FMT 4 / 5)
+_FQ_MOE_IQ = os.environ.get("MCPM_FQ_MOE_IQ", "1") != "0"
+
 @dataclass
 class FusedBuffers:
     temp_state_g: torch.Tensor
@@ -1754,7 +1757,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         for m in self.gates + self.ups + self.downs:
             if not isinstance(m, ForeignLinear):
                 return None
-            if m.format not in ("q4_k", "q5_k", "q6_k", "iq4_xs"):
+            if m.format not in ("q4_k", "q5_k", "q6_k", "iq4_xs") + (("iq3_xxs", "iq2_s") if _FQ_MOE_IQ else ()):
                 return None
             if m.packed is None or not m.packed.is_contiguous():
                 return None
@@ -1943,7 +1946,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         h = y.reshape(R, -1)
         dev = h.device
         K = h.shape[1]
-        _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136}
+        _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136, "iq3_xxs": 98, "iq2_s": 82}
         bb = _BB[fmt]
         bb_d = _BB[fmt_d]
         tbl = getattr(self, "_fq_kq_ptrs", None)
@@ -1970,12 +1973,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         routed_v = self._fq_kq_routed[:R]
         _FN = {"q4_k": "fq_moe_q4k_grouped_q8", "q5_k": "fq_moe_q5k_grouped_q8",
                "q6_k": "fq_moe_q6k_grouped_q8", "iq4_xs": "fq_moe_iq4xs_grouped_q8"}
-        if fmt == fmt_d:
+        if fmt == fmt_d and fmt in _FN:
             getattr(ext, _FN[fmt])(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
                                    gate_stride, up_stride, down_stride,
                                    partial_v, routed_v)
         else:
-            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3}
+            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3, "iq3_xxs": 4, "iq2_s": 5}
             ext.fq_moe_kq_grouped_mixed_q8(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
                                            gate_stride, up_stride, down_stride, _FID[fmt], _FID[fmt_d],
                                            partial_v, routed_v)
