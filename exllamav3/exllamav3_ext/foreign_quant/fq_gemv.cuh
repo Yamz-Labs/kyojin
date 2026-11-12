@@ -1026,6 +1026,49 @@ __device__ float fq_dot_iq2_s_q8(const uint8_t* __restrict__ wr,
     return acc;
 }
 
+
+// IQ3_S q8_1 lane dot (port of ggml vec_dot_iq3_s_q8_1, llama.cpp ggml-cuda/vecdotq.cuh, MIT): block = fp16 d, qs[64], qh[8] (9th index
+// bit per grid entry), signs[32], scales[4] (4-bit, one per 32 elements, value 1 + 2 s). One lane takes 32-element chunks round-robin:
+// 8 grid entries of 4, explicit sign bytes applied without borrow (grid bytes are >= 1), 8 dp4a.
+#define FQ_IQ3_S_BYTES 110
+__device__ float fq_dot_iq3_s_q8(const uint8_t* __restrict__ wr,
+                                 const uint8_t* __restrict__ aqb,
+                                 int K, int tid, int nthreads)
+{
+    int nchunks = K / 32;
+    float acc = 0.0f;
+    for (int c = tid; c < nchunks; c += nthreads)
+    {
+        const uint8_t* blk = wr + (size_t)(c >> 3) * FQ_IQ3_S_BYTES;
+        int j = c & 7;
+        __half dwh;
+        memcpy(&dwh, blk, 2);
+        const uint8_t* qs = blk + 2 + j * 8;
+        uint32_t qh = blk[2 + 64 + j];
+        const uint8_t* sg = blk + 2 + 72 + j * 4;
+        uint32_t sc = (blk[2 + 104 + j / 2] >> (4 * (j & 1))) & 15u;
+        __half dah;
+        memcpy(&dah, aqb + (size_t)c * FQ_Q8_1_BYTES, 2);
+        const int32_t* aq32 = reinterpret_cast<const int32_t*>(aqb + (size_t)c * FQ_Q8_1_BYTES + 4);
+        int sumi = 0;
+        #pragma unroll
+        for (int p = 0; p < 4; p++)
+        {
+            uint32_t i0 = (uint32_t)qs[2 * p] | ((qh << (8 - 2 * p)) & 0x100u);
+            uint32_t i1 = (uint32_t)qs[2 * p + 1] | ((qh << (7 - 2 * p)) & 0x100u);
+            uint32_t mlo = fq_sign_mask4(sg[p] & 15u);
+            uint32_t mhi = fq_sign_mask4(sg[p] >> 4);
+            uint32_t w0 = (FQ_IQ3S_GRID[i0] ^ mlo) + (mlo & 0x01010101u);
+            uint32_t w1 = (FQ_IQ3S_GRID[i1] ^ mhi) + (mhi & 0x01010101u);
+            sumi = fq_dp4a((int32_t)w0, aq32[2 * p], sumi);
+            sumi = fq_dp4a((int32_t)w1, aq32[2 * p + 1], sumi);
+        }
+        sumi *= 1 + 2 * (int)sc;
+        acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(__half2float(dwh), __half2float(dah)), (float)sumi));
+    }
+    return acc;
+}
+
 __device__ float fq_dot_q4_k_q8(const uint8_t* __restrict__ wr,
                                const uint8_t* __restrict__ aqb,
                                int K, int tid, int nthreads)

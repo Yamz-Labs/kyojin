@@ -58,6 +58,7 @@ _GAP_FORMATS = ("q4_0", "q5_0", "iq4_nl", "iq3_xxs", "iq3_s", "mxfp4", "nvfp4_gg
 _KQ_FORMATS = ("q4_k", "q5_k", "q6_k", "iq4_xs")
 # EXL3_IQ3_Q8 (default 1): IQ3_XXS decode rows run the q8_1 dp4a GEMV (fq_gemv_iq3_xxs_q8) instead of the Triton decode
 _IQ3_Q8 = os.environ.get("EXL3_IQ3_Q8", "1") != "0"
+_IQ_Q8_FN = {"iq3_xxs": "fq_gemv_iq3_xxs_q8", "iq2_s": "fq_gemv_iq2_s_q8", "iq3_s": "fq_gemv_iq3_s_q8"}
 _KQ_BLOCK_BYTES = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136}
 _KQ_GEMM_ROWS = 16
 _KQ_GEMM = os.environ.get("MCPM_FQ_KQ_GEMM", "1") != "0"
@@ -227,16 +228,16 @@ class ForeignLinear(Module):
             if out.dtype != dtype:
                 out = out.to(dtype)
         elif (
-            self.format == "iq3_xxs" and _IQ3_Q8 and R == 1 and flat.dtype == torch.half and K % 256 == 0
-            and hasattr(ext, "fq_gemv_iq3_xxs_q8")
+            self.format in _IQ_Q8_FN and _IQ3_Q8 and R == 1 and flat.dtype == torch.half and K % 256 == 0
+            and hasattr(ext, _IQ_Q8_FN[self.format])
         ):
-            # IQ3_XXS single decode row (2+ rows stay on the Triton decode, which reads the weights once for all rows): q8_1 activations + integer dp4a dots (ggml vec_dot_iq3_xxs_q8_1 port, fq_gemv_kq.cu FMT 4)
+            # IQ3_XXS / IQ2_S / IQ3_S single decode row (2+ rows stay on the Triton decode, which reads the weights once for all rows): q8_1 activations + integer dp4a dots (ggml vec_dot_iq3_xxs_q8_1 port, fq_gemv_kq.cu FMT 4)
             N = self.out_features
             out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)
             dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
             qb = ext.fq_q8_scratch(dev_idx, R, K)
             ext.fq_quant_q8_1_rows(flat, qb)
-            ext.fq_gemv_iq3_xxs_q8(qb, self.packed.reshape(N, -1), out)
+            getattr(ext, _IQ_Q8_FN[self.format])(qb, self.packed.reshape(N, -1), out)
             if out.dtype != dtype:
                 out = out.to(dtype)
         elif (
