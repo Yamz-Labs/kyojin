@@ -567,6 +567,83 @@ def test_harness_part0_layers_are_explicit_flags(monkeypatch):
     assert args.part0_layers == 3 and args.part0_layers_defaulted is True
 
 
+def test_harness_acceptance_flags_and_interval(monkeypatch):
+    mod = _load_split_eval()
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--bench-depth", "8192",
+                                      "--bench-acceptance", "--bench-prompt", "summary"])
+    args = mod.parse_args()
+    assert args.bench_depth == 8192 and args.bench_acceptance
+    assert args.bench_prompt == "summary"
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--vision-image", "doc/cat.png"])
+    assert mod.parse_args().vision_image == "doc/cat.png"
+    # Wilson interval: 0/0 has no interval, a larger sample is tighter than a small one.
+    assert mod.acceptance_ci95(0, 0) is None
+    small = mod.acceptance_ci95(1, 1)
+    large = mod.acceptance_ci95(500, 500)
+    assert small[0] < large[0] <= large[1] < small[1]
+    lo, hi = mod.acceptance_ci95(75, 25)
+    assert 65.0 < lo < 75.0 < hi < 85.0
+
+
+def test_harness_acceptance_needs_depth(monkeypatch):
+    mod = _load_split_eval()
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--bench-acceptance"])
+    with pytest.raises(SystemExit):
+        mod.parse_args()
+
+
+def test_harness_vision_image_rejects_no_vision(monkeypatch):
+    mod = _load_split_eval()
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--vision-image", "doc/cat.png",
+                                      "--no-vision"])
+    with pytest.raises(SystemExit):
+        mod.parse_args()
+
+
+def test_harness_compare_checks_every_summary_run(tmp_path, capsys):
+    import json
+    mod = _load_split_eval()
+    long = lambda ids_b: {
+        "prompt": "summary-set", "ids": [1, 2], "accepted": 90, "rejected": 10,
+        "acceptance": 90.0,
+        "runs": [
+            {"instruction": "first", "ids": [1, 2]},
+            {"instruction": "second", "ids": ids_b},
+        ],
+    }
+    a = {"prompts": [], "long": long([3, 4])}
+    b = {"prompts": [], "long": long([3, 5])}
+    for name, rec in (("a.json", a), ("b.json", b)):
+        (tmp_path / name).write_text(json.dumps(rec))
+    mod.compare(str(tmp_path / "a.json"), str(tmp_path / "b.json"))
+    out = capsys.readouterr().out
+    assert "long run 1 DIVERGED" in out
+    assert "long runs: IDENTICAL" not in out
+
+
+def test_harness_compare_skips_small_acceptance_samples(tmp_path, capsys):
+    import json
+    mod = _load_split_eval()
+    rec = {"prompts": [], "long": {
+        "prompt": "summary-set", "ids": [1], "accepted": 40, "rejected": 10,
+        "acceptance": 80.0, "runs": [{"instruction": "only", "ids": [1]}]}}
+    (tmp_path / "a.json").write_text(json.dumps(rec))
+    (tmp_path / "b.json").write_text(json.dumps(rec))
+    mod.compare(str(tmp_path / "a.json"), str(tmp_path / "b.json"))
+    out = capsys.readouterr().out
+    assert "acceptance: sample too small" in out
+    assert "acceptance: first" not in out
+
+    passkey = {"prompts": [], "long": {
+        "prompt": "passkey", "ids": [1], "accepted": 15, "rejected": 1,
+        "acceptance": 93.75, "runs": None}}
+    (tmp_path / "a.json").write_text(json.dumps(passkey))
+    (tmp_path / "b.json").write_text(json.dumps(passkey))
+    mod.compare(str(tmp_path / "a.json"), str(tmp_path / "b.json"))
+    out = capsys.readouterr().out
+    assert "acceptance: skipped (passkey" in out
+
+
 def test_adapter_unsafe_env_is_applied_and_logged(split_modules, monkeypatch):
     dm, _bridge, _split = split_modules
     monkeypatch.setenv("EXL3_TEST_UNSAFE", "0")

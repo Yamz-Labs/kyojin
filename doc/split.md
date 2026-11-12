@@ -109,23 +109,35 @@ defect.
 - Split **on** is judged by run-to-run determinism with plain greedy decoding, KLD/task
   metrics and the needle probe. A mixed-architecture pair is not expected to be bitwise.
 - `tools/strix_halo/split_eval.py` runs the battery: `--baseline`, `--part0-layers`,
-  `--part1-device`/`--part0-device`, `--needle-depth`, `--bench-depth`, `--num-draft`,
-  `--perf-tokens`/`--perf-reps` and `--compare a.json b.json`. Its context-dependent part0
+  `--part1-device`/`--part0-device`, `--needle-depth`, `--bench-depth`,
+  `--bench-prompt passkey|summary`, `--bench-acceptance`, `--num-draft`,
+  `--perf-tokens`/`--perf-reps`, `--vision-image PATH` and `--compare a.json b.json`.
+  Its context-dependent part0
   default is harness tuning, not a split property; override it with `--part0-layers` or the
-  `--long-ctx-part0-layers`/`--short-ctx-part0-layers` flags.
+  `--long-ctx-part0-layers`/`--short-ctx-part0-layers` flags. `--bench-acceptance` uses
+  long-form summary prompts and reports the drafted-token sample plus a 95% interval;
+  the passkey prompt is too short for an acceptance comparison. `--vision-image` encodes
+  one image through the split vision tower; the harness sets `EXL3_CONV_GEMM=1` as the
+  safe gfx12 spatial-merge fallback.
 
 ## Known limitations
 
-- MTP on the split is not deterministic. `--num-draft 0` remains the deterministic mode.
+- MTP on the split is deterministic at 8K/32K/128K with N=4 in the measured
+  configuration (two independent runs: 6/6 greedy prompts and identical long-prompt ids).
+  The earlier N=6 128K battery used short prompts; N=6 long prefill OOMs a 16 GB part0,
+  so N=4 is the long-context MTP configuration. Use `--num-draft 0` for configs outside
+  this measured set.
 - Per-segment graphs are not implemented. Split runs eager and pays about 0.95x decode on
   GLM with MTP.
 - Auto-N uses text bytes, cache and text endcaps, but does not yet subtract components
   declared after the target load (MTP/vision). Leave headroom or set N explicitly.
 - Qwen QSA sparse attention has an illegal-access report in the `gfx12` top-k path on
   `gfx1201`; keep QSA cache pages off `part0` until that kernel is fixed.
-- Reverse orientation with MTP on currently fails on the eGPU + iGPU device order with a
-  Triton `no kernel image is available` error when the MTP block lands on the eGPU.
-  Forward split is unaffected. Treat either-device MTP-on placement as requiring this JIT
-  fix; MTP-off reverse placement is validated.
+- Reverse orientation with MTP on passes at 32K in both device orders on the current box
+  (N=42, endcaps off, MTP on `part1`). The 2026-11-11 Triton `no kernel image` report did
+  not reproduce, including with a fresh Triton cache; it was most likely a Triton
+  seed/runtime mismatch (the shipped seed is for Triton 3.7, the runtime is 3.9). If it
+  returns, capture the failing kernel with a launch-device probe before changing
+  placement.
 - Same-architecture and RDNA3/3.5 pairs are selection-tested only until such hardware is
   available.

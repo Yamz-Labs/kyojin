@@ -53,6 +53,17 @@ PERF_PROMPTS = [
     "Write a detailed summary of the causes and consequences of the Industrial Revolution.",
 ]
 NEEDLE = "KX-4817-QM"
+# Long-form instructions for --bench-acceptance.  A passkey answer is only ~20 tokens,
+# which is too few drafted tokens to compare acceptance between configurations; these
+# ask for a long answer so the rate is measured over a useful sample.
+# The passkey answer is too short for an acceptance comparison; a summary-set arm
+# reaches several hundred drafted tokens.  Keep the compare output honest below this.
+MIN_ACCEPTANCE_SAMPLES = 100
+SUMMARY_INSTRUCTIONS = (
+    "Summarize the document in detail, at least 200 words.",
+    "Explain the main trade-offs and risks described above in detail.",
+    "Write a technical analysis of the document above, at least 200 words.",
+)
 FILLER = (
     "The archive room was quiet except for the soft hum of the ventilation and the slow "
     "turning of a clock on the far wall. Shelves of ledgers ran from floor to ceiling, each "
@@ -81,6 +92,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-c", "--max-ctx", type=int, default=131072)
     p.add_argument("--num-draft", type=int, default=2)
     p.add_argument("--no-vision", action="store_true")
+    p.add_argument("--vision-image", default=None,
+                   help="run this image through the split vision tower once (twice timed) and "
+                        "record the first-image latency; the vision tower must be loaded "
+                        "(cannot be combined with --no-vision)")
     p.add_argument("--no-graphs", action="store_true", help="force block/whole-forward graphs off (both modes)")
     p.add_argument("--no-budget", action="store_true", help="do not cap the per-device allocator (diagnostic: isolates reserve effects)")
     p.add_argument("--tokens", type=int, default=128)
@@ -89,11 +104,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--needle-depth", type=int, default=0, help="run one needle probe at this many prompt tokens")
     p.add_argument("--bench-depth", type=int, default=0,
                    help="also decode --perf-tokens at this prompt depth and report prefill/decode/acceptance")
+    p.add_argument("--bench-prompt", choices=("passkey", "summary"), default="passkey",
+                   help="long-depth prompt: passkey (needle) or a long-form summary instruction")
+    p.add_argument("--bench-acceptance", action="store_true",
+                   help="run all long-form summary instructions at --bench-depth and report the "
+                        "aggregate draft acceptance with a 95%% interval")
     p.add_argument("--out", default=None, help="write the full JSON here")
     p.add_argument("--compare", nargs=2, metavar=("BASE", "SPLIT"),
                    help="compare two saved runs: prompt ids and decode numbers")
     p.add_argument("--no-perf", action="store_true", help="skip the 3 decode timing prompts")
     args = p.parse_args()
+    if args.bench_acceptance and args.bench_depth <= 0:
+        p.error("--bench-acceptance needs --bench-depth N (the prompt depth to measure)")
+    if args.vision_image and args.no_vision:
+        p.error("--vision-image needs the vision tower; remove --no-vision")
     args.part0_layers_defaulted = args.part0_layers is None
     if args.part0_layers is None:
         # Harness tuning for memory, not a split property: a small part0 card cannot
@@ -114,6 +138,9 @@ def configure_env(args: argparse.Namespace) -> None:
     # (untuned, default) path instead of a per-process autotune winner.
     os.environ.setdefault("EXL3_DENSE_GEMM_TUNE", "0")
     os.environ.setdefault("EXL3_MOE_UNION_V2", "1")
+    # GLM serve's safe vision default: on gfx12 the MIOpen F.conv2d path can fail with
+    # "invalid device function", while the GEMM spatial-merge path is the measured fallback.
+    os.environ.setdefault("EXL3_CONV_GEMM", "1")
     # Same optional unquantized MTP eh_proj as serve.py: raises draft acceptance, never output.
     if "EXL3_MTP_EH_FP16" not in os.environ:
         for path in (os.path.join(args.model, "mtp_eh_proj.st"),
@@ -180,6 +207,34 @@ def build_needle(depth: int, tokenizer):
     mid = ids.numel() // 2
     ids = torch.cat((ids[:mid], marker, ids[mid:]), dim = -1)
     return torch.cat((p, ids, q), dim = -1).unsqueeze(0), NEEDLE
+
+
+def build_context_prompt(depth: int, tokenizer, instruction: str):
+    """~``depth`` tokens of filler followed by ``instruction``, for long-form acceptance."""
+    import torch
+    head = "Read the document below and follow the instruction that follows.\n\n"
+    tail = f"\n\nInstruction: {instruction}\n"
+    p = tokenizer.encode(f"[gMASK]<sop><|user|>\n{head}", encode_special_tokens = True).flatten()
+    q = tokenizer.encode(tail + "<|assistant|>\n", encode_special_tokens = True).flatten()
+    filler_ids = tokenizer.encode(FILLER, encode_special_tokens = False).flatten()
+    target = max(64, depth - int(p.numel() + q.numel()))
+    reps = target // max(1, filler_ids.numel()) + 1
+    ids = filler_ids.repeat(reps)[:target].clone()
+    return torch.cat((p, ids, q), dim = -1).unsqueeze(0)
+
+
+def acceptance_ci95(accepted: int, rejected: int) -> list[float] | None:
+    """Wilson score interval for the acceptance rate, in percent (None without samples)."""
+    import math
+    total = int(accepted) + int(rejected)
+    if total <= 0:
+        return None
+    z = 1.96
+    p = int(accepted) / total
+    denom = 1.0 + z * z / total
+    center = (p + z * z / (2.0 * total)) / denom
+    half = z * math.sqrt(p * (1.0 - p) / total + z * z / (4.0 * total * total)) / denom
+    return [round(max(0.0, center - half) * 100.0, 2), round(min(1.0, center + half) * 100.0, 2)]
 
 
 def main() -> None:
@@ -307,7 +362,30 @@ def main() -> None:
         "after_load_gib": after_load,
         "prompts": [],
         "perf": [],
+        "vision": None,
     }
+
+    if args.vision_image and vision is None:
+        raise SystemExit("--vision-image was requested but the vision tower did not load")
+    if vision is not None and args.vision_image:
+        from PIL import Image
+        image = Image.open(args.vision_image).convert("RGB")
+        times = []
+        emb = None
+        for _ in range(2):
+            t0 = time.perf_counter()
+            emb = vision.get_image_embeddings(tokenizer = tokenizer, image = image)
+            torch.cuda.synchronize()
+            times.append(time.perf_counter() - t0)
+        result["vision"] = {
+            "image": args.vision_image, "mm_length": int(emb.mm_length),
+            "embedding_shape": list(emb.embeddings.shape),
+            "embedding_device": str(emb.embeddings.device),
+            "first_s": times[0], "second_s": times[1],
+        }
+        print(f"[eval] vision {args.vision_image}: {emb.mm_length} tokens, "
+              f"first {times[0]:.2f} s, second {times[1]:.2f} s, "
+              f"embeddings {tuple(emb.embeddings.shape)} on {emb.embeddings.device}", flush = True)
 
     for prompt in PROMPTS:
         ids = ids_of(prompt, tokenizer)
@@ -349,25 +427,72 @@ def main() -> None:
               f" (ttft {r['ttft_s']:.1f} s) text={r['text'][:120]!r}", flush = True)
 
     if args.bench_depth > 0:
-        ids, _ = build_needle(min(args.bench_depth, args.max_ctx - 1024), tokenizer)
-        r = run_job(gen, Job, ids, args.perf_tokens)
-        tps = (r["tokens"] - 1) / r["decode_s"] if r["decode_s"] and r["tokens"] > 1 else None
-        acc, rej = r["accepted"], r["rejected"]
-        result["long"] = {
-            "depth": int(ids.numel()), "ttft_s": r["ttft_s"], "tokens": r["tokens"],
-            "decode_s": r["decode_s"], "decode_tps": tps,
-            "accepted": acc, "rejected": rej,
-            "acceptance": round(100 * acc / (acc + rej), 2) if acc + rej else None,
-            "text": r["text"],
-        }
-        if r["ttft_s"] is None or tps is None:
-            print(f"[eval] long depth {ids.numel()}: incomplete run "
-                  f"({r['tokens']} tokens, ttft={r['ttft_s']}, decode_tps={tps}, "
-                  f"accept {acc}/{rej})", flush = True)
+        depth = min(args.bench_depth, args.max_ctx - 1024)
+        if args.bench_prompt == "summary" or args.bench_acceptance:
+            instructions = SUMMARY_INSTRUCTIONS if args.bench_acceptance else SUMMARY_INSTRUCTIONS[:1]
+            runs = []
+            for instruction in instructions:
+                ids = build_context_prompt(depth, tokenizer, instruction)
+                r = run_job(gen, Job, ids, args.perf_tokens)
+                tps = (r["tokens"] - 1) / r["decode_s"] if r["decode_s"] and r["tokens"] > 1 else None
+                runs.append({
+                    "instruction": instruction,
+                    "depth": int(ids.numel()), "ids": r["ids"],
+                    "ttft_s": r["ttft_s"], "tokens": r["tokens"],
+                    "decode_s": r["decode_s"], "decode_tps": tps,
+                    "accepted": r["accepted"], "rejected": r["rejected"],
+                    "acceptance": round(100 * r["accepted"] / (r["accepted"] + r["rejected"]), 2)
+                                  if r["accepted"] + r["rejected"] else None,
+                    "text": r["text"],
+                })
+                if r["ttft_s"] is None or tps is None:
+                    print(f"[eval] long summary depth {ids.numel()}: incomplete run "
+                          f"({r['tokens']} tokens, ttft={r['ttft_s']}, decode_tps={tps}, "
+                          f"accept {r['accepted']}/{r['rejected']})", flush = True)
+                else:
+                    print(f"[eval] long summary depth {ids.numel()}: "
+                          f"ttft {r['ttft_s']:.1f} s, decode {tps:.2f} t/s, "
+                          f"accept {r['accepted']}/{r['rejected']}", flush = True)
+            acc = sum(x["accepted"] for x in runs)
+            rej = sum(x["rejected"] for x in runs)
+            base = runs[0]
+            result["long"] = {
+                "prompt": "summary-set" if args.bench_acceptance else "summary",
+                "depth": base["depth"], "ids": base["ids"],
+                "ttft_s": base["ttft_s"], "tokens": base["tokens"],
+                "decode_s": base["decode_s"], "decode_tps": base["decode_tps"],
+                "accepted": acc, "rejected": rej,
+                "acceptance": round(100 * acc / (acc + rej), 2) if acc + rej else None,
+                "acceptance_ci95": acceptance_ci95(acc, rej),
+                "runs": runs, "text": base["text"],
+            }
+            if acc + rej:
+                lo, hi = result["long"]["acceptance_ci95"]
+                print(f"[eval] acceptance {acc}/{acc + rej} = {result['long']['acceptance']:.2f}% "
+                      f"(95% CI {lo:.2f}-{hi:.2f}%, {acc + rej} drafted tokens)", flush = True)
         else:
-            print(f"[eval] long depth {ids.numel()}: ttft {r['ttft_s']:.1f} s, "
-                  f"prefill {ids.numel() / r['ttft_s']:.2f} t/s, decode {tps:.2f} t/s, "
-                  f"accept {acc}/{rej}", flush = True)
+            ids, _ = build_needle(depth, tokenizer)
+            r = run_job(gen, Job, ids, args.perf_tokens)
+            tps = (r["tokens"] - 1) / r["decode_s"] if r["decode_s"] and r["tokens"] > 1 else None
+            acc, rej = r["accepted"], r["rejected"]
+            result["long"] = {
+                "prompt": "passkey",
+                "depth": int(ids.numel()), "ids": r["ids"],
+                "ttft_s": r["ttft_s"], "tokens": r["tokens"],
+                "decode_s": r["decode_s"], "decode_tps": tps,
+                "accepted": acc, "rejected": rej,
+                "acceptance": round(100 * acc / (acc + rej), 2) if acc + rej else None,
+                "acceptance_ci95": acceptance_ci95(acc, rej),
+                "text": r["text"],
+            }
+            if r["ttft_s"] is None or tps is None:
+                print(f"[eval] long depth {ids.numel()}: incomplete run "
+                      f"({r['tokens']} tokens, ttft={r['ttft_s']}, decode_tps={tps}, "
+                      f"accept {acc}/{rej})", flush = True)
+            else:
+                print(f"[eval] long depth {ids.numel()}: ttft {r['ttft_s']:.1f} s, "
+                      f"prefill {ids.numel() / r['ttft_s']:.2f} t/s, decode {tps:.2f} t/s, "
+                      f"accept {acc}/{rej}", flush = True)
 
     for d in devs:
         result["devices"][str(d)].update({
@@ -414,6 +539,40 @@ def compare(base_path: str, split_path: str) -> None:
                       f"({b['decode_tps'] / a['decode_tps']:.3f}x)")
     if "needle" in split:
         print(f"[compare] needle: {'found' if split['needle']['found'] else 'MISSING'}")
+    if base.get("long") and split.get("long"):
+        a, b = base["long"], split["long"]
+        runs_a, runs_b = a.get("runs"), b.get("runs")
+        if runs_a is not None or runs_b is not None:
+            if not runs_a or not runs_b:
+                print("[compare] long runs: cannot compare (one side has no per-run ids)")
+            else:
+                if len(runs_a) != len(runs_b):
+                    print(f"[compare] long runs: {len(runs_a)} vs {len(runs_b)} runs")
+                differing = [
+                    i for i, (ra, rb) in enumerate(zip(runs_a, runs_b))
+                    if ra.get("ids") != rb.get("ids")
+                ]
+                if differing:
+                    i = differing[0]
+                    print(f"[compare] long run {i} DIVERGED: {runs_a[i].get('instruction')!r}")
+                else:
+                    print("[compare] long runs: IDENTICAL")
+        elif a.get("ids") is not None and b.get("ids") is not None:
+            same_long = a["ids"] == b["ids"]
+            print(f"[compare] long prompt ids: {'IDENTICAL' if same_long else 'DIVERGED'}")
+        if a.get("acceptance") is not None and b.get("acceptance") is not None:
+            a_n = a["accepted"] + a["rejected"]
+            b_n = b["accepted"] + b["rejected"]
+            if a.get("prompt") == "passkey" or b.get("prompt") == "passkey":
+                print(f"[compare] acceptance: skipped (passkey sample {a_n}/{b_n} drafted tokens; "
+                      "use --bench-prompt summary)")
+            elif min(a_n, b_n) < MIN_ACCEPTANCE_SAMPLES:
+                print(f"[compare] acceptance: sample too small ({a_n}/{b_n} drafted tokens; "
+                      f"need >= {MIN_ACCEPTANCE_SAMPLES})")
+            else:
+                print(f"[compare] acceptance: first {a['acceptance']:.2f}% "
+                      f"({a['accepted']}/{a_n}), second {b['acceptance']:.2f}% "
+                      f"({b['accepted']}/{b_n})")
 
 
 if __name__ == "__main__":
