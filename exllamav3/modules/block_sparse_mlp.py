@@ -2078,11 +2078,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         fmts = self._fq_grouped_kq_ok(y)
         _KQ = {"q4_k": 0, "q5_k": 1, "q6_k": 2}
         use_kq = fmts is not None and fmts[0] in _KQ and fmts[1] in _KQ   # Q4_K/Q5_K/Q6_K (mixed gate-up/down ok)
+        # IQ packs (gate/up IQ2_S + down IQ3_XXS / IQ4_XS): grouped dequant + fp16 grouped GEMM (fq_moe_prefill_iq.py)
+        use_iq = _FQ_MOE_IQ and fmts is not None and not use_kq and set(fmts) <= {"iq3_xxs", "iq2_s", "iq4_xs"} and \
+            fmts != ("iq4_xs", "iq4_xs")
         # K-quant: grouped from 33 rows (just above the multi-row decode kernel, FQ_GROUPED_MAX_ROWS=32); below that the
         # per-expert loop launched ~1650 small gemvs per forward (3090 cut4 8K prefill +14..25 %). Others keep 256.
-        if R < int(os.environ.get("MCPM_FQ_PF_GROUPED_MIN", "33" if use_kq else "256")):
+        # IQ: the grouped path dequantizes every expert per forward (fixed cost): on HIP it pays from 512 rows (35B UD-IQ3_XXS: from 33
+        # rows, 8 different users -20 %; from 512, prefill 8K 21.8 -> 8.6 s with the other cells unchanged)
+        if R < int(os.environ.get("MCPM_FQ_PF_GROUPED_MIN", "512" if (use_iq and torch.version.hip) else
+                                  "33" if (use_kq or use_iq) else "256")):
             return None
-        if fmts is None or not (use_kq or fmts == ("iq4_xs", "iq4_xs")) or self.act_limit or \
+        if fmts is None or not (use_kq or use_iq or fmts == ("iq4_xs", "iq4_xs")) or self.act_limit or \
                 self.activation_fn not in ("silu", None):
             return None
         # Scratch path (grouped dequant + fp16 grouped GEMM): CUDA 2.4-4.2x on the MoE layer. ROCm iGPU with the
@@ -2101,7 +2107,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if tuple(selected_experts.shape) != (R, top_k) or selected_experts.dtype != torch.long:
             return None
         from .fq_moe_prefill import build_tiles, gmm_iq4, perm_cols
-        if use_kq:
+        if use_kq or use_iq:
             from .fq_moe_prefill_kq import moe_kq_prefill, gmm_kq, PF_BM
         E = self.num_experts
         dev = y.device
@@ -2116,7 +2122,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         weight_sorted = wts.reshape(-1)[order]
         counts = _scatter_expert_count(flat_expert, E + 1)[:E]
         M = R * top_k
-        bm = PF_BM if use_kq else 64
+        bm = PF_BM if (use_kq or use_iq) else 64
         tile_e, tile_r0, offs = build_tiles(counts, M, bm)
         tbl = getattr(self, "_fq_pf_ptrs", None)
         if tbl is None or tbl[0] != self.gates[0].packed.data_ptr() or tbl[3] != dev:
@@ -2135,6 +2141,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             else:
                 moe_kq_prefill(xs, gu_ptrs, dn_ptrs, a, dn, tile_e, tile_r0, offs, weight_sorted, E, I, K,
                                _KQ[fmts[0]], _KQ[fmts[1]], bm)
+        elif use_iq:
+            from .fq_moe_prefill_iq import moe_iq_prefill, FMT_ID
+            xs = y.index_select(0, token_sorted)
+            moe_iq_prefill(xs, gu_ptrs, dn_ptrs, a, dn, tile_e, tile_r0, offs, weight_sorted, E, I, K,
+                           FMT_ID[fmts[0]], FMT_ID[fmts[1]], bm)
         else:
             xs = perm_cols(y.index_select(0, token_sorted))
             gmm_iq4(xs, gu_ptrs, a, tile_e, tile_r0, offs, I, K, E, swiglu=True)
