@@ -970,7 +970,7 @@ class ResidentEngine:
                 self.split.load("vision", tower, progressbar=False,
                                 callback=startup_health.load_callback())
             else:
-                tower.load(device=torch.device("cuda:0"), progressbar=False,
+                tower.load(device="cuda:0", progressbar=False,
                            callback=startup_health.load_callback())
         except Exception as exc:                                      # noqa: BLE001
             print(f"serve: vision tower not loaded ({type(exc).__name__}: {exc}); image input disabled", flush=True)
