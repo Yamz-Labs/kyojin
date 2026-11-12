@@ -17,7 +17,7 @@
 namespace {
 
 constexpr int WAVE_SIZE = 32;
-constexpr int GEMV_WAVES = 8;
+constexpr int GEMV_WAVES = 2;   // 2 expert rows per block: E / 2 blocks (8 per block left most CUs idle at E = 256)
 // Supported (hidden, experts, top-k) decode shapes: see routing_std_gfx12_bsz1 below and _HIP_ROUTER_SHAPES in block_sparse_mlp_routing.py
 constexpr int MAX_ROUTER_ROWS = 16;
 constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
@@ -84,7 +84,7 @@ void routing_gemv_gfx12_bsz1_kernel
         gate_t + static_cast<size_t>(expert) * ROUTER_HIDDEN);
 
     float sum = 0.0f;
-    #pragma unroll 2
+    #pragma unroll 8
     for (int col = lane; col < ROUTER_HIDDEN / 2; col += WAVE_SIZE)
     {
         const half2 h = hidden2[col];
@@ -97,9 +97,9 @@ void routing_gemv_gfx12_bsz1_kernel
     if (lane == 0) scores[expert] = __float2half_rn(sum);
 }
 
-// This is the standard routing top-k reduction from routing.cu for wave32 decode shapes
-// (E a multiple of 32, E / 32 * K candidates). Each wave first contributes its K best
-// candidates; wave 0 then selects and normalizes the global K in descending order.
+// Top-k by rank (same result as the standard routing.cu reduction): every thread holds one expert score and counts, from shared
+// memory, the scores that beat it (greater, or equal with a lower expert index); a rank below K is that expert's output slot.
+// Then the softmax over the K selected exactly as before: exp(score - max over all experts), lane-order sum, divide.
 template <int ROUTER_EXPERTS, int ROUTER_TOP_K>
 __global__ __launch_bounds__(ROUTER_EXPERTS)
 void routing_std_topk_gfx12_bsz1_kernel
@@ -110,11 +110,9 @@ void routing_std_topk_gfx12_bsz1_kernel
 )
 {
     constexpr int NUM_WAVES = ROUTER_EXPERTS / WAVE_SIZE;
-    constexpr int NUM_CANDIDATES = NUM_WAVES * ROUTER_TOP_K;
     static_assert(ROUTER_EXPERTS % WAVE_SIZE == 0 && NUM_WAVES <= WAVE_SIZE && ROUTER_TOP_K < WAVE_SIZE, "router shape");
 
-    __shared__ float candidates_key[NUM_CANDIDATES];
-    __shared__ int candidates_idx[NUM_CANDIDATES];
+    __shared__ float logits[ROUTER_EXPERTS];
     __shared__ float wave_max[NUM_WAVES];
     __shared__ float global_max;
     __shared__ float selected_exp[ROUTER_TOP_K];
@@ -127,6 +125,7 @@ void routing_std_topk_gfx12_bsz1_kernel
     topk_indices += static_cast<size_t>(blockIdx.x) * ROUTER_TOP_K;
     topk_weights += static_cast<size_t>(blockIdx.x) * ROUTER_TOP_K;
     const float logit = __half2float(scores[tid]);
+    logits[tid] = logit;
 
     float max_logit = wave_reduce_max(logit);
     if (lane == 0) wave_max[wave] = max_logit;
@@ -138,88 +137,23 @@ void routing_std_topk_gfx12_bsz1_kernel
         if (lane == 0) global_max = max_logit;
     }
 
-    float key = logit;
-    int idx = tid;
-    #pragma unroll
-    for (int rank = 0; rank < ROUTER_TOP_K; ++rank)
+    int rank = 0;
+    #pragma unroll 8
+    for (int j = 0; j < ROUTER_EXPERTS; ++j)
     {
-        float best_key = key;
-        int best_idx = idx;
-        wave_reduce_best(best_key, best_idx);
-        if (lane == rank)
-        {
-            candidates_key[wave * ROUTER_TOP_K + rank] = best_key;
-            candidates_idx[wave * ROUTER_TOP_K + rank] = best_idx;
-        }
-        if (idx == best_idx)
-        {
-            key = NEG_INF;
-            idx = -1;
-        }
+        const float other = logits[j];
+        rank += (other > logit || (other == logit && j < tid)) ? 1 : 0;
+    }
+    __syncthreads();
+    if (rank < ROUTER_TOP_K)
+    {
+        selected_exp[rank] = logit == global_max ? 1.0f : expf(logit - global_max);
+        selected_idx[rank] = tid;
     }
     __syncthreads();
 
-    // Candidates are compacted wave by wave (E=512/K=10: 160 -> 50 -> 20 -> the final ten). The fixed
-    // bounds avoid dynamic masks and shifts and preserve routing.cu's candidate order.
-    int num_candidates = NUM_CANDIDATES;
-    while (num_candidates > WAVE_SIZE)
-    {
-        const int stage_waves = (num_candidates + WAVE_SIZE - 1) / WAVE_SIZE;
-        const bool active_wave = wave < stage_waves;
-        const int pos = wave * WAVE_SIZE + lane;
-        key = active_wave && pos < num_candidates ? candidates_key[pos] : NEG_INF;
-        idx = active_wave && pos < num_candidates ? candidates_idx[pos] : -1;
-        // All candidates must be loaded into registers before compacted output overwrites
-        // the front of the same shared arrays; wave scheduling is otherwise unconstrained.
-        __syncthreads();
-        if (active_wave)
-        {
-            #pragma unroll
-            for (int rank = 0; rank < ROUTER_TOP_K; ++rank)
-            {
-                float best_key = key;
-                int best_idx = idx;
-                wave_reduce_best(best_key, best_idx);
-                if (lane == rank)
-                {
-                    candidates_key[wave * ROUTER_TOP_K + rank] = best_key;
-                    candidates_idx[wave * ROUTER_TOP_K + rank] = best_idx;
-                }
-                if (idx == best_idx)
-                {
-                    key = NEG_INF;
-                    idx = -1;
-                }
-            }
-        }
-        __syncthreads();
-        num_candidates = stage_waves * ROUTER_TOP_K;
-    }
-
     if (wave == 0)
     {
-        key = lane < num_candidates ? candidates_key[lane] : NEG_INF;
-        idx = lane < num_candidates ? candidates_idx[lane] : -1;
-        #pragma unroll
-        for (int rank = 0; rank < ROUTER_TOP_K; ++rank)
-        {
-            float best_key = key;
-            int best_idx = idx;
-            wave_reduce_best(best_key, best_idx);
-            if (lane == rank)
-            {
-                selected_exp[rank] = best_key == global_max ?
-                    1.0f : expf(best_key - global_max);
-                selected_idx[rank] = best_idx;
-            }
-            if (idx == best_idx)
-            {
-                key = NEG_INF;
-                idx = -1;
-            }
-        }
-        __syncwarp();
-
         const float e = lane < ROUTER_TOP_K ? selected_exp[lane] : 0.0f;
         const float sum = wave_reduce_sum(e) + 1.0e-20f;
         if (lane < ROUTER_TOP_K)
