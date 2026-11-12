@@ -844,6 +844,8 @@ class QwenEngine:
         # of fp32 state, which is what made the UD-Q4_K_XL GGUF (20.3 GiB of weights on the GPU) miss a 24 GB card. Without a drafter
         # and without the plain lookup nothing writes history: keep the committed-state row only.
         hist = max(3, ndt) if (draft_policy != "off" or pl is not None) else 0
+        if os.environ.get("KYO_GDN_HISTORY"):   # A/B override
+            hist = int(os.environ["KYO_GDN_HISTORY"])
         self.cache = Cache(self.model, max_num_tokens=ctx, max_history=hist, max_batch_size=sessions, **qkw)
         if qkw.get("layer_type") is not None and getattr(qkw["layer_type"], "tq", False):
             from exllamav3.cache.tq import cache_is_tq
