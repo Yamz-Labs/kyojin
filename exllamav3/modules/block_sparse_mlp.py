@@ -1754,10 +1754,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         # gate/up share one format, down has its own (unsloth UD: gate/up Q4_K + down Q5_K)
         fmt = fmt_d = None
-        for m in self.gates + self.ups + self.downs:
+        _ug_ok = ("q4_k", "q5_k", "q6_k", "iq4_xs") + (("iq3_xxs", "iq2_s") if _FQ_MOE_IQ else ())
+        for m in self.gates + self.ups:
+            if not isinstance(m, ForeignLinear) or m.format not in _ug_ok:
+                return None
+            if m.packed is None or not m.packed.is_contiguous():
+                return None
+        # downs may also be 32-element blocks (Q8_0 / Q5_1: expert widths not a multiple of 256, e.g. 640)
+        for m in self.downs:
             if not isinstance(m, ForeignLinear):
                 return None
-            if m.format not in ("q4_k", "q5_k", "q6_k", "iq4_xs") + (("iq3_xxs", "iq2_s") if _FQ_MOE_IQ else ()):
+            if m.format not in _ug_ok and not (m.format in ("q8_0", "q5_1") and m.in_features % 32 == 0):
                 return None
             if m.packed is None or not m.packed.is_contiguous():
                 return None
@@ -1946,7 +1953,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         h = y.reshape(R, -1)
         dev = h.device
         K = h.shape[1]
-        _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136, "iq3_xxs": 98, "iq2_s": 82}
+        _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136, "iq3_xxs": 98, "iq2_s": 82, "q8_0": 34, "q5_1": 24}
         bb = _BB[fmt]
         bb_d = _BB[fmt_d]
         tbl = getattr(self, "_fq_kq_ptrs", None)
@@ -1963,7 +1970,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         I = self.intermediate_size
         gate_stride = (K // 256) * bb
         up_stride = gate_stride
-        down_stride = (I // 256) * bb_d
+        down_stride = (I // (32 if fmt_d in ("q8_0", "q5_1") else 256)) * bb_d
         # buffers sized once for the largest row count (stable pointers for CUDA graphs); the kernel gets row-prefix views
         if getattr(self, "_fq_kq_partial", None) is None or \
                 self._fq_kq_partial.shape != (FQ_GROUPED_MAX_ROWS * S, K) or self._fq_kq_partial.device != dev:
@@ -1978,7 +1985,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                    gate_stride, up_stride, down_stride,
                                    partial_v, routed_v)
         else:
-            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3, "iq3_xxs": 4, "iq2_s": 5}
+            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3, "iq3_xxs": 4, "iq2_s": 5, "q8_0": 6, "q5_1": 7}
             ext.fq_moe_kq_grouped_mixed_q8(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
                                            gate_stride, up_stride, down_stride, _FID[fmt], _FID[fmt_d],
                                            partial_v, routed_v)

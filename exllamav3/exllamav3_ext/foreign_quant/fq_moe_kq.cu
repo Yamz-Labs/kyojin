@@ -267,6 +267,47 @@ static bool fq_moe_v2_on()
     return on;
 }
 
+// Q5_1 x q8_1 dot (ggml vec_dot_q5_1_q8_1 arithmetic): per 32-block, 8 dp4a over the 5-bit values (0..31) and the int8 activations,
+// then d_w * d_a * sumi + m_w * s_a (s_a = the q8_1 block's stored sum). Lanes take 32-blocks round-robin like fq_dot_q8_0_q8.
+constexpr int FQ_Q5_1_BYTES = 24;
+__device__ __forceinline__ float fq_dot_q5_1_q8(const uint8_t* __restrict__ wr, const uint8_t* __restrict__ aqb,
+                                                int K, int tid, int nthreads)
+{
+    const int nchunks = K / 32;
+    float acc = 0.0f;
+    for (int c = tid; c < nchunks; c += nthreads)
+    {
+        const uint8_t* blk = wr + (size_t)c * FQ_Q5_1_BYTES;
+        __half dwh, mwh, dah, sah;
+        memcpy(&dwh, blk, 2);
+        memcpy(&mwh, blk + 2, 2);
+        const uint8_t* ab = aqb + (size_t)c * FQ_Q8_1_BYTES;
+        memcpy(&dah, ab, 2);
+        memcpy(&sah, ab + 2, 2);
+        const uint32_t qh = (uint32_t)blk[4] | ((uint32_t)blk[5] << 8) | ((uint32_t)blk[6] << 16) | ((uint32_t)blk[7] << 24);
+        const uint8_t* qs = blk + 8;
+        const int32_t* aq32 = reinterpret_cast<const int32_t*>(ab + 4);
+        int sumi = 0;
+        #pragma unroll
+        for (int w = 0; w < 4; w++)
+        {
+            int32_t lo = 0, hi = 0;
+            #pragma unroll
+            for (int b = 0; b < 4; b++)
+            {
+                const int j = 4 * w + b;
+                lo |= (int32_t)((qs[j] & 15) | (((qh >> j) & 1) << 4)) << (8 * b);
+                hi |= (int32_t)((qs[j] >> 4) | (((qh >> (j + 16)) & 1) << 4)) << (8 * b);
+            }
+            sumi = fq_dp4a(lo, aq32[w], sumi);
+            sumi = fq_dp4a(hi, aq32[w + 4], sumi);
+        }
+        const float dw = __half2float(dwh), mw = __half2float(mwh), da = __half2float(dah), sa = __half2float(sah);
+        acc = __fadd_rn(acc, __fadd_rn(__fmul_rn(__fmul_rn(dw, da), (float)sumi), __fmul_rn(mw, sa)));
+    }
+    return acc;
+}
+
 // Down kernel: block (s, t) dots down[sel[s]] rows against the
 // pre-quantized act row s into partial[s]. Same lane split as above.
 template <int FMT>
@@ -304,6 +345,10 @@ __global__ void fq_moe_kq_down_kernel(const uint8_t* __restrict__ aqb,
             p = fq_dot_iq4_xs_q8(dr, aq, I, lane, FQ_GEMV_LANES);
         else if constexpr (FMT == 4)
             p = fq_dot_iq3_xxs_q8(dr, aq, I, lane, FQ_GEMV_LANES);
+        else if constexpr (FMT == 6)
+            p = fq_dot_q8_0_q8(dr, aq, I, lane, FQ_GEMV_LANES);
+        else if constexpr (FMT == 7)
+            p = fq_dot_q5_1_q8(dr, aq, I, lane, FQ_GEMV_LANES);
         else
             p = fq_dot_iq2_s_q8(dr, aq, I, lane, FQ_GEMV_LANES);
     }
@@ -361,7 +406,7 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
     int E = (int)up_ptrs.numel();
     // I from the down row stride (down rows are I-wide, like Bolt's
     // derivation from down_stride).
-    int I = (int)(down_stride / block_bytes) * FQ_Q4_K_GROUP;
+    int I = (int)(down_stride / block_bytes) * ((FMT_D >= 6) ? 32 : FQ_Q4_K_GROUP);   // ids 6 / 7: 32-element blocks
     at::cuda::CUDAGuard guard(h.device());
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     int ntiles_u = (I + FQ_GEMV_OUT_PER_BLOCK - 1) / FQ_GEMV_OUT_PER_BLOCK;
@@ -465,7 +510,8 @@ void fq_moe_iq4xs_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor w
                                 FQ_IQ4_XS_BYTES, partial, out);
 }
 
-static const int64_t kFmtBytes[6] = {FQ_Q4_K_BYTES, FQ_Q5_K_BYTES, FQ_Q6_K_BYTES, FQ_IQ4_XS_BYTES, FQ_IQ3_XXS_BYTES, FQ_IQ2_S_BYTES};
+static const int64_t kFmtBytes[8] = {FQ_Q4_K_BYTES, FQ_Q5_K_BYTES, FQ_Q6_K_BYTES, FQ_IQ4_XS_BYTES, FQ_IQ3_XXS_BYTES, FQ_IQ2_S_BYTES,
+                                     FQ_Q8_0_BYTES, FQ_Q5_1_BYTES};
 
 template <int FU>
 static void fq_moe_kq_dispatch_d(int fd, torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
@@ -481,6 +527,8 @@ static void fq_moe_kq_dispatch_d(int fd, torch::Tensor h, torch::Tensor sel, tor
         case 3: fq_moe_kq_grouped_launch<FU, 3>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[3], partial, out); break;
         case 4: fq_moe_kq_grouped_launch<FU, 4>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[4], partial, out); break;
         case 5: fq_moe_kq_grouped_launch<FU, 5>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[5], partial, out); break;
+        case 6: fq_moe_kq_grouped_launch<FU, 6>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[6], partial, out); break;
+        case 7: fq_moe_kq_grouped_launch<FU, 7>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[7], partial, out); break;
         default: TORCH_CHECK(false, "fq_moe_kq: bad down format ", fd);
     }
 }
