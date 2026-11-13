@@ -69,9 +69,9 @@ _KQ_FORMATS = ("q4_k", "q5_k", "q6_k", "iq4_xs")
 # EXL3_IQ3_Q8 (default 1): IQ3_XXS decode rows run the q8_1 dp4a GEMV (fq_gemv_iq3_xxs_q8) instead of the Triton decode
 _IQ3_Q8 = os.environ.get("EXL3_IQ3_Q8", "1") != "0"
 _IQ_Q8_FN = {"iq3_xxs": "fq_gemv_iq3_xxs_q8", "iq2_s": "fq_gemv_iq2_s_q8", "iq3_s": "fq_gemv_iq3_s_q8"}
-# BOLT_FQ_MMVQ (default 1, CUDA): IQ formats decode (1..16 rows) through the llama.cpp mmvq-style kernel (fq_mmvq.cu: ggml vec_dot_iq*_q8_1 dp4a dots,
+# BOLT_FQ_MMVQ (default 1, CUDA and HIP): IQ formats decode (1..16 rows) through the llama.cpp mmvq-style kernel (fq_mmvq.cu: ggml vec_dot_iq*_q8_1 dp4a dots,
 # warp-per-row blocks, 1..8 activation columns per launch, weights read once). 0 = the previous paths (A/B).
-_MMVQ_ON = os.environ.get("BOLT_FQ_MMVQ", "1") != "0" and bool(torch.version.cuda) and not torch.version.hip
+_MMVQ_ON = os.environ.get("BOLT_FQ_MMVQ", "1") != "0"
 _MMVQ_FN = {"iq2_xxs": "fq_mmvq_iq2_xxs", "iq2_xs": "fq_mmvq_iq2_xs", "iq2_s": "fq_mmvq_iq2_s", "iq3_xxs": "fq_mmvq_iq3_xxs",
             "iq3_s": "fq_mmvq_iq3_s", "iq4_nl": "fq_mmvq_iq4_nl", "iq4_xs": "fq_mmvq_iq4_xs", "q5_k": "fq_mmvq_q5_k"}
 _MMVQ_QK = {"iq4_nl": 32}

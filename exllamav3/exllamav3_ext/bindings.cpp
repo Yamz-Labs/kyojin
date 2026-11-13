@@ -192,9 +192,7 @@ static void bind_exl3_dec(py::module_& m)
 }
 #endif
 
-#if !defined(USE_ROCM)
 #include "foreign_quant/fq_mmvq_api.h"
-#endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -633,7 +631,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_gemv_iq3_s_q8", &fq_gemv_iq3_s_q8, "fq_gemv_iq3_s_q8",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
-#if !defined(USE_ROCM)
     m.def("fq_mmvq_iq2_xxs", &fq_mmvq_iq2_xxs, "fq_mmvq_iq2_xxs",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_mmvq_iq2_xs", &fq_mmvq_iq2_xs, "fq_mmvq_iq2_xs",
@@ -655,7 +652,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("partial"), py::arg("out"));
     m.def("fq_mmvq_q5_k", &fq_mmvq_q5_k, "fq_mmvq_q5_k",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
-#endif
 // grouped KQ/IQ4_XS decode MoE (fq_moe_kq.cu): portable dp4a kernels, built on ROCm too
     m.def("fq_moe_q4k_grouped_q8", &fq_moe_q4k_grouped_q8, "fq_moe_q4k_grouped_q8",
           py::arg("h"), py::arg("sel"), py::arg("wts"),

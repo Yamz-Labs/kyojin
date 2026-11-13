@@ -12,7 +12,7 @@ ROCM_EXCLUDE_DIRS = {'parallel', 'comp_units', 'foreign_quant'}
 # Other comp_units remain excluded because they implement unported MoE/GEMM paths.
 ROCM_ALLOW_PREFIXES = (
     'foreign_quant/fq_dequant.cu', 'foreign_quant/fq_dequant_kq.cu', 'foreign_quant/fq_gemv.cu',
-    'foreign_quant/fq_gemv_kq.cu', 'foreign_quant/fq_gemv_q8.cu', 'foreign_quant/fq_moe_kq.cu', 'foreign_quant/fq_gemm.cu',
+    'foreign_quant/fq_gemv_kq.cu', 'foreign_quant/fq_gemv_q8.cu', 'foreign_quant/fq_mmvq.cu', 'foreign_quant/fq_moe_kq.cu', 'foreign_quant/fq_gemm.cu',
     'quant/comp_units/exl3_gemv_int8_inst_',
     'quant/comp_units/quantize_tiles_inst_',
 )

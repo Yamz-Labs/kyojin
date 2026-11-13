@@ -1,7 +1,7 @@
 // Q5_K vec-dot (q8_1 activations, integer dp4a dots) ported from llama.cpp ggml/src/ggml-cuda/vecdotq.cuh
 // (https://github.com/ggml-org/llama.cpp, commit 7182ef7) and block_q5_K of ggml/src/ggml-common.h.
 // MIT License, Copyright (c) 2023-2026 The ggml authors. See THIRD_PARTY_NOTICES.md at the repository root.
-// Changes: ggml_cuda_dp4a -> __dp4a, namespace ggml_iq. The dot-product body is unchanged.
+// Changes: ggml_cuda_dp4a -> ggml_dp4a, namespace ggml_iq. The dot-product body is unchanged.
 #pragma once
 
 #include "ggml_vecdotq_iq.cuh"
@@ -41,8 +41,8 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
         const int v0i = vl0i | vh0i;
         const int v1i = vl1i | vh1i;
 
-        const int dot1 = __dp4a(v0i, u[2*i+0], __dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
-        const int dot2 = __dp4a(0x01010101, u[2*i+0], __dp4a(0x01010101, u[2*i+1], 0)); // sum of u
+        const int dot1 = ggml_dp4a(v0i, u[2*i+0], ggml_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
+        const int dot2 = ggml_dp4a(0x01010101, u[2*i+0], ggml_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
 
         sumf_d += d8[i] * (dot1 * sc[i]);
         sumf_m += d8[i] * (dot2 * m[i]);
