@@ -790,7 +790,7 @@ class QwenEngine:
         if on_cuda:
             for k, v in CUDA_SERVE_ENV:
                 os.environ.setdefault(k, v)
-            if sessions > 1:   # one graph per (jobs, rows) shape of the batched step; the LRU holds the 4 x 8 shapes
+            if sessions > 1:   # one graph per (jobs, rows) shape of the batched step; the LRU holds the 8 x 4 shapes (jobs x rows)
                 os.environ.setdefault("EXL3_CUDA_GRAPH_MULTI", "1")
                 os.environ.setdefault("EXL3_CUDA_GRAPH_MAX", "32")
                 # several users: a big prompt prefills in 768-row steps beside the decoding users, which decode between two of its
