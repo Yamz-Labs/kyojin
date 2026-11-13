@@ -406,7 +406,7 @@ def main(argv=None):
     sp.add_argument("--ssh-pythonpath",
                     default="~/ds41_work/port1/release/kyojin-cuda-0d725cb-q35")
     sp.add_argument("--ssh-env", default="", help="extra 'VAR=value ...' for the remote worker, e.g. EXL3_QUANT_PROFILE=1")
-    sp.add_argument("--ssh-lock", default="~/strix-bench/gpu3090.lock")
+    sp.add_argument("--ssh-lock", default="/tmp/gpu3090.lock")
     sp.add_argument("--ssh-min-mem-mib", type=int, default=12288)
     sp.add_argument("--ssh-restarts", type=int, default=100000)
     sp.add_argument("--ssh-retry-s", type=float, default=300.0)

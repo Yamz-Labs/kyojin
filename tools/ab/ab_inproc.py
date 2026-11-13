@@ -21,7 +21,8 @@ import threading
 import time
 import urllib.request
 
-CORPUS = os.path.expanduser("~/hermes-work/leadk/fleet/wt_roof3090/exllamav3/conversion/standard_cal_data")
+CORPUS = os.environ.get("AB_CORPUS") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                                                     "exllamav3", "conversion", "standard_cal_data")
 
 
 def http(port, path, body=None, timeout=3600):
