@@ -24,6 +24,7 @@ _shared_check = os.environ.get("EXL3_ATTN_SHARED_CHECK", "0") != "0"
 _batch_qsa = os.environ.get("EXL3_ATTN_BATCH_QSA", "1") != "0"
 _SHARED_STATS = [0, 0]
 _QKV_IG_MULTI = os.environ.get("EXL3_ATTN_QKV_IG_MULTI", "1") != "0"   # (q|gate, k, v one launch)
+_QKVCAT = os.environ.get("EXL3_ATTN_QKVCAT", "1") != "0"   # GGUF Q8_0 q / k / v decode in one launch (_qkv_q8cat)
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):
@@ -633,6 +634,50 @@ class Attention(Module):
     def load(self, device: torch.Device, **kwargs):
         super().load(device, **kwargs)
         self.load_local(device, **kwargs)
+        self._q8cat_build()
+
+    def _q8cat_build(self):
+        """GGUF Q8_0 q / k / v weights as one [nq + nk + nv, row] tensor, the ForeignLinears re-pointed to views of it (same bytes,
+        no copy kept). Done at load, before any decode graph is captured. Nothing for other formats."""
+        self._q8cat_w = None
+        if not _QKVCAT or self.use_k_as_v:
+            return
+        from .foreign_linear import ForeignLinear
+        lins = (self.q_proj, self.k_proj, self.v_proj)
+        if not all(isinstance(l, ForeignLinear) and l.format == "q8_0" and l.packed is not None and l.packed.dtype == torch.uint8
+                   for l in lins):
+            return
+        if len({l.in_features for l in lins}) != 1 or len({l.packed.device for l in lins}) != 1:
+            return
+        shapes = [l.packed.shape for l in lins]
+        cat = torch.cat([l.packed.reshape(l.out_features, -1) for l in lins], dim = 0)
+        a = 0
+        for l, sh in zip(lins, shapes):
+            l.packed = cat[a:a + l.out_features].view(sh)
+            a += l.out_features
+        self._q8cat_w = cat
+        if not getattr(Attention, "_q8cat_said", False):
+            Attention._q8cat_said = True
+            print(f" -- attention q / k / v Q8_0 decode rows concatenated ({' + '.join(str(l.out_features) for l in lins)})", flush = True)
+
+    def _qkv_q8cat(self, x: torch.Tensor, params: dict, bsz: int, q_len: int):
+        """q, k, v of one decode row from ONE fq_gemv_q8_0 launch over the rows concatenated at load: the same per-row q8_1 x Q8_0
+        dot as three launches (bit-exact), one quantization instead of three. None = fall back to the three projections."""
+        cat = getattr(self, "_q8cat_w", None)
+        if cat is None or bsz * q_len != 1 or not x.is_contiguous() or "capture" in params or "ovr" in params:
+            return None
+        lins = (self.q_proj, self.k_proj, self.v_proj)
+        flat = x.reshape(1, -1)
+        dts = {l.out_dtype or torch.half for l in lins}
+        if len(dts) != 1 or not all(l.q8_fused_gemv_ok(flat) for l in lins):
+            return None
+        n = [l.out_features for l in lins]
+        out = torch.empty((1, sum(n)), dtype = dts.pop(), device = x.device)
+        ext.fq_gemv_q8_0(flat, cat.view(sum(n), -1, 34), out)
+        q = out[:, :n[0]].view(bsz, q_len, n[0])
+        k = out[:, n[0]:n[0] + n[1]].view(bsz, q_len, n[1])
+        v = out[:, n[0] + n[1]:].view(bsz, q_len, n[2])
+        return q, k, v
 
 
     @override
@@ -861,8 +906,9 @@ class Attention(Module):
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
+        qkv8 = self._qkv_q8cat(x, params, bsz, q_len)
         if self.multi_qg is None or bsz * q_len > 32:
-            q = self.q_proj.forward(x, params)
+            q = qkv8[0] if qkv8 is not None else self.q_proj.forward(x, params)
             if self.interleaved_gate:
                 if self.head_dim % 8 == 0 and q.dtype == torch.half:
                     qg = q
@@ -909,7 +955,9 @@ class Attention(Module):
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
-        if self.multi_kv is None or bsz * q_len > 32:
+        if qkv8 is not None:
+            k, v = qkv8[1], qkv8[2]
+        elif self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
 
