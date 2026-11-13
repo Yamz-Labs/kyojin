@@ -192,6 +192,10 @@ static void bind_exl3_dec(py::module_& m)
 }
 #endif
 
+#if !defined(USE_ROCM)
+#include "foreign_quant/fq_mmvq_api.h"
+#endif
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
 #if !defined(USE_ROCM)
@@ -629,6 +633,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_gemv_iq3_s_q8", &fq_gemv_iq3_s_q8, "fq_gemv_iq3_s_q8",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
+#if !defined(USE_ROCM)
+    m.def("fq_mmvq_iq2_xxs", &fq_mmvq_iq2_xxs, "fq_mmvq_iq2_xxs",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq2_xs", &fq_mmvq_iq2_xs, "fq_mmvq_iq2_xs",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq2_s", &fq_mmvq_iq2_s, "fq_mmvq_iq2_s",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq3_xxs", &fq_mmvq_iq3_xxs, "fq_mmvq_iq3_xxs",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq3_s", &fq_mmvq_iq3_s, "fq_mmvq_iq3_s",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq4_nl", &fq_mmvq_iq4_nl, "fq_mmvq_iq4_nl",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq4_xs", &fq_mmvq_iq4_xs, "fq_mmvq_iq4_xs",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_dequant_iq", &fq_dequant_iq, "fq_dequant_iq", py::arg("packed"), py::arg("out"), py::arg("fmt"));
+    m.def("fq_moe_mmvq_grouped", &fq_moe_mmvq_grouped, "fq_moe_mmvq_grouped",
+          py::arg("h"), py::arg("sel"), py::arg("wts"), py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"), py::arg("type_ug"), py::arg("type_down"),
+          py::arg("partial"), py::arg("out"));
+    m.def("fq_mmvq_q5_k", &fq_mmvq_q5_k, "fq_mmvq_q5_k",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+#endif
 // grouped KQ/IQ4_XS decode MoE (fq_moe_kq.cu): portable dp4a kernels, built on ROCm too
     m.def("fq_moe_q4k_grouped_q8", &fq_moe_q4k_grouped_q8, "fq_moe_q4k_grouped_q8",
           py::arg("h"), py::arg("sel"), py::arg("wts"),
@@ -656,5 +683,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
           py::arg("fmt_ug"), py::arg("fmt_down"),
           py::arg("partial"), py::arg("out"));
+    m.def("fq_moe_kq_grouped_mixed_sh_q8", &fq_moe_kq_grouped_mixed_sh_q8, "fq_moe_kq_grouped_mixed_sh_q8",
+          py::arg("h"), py::arg("sel"), py::arg("wts"),
+          py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
+          py::arg("fmt_ug"), py::arg("fmt_down"),
+          py::arg("partial"), py::arg("out"),
+          py::arg("sh_gate"), py::arg("sh_up"), py::arg("sh_down"), py::arg("sh_wg"));
 #endif
 }

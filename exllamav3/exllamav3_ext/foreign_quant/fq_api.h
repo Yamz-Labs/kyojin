@@ -81,3 +81,11 @@ void fq_moe_kq_grouped_mixed_q8(torch::Tensor h, torch::Tensor sel, torch::Tenso
                                 int64_t gate_stride, int64_t up_stride, int64_t down_stride,
                                 int64_t fmt_ug, int64_t fmt_down,
                                 torch::Tensor partial, torch::Tensor out);
+void fq_moe_kq_grouped_mixed_sh_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
+                                   torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
+                                   torch::Tensor down_ptrs,
+                                   int64_t gate_stride, int64_t up_stride, int64_t down_stride,
+                                   int64_t fmt_ug, int64_t fmt_down,
+                                   torch::Tensor partial, torch::Tensor out,
+                                   torch::Tensor sh_gate, torch::Tensor sh_up, torch::Tensor sh_down,
+                                   torch::Tensor sh_wg);
