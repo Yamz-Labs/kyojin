@@ -33,6 +33,12 @@ _ROWS_TRITON = os.environ.get("BOLT_FQ_ROWS_TRITON", "1") != "0"
 # BOLT_FQ_ROWS_TRITON_Q8=1 restores it on CUDA (A/B).
 _ROWS_TRITON_Q8 = os.environ.get("BOLT_FQ_ROWS_TRITON_Q8", "0" if (torch.version.cuda and not torch.version.hip) else "1") != "0"
 
+# Q4_K / Q6_K rows 2..16: the C++ multi-row q8_1 GEMV (fq_gemv_kq.cu fq_gemv_kq_mrows_kernel: weights read once for all rows, per-row result bit-identical to
+# the one-row kernel) instead of the Triton rows kernel (fp16 activations, Triton speed). Default on CUDA; HIP keeps Triton until measured on gfx1151.
+# BOLT_FQ_KQ_MROWS=0 restores the Triton rows kernel (A/B); BOLT_FQ_KQ_MROWS=1 on HIP opts in. Read here and in the extension (same variable).
+_KQ_MROWS = os.environ.get("BOLT_FQ_KQ_MROWS", "1" if (torch.version.cuda and not torch.version.hip) else "0") != "0"
+_KQ_MROWS_FORMATS = ("q4_k", "q6_k")
+
 FUSED_ROWS_MAX = 16
 _FUSED = os.environ.get("BOLT_FQ_FUSED", "1") != "0"
 # Cooperative GEMV (fq_gemv.cu: shared-memory x staging, lanes split K):
@@ -238,6 +244,7 @@ class ForeignLinear(Module):
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
         if (_ROWS_TRITON and flat.dtype == torch.half and (_ROWS_TRITON_Q8 or self.format != "q8_0")
+                and not (_KQ_MROWS and self.format in _KQ_MROWS_FORMATS)
                 and triton_rows.supported(self.format, R, K)):
             # 2..16 rows (verify / multi-user): weights read once for all rows (the fq_gemv kernels re-read them per row)
             out = triton_rows.gemv(self.format, flat, self.packed.reshape(self.out_features, -1), self.scales.reshape(self.out_features, -1)
@@ -283,7 +290,7 @@ class ForeignLinear(Module):
             bb = _KQ_BLOCK_BYTES[self.format]
             assert self.packed.shape[1] == (K // 256) * bb, \
                 f"{self.key}: packed width {self.packed.shape[1]} != K={K} ({bb}B)"
-            if _KQ_GEMM and R >= _KQ_GEMM_ROWS:
+            if _KQ_GEMM and R >= _KQ_GEMM_ROWS + (1 if (_KQ_MROWS and self.format in _KQ_MROWS_FORMATS) else 0):   # multi-row kernel covers R == 16 too
                 xuse = flat.half() if flat.dtype != torch.half else flat
                 out = torch.empty((R, N), dtype=dtype, device=dev)
                 _RCH = 2048

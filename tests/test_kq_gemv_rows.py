@@ -42,7 +42,7 @@ def main():
     outs = {}
     for rows in (0, 1, 2, 4, 8, "default"):
         p = os.path.join(tmp, f"r{rows}.pt")
-        env = dict(os.environ, BOLT_FQ_KQ_ROWS=str(rows))
+        env = dict(os.environ, BOLT_FQ_KQ_ROWS=str(rows), BOLT_FQ_KQ_MROWS="0")   # R=3: v2 one-row vs v1 per x-row (multi-row has its own test)
         if rows == "default":
             env.pop("BOLT_FQ_KQ_ROWS")
         subprocess.run([sys.executable, os.path.abspath(__file__), "child", p], check=True, env=env)
