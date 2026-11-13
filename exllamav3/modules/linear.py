@@ -41,6 +41,15 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return w.view(blocks.shape[0], -1).half()
 
 
+def _mxfp4_to_gguf(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """OpenAI MXFP4 (N, G, 16) blocks (byte j = elements 2j | 2j+1 << 4) + (N, G) E8M0 scales -> GGUF MXFP4 rows (N, G * 17):
+    per 32-block the E8M0 byte then 16 bytes with element j in the low nibble and element j + 16 in the high one (ggml block_mxfp4)."""
+    b = blocks.to(torch.uint8)
+    e = torch.stack((b & 0x0F, b >> 4), dim = -1).view(b.shape[0], b.shape[1], 32)     # elements in order
+    q = e[..., :16] | (e[..., 16:] << 4)
+    return torch.cat((scales.to(torch.uint8).unsqueeze(-1), q), dim = -1).reshape(b.shape[0], -1).contiguous()
+
+
 def _scale_block(n: int, s: int, block: int | None) -> int:
     """Block length along an axis of n elements covered by s scales (config block first, else exact division)."""
     if block and -(-n // block) == s:
@@ -67,6 +76,34 @@ def apply_scale_grid(w: torch.Tensor, scale: torch.Tensor, block: tuple | None =
         return (w.view(sr, bo, sc, bi) * scale.view(sr, 1, sc, 1)).view(rows, cols)
     full = scale.repeat_interleave(bo, 0).repeat_interleave(bi, 1)[:rows, :cols]
     return w * full
+
+
+
+class _ForeignInner:
+    """Linear inner over a ForeignLinear payload (NVFP4 served as stored): the ForeignLinear kernels, Linear's interface."""
+
+    def __init__(self, fl, bias):
+        self.fl, self.bias = fl, bias
+        self.in_features, self.out_features = fl.in_features, fl.out_features
+        self.bc = None
+        self._pinned_store = None
+        self.swap_device = None
+
+    def unload(self):
+        pass
+
+    def get_tensors(self, key):
+        return self.fl.get_tensors()
+
+    def get_weight_tensor(self):
+        return self.fl._dequant_rows(0, self.out_features).T
+
+    def get_bias_tensor(self):
+        return self.bias
+
+    def forward(self, x, params, out_dtype = None):
+        y = self.fl.forward(x, params, out_dtype)
+        return y + self.bias if self.bias is not None else y
 
 
 class Linear(Module):
@@ -201,6 +238,72 @@ class Linear(Module):
         return self.apply_fp8_scales_(weight, scale_inv)
 
 
+    def load_nvfp4_stored_(self, key: str, dev) -> bool:
+        """NVFP4 linear (ModelOpt weight / weight_scale / weight_scale_2, or compressed-tensors weight_packed / weight_scale /
+        weight_global_scale divisor) kept as stored: the ForeignLinear nvfp4 kernels (fq_gemv_nvfp4 <= 16 rows) instead of the
+        fp16 dequant. quant_type "nvfp4". EXL3_NVFP4_STORED=0 restores the fp16 dequant."""
+        if os.environ.get("EXL3_NVFP4_STORED", "1") == "0" or self.is_sliced or self.weight_scale != 1.0 or self.alt_key and key == self.alt_key:
+            return False
+        stc = self.config.stc
+        if not isinstance(key, str) or not stc.has_tensor(key + ".weight_scale"):
+            return False
+        ws = stc.get_tensor(key + ".weight_scale", dev, optional = True, no_defer = True)
+        if ws is None or ws.dtype != torch.float8_e4m3fn or ws.dim() != 2:
+            return False
+        g = stc.get_tensor(key + ".weight_scale_2", dev, optional = True, no_defer = True)
+        inv = g is None
+        if inv:
+            g = stc.get_tensor(key + ".weight_global_scale", dev, optional = True, no_defer = True)
+        if g is None:
+            return False
+        wname = ".weight_packed" if stc.has_tensor(key + ".weight_packed") else ".weight"
+        packed = stc.get_tensor(key + wname, dev, no_defer = True).contiguous().view(torch.uint8)
+        N, K = self.out_features, self.in_features
+        if tuple(packed.shape) != (N, K // 2) or tuple(ws.shape) != (N, K // 16) or K % 512:
+            return False
+        from .foreign_linear import ForeignLinear
+        fl = ForeignLinear(self.config, self.key, K, N, "nvfp4", out_dtype = self.out_dtype)
+        fl.packed, fl.scales = packed, ws.contiguous().view(torch.uint8)
+        gv = float(g.float().reshape(-1)[0].item())
+        fl.global_scale = 1.0 / gv if inv else gv
+        bias = stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, no_defer = True)
+        self.used_alt_key = key == self.alt_key
+        self.inner = _ForeignInner(fl, bias)
+        self.quant_type = "nvfp4"
+        return True
+
+    def load_fp8_stored_(self, key: str, dev, has_scale: bool, has_scale_inv: bool) -> bool:
+        """FP8 E4M3 linear kept as stored (quant_type "fp8", modules/quant/fp8.py): one byte per weight instead of the fp16 dequant.
+        Per-row / per-tensor weight_scale or the weight_scale_inv block grid. EXL3_FP8_STORED=0 restores the fp16 dequant."""
+        if os.environ.get("EXL3_FP8_STORED", "1") == "0" or self.is_sliced or self.weight_scale != 1.0 or not (has_scale or has_scale_inv):
+            return False
+        stc = self.config.stc
+        w = stc.get_tensor(key + ".weight", dev, no_defer = True)
+        if w.dtype != torch.float8_e4m3fn or tuple(w.shape) != (self.out_features, self.in_features):
+            return False
+        s = stc.get_tensor(key + (".weight_scale" if has_scale else ".weight_scale_inv"), dev, no_defer = True)
+        s = (s.float() - 127.0).exp2() if s.dtype == torch.uint8 else s.float()
+        N, K = w.shape
+        from .quant.fp8 import LinearFP8, ok as fp8_ok
+        if s.numel() == 1:
+            s, grid, block = s.reshape(1).expand(N).contiguous(), False, (1, 1)
+        elif s.dim() == 1 or (s.dim() == 2 and s.shape == (N, 1)):
+            s, grid, block = s.reshape(N).contiguous(), False, (1, 1)
+        elif s.dim() == 2:
+            qb = self.quant_block_()
+            block = (_scale_block(N, s.shape[0], qb[0] if qb else None), _scale_block(K, s.shape[1], qb[1] if qb else None))
+            grid = True
+            if not fp8_ok(N, K, grid, block):
+                return False
+        else:
+            return False
+        bias = stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, no_defer = True)
+        self.used_alt_key = key == self.alt_key
+        self.inner = LinearFP8(K, N, w.view(torch.uint8), s, grid, block, bias, self.out_dtype, key = self.key)
+        self.quant_type = "fp8"
+        return True
+
+
     # NVFP4: packed e2m1 (U8 [out, in/2], low nibble first) x E4M3 scale per 16 inputs x one fp32 global scale.
     # ModelOpt: weight / weight_scale / weight_scale_2 (multiplier); compressed-tensors: weight_packed /
     # weight_scale / weight_global_scale (divisor). Returns (out, in) fp16 in checkpoint orientation, or None.
@@ -266,6 +369,8 @@ class Linear(Module):
                 dev = "cpu" if self.is_sliced else self.device
                 pad1 = (self.out_features,) if not self.is_sliced else None
                 pad2 = (self.in_features, self.out_features) if not self.is_sliced else None
+                if self.load_nvfp4_stored_(key, dev):
+                    return True
                 scale_q = self.config.stc.get_tensor(key + ".scale", dev, optional = True, no_defer = True)
                 nv = self.dequant_nvfp4_(key, dev) if scale_q is None and self.config.stc.has_tensor(key + ".weight_scale") else None
                 if nv is None and scale_q is None and self.config.stc.has_tensor(key + ".weight_scale"):
@@ -302,6 +407,8 @@ class Linear(Module):
                         scale_inv = (scale_inv.float() - 127.0).exp2()
                     if scale is not None and scale.dtype == torch.uint8:
                         scale = (scale.float() - 127.0).exp2()
+                    if self.load_fp8_stored_(key, dev, scale is not None, scale_inv is not None):
+                        return True
                     no_defer = self.no_defer_load or scale is not None or scale_inv is not None or self.weight_scale != 1.0
                     weight = self.config.stc.get_tensor(key + ".weight", dev, float2half = True, transpose = self.transposed_load, pad_to = pad2, no_defer = no_defer)
                     bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, pad_to = pad1, no_defer = no_defer)
@@ -410,6 +517,22 @@ class Linear(Module):
                 scales = scales[sl].contiguous()
                 if bias is not None:
                     bias = bias[sl].contiguous()
+            if os.environ.get("EXL3_MXFP4_STORED", "1") != "0" and self.weight_scale == 1.0 and not self.is_sliced \
+                    and blocks.shape[0] <= self.out_features and blocks.shape[1] * 32 <= self.in_features and self.in_features % 32 == 0:
+                # kept as stored: the ForeignLinear mxfp4 kernels (GGUF block layout, same E8M0 bytes) instead of the fp16 dequant.
+                # The engine pads both dims to 128 (gpt-oss 2880 -> 2944): zero blocks / zero rows (weight 0, bias 0) fill the pad.
+                from .foreign_linear import ForeignLinear
+                pk = _mxfp4_to_gguf(blocks, scales)
+                Kb, Kp = blocks.shape[1], self.in_features // 32
+                if Kp > Kb:
+                    pk = torch.cat((pk, torch.zeros((pk.shape[0], (Kp - Kb) * 17), dtype = torch.uint8, device = pk.device)), dim = 1)
+                if self.out_features > pk.shape[0]:
+                    pk = torch.cat((pk, torch.zeros((self.out_features - pk.shape[0], pk.shape[1]), dtype = torch.uint8, device = pk.device)), dim = 0)
+                fl = ForeignLinear(self.config, self.key, self.in_features, self.out_features, "mxfp4", out_dtype = self.out_dtype)
+                fl.packed = pk.contiguous()
+                self.inner = _ForeignInner(fl, self.pad_out(bias).half() if bias is not None else None)
+                self.quant_type = "mxfp4"
+                return True
             weight = _mxfp4_dequant(blocks, scales)
             weight = weight.T.contiguous()
             weight = self.pad_out(weight)
@@ -546,9 +669,30 @@ class Linear(Module):
         keys = [self.key]
         if self.alt_key:
             keys += [self.alt_key]
+        if any(self.load_gguf_(k, device) for k in keys): return
         if any(self.load_exl3(k) for k in keys): return
         if any(self.load_fp16(k) for k in keys): return
         raise ValueError(f"No tensors found for {self.key} matching supported quantization format.")
+
+    def load_gguf_(self, key, dev) -> bool:
+        """GGUF backing store (config.gguf + config.gguf_formats): a weight stored in a ggml quant format loads as a ForeignLinear
+        (kernels on the stored blocks, no dequant); fp / bf16 tensors go on to load_fp16 as before."""
+        g, fm = getattr(self.config, "gguf", None), getattr(self.config, "gguf_formats", None)
+        if g is None or not fm or not isinstance(key, str) or self.is_sliced or self.weight_scale != 1.0:
+            return False
+        gname = g.name_map.get(key + ".weight")
+        gname = gname[0] if isinstance(gname, tuple) else gname
+        fmt = fm.get(gname) if gname else None
+        if fmt is None or fmt == "fp" or fmt.startswith("unk"):
+            return False
+        from .foreign_linear import ForeignLinear
+        fl = ForeignLinear(self.config, key, self.in_features, self.out_features, fmt, out_dtype = self.out_dtype)
+        fl.load(dev)
+        bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, no_defer = True)
+        self.used_alt_key = key == self.alt_key
+        self.inner = _ForeignInner(fl, bias)
+        self.quant_type = fmt
+        return True
 
 
     @override

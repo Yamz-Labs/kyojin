@@ -1943,7 +1943,7 @@ __device__ __forceinline__ float block_sum(float v, float* red)
 constexpr int NORM_MAX_PER_THREAD = 32;
 
 // mode 0: y = norm(x) (* w); 1: y += norm(x); 2 (res_in): r += x, y = norm(r)
-template <typename TX, typename TY, typename TR>
+template <typename TX, typename TY, typename TR, int PER>
 __global__ __launch_bounds__(256)
 void rms_norm_kernel(const TX* __restrict__ x, const void* w, int wtype, TY* y, TR* r, int dim,
                      float eps, float constant_bias, float constant_scale, int mode)
@@ -1953,12 +1953,12 @@ void rms_norm_kernel(const TX* __restrict__ x, const void* w, int wtype, TY* y, 
     x += row * dim;
     y += row * dim;
     if (r) r += row * dim;
-    float v[NORM_MAX_PER_THREAD];
-    float wv[NORM_MAX_PER_THREAD];
+    float v[PER];
+    float wv[PER];
     float ss = 0.0f;
     // weights and (mode 1) the old output are fetched up front, in the same memory round trip as x
     #pragma unroll
-    for (int j = 0; j < NORM_MAX_PER_THREAD; ++j)
+    for (int j = 0; j < PER; ++j)
     {
         const int i = threadIdx.x + j * 256;
         wv[j] = 0.0f;
@@ -1967,15 +1967,15 @@ void rms_norm_kernel(const TX* __restrict__ x, const void* w, int wtype, TY* y, 
             wv[j] = wtype ? ld_w(w, wtype, i) + constant_bias : 1.0f;
         }
     }
-    float yo[NORM_MAX_PER_THREAD];
+    float yo[PER];
     #pragma unroll
-    for (int j = 0; j < NORM_MAX_PER_THREAD; ++j)
+    for (int j = 0; j < PER; ++j)
     {
         const int i = threadIdx.x + j * 256;
         yo[j] = (mode == 1 && i < dim) ? ld_f<TY>(y, i) : 0.0f;
     }
     #pragma unroll
-    for (int j = 0; j < NORM_MAX_PER_THREAD; ++j)
+    for (int j = 0; j < PER; ++j)
     {
         const int i = threadIdx.x + j * 256;
         if (i < dim)
@@ -1993,7 +1993,7 @@ void rms_norm_kernel(const TX* __restrict__ x, const void* w, int wtype, TY* y, 
     }
     const float scale = rsqrtf(block_sum(ss, red) / (float) dim + eps) * constant_scale;
     #pragma unroll
-    for (int j = 0; j < NORM_MAX_PER_THREAD; ++j)
+    for (int j = 0; j < PER; ++j)
     {
         const int i = threadIdx.x + j * 256;
         if (i < dim)
@@ -2007,6 +2007,19 @@ void rms_norm_kernel(const TX* __restrict__ x, const void* w, int wtype, TY* y, 
 }
 
 // ------------------------------------------------------------------------------------------------
+// PER = values per thread: the smallest of 8 / 16 / 32 that covers the row (256 threads), same arithmetic for every PER.
+template <typename TX, typename TY, typename TR>
+static void rn_launch(int rows, cudaStream_t stream, const TX* x, const void* w, int wtype, TY* y, TR* r, int dim,
+                      float eps, float constant_bias, float constant_scale, int mode)
+{
+    if (dim <= 256 * 8)
+        rms_norm_kernel<TX, TY, TR, 8><<<rows, 256, 0, stream>>>(x, w, wtype, y, r, dim, eps, constant_bias, constant_scale, mode);
+    else if (dim <= 256 * 16)
+        rms_norm_kernel<TX, TY, TR, 16><<<rows, 256, 0, stream>>>(x, w, wtype, y, r, dim, eps, constant_bias, constant_scale, mode);
+    else
+        rms_norm_kernel<TX, TY, TR, NORM_MAX_PER_THREAD><<<rows, 256, 0, stream>>>(x, w, wtype, y, r, dim, eps, constant_bias, constant_scale, mode);
+}
+
 // Host side
 
 // k-tiles per wave (ktw). Measured on gfx1151 at MiMo shapes (tools/decode/sweep.py): the best
@@ -3391,7 +3404,7 @@ void exl3_dec_rms_norm
         TORCH_CHECK(r.has_value() && r->is_contiguous() && r->numel() == x.numel(), "exl3_dec_rms_norm: residual");
         const bool fr = r->dtype() == at::kFloat;
         TORCH_CHECK(fr || r->dtype() == at::kHalf, "exl3_dec_rms_norm: residual dtype");
-        #define RN_LAUNCH(TX, TY, TR) rms_norm_kernel<TX, TY, TR><<<rows, 256, 0, stream>>>( \
+        #define RN_LAUNCH(TX, TY, TR) rn_launch<TX, TY, TR>(rows, stream, \
             reinterpret_cast<const TX*>(x.data_ptr()), wp, wtype, reinterpret_cast<TY*>(y.data_ptr()), \
             reinterpret_cast<TR*>(r->data_ptr()), dim, e, cb, cs, 2)
         if (fx && fr && !fy) RN_LAUNCH(float, half, float);
@@ -3403,7 +3416,7 @@ void exl3_dec_rms_norm
     }
     else
     {
-        #define RN_LAUNCH(TX, TY) rms_norm_kernel<TX, TY, float><<<rows, 256, 0, stream>>>( \
+        #define RN_LAUNCH(TX, TY) rn_launch<TX, TY, float>(rows, stream, \
             reinterpret_cast<const TX*>(x.data_ptr()), wp, wtype, reinterpret_cast<TY*>(y.data_ptr()), \
             nullptr, dim, e, cb, cs, (int) mode)
         if (fx && fy) RN_LAUNCH(float, float);

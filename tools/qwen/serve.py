@@ -848,7 +848,14 @@ class QwenEngine:
             else:
                 print(f"qserve: kv-mode tq: k{k_bits}v{v_bits} at head_dim {hd} has no TurboQuant codebook, keeping the quant cache", flush=True)
         # one recurrent (GDN) slot per session; the Generator caps its batch at the slot count
-        self.cache = Cache(self.model, max_num_tokens=ctx, max_history=max(3, ndt), max_batch_size=sessions, **qkw)
+        # Recurrent (GDN) state history rows exist only for speculative verify rounds (draft_tokens is not None). Each row costs
+        # sessions x 32 x 128 x 128 x 4 B = 0.5 MiB per session and layer: ndt 7 on the 35B-A3B (30 GDN layers, 8 sessions) is 3.75 GiB
+        # of fp32 state, which is what made the UD-Q4_K_XL GGUF (20.3 GiB of weights on the GPU) miss a 24 GB card. Without a drafter
+        # and without the plain lookup nothing writes history: keep the committed-state row only.
+        hist = max(3, ndt) if (draft_policy != "off" or pl is not None) else 0
+        if os.environ.get("KYO_GDN_HISTORY"):   # A/B override
+            hist = int(os.environ["KYO_GDN_HISTORY"])
+        self.cache = Cache(self.model, max_num_tokens=ctx, max_history=hist, max_batch_size=sessions, **qkw)
         if qkw.get("layer_type") is not None and getattr(qkw["layer_type"], "tq", False):
             from exllamav3.cache.tq import cache_is_tq
             if not cache_is_tq(self.cache):

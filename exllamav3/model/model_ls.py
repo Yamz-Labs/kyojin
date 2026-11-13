@@ -290,6 +290,9 @@ class Model_LSMixin(ABC):
                                         f"margin (EXL3_AUTOSPLIT_MARGIN_MB)"
                                     )
 
+                        if os.environ.get("EXL3_LOAD_DIAG") and load_device.type == "cuda":
+                            print(f"[loaddiag] {idx:3d} {module.key:48s} alloc {torch.cuda.memory_allocated(load_device)/2**30:7.3f}G "
+                                  f"reserved {torch.cuda.memory_reserved(load_device)/2**30:7.3f}G peak {torch.cuda.max_memory_allocated(load_device)/2**30:7.3f}G", flush=True)
                         # Account for max_output_factor after last layer
                         extra_dummy_out_states = None
                         if is_logits_layer:
@@ -317,6 +320,20 @@ class Model_LSMixin(ABC):
                             "HIP out of memory" in str(e):
                             # Exception object will hold references to tensors so we can't free them here
                             fail = True
+                            if os.environ.get("EXL3_LOAD_DIAG"):
+                                import gc, collections
+                                agg = collections.defaultdict(lambda: [0, 0]); seen = set()
+                                for o in gc.get_objects():
+                                    try:
+                                        if isinstance(o, torch.Tensor) and o.is_cuda:
+                                            ptr = o.untyped_storage().data_ptr()
+                                            if ptr in seen: continue
+                                            seen.add(ptr)
+                                            a = agg[(str(o.dtype), tuple(o.shape))]; a[0] += 1; a[1] += o.untyped_storage().nbytes()
+                                    except Exception: pass
+                                print(f"[loaddiag] OOM at {module.key}: live CUDA storages {sum(v[1] for v in agg.values())/2**30:.3f} GiB, allocated {torch.cuda.memory_allocated()/2**30:.3f}", flush=True)
+                                for k, v in sorted(agg.items(), key=lambda kv: -kv[1][1])[:25]:
+                                    print(f"[loaddiag]   {v[1]/2**20:10.1f} MiB  n={v[0]:5d}  {k[0]} {k[1]}", flush=True)
                         else:
                             raise
 

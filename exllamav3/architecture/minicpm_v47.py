@@ -39,7 +39,9 @@ MCPM_ARCH = "MiniCPMV4_7ForConditionalGeneration"
 MCPM_GGUF_ENV = "MCPM_GGUF"
 MCPM_FOREIGN = os.environ.get("MCPM_FOREIGN", "1") != "0"
 
-_GGML_FMT = {12: "q4_k", 13: "q5_k", 14: "q6_k", 23: "iq4_xs", 8: "q8_0", 0: "fp", 1: "fp"}
+_GGML_FMT = {12: "q4_k", 13: "q5_k", 14: "q6_k", 23: "iq4_xs", 8: "q8_0", 0: "fp", 1: "fp",
+             # ForeignLinear gap formats (fused Triton decode, torch dequant otherwise): unsloth UD-IQ packs mix these into the experts
+             16: "iq2_xxs", 17: "iq2_xs", 18: "iq3_xxs", 21: "iq3_s", 22: "iq2_s", 20: "iq4_nl", 2: "q4_0", 6: "q5_0", 7: "q5_1", 10: "q2_k", 11: "q3_k"}
 
 P = "model.language_model"
 
@@ -106,9 +108,12 @@ class MiniCPMV47Config(Config):
         self.linear_key_head_dim = self.read_cfg(int, pfx("linear_key_head_dim"), 128)
         self.linear_value_head_dim = self.read_cfg(int, pfx("linear_value_head_dim"), 128)
         self.assert_cfg(str, pfx("hidden_act"), "silu", True)
-        self.moe_intermediate_size = self.read_cfg(int, pfx("moe_intermediate_size"), no_default)
-        self.num_experts = self.read_cfg(int, pfx("num_experts"), no_default)
-        self.num_experts_per_tok = self.read_cfg(int, pfx("num_experts_per_tok"), no_default)
+        # dense variant (gguf qwen35): intermediate_size and no experts; the MoE fields stay None
+        self.intermediate_size = self.read_cfg(int, pfx("intermediate_size"), None)
+        moe_def = None if self.intermediate_size else no_default
+        self.moe_intermediate_size = self.read_cfg(int, pfx("moe_intermediate_size"), moe_def)
+        self.num_experts = self.read_cfg(int, pfx("num_experts"), moe_def)
+        self.num_experts_per_tok = self.read_cfg(int, pfx("num_experts_per_tok"), moe_def)
         self.shared_expert_intermediate_size = self.read_cfg(
             int, pfx("shared_expert_intermediate_size"), 512)
         self.rms_norm_eps = self.read_cfg(float, pfx("rms_norm_eps"), no_default)
@@ -153,10 +158,10 @@ class MiniCPMV47Config(Config):
     def _load_embedding_override(self):
         # token_embd dequantized to fp16 once (~1 GB) and served as an
         # in-memory override under the engine key (vectorized numpy, no
-        # per-block Python). Format-generic (IQ4_XS / Q4_K).
-        from ..foreign_quant.k_quants import dequant_iq4_xs_bulk, dequant_q4_K_bulk
+        # per-block Python). Format-generic (IQ4_XS / Q4_K / Q6_K / Q8_0).
+        from ..foreign_quant.k_quants import dequant_iq4_xs_bulk, dequant_q4_K_bulk, dequant_q6_K_bulk
         ty, dims, off = self.gguf.infos["token_embd.weight"]
-        bbs = {23: 136, 12: 144, 8: 34}
+        bbs = {23: 136, 12: 144, 14: 210, 8: 34}
         assert ty in bbs, f"token_embd type {ty}"
         bb = bbs[ty]
         K, N = dims[0], dims[1]
@@ -170,7 +175,7 @@ class MiniCPMV47Config(Config):
         assert K % 256 == 0
         raw = self.gguf._pread(off, N * (K // 256) * bb).reshape(N, (K // 256) * bb)
         nb = N * (K // 256)
-        bulk = dequant_iq4_xs_bulk if ty == 23 else dequant_q4_K_bulk
+        bulk = {23: dequant_iq4_xs_bulk, 12: dequant_q4_K_bulk, 14: dequant_q6_K_bulk}[ty]
         w = bulk(raw.reshape(nb, bb)).reshape(N, K)
         self.gguf.new_tensors = {
             f"{P}.embed_tokens.weight": torch.from_numpy(np.ascontiguousarray(w))}
@@ -358,6 +363,16 @@ class MiniCPMV47TextModel(Model):
 
     @staticmethod
     def _moe(config, L, G, H):
+        if config.num_experts is None:          # dense block (gguf qwen35): one gated MLP
+            I = config.intermediate_size
+            mlp = GatedMLP(
+                config=config, key=f"{L}.mlp", hidden_size=H, intermediate_size=I,
+                qmap="block.mlp", interm_dtype=torch.half, out_dtype=torch.float, select_hq_bits=2,
+                gates=[_fl(config, f"{G}.ffn_gate", H, I)], ups=[_fl(config, f"{G}.ffn_up", H, I)],
+                downs=[_fl(config, f"{G}.ffn_down", I, H, out_dtype=torch.float)])
+            for m in mlp.gates + mlp.ups + mlp.downs:
+                mlp.register_submodule(m)
+            return mlp
         I = config.moe_intermediate_size
         E = config.num_experts
         if MCPM_FOREIGN:

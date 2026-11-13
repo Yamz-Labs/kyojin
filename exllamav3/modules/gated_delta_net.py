@@ -15,6 +15,7 @@ from ..cache import Cache
 from ..util.tensor import g_tensor_cache
 from .multilinear import SlicedMultiLinear
 import os
+_QZCAT = os.environ.get("EXL3_GDN_QZCAT", "1" if torch.version.hip else "0") != "0"   # GGUF Q8_0 qkv + z decode in one launch (project_qkvz_q8cat)
 
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
@@ -1008,6 +1009,7 @@ class GatedDeltaNet(Module):
                 self.conv1d_v_weight = self.config.stc.get_tensor(self.key_conv1d_v_weight, self.device, optional = False, allow_bf16 = True, no_defer = True)
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
+        self._q8cat_build()
 
 
     @override
@@ -1023,6 +1025,7 @@ class GatedDeltaNet(Module):
         self.ba_weight_filled = False
         self.multi_qkvz = None
         self.prealloc_qkvz_carrier = None
+        self._q8cat_w = None
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
@@ -1133,6 +1136,44 @@ class GatedDeltaNet(Module):
         qkv, z = dec_proj_multi(lins, x, rows)
         return (qkv.view(bsz, seqlen, -1), z.view(bsz, seqlen, -1))
 
+
+    def _q8cat_build(self):
+        """GGUF Q8_0 qkv + z weights as one [nq + nz, row] tensor, both ForeignLinears re-pointed to views of it (same bytes, no
+        copy kept). Done at load, before any decode graph is captured. Nothing for other formats."""
+        self._q8cat_w = None
+        if not _QZCAT or self.qkv_proj is None or self.z_proj is None:
+            return
+        from .foreign_linear import ForeignLinear
+        fq, fz = self.qkv_proj, self.z_proj
+        if not (isinstance(fq, ForeignLinear) and isinstance(fz, ForeignLinear) and fq.format == "q8_0" and fz.format == "q8_0"
+                and fq.in_features == fz.in_features and fq.packed is not None and fz.packed is not None
+                and fq.packed.device == fz.packed.device and fq.packed.dtype == torch.uint8 and fz.packed.dtype == torch.uint8):
+            return
+        nq, nz = fq.out_features, fz.out_features
+        sq, sz = fq.packed.shape, fz.packed.shape
+        cat = torch.cat([fq.packed.reshape(nq, -1), fz.packed.reshape(nz, -1)], dim = 0)
+        fq.packed = cat[:nq].view(sq)
+        fz.packed = cat[nq:].view(sz)
+        self._q8cat_w = cat
+        if not getattr(GatedDeltaNet, "_q8cat_said", False):
+            GatedDeltaNet._q8cat_said = True
+            print(f" -- GDN qkv + z Q8_0 decode rows concatenated ({nq} + {nz})", flush = True)
+
+    def project_qkvz_q8cat(self, x: torch.Tensor, params: dict, qkv_dt, z_dt, bsz: int, seqlen: int):
+        """GGUF Q8_0 qkv + z of one decode row in ONE fq_gemv_q8_0 launch over the rows concatenated at load (_q8cat_build): one q8_1
+        quant and one launch instead of two, the same per-row dot: bit-exact. None = fall back to the two projections."""
+        cat = getattr(self, "_q8cat_w", None)
+        if cat is None or bsz * seqlen != 1 or not x.is_contiguous() or "capture" in params or "ovr" in params:
+            return None
+        fq, fz = self.qkv_proj, self.z_proj
+        flat = x.reshape(1, -1)
+        dq = qkv_dt or fq.out_dtype or torch.half
+        if dq != (z_dt or fz.out_dtype or torch.half) or not (fq.q8_fused_gemv_ok(flat) and fz.q8_fused_gemv_ok(flat)):
+            return None
+        nq, nz = fq.out_features, fz.out_features
+        out = torch.empty((1, nq + nz), dtype = dq, device = x.device)
+        ext.fq_gemv_q8_0(flat, cat.view(nq + nz, -1, 34), out)
+        return out[:, :nq].view(bsz, seqlen, nq), out[:, nq:].view(bsz, seqlen, nz)
 
     def _ab_cat(self, x: torch.Tensor, params: dict, bsz: int, seqlen: int):
         """decode b and a skinny projections in ONE launch (ext.skinny_cat_w, same per-column reduction order as the two
@@ -1791,8 +1832,12 @@ class GatedDeltaNet(Module):
             else:
                 qkv_dt = torch.half if self._pfe_f16_out(self.qkv_proj, x, params, "EXL3_PFE_QKVZ") else None
                 z_dt = torch.half if self._pfe_f16_out(self.z_proj, x, params, "EXL3_PFE_QKVZ") else None
-                qkv = self.qkv_proj.forward(x, params, qkv_dt)
-                z = self.z_proj.forward(x, params, z_dt)
+                qz8 = self.project_qkvz_q8cat(x, params, qkv_dt, z_dt, bsz, seqlen)
+                if qz8 is not None:
+                    qkv, z = qz8
+                else:
+                    qkv = self.qkv_proj.forward(x, params, qkv_dt)
+                    z = self.z_proj.forward(x, params, z_dt)
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
             if not ab_first and qzab is None:
                 _c = getattr(self, "_qd3_ba", None)
@@ -1868,7 +1913,8 @@ class GatedDeltaNet(Module):
                 _kd2 = 2 * self.k_dim
                 _q = _mq[..., :self.k_dim]
                 _k = _mq[..., self.k_dim:_kd2]
-                _mq = torch.cat([_q, _q, _k, _k, _mq[..., _kd2:]], dim=-1)
+                _r = self.num_v_heads // self.num_k_heads             # 2 on the 35B-A3B, 3 on the dense 27B (48 v / 16 k)
+                _mq = torch.cat([_q] * _r + [_k] * _r + [_mq[..., _kd2:]], dim=-1)
                 _nk, _kd = self.num_v_heads, self.v_dim
             core_attn_out = gated_delta_rule_fn(
                 mixed_qkv = _mq,

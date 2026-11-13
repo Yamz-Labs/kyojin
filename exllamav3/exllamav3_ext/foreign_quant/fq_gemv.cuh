@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cuda_fp16.h>
 #include "fq_dequant.cuh"
+#include "fq_iq3_tables.cuh"
 
 namespace {
 
@@ -79,6 +80,11 @@ __device__ __forceinline__ int fq_dp4a(int a, int b, int c)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
     return __dp4a(a, b, c);
+#elif defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+      defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1200__) || defined(__gfx1201__))
+    // RDNA3 / RDNA3.5 / RDNA4: v_dot4_i32_iu8, signed x signed, no clamp (same call as llama.cpp ggml-cuda/common.cuh
+    // ggml_cuda_dp4a, MIT). Exact integer dot: same results as the scalar arm below, which the compiler only sometimes fused.
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #else
     const int8_t* a8 = reinterpret_cast<const int8_t*>(&a);
     const int8_t* b8 = reinterpret_cast<const int8_t*>(&b);
@@ -923,6 +929,146 @@ __device__ __forceinline__ void fq_q4k_scales(const uint8_t* __restrict__ sc12,
 // Q4_K q8_1 lane dot: per-thread partial over 16-elem sub-chunks
 // (t = c & 15 within each 256-block b = c >> 4). Same integer arithmetic
 // and op order as ggml vec_dot_q4_K_q8_1 (vmmq arm).
+
+// IQ3_XXS q8_1 lane dot (port of ggml vec_dot_iq3_xxs_q8_1, llama.cpp ggml-cuda/vecdotq.cuh, MIT): block = fp16 d, 64 grid indices,
+// 8 x uint32 (4 x 7-bit sign index | 4-bit scale << 28). One lane takes 32-element chunks round-robin; per chunk 4 pairs of grid
+// entries, signs applied bytewise without borrow (grid bytes are >= 4), 8 dp4a against the q8_1 chunk, then ggml's (ls*s + s/2)/2.
+#define FQ_IQ3_XXS_BYTES 98
+__device__ float fq_dot_iq3_xxs_q8(const uint8_t* __restrict__ wr,
+                                   const uint8_t* __restrict__ aqb,
+                                   int K, int tid, int nthreads)
+{
+    int nchunks = K / 32;
+    float acc = 0.0f;
+    for (int c = tid; c < nchunks; c += nthreads)
+    {
+        const uint8_t* blk = wr + (size_t)(c >> 3) * FQ_IQ3_XXS_BYTES;
+        int sub = c & 7;
+        __half dwh;
+        memcpy(&dwh, blk, 2);
+        const uint8_t* q3 = blk + 2 + sub * 8;
+        uint32_t aux32;
+        memcpy(&aux32, blk + 2 + 64 + sub * 4, 4);
+        __half dah;
+        memcpy(&dah, aqb + (size_t)c * FQ_Q8_1_BYTES, 2);
+        const int32_t* aq32 = reinterpret_cast<const int32_t*>(aqb + (size_t)c * FQ_Q8_1_BYTES + 4);
+        int sumi = 0;
+        #pragma unroll
+        for (int p = 0; p < 4; p++)
+        {
+            uint32_t si = (aux32 >> (7 * p)) & 127u;
+            uint32_t slo = FQ_IQ3XXS_SIGNS32[2 * si];
+            uint32_t shi = FQ_IQ3XXS_SIGNS32[2 * si + 1];
+            uint32_t w0 = (FQ_IQ3XXS_GRID[q3[2 * p]] ^ slo) + (slo & 0x01010101u);
+            uint32_t w1 = (FQ_IQ3XXS_GRID[q3[2 * p + 1]] ^ shi) + (shi & 0x01010101u);
+            sumi = fq_dp4a((int32_t)w0, aq32[2 * p], sumi);
+            sumi = fq_dp4a((int32_t)w1, aq32[2 * p + 1], sumi);
+        }
+        int ls = (int)(aux32 >> 28);
+        sumi = (ls * sumi + sumi / 2) / 2;
+        acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(__half2float(dwh), __half2float(dah)), (float)sumi));
+    }
+    return acc;
+}
+
+
+// IQ2_S q8_1 lane dot (port of ggml vec_dot_iq2_s_q8_1, llama.cpp ggml-cuda/vecdotq.cuh, MIT): block = fp16 d, 32 grid low bytes,
+// 32 sign bytes, 8 qh (2 high index bits per grid entry), 8 scales (4-bit, one per 16 elements). One lane takes 32-element chunks
+// round-robin; per chunk 4 grid entries of 8, explicit sign bytes applied without borrow (grid bytes are >= 8), 8 dp4a, then
+// ggml's (s0*ls0 + s1*ls1 + (s0 + s1)/2)/4.
+#define FQ_IQ2_S_BYTES 82
+__device__ __forceinline__ uint32_t fq_sign_mask4(uint32_t b)
+{
+    return ((b * 0x00204081u) & 0x01010101u) * 0xFFu;   // bit i of the low nibble -> byte i = 0xFF
+}
+__device__ float fq_dot_iq2_s_q8(const uint8_t* __restrict__ wr,
+                                 const uint8_t* __restrict__ aqb,
+                                 int K, int tid, int nthreads)
+{
+    int nchunks = K / 32;
+    float acc = 0.0f;
+    for (int c = tid; c < nchunks; c += nthreads)
+    {
+        const uint8_t* blk = wr + (size_t)(c >> 3) * FQ_IQ2_S_BYTES;
+        int j = c & 7;
+        __half dwh;
+        memcpy(&dwh, blk, 2);
+        const uint8_t* qs = blk + 2 + j * 4;
+        const uint8_t* sg = blk + 2 + 32 + j * 4;
+        uint32_t qh = blk[2 + 64 + j];
+        uint32_t sc = blk[2 + 72 + j];
+        __half dah;
+        memcpy(&dah, aqb + (size_t)c * FQ_Q8_1_BYTES, 2);
+        const int32_t* aq32 = reinterpret_cast<const int32_t*>(aqb + (size_t)c * FQ_Q8_1_BYTES + 4);
+        int sumi0 = 0, sumi1 = 0;
+        #pragma unroll
+        for (int p = 0; p < 4; p++)
+        {
+            uint32_t idx = (uint32_t)qs[p] | ((qh << (8 - 2 * p)) & 0x300u);
+            uint32_t mlo = fq_sign_mask4(sg[p] & 15u);
+            uint32_t mhi = fq_sign_mask4(sg[p] >> 4);
+            uint32_t w0 = (FQ_IQ2S_GRID[2 * idx] ^ mlo) + (mlo & 0x01010101u);
+            uint32_t w1 = (FQ_IQ2S_GRID[2 * idx + 1] ^ mhi) + (mhi & 0x01010101u);
+            if (p < 2)
+            {
+                sumi0 = fq_dp4a((int32_t)w0, aq32[2 * p], sumi0);
+                sumi0 = fq_dp4a((int32_t)w1, aq32[2 * p + 1], sumi0);
+            }
+            else
+            {
+                sumi1 = fq_dp4a((int32_t)w0, aq32[2 * p], sumi1);
+                sumi1 = fq_dp4a((int32_t)w1, aq32[2 * p + 1], sumi1);
+            }
+        }
+        int sumi = (sumi0 * (int)(sc & 15u) + sumi1 * (int)(sc >> 4) + (sumi0 + sumi1) / 2) / 4;
+        acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(__half2float(dwh), __half2float(dah)), (float)sumi));
+    }
+    return acc;
+}
+
+
+// IQ3_S q8_1 lane dot (port of ggml vec_dot_iq3_s_q8_1, llama.cpp ggml-cuda/vecdotq.cuh, MIT): block = fp16 d, qs[64], qh[8] (9th index
+// bit per grid entry), signs[32], scales[4] (4-bit, one per 32 elements, value 1 + 2 s). One lane takes 32-element chunks round-robin:
+// 8 grid entries of 4, explicit sign bytes applied without borrow (grid bytes are >= 1), 8 dp4a.
+#define FQ_IQ3_S_BYTES 110
+__device__ float fq_dot_iq3_s_q8(const uint8_t* __restrict__ wr,
+                                 const uint8_t* __restrict__ aqb,
+                                 int K, int tid, int nthreads)
+{
+    int nchunks = K / 32;
+    float acc = 0.0f;
+    for (int c = tid; c < nchunks; c += nthreads)
+    {
+        const uint8_t* blk = wr + (size_t)(c >> 3) * FQ_IQ3_S_BYTES;
+        int j = c & 7;
+        __half dwh;
+        memcpy(&dwh, blk, 2);
+        const uint8_t* qs = blk + 2 + j * 8;
+        uint32_t qh = blk[2 + 64 + j];
+        const uint8_t* sg = blk + 2 + 72 + j * 4;
+        uint32_t sc = (blk[2 + 104 + j / 2] >> (4 * (j & 1))) & 15u;
+        __half dah;
+        memcpy(&dah, aqb + (size_t)c * FQ_Q8_1_BYTES, 2);
+        const int32_t* aq32 = reinterpret_cast<const int32_t*>(aqb + (size_t)c * FQ_Q8_1_BYTES + 4);
+        int sumi = 0;
+        #pragma unroll
+        for (int p = 0; p < 4; p++)
+        {
+            uint32_t i0 = (uint32_t)qs[2 * p] | ((qh << (8 - 2 * p)) & 0x100u);
+            uint32_t i1 = (uint32_t)qs[2 * p + 1] | ((qh << (7 - 2 * p)) & 0x100u);
+            uint32_t mlo = fq_sign_mask4(sg[p] & 15u);
+            uint32_t mhi = fq_sign_mask4(sg[p] >> 4);
+            uint32_t w0 = (FQ_IQ3S_GRID[i0] ^ mlo) + (mlo & 0x01010101u);
+            uint32_t w1 = (FQ_IQ3S_GRID[i1] ^ mhi) + (mhi & 0x01010101u);
+            sumi = fq_dp4a((int32_t)w0, aq32[2 * p], sumi);
+            sumi = fq_dp4a((int32_t)w1, aq32[2 * p + 1], sumi);
+        }
+        sumi *= 1 + 2 * (int)sc;
+        acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(__half2float(dwh), __half2float(dah)), (float)sumi));
+    }
+    return acc;
+}
+
 __device__ float fq_dot_q4_k_q8(const uint8_t* __restrict__ wr,
                                const uint8_t* __restrict__ aqb,
                                int K, int tid, int nthreads)
