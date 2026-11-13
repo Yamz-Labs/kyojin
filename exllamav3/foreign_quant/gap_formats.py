@@ -11,9 +11,9 @@ import torch
 from .gguf_tables import IQ3_S_GRID, IQ3_XXS_GRID, IQ4_NL_VALUES, KSIGNS
 
 # name -> (elements per block, bytes per block)
-BLOCKS = {"q8_0": (32, 34), "q4_0": (32, 18), "q5_0": (32, 22), "iq4_nl": (32, 18), "iq3_xxs": (256, 98), "iq3_s": (256, 110), "iq2_xs": (256, 74), "iq2_s": (256, 82), "q3_k": (256, 110), "q2_k": (256, 84),
+BLOCKS = {"q8_0": (32, 34), "q4_0": (32, 18), "q5_0": (32, 22), "q5_1": (32, 24), "iq4_nl": (32, 18), "iq3_xxs": (256, 98), "iq3_s": (256, 110), "iq2_xs": (256, 74), "iq2_s": (256, 82), "q3_k": (256, 110), "q2_k": (256, 84),
           "mxfp4": (32, 17), "nvfp4_gguf": (64, 36)}
-GGML_TYPE_IDS = {"q8_0": 8, "q4_0": 2, "q5_0": 6, "iq3_xxs": 18, "iq4_nl": 20, "iq3_s": 21, "mxfp4": 39, "nvfp4_gguf": 40, "iq2_xs": 17, "iq2_s": 22, "q3_k": 11, "q2_k": 10}
+GGML_TYPE_IDS = {"q8_0": 8, "q4_0": 2, "q5_0": 6, "q5_1": 7, "iq3_xxs": 18, "iq4_nl": 20, "iq3_s": 21, "mxfp4": 39, "nvfp4_gguf": 40, "iq2_xs": 17, "iq2_s": 22, "q3_k": 11, "q2_k": 10}
 # MXFP4 / NVFP4 nibble -> value in half units (the scale carries the other factor 0.5)
 _FP4_HALF = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
@@ -135,6 +135,14 @@ def dequant(fmt: str, raw: torch.Tensor) -> torch.Tensor:
         out = (db.repeat_interleave(2, 1).unsqueeze(-1) * grid * sgn).reshape(nb, 256)
         return out.reshape(raw.shape[0], -1).half()
     d = _f16(b[:, 0:2])                                         # [nb, 1]
+    if fmt == "q5_1":       # [d fp16][m fp16][qh u32][qs 16]: x = d * (low nibble | high bit << 4) + m
+        m = _f16(b[:, 2:4])
+        qs = b[:, 8:24]
+        q = torch.cat([qs & 15, qs >> 4], dim=1).long()
+        qh = b[:, 4:8].contiguous().view(torch.int32).long() & 0xFFFFFFFF
+        hb = _bits(qh.reshape(nb), 32)
+        out = d * (q | (hb << 4)).float() + m
+        return out.reshape(raw.shape[0], -1).half()
     if fmt in ("q4_0", "iq4_nl", "q5_0"):
         qs = b[:, 2:18] if fmt != "q5_0" else b[:, 6:22]
         q = torch.cat([qs & 15, qs >> 4], dim=1).long()         # elements 0..15 low nibbles, 16..31 high nibbles

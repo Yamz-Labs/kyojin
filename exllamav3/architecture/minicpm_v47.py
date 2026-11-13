@@ -41,7 +41,7 @@ MCPM_FOREIGN = os.environ.get("MCPM_FOREIGN", "1") != "0"
 
 _GGML_FMT = {12: "q4_k", 13: "q5_k", 14: "q6_k", 23: "iq4_xs", 8: "q8_0", 0: "fp", 1: "fp",
              # ForeignLinear gap formats (fused Triton decode, torch dequant otherwise): unsloth UD-IQ packs mix these into the experts
-             16: "iq2_xxs", 17: "iq2_xs", 18: "iq3_xxs", 21: "iq3_s", 22: "iq2_s", 20: "iq4_nl", 2: "q4_0", 6: "q5_0", 10: "q2_k", 11: "q3_k"}
+             16: "iq2_xxs", 17: "iq2_xs", 18: "iq3_xxs", 21: "iq3_s", 22: "iq2_s", 20: "iq4_nl", 2: "q4_0", 6: "q5_0", 7: "q5_1", 10: "q2_k", 11: "q3_k"}
 
 P = "model.language_model"
 

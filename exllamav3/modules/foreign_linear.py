@@ -55,11 +55,11 @@ _UNFUSED_ROWS = int(os.environ.get("BOLT_FQ_UNFUSED_ROWS", "8192"))
 _PAIR = os.environ.get("BOLT_FQ_PAIR", "1") != "0"
 
 _FORMATS = ("q8_0", "iq2_xxs", "nvfp4", "q4_k", "q5_k", "q6_k", "iq4_xs",
-            "q4_0", "q5_0", "iq4_nl", "iq3_xxs", "iq3_s", "mxfp4", "nvfp4_gguf", "iq2_xs", "iq2_s", "q3_k", "q2_k")
+            "q4_0", "q5_0", "q5_1", "iq4_nl", "iq3_xxs", "iq3_s", "mxfp4", "nvfp4_gguf", "iq2_xs", "iq2_s", "q3_k", "q2_k")
 # GGUF blocks without a fused kernel yet: torch dequant (foreign_quant/gap_formats.py) + matmul at every width.
 # BOLT_FQ_GAP_FUSED=0 turns the fused Triton decode kernel off (A/B).
 _GAP_FUSED = os.environ.get("BOLT_FQ_GAP_FUSED", "1") != "0"
-_GAP_FORMATS = ("q4_0", "q5_0", "iq4_nl", "iq3_xxs", "iq3_s", "mxfp4", "nvfp4_gguf", "iq2_xs", "iq2_s", "q3_k", "q2_k")
+_GAP_FORMATS = ("q4_0", "q5_0", "q5_1", "iq4_nl", "iq3_xxs", "iq3_s", "mxfp4", "nvfp4_gguf", "iq2_xs", "iq2_s", "q3_k", "q2_k")
 # GGUF K-quant formats: decode (rows < 16) via the q8_1-
 # activation row kernels; prefill (rows >= 16) via the unfused fp16 dequant
 # + cuBLAS GEMM path, one GEMM per call -- i.e. one GEMM per

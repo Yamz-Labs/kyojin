@@ -10,15 +10,15 @@ import torch
 import triton
 import triton.language as tl
 
-FUSED = {"q4_0": 0, "iq4_nl": 1, "mxfp4": 2, "q5_0": 3}
-_BB = {"q4_0": 18, "iq4_nl": 18, "mxfp4": 17, "q5_0": 22}
+FUSED = {"q4_0": 0, "iq4_nl": 1, "mxfp4": 2, "q5_0": 3, "q5_1": 4}
+_BB = {"q4_0": 18, "iq4_nl": 18, "mxfp4": 17, "q5_0": 22, "q5_1": 24}
 MAX_ROWS = 16
 # 32-blocks per loop iteration (static unroll): Strix sweep 11/11 (gap_nb.py, 17408 x 5120) q4_0 NB 8 141 -> 181 GB/s, q5_0 NB 4 156 -> 192;
 # iq4_nl / mxfp4 lose or gain < 5 %: 1. EXL3_GAP_NB forces one value for every format (A/B).
 _NB = {"q4_0": 8, "q5_0": 4} if getattr(__import__("torch").version, "hip", None) else {}
 GAP_NB = int(__import__("os").environ.get("EXL3_GAP_NB", "0"))
 # (BN, num_warps) per format, from a 3090 sweep at N=12288, K=4096, 4 rows
-_CFG = {"q4_0": (32, 1), "q5_0": (32, 1), "mxfp4": (32, 1), "iq4_nl": (16, 1)}
+_CFG = {"q4_0": (32, 1), "q5_0": (32, 1), "q5_1": (32, 1), "mxfp4": (32, 1), "iq4_nl": (16, 1)}
 # Strix Halo (gfx1151) sweep 11/11 (gap_tiles.py, 17408 x 5120, R1 / R4): q4_0 117 -> 136-139 GB/s at (16, 1), q5_0 133 -> 152-156 at (64, 4)
 if getattr(__import__("torch").version, "hip", None) and __import__("os").environ.get("EXL3_GAP_HIP_CFG", "1") != "0":
     _CFG.update({"q4_0": (16, 1), "q5_0": (64, 4), "iq4_nl": (64, 2)})
@@ -67,6 +67,8 @@ def _gemv32(x_ptr, w_ptr, o_ptr, R, K, N, FMT: tl.constexpr, BB: tl.constexpr, B
             qoff = 2
             if FMT == 3:
                 qoff = 6
+            if FMT == 4:
+                qoff = 8
         qs = tl.load(w_ptr + base[:, None] + qoff + j[None, :]).to(tl.int32)
         lo = qs & 15
         hi = qs >> 4
@@ -79,13 +81,25 @@ def _gemv32(x_ptr, w_ptr, o_ptr, R, K, N, FMT: tl.constexpr, BB: tl.constexpr, B
         elif FMT == 2:
             wl = _fp4half(lo)
             wh = _fp4half(hi)
-        else:
+        elif FMT == 3:
             qh = tl.load(w_ptr + base + 2).to(tl.int32) | (tl.load(w_ptr + base + 3).to(tl.int32) << 8) \
                 | (tl.load(w_ptr + base + 4).to(tl.int32) << 16) | (tl.load(w_ptr + base + 5).to(tl.int32) << 24)
             wl = ((lo | (((qh[:, None] >> j[None, :]) & 1) << 4)) - 16).to(tl.float32)
             wh = ((hi | (((qh[:, None] >> (j[None, :] + 16)) & 1) << 4)) - 16).to(tl.float32)
-        wl = (wl * d[:, None]).to(tl.float16)
-        wh = (wh * d[:, None]).to(tl.float16)
+        else:   # FMT 4 = q5_1: [d][m][qh u32][qs], x = d * q + m
+            qh = tl.load(w_ptr + base + 4).to(tl.int32) | (tl.load(w_ptr + base + 5).to(tl.int32) << 8) \
+                | (tl.load(w_ptr + base + 6).to(tl.int32) << 16) | (tl.load(w_ptr + base + 7).to(tl.int32) << 24)
+            wl = (lo | (((qh[:, None] >> j[None, :]) & 1) << 4)).to(tl.float32)
+            wh = (hi | (((qh[:, None] >> (j[None, :] + 16)) & 1) << 4)).to(tl.float32)
+        if FMT == 4:
+            m0 = tl.load(w_ptr + base + 2).to(tl.int32)
+            m1 = tl.load(w_ptr + base + 3).to(tl.int32)
+            mm = (m0 | (m1 << 8)).to(tl.int16).to(tl.float16, bitcast=True).to(tl.float32)
+            wl = (wl * d[:, None] + mm[:, None]).to(tl.float16)
+            wh = (wh * d[:, None] + mm[:, None]).to(tl.float16)
+        else:
+            wl = (wl * d[:, None]).to(tl.float16)
+            wh = (wh * d[:, None]).to(tl.float16)
         a_lo = tl.load(x_ptr + rr[:, None] * K + kb * 32 + j[None, :], mask=rr[:, None] < R, other=0.0)
         a_hi = tl.load(x_ptr + rr[:, None] * K + kb * 32 + 16 + j[None, :], mask=rr[:, None] < R, other=0.0)
         acc = tl.dot(a_lo, tl.trans(wl), acc)
