@@ -1,7 +1,7 @@
 // Lookup tables of the IQ formats, verbatim from llama.cpp ggml/src/ggml-common.h
 // (https://github.com/ggml-org/llama.cpp, commit 7182ef7).
 // MIT License, Copyright (c) 2023-2026 The ggml authors. See THIRD_PARTY_NOTICES.md at the repository root.
-// Extracted only: iq2xxs_grid, iq2xs_grid, iq2s_grid, iq3xxs_grid, iq3s_grid, kvalues_iq4nl.
+// Extracted only: iq2xxs_grid, iq2xs_grid, iq2s_grid, iq3xxs_grid, iq3s_grid, kvalues_iq4nl, kmask_iq2xs, ksigns_iq2xs.
 // Plain __device__ (global, L1-cached), like ggml: every lane reads a different entry (see fq_tables.cuh).
 #pragma once
 #include <stdint.h>
@@ -569,6 +569,21 @@ static __device__ const uint32_t iq3s_grid[512] = {
 
 static __device__ const int8_t kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
+static __device__ const uint8_t kmask_iq2xs[8] = {
+    1, 2, 4, 8, 16, 32, 64, 128
+};
+
+static __device__ const uint8_t ksigns_iq2xs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
 }  // namespace ggml_iq

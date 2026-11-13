@@ -353,6 +353,125 @@ __global__ void fq_mmvq_moe_combine_kernel(const float* __restrict__ partial, co
     }
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Dequantize to fp16 [N, K] (prefill / large-batch path: dequant + GEMM). Port of ggml/src/ggml-cuda/convert.cu dequantize_block_iq*
+// (MIT, The ggml authors): one 32-thread block per 256-element super block, 8 outputs per thread (4 + 4 for the 4-bit formats).
+// ---------------------------------------------------------------------------------------------------------------------------------
+template <int T> __global__ void fq_deq_iq_kernel(const uint8_t* __restrict__ packed, __half* __restrict__ out, int64_t row_bytes, int64_t K, int nb)
+{
+    const int blk = blockIdx.x;                       // block id in [0, N * nb)
+    const int64_t row = blk / nb, bi = blk % nb;
+    const uint8_t* base = packed + row * row_bytes;
+    __half* y0 = out + row * K + bi * 256;
+    const int tid = threadIdx.x;
+    const int il = tid / 8, ib = tid % 8;
+    if constexpr (T == MQ_IQ2_XXS)
+    {
+        const block_iq2_xxs* x = (const block_iq2_xxs*)base + bi;
+        __half* y = y0 + 32 * ib + 8 * il;
+        const uint16_t* q2 = x->qs + 4 * ib;
+        const uint8_t* aux8 = (const uint8_t*)q2;
+        const uint8_t* grid = (const uint8_t*)(iq2xxs_grid + aux8[il]);
+        const uint32_t aux32 = q2[2] | (q2[3] << 16);
+        const float d = __half2float(x->d) * (0.5f + (aux32 >> 28)) * 0.25f;
+        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+        for (int j = 0; j < 8; ++j) y[j] = __float2half_rn(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    }
+    else if constexpr (T == MQ_IQ2_XS)
+    {
+        const block_iq2_xs* x = (const block_iq2_xs*)base + bi;
+        __half* y = y0 + 32 * ib + 8 * il;
+        const uint16_t* q2 = x->qs + 4 * ib;
+        const uint8_t* grid = (const uint8_t*)(iq2xs_grid + (q2[il] & 511));
+        const float d = __half2float(x->d) * (0.5f + ((x->scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+        const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+        for (int j = 0; j < 8; ++j) y[j] = __float2half_rn(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    }
+    else if constexpr (T == MQ_IQ2_S)
+    {
+        const block_iq2_s* x = (const block_iq2_s*)base + bi;
+        __half* y = y0 + 32 * ib + 8 * il;
+        const uint8_t* grid = (const uint8_t*)(iq2s_grid + (x->qs[4 * ib + il] | ((x->qh[ib] << (8 - 2 * il)) & 0x300)));
+        const float d = __half2float(x->d) * (0.5f + ((x->scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+        const uint8_t signs = x->qs[QK_K / 8 + 4 * ib + il];
+        for (int j = 0; j < 8; ++j) y[j] = __float2half_rn(d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f));
+    }
+    else if constexpr (T == MQ_IQ3_XXS)
+    {
+        const block_iq3_xxs* x = (const block_iq3_xxs*)base + bi;
+        __half* y = y0 + 32 * ib + 8 * il;
+        const uint8_t* q3 = x->qs + 8 * ib;
+        const uint16_t* gas = (const uint16_t*)(x->qs + QK_K / 4) + 2 * ib;
+        const uint8_t* grid1 = (const uint8_t*)(iq3xxs_grid + q3[2 * il + 0]);
+        const uint8_t* grid2 = (const uint8_t*)(iq3xxs_grid + q3[2 * il + 1]);
+        const uint32_t aux32 = gas[0] | (gas[1] << 16);
+        const float d = __half2float(x->d) * (0.5f + (aux32 >> 28)) * 0.5f;
+        const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+        for (int j = 0; j < 4; ++j)
+        {
+            y[j + 0] = __float2half_rn(d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f));
+            y[j + 4] = __float2half_rn(d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f));
+        }
+    }
+    else if constexpr (T == MQ_IQ3_S)
+    {
+        const block_iq3_s* x = (const block_iq3_s*)base + bi;
+        __half* y = y0 + 32 * ib + 8 * il;
+        const uint8_t* qs = x->qs + 8 * ib;
+        const uint8_t* grid1 = (const uint8_t*)(iq3s_grid + (qs[2 * il + 0] | ((x->qh[ib] << (8 - 2 * il)) & 256)));
+        const uint8_t* grid2 = (const uint8_t*)(iq3s_grid + (qs[2 * il + 1] | ((x->qh[ib] << (7 - 2 * il)) & 256)));
+        const float d = __half2float(x->d) * (1 + 2 * ((x->scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
+        const uint8_t signs = x->signs[4 * ib + il];
+        for (int j = 0; j < 4; ++j)
+        {
+            y[j + 0] = __float2half_rn(d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f));
+            y[j + 4] = __float2half_rn(d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f));
+        }
+    }
+    else if constexpr (T == MQ_IQ4_NL)
+    {
+        const block_iq4_nl* x = (const block_iq4_nl*)base + bi * (QK_K / QK4_NL);
+        __half* y = y0 + 32 * ib + 4 * il;
+        const uint8_t* q4 = x[ib].qs + 4 * il;
+        const float d = __half2float(x[ib].d);
+        for (int j = 0; j < 4; ++j)
+        {
+            y[j + 0] = __float2half_rn(d * kvalues_iq4nl[q4[j] & 0xf]);
+            y[j + 16] = __float2half_rn(d * kvalues_iq4nl[q4[j] >> 4]);
+        }
+    }
+    else  // MQ_IQ4_XS
+    {
+        const block_iq4_xs* x = (const block_iq4_xs*)base + bi;
+        __half* y = y0 + 32 * ib + 4 * il;
+        const uint8_t* q4 = x->qs + 16 * ib + 4 * il;
+        const float d = __half2float(x->d) * ((((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4)) - 32);
+        for (int j = 0; j < 4; ++j)
+        {
+            y[j + 0] = __float2half_rn(d * kvalues_iq4nl[q4[j] & 0xf]);
+            y[j + 16] = __float2half_rn(d * kvalues_iq4nl[q4[j] >> 4]);
+        }
+    }
+}
+
+template <int T> void mq_dequant_t(torch::Tensor packed, torch::Tensor out)
+{
+    using Tr = MqTraits<T>;
+    TORCH_CHECK(packed.is_cuda() && out.is_cuda() && packed.is_contiguous() && out.is_contiguous(), "tensors must be contiguous CUDA");
+    TORCH_CHECK(out.dtype() == torch::kHalf, "out must be half");
+    TORCH_CHECK_DIM(packed, 2);
+    TORCH_CHECK_DIM(out, 2);
+    const int64_t N = packed.size(0), K = out.size(1);
+    TORCH_CHECK(out.size(0) == N && K % 256 == 0 && packed.size(1) == (K / Tr::qk) * Tr::bb, "shape mismatch");
+    TORCH_CHECK((uintptr_t)packed.data_ptr() % 4 == 0, "weights must be 4-byte aligned");
+    at::cuda::CUDAGuard guard(packed.device());
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int nb = (int)(K / 256);
+    fq_deq_iq_kernel<T><<<(unsigned)(N * nb), 32, 0, stream>>>(packed.data_ptr<uint8_t>(), reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+                                                                  packed.size(1), K, nb);
+}
+
 }  // namespace
 
 void fq_mmvq_iq2_xxs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ2_XXS>(qb, packed, out); }
@@ -419,4 +538,20 @@ void fq_moe_mmvq_grouped(torch::Tensor h, torch::Tensor sel, torch::Tensor wts, 
     }
     fq_mmvq_moe_combine_kernel<<<dim3((K + 255) / 256, R), 256, 0, stream>>>(partial.data_ptr<float>(), reinterpret_cast<const __half*>(wts.data_ptr<at::Half>()),
                                                                                 out.data_ptr<float>(), topk, K);
+}
+
+// out [N, K] half from raw GGUF bytes; fmt = MQ type id (0 iq2_xxs, 1 iq2_xs, 2 iq2_s, 3 iq3_xxs, 4 iq3_s, 5 iq4_nl, 6 iq4_xs), K % 256 == 0
+void fq_dequant_iq(torch::Tensor packed, torch::Tensor out, int64_t fmt)
+{
+    switch (fmt)
+    {
+        case MQ_IQ2_XXS: mq_dequant_t<MQ_IQ2_XXS>(packed, out); break;
+        case MQ_IQ2_XS: mq_dequant_t<MQ_IQ2_XS>(packed, out); break;
+        case MQ_IQ2_S: mq_dequant_t<MQ_IQ2_S>(packed, out); break;
+        case MQ_IQ3_XXS: mq_dequant_t<MQ_IQ3_XXS>(packed, out); break;
+        case MQ_IQ3_S: mq_dequant_t<MQ_IQ3_S>(packed, out); break;
+        case MQ_IQ4_NL: mq_dequant_t<MQ_IQ4_NL>(packed, out); break;
+        case MQ_IQ4_XS: mq_dequant_t<MQ_IQ4_XS>(packed, out); break;
+        default: TORCH_CHECK(false, "fq_dequant_iq: bad format id ", fmt);
+    }
 }

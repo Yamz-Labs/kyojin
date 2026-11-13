@@ -218,6 +218,9 @@ _FQ_MOE_IQ = os.environ.get("MCPM_FQ_MOE_IQ", "1") != "0"
 # (fq_mmvq.cu fq_moe_mmvq_grouped) instead of fq_moe_kq.cu. 0 = the previous kernels (A/B).
 _MQ_ID = {"iq2_xxs": 0, "iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5, "iq4_xs": 6}
 _MQ_MOE = os.environ.get("BOLT_FQ_MMVQ", "1") != "0" and bool(torch.version.cuda) and not torch.version.hip and hasattr(ext, "fq_moe_mmvq_grouped")
+# Rows up to which the slot-parallel IQ MoE kernel also serves the prefill-sized forwards (the grouped prefill path dequantizes every expert on every
+# call: 0.25 s per short prompt on the 35B, llama.cpp needs ~30 ms; the slot kernel re-reads one expert per (row, pick) and wins up to ~500 rows).
+_MQ_MOE_MAXR = int(os.environ.get("BOLT_FQ_MMVQ_MOE_MAXR", "256"))
 
 @dataclass
 class FusedBuffers:
@@ -1946,7 +1949,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return final_hidden_states
 
     def _forward_foreign_grouped_kq(self, x, y, selected_experts, routing_weights,
-                                    params, out_dtype, eshape):
+                                    params, out_dtype, eshape, big=False):
         """Grouped KQ MoE for SwiGLU decode, R = 1..FQ_GROUPED_MAX_ROWS rows (one per user / session). One fq_moe kernel
         runs all R x top-k assignments (gate+up dots, torch-half SwiGLU, down dots, per-row weighted fold), replacing the
         per-expert torch loop (host-synced expert counts, ~10x slower from the second row). Returns routed+shared sum or None."""
@@ -1956,7 +1959,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         fmt, fmt_d = fmts
         S = self.num_experts_per_tok
         R = y.shape[0]
-        if R > FQ_GROUPED_MAX_ROWS or tuple(selected_experts.shape) != (R, S):
+        if (R > FQ_GROUPED_MAX_ROWS and not (big and fmt in _MQ_ID and fmt_d in _MQ_ID and R <= _MQ_MOE_MAXR)) or tuple(selected_experts.shape) != (R, S):
             return None
         sel = selected_experts.reshape(-1)
         wts = routing_weights.reshape(-1)
@@ -1990,10 +1993,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         up_stride = gate_stride
         down_stride = (I // _QK(fmt_d)) * bb_d
         # buffers sized once for the largest row count (stable pointers for CUDA graphs); the kernel gets row-prefix views
+        _GR = max(FQ_GROUPED_MAX_ROWS, _MQ_MOE_MAXR) if (_MQ_MOE and fmt in _MQ_ID and fmt_d in _MQ_ID) else FQ_GROUPED_MAX_ROWS
         if getattr(self, "_fq_kq_partial", None) is None or \
-                self._fq_kq_partial.shape != (FQ_GROUPED_MAX_ROWS * S, K) or self._fq_kq_partial.device != dev:
-            self._fq_kq_partial = torch.empty((FQ_GROUPED_MAX_ROWS * S, K), dtype=torch.float, device=dev)
-            self._fq_kq_routed = torch.empty((FQ_GROUPED_MAX_ROWS, K), dtype=torch.float, device=dev)
+                self._fq_kq_partial.shape != (_GR * S, K) or self._fq_kq_partial.device != dev:
+            self._fq_kq_partial = torch.empty((_GR * S, K), dtype=torch.float, device=dev)
+            self._fq_kq_routed = torch.empty((_GR, K), dtype=torch.float, device=dev)
         partial_v = self._fq_kq_partial[:R * S]
         routed_v = self._fq_kq_routed[:R]
         _FN = {"q4_k": "fq_moe_q4k_grouped_q8", "q5_k": "fq_moe_q5k_grouped_q8",
@@ -2381,6 +2385,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 return grouped
             grouped = self._forward_foreign_grouped(
                 x, y, selected_experts, routing_weights, params, out_dtype, eshape) if bsz == 1 else None
+            if grouped is not None:
+                return grouped
+
+        if _MQ_MOE and FQ_GROUPED_MAX_ROWS < bsz <= _MQ_MOE_MAXR and not params.get("activate_all_experts") and                 not params.get("reconstruct") and not params.get("autosplit_measure") and not params.get("dflash_verify"):
+            grouped = self._forward_foreign_grouped_kq(
+                x, y, selected_experts, routing_weights, params, out_dtype, eshape, big=True)
             if grouped is not None:
                 return grouped
 

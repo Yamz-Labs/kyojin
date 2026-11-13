@@ -75,6 +75,7 @@ _MMVQ_ON = os.environ.get("BOLT_FQ_MMVQ", "1") != "0" and bool(torch.version.cud
 _MMVQ_FN = {"iq2_xxs": "fq_mmvq_iq2_xxs", "iq2_xs": "fq_mmvq_iq2_xs", "iq2_s": "fq_mmvq_iq2_s", "iq3_xxs": "fq_mmvq_iq3_xxs",
             "iq3_s": "fq_mmvq_iq3_s", "iq4_nl": "fq_mmvq_iq4_nl", "iq4_xs": "fq_mmvq_iq4_xs", "q5_k": "fq_mmvq_q5_k"}
 _MMVQ_QK = {"iq4_nl": 32}
+_DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}   # fq_dequant_iq format ids (the others have native dequants already)
 # rows served by the mmvq kernel (8 columns per launch, so R/8 passes over the weights): the old IQ path above 16 rows dequantized the whole weight in torch
 # on every call (1.7 s for the 8B at ANY prompt length). Past ~64 rows the dequant + GEMM path is the better one again.
 _MMVQ_MAXR = int(os.environ.get("BOLT_FQ_MMVQ_MAXR", "64"))
@@ -193,6 +194,11 @@ class ForeignLinear(Module):
         N = self.out_features
         assert 0 <= first and first + count <= N
         dev = self.packed.device
+        if _MMVQ_ON and self.format in _DEQ_IQ_ID and self.in_features % 256 == 0 and hasattr(ext, "fq_dequant_iq"):
+            # native fp16 dequant of the IQ blocks (ggml convert.cu port); the torch gap_dequant below takes ~1.7 s for the whole 8B
+            out = torch.empty((count, self.in_features), dtype=torch.float16, device=dev)
+            ext.fq_dequant_iq(self.packed[first:first + count].reshape(count, -1).contiguous(), out, _DEQ_IQ_ID[self.format])
+            return out
         if self.format in _GAP_FORMATS:
             return gap_dequant(self.format, self.packed[first:first + count])
         if self.format in _KQ_FORMATS:

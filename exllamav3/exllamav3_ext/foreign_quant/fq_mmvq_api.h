@@ -16,3 +16,5 @@ void fq_mmvq_q5_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_moe_mmvq_grouped(torch::Tensor h, torch::Tensor sel, torch::Tensor wts, torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
                          torch::Tensor down_ptrs, int64_t gate_stride, int64_t up_stride, int64_t down_stride, int64_t type_ug, int64_t type_down,
                          torch::Tensor partial, torch::Tensor out);
+// Dequantize IQ blocks to fp16 [N, K] (K % 256 == 0); fmt = MQ type id as above (0..6). Port of ggml convert.cu dequantize_block_iq*.
+void fq_dequant_iq(torch::Tensor packed, torch::Tensor out, int64_t fmt);
