@@ -66,6 +66,7 @@ class GGUFCollection:
         m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", real)
         paths = [real] if m is None else [real[:m.start()] + f"-{i:05d}-of-{m.group(2)}.gguf" for i in range(1, int(m.group(2)) + 1)]
         self.fds, self.bases, self.meta, self.infos = [], [], {}, {}
+        self.paths = paths
         for i, p in enumerate(paths):
             meta, infos, base = self._read_header(p)
             for k, v in meta.items():
