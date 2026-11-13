@@ -30,34 +30,6 @@ Measured configuration: an RX 9070 (`gfx1201`, 15.92 GiB) over USB4 as `part0` a
 118 GiB Strix Halo iGPU (`gfx1151`) as `part1`. The numbers below are measurements from
 that pair, not assumptions of the interface.
 
-### Measured results
-
-GLM-5.3-Flash, MTP on, one long summary prompt per depth, 128 decode tokens (500K uses
-64). These are measured values for the configuration above; they are not targets.
-
-| Context | Arm | Prefill t/s | Decode t/s | Acceptance |
-| --- | --- | --- | --- | --- |
-| 8K | split, N=4 | 448 | 23.58 | 62.3% |
-| 8K | single device | 330 | 24.42 | 70.8% |
-| 32K | split, N=4 | 495 | 25.15 | 70.8% |
-| 32K | single device | 386 | 24.82 | 73.1% |
-| 128K | split, N=4 | 495 | 25.12 | 70.8% |
-| 128K | single device | 391 | 23.24 | 62.3% |
-| 500K | split, N=5 | 446 | 28.84 | 78.0% |
-
-Prefill is consistently faster on the split because the first 4-5 layers run on the
-`part0` card. Decode is within a few percent either way. At 500K the split fits: the
-load-time peaks are 10.75 GiB on `part0` and 100.2 GiB on `part1`. A single 118 GiB
-device did not have headroom for the same context on this pair, so the split's benefit
-there is capacity, not only speed. Acceptance samples are 50-114 drafted tokens per arm;
-treat the differences as overlapping intervals rather than a trend. Stage 2a's longer
-256-token acceptance run measured 64.6% split vs 66.0% single-device at 8K.
-
-Auto-N measured at 8K: MTP+vision chose N=5, MTP only N=6, vision only N=7. At 32K,
-MTP+vision chose N=5 under the 2 GiB default and matched manual N=5 on placement, peaks
-and n-gram-off greedy text. The 32K safety boundary is 1.0 GiB -> N=6 (warm-up OOM),
-1.5 GiB -> N=5; the default is 2 GiB.
-
 ## Quick start
 
 The GLM server and the split harnesses accept the flags below. The environment-only path
@@ -113,8 +85,8 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
   module. Size it to the part0 card.
 - Split mode runs eager. Whole-forward and per-block graphs are disabled; per-segment
   capture is not implemented yet.
-- Use `util/memguard.py` when loading near the limit. It helps avoid OOMs, but slight
-  adverse performance effects have been noted (to be investigated).
+- Use `util/memguard.py` when loading near the limit.  It help save you from the dreaded OOM but slight adverse 
+  performance effects have been noted (to be investigated further.)
 
 ## Model support
 
