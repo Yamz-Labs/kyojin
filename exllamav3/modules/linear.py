@@ -669,9 +669,30 @@ class Linear(Module):
         keys = [self.key]
         if self.alt_key:
             keys += [self.alt_key]
+        if any(self.load_gguf_(k, device) for k in keys): return
         if any(self.load_exl3(k) for k in keys): return
         if any(self.load_fp16(k) for k in keys): return
         raise ValueError(f"No tensors found for {self.key} matching supported quantization format.")
+
+    def load_gguf_(self, key, dev) -> bool:
+        """GGUF backing store (config.gguf + config.gguf_formats): a weight stored in a ggml quant format loads as a ForeignLinear
+        (kernels on the stored blocks, no dequant); fp / bf16 tensors go on to load_fp16 as before."""
+        g, fm = getattr(self.config, "gguf", None), getattr(self.config, "gguf_formats", None)
+        if g is None or not fm or not isinstance(key, str) or self.is_sliced or self.weight_scale != 1.0:
+            return False
+        gname = g.name_map.get(key + ".weight")
+        gname = gname[0] if isinstance(gname, tuple) else gname
+        fmt = fm.get(gname) if gname else None
+        if fmt is None or fmt == "fp" or fmt.startswith("unk"):
+            return False
+        from .foreign_linear import ForeignLinear
+        fl = ForeignLinear(self.config, key, self.in_features, self.out_features, fmt, out_dtype = self.out_dtype)
+        fl.load(dev)
+        bias = self.config.stc.get_tensor(key + ".bias", dev, float2half = True, optional = True, no_defer = True)
+        self.used_alt_key = key == self.alt_key
+        self.inner = _ForeignInner(fl, bias)
+        self.quant_type = fmt
+        return True
 
 
     @override
