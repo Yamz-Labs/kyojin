@@ -24,7 +24,7 @@ _shared_check = os.environ.get("EXL3_ATTN_SHARED_CHECK", "0") != "0"
 _batch_qsa = os.environ.get("EXL3_ATTN_BATCH_QSA", "1") != "0"
 _SHARED_STATS = [0, 0]
 _QKV_IG_MULTI = os.environ.get("EXL3_ATTN_QKV_IG_MULTI", "1") != "0"   # (q|gate, k, v one launch)
-_QKVCAT = os.environ.get("EXL3_ATTN_QKVCAT", "1") != "0"   # GGUF Q8_0 q / k / v decode in one launch (_qkv_q8cat)
+_QKVCAT = os.environ.get("EXL3_ATTN_QKVCAT", "1" if torch.version.hip else "0") != "0"   # GGUF Q8_0 q / k / v decode in one launch (_qkv_q8cat)
 
 
 def _sim_kvq_inplace(t: torch.Tensor, bits: int | None, compand_a: float):

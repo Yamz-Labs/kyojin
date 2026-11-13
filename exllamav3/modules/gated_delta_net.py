@@ -15,7 +15,7 @@ from ..cache import Cache
 from ..util.tensor import g_tensor_cache
 from .multilinear import SlicedMultiLinear
 import os
-_QZCAT = os.environ.get("EXL3_GDN_QZCAT", "1") != "0"   # GGUF Q8_0 qkv + z decode in one launch (project_qkvz_q8cat)
+_QZCAT = os.environ.get("EXL3_GDN_QZCAT", "1" if torch.version.hip else "0") != "0"   # GGUF Q8_0 qkv + z decode in one launch (project_qkvz_q8cat)
 
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
