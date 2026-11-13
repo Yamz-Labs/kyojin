@@ -31,6 +31,73 @@ def _rocm_device_arch(index: int) -> str:
     )
 
 
+def device_index(device=None) -> int:
+    """CUDA index for a torch.device, an int, or None (the ambient device)."""
+    if device is None:
+        return torch.cuda.current_device()
+    if isinstance(device, torch.device):
+        if device.type != "cuda":
+            raise ValueError(f"not a CUDA device: {device}")
+        return device.index if device.index is not None else torch.cuda.current_device()
+    return int(device)
+
+
+def device_arch(device=None) -> str:
+    """ROCm arch of a device (index, torch.device, or None for the ambient device)."""
+    return _rocm_device_arch(device_index(device))
+
+
+def select_device(device=None) -> int:
+    """Select the ambient CUDA device when it differs from `device`; return its index.
+
+    The JIT loaders take the calling tensor's device explicitly, so their arch and cache
+    keys do not depend on a separate ambient-device hook having run first."""
+    index = device_index(device)
+    if torch.cuda.current_device() != index:
+        torch.cuda.set_device(index)
+    return index
+
+
+GFX115_ARCHS = frozenset(("gfx1150", "gfx1151", "gfx1152"))
+
+# Arches where the fused KDA output path is known nondeterministic in split mode.
+# gfx12 today; the split gate and the adapters that size the fallback workspace
+# must use this one predicate so they cannot drift.
+KDA_FUSED_UNSTABLE_PREFIXES = ("gfx12",)
+
+
+def kda_fused_output_unstable(arch: str | None, unknown: bool = True) -> bool:
+    """Whether the fused KDA output path is known unsafe on this arch.
+
+    An unreadable/empty arch is conservatively treated as unstable by default, so
+    split mode takes the deterministic chain and adapters size its workspace.
+    """
+    key = (arch or "").strip().lower()
+    if not key:
+        return bool(unknown)
+    return key.startswith(KDA_FUSED_UNSTABLE_PREFIXES)
+
+
+_support_cache = {}
+
+
+def device_supported(device=None, archs=GFX115_ARCHS) -> bool:
+    """True when the device's ROCm arch is in `archs`; cached per (device, arch set)."""
+    try:
+        index = device_index(device)
+        key = (index, archs)
+        ok = _support_cache.get(key)
+        if ok is None:
+            ok = _support_cache[key] = device_arch(index) in archs
+        return ok
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def reset_support_cache():
+    _support_cache.clear()
+
+
 def maybe_set_arch_list_env():
 
     if os.environ.get('TORCH_CUDA_ARCH_LIST', None):

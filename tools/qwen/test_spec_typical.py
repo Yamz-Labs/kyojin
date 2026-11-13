@@ -87,5 +87,312 @@ class TypicalRule(unittest.TestCase):
         self.assertIsNone(ss.eligible(J()))
 
 
+class EntropyGate(unittest.TestCase):
+    """EXL3_SPEC_TYPICAL_HMAX: relaxation only at rows with H <= HMAX."""
+    P = [0.5, 0.3, 0.2] + [0.0] * (V - 3)
+    H = -sum(x * math.log(x) for x in P if x > 0)
+
+    def setUp(self): self.old = ss.TYP_HMAX
+    def tearDown(self): ss.TYP_HMAX = self.old
+
+    def run_rule(self):
+        return ss.typical_rows(row_from_probs(self.P), [2], PRM_FULL, 0.09, 0.3)
+
+    def test_default_off(self):
+        self.assertIsNone(self.old)
+        ss.TYP_HMAX = None
+        pp, hh, ok = self.run_rule()
+        self.assertTrue(ok[0])
+
+    def test_above_hmax_never_relaxed(self):
+        ss.TYP_HMAX = self.H - 0.01
+        pp, hh, ok = self.run_rule()
+        self.assertGreater(pp[0], 0.09)   # high p, still refused
+        self.assertFalse(ok[0])
+
+    def test_below_hmax_as_before(self):
+        ss.TYP_HMAX = self.H + 0.01
+        self.assertTrue(self.run_rule()[2][0])
+        # a draft under the threshold stays refused
+        pp, hh, ok = ss.typical_rows(row_from_probs(self.P), [2], PRM_FULL, 1.0, 1.0)
+        self.assertFalse(ok[0])
+
+    def test_greedy_not_eligible(self):
+        class J:
+            filters = []; forced_ids = None; return_probs = False; return_top_tokens = False; device_logit_mask = None; sequences = [1]
+            sampler = CustomSampler([SS_Argmax()])
+            class generator:
+                class tokenizer: actual_vocab_size = V
+        ss.TYP_HMAX = 0.1
+        self.assertIsNone(ss.eligible(J()))
+
+
+class CopiedDrafts(unittest.TestCase):
+    """EXL3_SPEC_TYPICAL_LOOKUP: copied drafts keep the exact rule; model-head drafts stay relaxed."""
+    class Gen:
+        draft_ids_pinned = torch.zeros(2, 4, dtype=torch.long)
+
+    def setUp(self):
+        self.old = ss.TYPICAL_LOOKUP
+
+    def tearDown(self):
+        ss.TYPICAL_LOOKUP = self.old
+
+    def test_default_is_exact_for_copies(self):
+        self.assertEqual(ss.TYPICAL_LOOKUP, "rep")
+
+    def test_model_head_vs_copy(self):
+        g = self.Gen()
+        mtp = g.draft_ids_pinned[:, :3]            # drafter round: slice of the pinned buffer
+        copy = torch.tensor([[1, 2, 3]])           # lookup round: tensor of its own
+        for flag, want_copy in (("0", False), ("1", True), ("rep", True)):
+            ss.TYPICAL_LOOKUP = flag
+            self.assertTrue(ss.relax_allowed(g, mtp, 0))          # MTP unchanged in both modes
+            self.assertEqual(ss.relax_allowed(g, copy, 0), want_copy)
+
+    def test_mixed_rows_marked(self):
+        g = self.Gen()
+        t = torch.tensor([[1, 2], [3, 4]])
+        g.draft_copy_rows = (t, [True, False])
+        ss.TYPICAL_LOOKUP = "0"
+        self.assertFalse(ss.relax_allowed(g, t, 0))
+        self.assertTrue(ss.relax_allowed(g, t, 1))
+        g.draft_copy_rows = (torch.tensor([[9]]), [False, False])   # stale mark for another tensor: ignored
+        self.assertFalse(ss.relax_allowed(g, t, 1))
+
+    def test_copy_never_relaxed_end_to_end(self):
+        # the generator keeps a relaxed draft only when relax_allowed; a draft that rule 1 would keep (ok) is dropped at 0
+        p = [0.5, 0.3, 0.2] + [0.0] * (V - 3)
+        _, _, ok = ss.typical_rows(row_from_probs(p), [2], PRM_FULL, 0.09, 0.3)
+        self.assertTrue(ok[0])
+        g = self.Gen(); copy = torch.tensor([[2]])
+        ss.TYPICAL_LOOKUP = "0"
+        self.assertFalse(ok[0] and ss.relax_allowed(g, copy, 0))
+        ss.TYPICAL_LOOKUP = "1"
+        self.assertTrue(ok[0] and ss.relax_allowed(g, copy, 0))
+
+    def test_greedy_unchanged(self):
+        # greedy jobs are never eligible, so neither rule is reached whatever the flag
+        class J:
+            filters = []; forced_ids = None; return_probs = False; return_top_tokens = False; device_logit_mask = None; sequences = [1]
+            sampler = CustomSampler([SS_Argmax()])
+            class generator:
+                class tokenizer: actual_vocab_size = V
+        for flag in ("0", "1", "rep"):
+            ss.TYPICAL_LOOKUP = flag
+            self.assertIsNone(ss.eligible(J()))
+
+
+class FakeSeq:
+    def __init__(self, ids): self.ids = list(ids)
+    def __len__(self): return len(self.ids)
+    def torch_slice(self, a, b): return torch.tensor([self.ids[a:b]], dtype=torch.long)   # (1, n), like the real SeqTensor
+
+
+class FakeJob:
+    def __init__(self, prompt, gen=()):
+        self.seq = FakeSeq(list(prompt) + list(gen)); self.new_tokens = len(gen)
+        class S: pass
+        s = S(); s.sequence_ids = self.seq; self.sequences = [s]
+    def emit(self, t): self.seq.ids.append(t); self.new_tokens += 1
+
+
+class RepetitionAware(unittest.TestCase):
+    """Default "rep": the relaxed rule is refused for a draft that completes an n-gram the job already repeated >= 2 times."""
+    def setUp(self):
+        self.old = (ss.TYPICAL_LOOKUP, ss.REP_N, ss.REP_W); ss.TYPICAL_LOOKUP = "rep"; ss.REP_N = 8; ss.REP_W = 512
+        self.n0 = ss.REP_REFUSED[0]
+
+    def tearDown(self):
+        ss.TYPICAL_LOOKUP, ss.REP_N, ss.REP_W = self.old
+
+    def test_prompt_copy_stays_relaxed(self):
+        prompt = list(range(100, 160))
+        gen = [5, 6, 7, 8, 9, 10, 11, 12]       # output so far; the draft continues a span that exists only in the prompt
+        j = FakeJob(prompt, gen)
+        self.assertFalse(ss.rep_refused(j, 13))
+        self.assertEqual(ss.REP_REFUSED[0], self.n0)
+
+    def test_own_output_repeat_refused(self):
+        loop = list(range(200, 220))             # a 20-token span emitted twice, third copy starts
+        j = FakeJob([1, 2, 3], loop + loop + loop[:10])
+        self.assertTrue(ss.rep_refused(j, loop[10]))      # would continue the third copy of a span seen twice
+        self.assertFalse(ss.rep_refused(j, 999))          # a different token is not a repeat
+        self.assertEqual(ss.REP_REFUSED[0], self.n0 + 1)
+        self.assertEqual(j.rep_refused, 1)
+
+    def test_seen_once_not_refused(self):
+        loop = list(range(200, 220))
+        j = FakeJob([1], loop + loop[:10])              # the span seen only once so far
+        self.assertFalse(ss.rep_refused(j, loop[10]))
+
+    def test_incremental_and_equality(self):
+        loop = list(range(200, 220))
+        j = FakeJob([1], loop + loop[:3])
+        self.assertFalse(ss.rep_refused(j, loop[3]))
+        for t in loop[3:] + loop + loop[:10]: j.emit(t)   # tracker catches up from the new tail
+        self.assertTrue(ss.rep_refused(j, loop[10]))
+        # equality still accepts: the generator only replaces the sampled token by a draft when not refused, so a refused draft
+        # reaches acceptance only if the target sampled the same token (nothing in rep_refused touches that path)
+
+    def test_window_evicts(self):
+        ss.REP_W = 40
+        loop = list(range(200, 220))
+        j = FakeJob([1], loop + loop + list(range(300, 360)) + loop[:10])   # the repeats left the window
+        self.assertFalse(ss.rep_refused(j, loop[10]))
+
+    def test_other_arms_never_refuse(self):
+        loop = list(range(200, 220))
+        j = FakeJob([1], loop + loop + loop[:10])
+        for arm in ("0", "1"):
+            ss.TYPICAL_LOOKUP = arm
+            self.assertFalse(ss.rep_refused(j, loop[10]))
+
+    def test_mtp_source_checked_too(self):
+        # the check is keyed on the output only: relax_allowed (source gate) is True for a model-head draft, rep_refused still applies
+        class G: draft_ids_pinned = torch.zeros(1, 4, dtype=torch.long)
+        g = G(); mtp = g.draft_ids_pinned[:, :2]
+        loop = list(range(200, 220)); j = FakeJob([1], loop + loop + loop[:10])
+        self.assertTrue(ss.relax_allowed(g, mtp, 0))
+        self.assertTrue(ss.rep_refused(j, loop[10]))
+
+
+class CooldownRule(unittest.TestCase):
+    """EXL3_SPEC_TYPICAL_COOLDOWN: exact acceptance for a window after an early loop signal, doubling on re-trigger, capped."""
+    def setUp(self):
+        self.old = (ss.TYPICAL_LOOKUP, ss.REP_N, ss.REP_W, dict(ss.STATS))
+        ss.TYPICAL_LOOKUP = "rep"; ss.REP_N = 8; ss.REP_W = 512
+        for k in ("EXL3_SPEC_TYPICAL_COOLDOWN", "EXL3_SPEC_TYPICAL_REWIND"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        ss.TYPICAL_LOOKUP, ss.REP_N, ss.REP_W = self.old[:3]
+        ss.STATS.update(self.old[3])
+        for k in ("EXL3_SPEC_TYPICAL_COOLDOWN", "EXL3_SPEC_TYPICAL_REWIND"):
+            os.environ.pop(k, None)
+
+    def test_defaults_and_off(self):
+        self.assertEqual((ss.cooldown_base(), ss.rewind_max()), (512, 3))
+        os.environ["EXL3_SPEC_TYPICAL_COOLDOWN"] = "0"; os.environ["EXL3_SPEC_TYPICAL_REWIND"] = "0"
+        self.assertEqual((ss.cooldown_base(), ss.rewind_max()), (0, 0))
+        os.environ["EXL3_SPEC_TYPICAL_COOLDOWN"] = "junk"
+        self.assertEqual(ss.cooldown_base(), 0)
+
+    def test_window_exact_length_then_relaxed(self):
+        cd = ss.Cooldown()
+        self.assertFalse(cd.armed(0))
+        self.assertTrue(cd.trigger(100, 2048))
+        self.assertTrue(cd.armed(100)); self.assertTrue(cd.armed(100 + 2047)); self.assertFalse(cd.armed(100 + 2048))
+
+    def test_doubling_cap_and_debounce(self):
+        cd = ss.Cooldown(); t0 = ss.STATS["cooldown_triggers"]
+        self.assertTrue(cd.trigger(100, 2048))
+        self.assertFalse(cd.trigger(150, 2048))             # same burst (< 64 tokens): counted once
+        self.assertEqual(cd.win, 2048)
+        self.assertTrue(cd.trigger(200, 2048)); self.assertEqual(cd.win, 4096)     # re-trigger while armed doubles
+        self.assertTrue(cd.trigger(200 + 4096 + 100, 2048)); self.assertEqual(cd.win, 8192)   # ... or within the next window
+        self.assertTrue(cd.trigger(cd.end + 10, 2048)); self.assertEqual(cd.win, 16384)
+        self.assertTrue(cd.trigger(cd.end + 10, 2048)); self.assertEqual(cd.win, 16384)       # cap
+        self.assertTrue(cd.trigger(cd.end + 3 * 16384, 2048)); self.assertEqual(cd.win, 2048)  # long quiet: back to the base window
+        self.assertEqual(ss.STATS["cooldown_triggers"], t0 + 6)
+
+    def test_cd_armed_follows_job_count(self):
+        j = FakeJob([1], list(range(10)))
+        self.assertFalse(ss.cd_armed(j))                   # no signal: no state, the relaxed path is untouched
+        j.cd = ss.Cooldown(); j.cd.trigger(j.new_tokens, 5)
+        self.assertTrue(ss.cd_armed(j))
+        for t in range(5): j.emit(t)
+        self.assertFalse(ss.cd_armed(j))
+
+    def test_rep_refusal_arms_job_and_marks_first_copy(self):
+        loop = list(range(200, 220))
+        j = FakeJob([1, 2, 3], loop + loop + loop[:10])
+        self.assertTrue(ss.rep_refused(j, loop[10]))
+        self.assertTrue(ss.cd_armed(j))
+        self.assertEqual(j.cd.win, 512)
+        self.assertEqual(j.cd.rw_abs, 6)                   # start of the first copy of the refused 8-gram: 3 prompt tokens + offset 3
+        self.assertEqual(ss.STATS["cooldown_triggers"] - self.old[3]["cooldown_triggers"], 1)
+
+    def test_rep_refusal_rewind_off_no_mark_cooldown_off_no_state(self):
+        loop = list(range(200, 220))
+        os.environ["EXL3_SPEC_TYPICAL_REWIND"] = "0"
+        j = FakeJob([1], loop + loop + loop[:10])
+        self.assertTrue(ss.rep_refused(j, loop[10])); self.assertIsNone(j.cd.rw_abs); self.assertTrue(ss.cd_armed(j))
+        os.environ["EXL3_SPEC_TYPICAL_COOLDOWN"] = "0"
+        j = FakeJob([1], loop + loop + loop[:10])
+        self.assertTrue(ss.rep_refused(j, loop[10])); self.assertFalse(hasattr(j, "cd")); self.assertFalse(ss.cd_armed(j))
+
+    def test_no_signal_leaves_job_untouched(self):
+        j = FakeJob([1], list(range(300, 340)))
+        self.assertFalse(ss.rep_refused(j, 5))
+        self.assertFalse(hasattr(j, "cd")); self.assertFalse(ss.cd_armed(j))
+        self.assertEqual(ss.STATS, self.old[3])
+
+    def test_rep_extra_sees_the_kept_thinking(self):
+        # a rewound reply restarts with its kept thinking in the prompt: rep_extra lets the tracker still see the first copy
+        loop = list(range(200, 220))
+        kept = loop + loop[:2]
+        j = FakeJob([1, 2, 3] + kept, loop[2:10] * 0)       # no tokens generated yet by the new job
+        j.rep_extra = len(kept)
+        for t in loop[2:] + loop[:10]: j.emit(t)            # the loop comes round again
+        self.assertTrue(ss.rep_refused(j, loop[10]))
+        self.assertEqual(j.cd.rw_abs, 6)
+
+    def test_first_repeat_picks_earliest_copy(self):
+        tr = ss.RepTracker()
+        loop = list(range(200, 220))
+        seq = FakeSeq([9, 9] + loop + loop + loop[:10])
+        tr.feed(seq, len(seq))
+        self.assertEqual(tr.first_repeat(loop[10]), 5)   # 2 leading ids + offset 3
+        self.assertEqual(tr.first_repeat(999), -1)
+
+
+
+class _Seq:
+    def __init__(self, ids): self.ids = list(ids)
+    def __len__(self): return len(self.ids)
+    def torch_slice(self, a, b): return torch.tensor(self.ids[a:b])
+
+
+class _Tok:
+    def single_id(self, t): return {"<think>": 101, "</think>": 102}[t]
+
+
+class _Job:
+    def __init__(self, ids):
+        self.sequences = [type("S", (), {})()]
+        self.sequences[0].sequence_ids = _Seq(ids)
+
+
+class TypicalPhase(unittest.TestCase):
+    def test_in_think_tracks_markers_incrementally(self):
+        gen = type("G", (), {"tokenizer": _Tok()})()
+        job = _Job([1, 2, 101, 5, 6])          # prompt ends with an open <think>
+        self.assertTrue(ss.in_think(gen, job))
+        job.sequences[0].sequence_ids.ids += [7, 102, 8]   # thinking closed: answer phase
+        self.assertFalse(ss.in_think(gen, job))
+        job.sequences[0].sequence_ids.ids += [9]
+        self.assertFalse(ss.in_think(gen, job))
+        job.sequences[0].sequence_ids.ids = [1, 2, 101, 5]  # rewound below the close: rescan
+        self.assertTrue(ss.in_think(gen, job))
+        nothink = _Job([1, 101, 102, 3])       # thinking disabled in the prompt (empty think block)
+        self.assertFalse(ss.in_think(gen, nothink))
+
+    def test_no_think_tokens_never_in_think(self):
+        class T:
+            def single_id(self, t): raise KeyError(t)
+        gen = type("G", (), {"tokenizer": T()})()
+        self.assertFalse(ss.in_think(gen, _Job([1, 2, 3])))
+
+    def test_phase_flag(self):
+        old = os.environ.pop("EXL3_SPEC_TYPICAL_PHASE", None)
+        try:
+            self.assertFalse(ss.phase_answer_only())
+            os.environ["EXL3_SPEC_TYPICAL_PHASE"] = "answer"
+            self.assertTrue(ss.phase_answer_only())
+        finally:
+            os.environ.pop("EXL3_SPEC_TYPICAL_PHASE", None)
+            if old is not None: os.environ["EXL3_SPEC_TYPICAL_PHASE"] = old
+
 if __name__ == "__main__":
     unittest.main()

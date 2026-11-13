@@ -68,6 +68,16 @@ class Model(Model_TPMixin, Model_LSMixin):
 
 
     @property
+    def split_active(self) -> bool:
+        """True when this model was loaded through a contiguous layer split device map.
+
+        A graph must never span the bridge, and a whole-forward graph would. Per-segment
+        capture comes with the split graphs stage; until then split mode runs eager.
+        """
+        return bool(getattr(self.config, "split_active", False))
+
+
+    @property
     def recurrent_state_cls(self):
         """The job state class. A model with no recurrent state of its own (plain attention) whose attention modules declare
         a KVWIN ring gets KVWinState: a job state that only carries the rings."""
@@ -262,7 +272,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             advance_recurrent_states(input_ids, params, self)
             return y
         else:
-            if _cuda_graph.CUDA_GRAPH_ENABLED:
+            if _cuda_graph.CUDA_GRAPH_ENABLED and not self.split_active:
                 # opt-in whole-forward CUDA graph (decode only); None = declined, run eager below
                 y = _cuda_graph.maybe_forward(self, x, params)
                 if y is not None:
@@ -283,7 +293,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         self._lag_tbl = None
         try:
             from ..modules import Embedding, NGramEmbedding
-            if self.loaded_tp or not torch.cuda.is_available() or self._get_prefetch_layers or getattr(self.config, "moe_cpu_hosts", None):
+            if self.split_active or self.loaded_tp or not torch.cuda.is_available() or self._get_prefetch_layers or getattr(self.config, "moe_cpu_hosts", None):
                 return None
             if any(type(m).__name__ in ("PLE", "PerLayerEmbedding") or isinstance(m, NGramEmbedding) for m in self.modules):
                 return None
@@ -319,7 +329,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         graph can take them (its GPU embedding table), a decline returns None. Otherwise the eager layers run from a device-side
         embedding gather (lag_table). Same arithmetic as forward(): the table rows are the rows Embedding.forward reads."""
         if _cuda_graph.CUDA_GRAPH_ENABLED and (not torch.version.hip or _cuda_graph.HIP_GRAPH):
-            if self.loaded_tp or not torch.cuda.is_available():
+            if self.split_active or self.loaded_tp or not torch.cuda.is_available():
                 return None
             x = self.prepare_inputs(input_ids, params)
             if params.get("recurrent_states") is not None and "recurrent_slots" not in params:
@@ -364,6 +374,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         tp_output_device: torch.device | str | int | None = None,
         reserve_per_device: list[float] | float | None = None,
         use_per_device: list[float] | float | None = None,
+        device_map = None,
         tensor_p: bool = False,
         progressbar: bool = False,
         max_chunk_size: int = 2048,
@@ -383,6 +394,12 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         :param device:
             (optional) If specified, load to single device, e.g. "cuda:0"
+
+        :param device_map:
+            (optional) LayerDeviceMap from exllamav3.device_map. Assigns each top-level
+            module to a device (contiguous front layers plus optional endcaps) and streams
+            weights directly there. The caller releases the map's memory budget after the
+            last component (target, drafter, vision) has loaded.
 
         :param tp_output_device:
             (optional) If loading with tensor_p == True, device on which to gather output logits. Must be one of
@@ -481,8 +498,20 @@ class Model(Model_TPMixin, Model_LSMixin):
         assert max_output_size >= 1, "max_output_size must be positive"
         assert max_output_factor >= 1, "max_output_factor must be positive"
 
+        # Explicit contiguous layer split. The map owns the per-device budget; the
+        # caller releases it after the last component (target/drafter/vision).
+        if device_map is not None:
+            assert device is None and not reserve_per_device and not use_per_device, \
+                "device_map cannot be combined with device/reserve_per_device/use_per_device."
+            assert not tensor_p, "device_map cannot be combined with tensor_p."
+            assert not os.environ.get("EXL3_LOAD_SPLIT"), \
+                "device_map cannot be combined with the legacy EXL3_LOAD_SPLIT budget"
+            self._load_mapped(progressbar, device_map, self.config, self.modules, verbose,
+                              callback, max_chunk_size)
+            self.output_device = self.modules[-1].device
+
         # Load to single device
-        if device is not None:
+        elif device is not None:
             assert not bool(reserve_per_device) and not bool(use_per_device), \
                 "Cannot specify reserve_per_device or use_per_device when loading to single device."
             assert not tensor_p, \

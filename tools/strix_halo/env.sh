@@ -94,19 +94,39 @@ if [ "${1:-}" = "--check" ]; then
         exit 1
     fi
     "$EXL3_VENV/bin/python" - <<'PY'
+import sys
 import torch
-p = torch.cuda.get_device_properties(0)
 print(f"torch {torch.__version__}  hip {torch.version.hip}")
-print(f"{p.name} / {p.gcnArchName} / warp={p.warp_size} / {p.total_memory/2**30:.1f} GiB / {p.multi_processor_count} CUs")
-a = torch.randn(512, 512, dtype=torch.float16, device="cuda")
+n = torch.cuda.device_count()
+if n == 0:
+    print("no HIP devices visible")
+    sys.exit(1)
+
+def key_of(p):
+    # ROCm: gcnArchName ("gfx1151"); CUDA: sm_XY from major/minor.
+    arch = getattr(p, "gcnArchName", "") or ""
+    arch = arch.split(":", 1)[0]
+    return arch or f"sm_{p.major}{p.minor}"
+
+keys = []
+for i in range(n):
+    p = torch.cuda.get_device_properties(i)
+    keys.append(key_of(p))
+    warp = getattr(p, "warp_size", None)
+    extra = f" / warp={warp}" if warp else ""
+    print(f"[{i}] {p.name} / {keys[-1]}{extra} / "
+          f"{p.total_memory/2**30:.1f} GiB / {p.multi_processor_count} CUs")
+# gfx1151 is the primary target; with an eGPU visible it is not necessarily device 0.
+target = keys.index("gfx1151") if "gfx1151" in keys else 0
+print(f"checking device [{target}] ({keys[target]})")
+a = torch.randn(512, 512, dtype=torch.float16, device=f"cuda:{target}")
 (a @ a).sum().item()
 torch.cuda.synchronize()
 print("GPU compute: OK")
 try:
     import exllamav3_ext
     print("exllamav3_ext: OK")
-    print("exl3_gemv_supported(0):", exllamav3_ext.exl3_gemv_supported(0),
-          "<- False on gfx1151 => reconstruct+hgemm fallback (expected)")
+    print(f"exl3_gemv_supported({target}):", exllamav3_ext.exl3_gemv_supported(target))
 except ImportError as e:
     print("exllamav3_ext: NOT BUILT --", e)
 import exllamav3

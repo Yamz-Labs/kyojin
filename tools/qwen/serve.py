@@ -502,7 +502,7 @@ class Heartbeat:
 
 # The detectors live in tools/loopguard.py (shared with the GLM server).
 from loopguard import (GUARD_ANSWER, loop_guard_default, GUARD_CHECK_EVERY, GUARD_MAX_N, GUARD_THINK, SPAN_LEN, SPAN_MIN, SPAN_TAIL,  # noqa: E402,F401
-                       TEXT_MIN_CHARS, TEXT_RATIO, TEXT_WINDOW, LoopMonitor, answer_text_loop, counter_drift,
+                       LineWatch, TEXT_MIN_CHARS, TEXT_RATIO, TEXT_WINDOW, LoopMonitor, answer_text_loop, counter_drift,
                        max_span_repeat, repeated_units, shingle_repeat, text_loop)
 
 THINK_CLOSE_TEXT = "\n</think>\n\n"
@@ -531,6 +531,15 @@ def final_cut(vis: str) -> int | None:
         if max_span_repeat(pre) <= 1 and not text_loop(pre + THINK_CLOSE_TAG + ans.strip()):
             return c
     return None
+
+
+def _spec_sample():
+    """exllamav3.generator.spec_sample, None when the library is not importable (model-free tests)."""
+    try:
+        from exllamav3.generator import spec_sample
+        return spec_sample
+    except Exception:
+        return None
 
 
 class Retract(int):
@@ -1343,21 +1352,36 @@ class QwenEngine:
         generated = 0                      # tokens the model produced, including the discarded thinking tail
         discount = 0                       # discarded tokens of final-check recoveries: not charged to max_tokens
         final_tries = 0
+        open_eos = False
+        open_tried = False                 # the EOS-inside-an-open-think recovery runs once
         final_on = guard_on and reasoning_first and close_id is not None and loop_final is not False
         vis = ""                          # the text the client holds (Retract applied)
         gmarks: list[tuple[int, int]] = [(0, 0)]   # (len(token_ids), chars) after each event, all segments
         job_ids = ids
+        ss = _spec_sample()
+        greedy = sampling.get("temperature") == 0 or sampling.get("top_k") == 1
+        think_open = bool(reasoning_first and close_id is not None)   # the generation is inside an open think block
+        rewinds = 0                        # EXL3_SPEC_TYPICAL_REWIND: thinking cut back to before a repeated span, this reply
+        carry_win = 0                      # cooldown window the next job starts with (after a rewind)
+        lw = None                          # tools.loopguard.LineWatch over the thinking text, created per reply when the cooldown is on
 
         while True:
             max_new = max(max_tokens - generated + discount, 1)
             rq = serve_compat.rq_budget(ctx, self.sessions, int(job_ids.numel()), max_new, int(getattr(self.generator, "num_draft_tokens", 0)), PAGE_TOKENS)
             job = self.Job(input_ids=job_ids, max_new_tokens=max_new,
                            sampler=self._sampler(sampling), stop_conditions=([] if ignore_eos else self.eos) + list(stop),
-                           embeddings=embs or None, decode_special_tokens=True, seed=seed,
+                           embeddings=embs or None, decode_special_tokens=True,
+                           seed=seed if not rewinds or seed is None else seed + 1000003 * rewinds,   # a rewound reply must not redraw the same tokens
                            **({} if rq is None else {"max_rq_tokens": rq}),
                            **({} if logprobs is None else {"return_probs": True, "return_top_tokens": logprobs}))
             if disk_on and generated == 0 and not discount:
                 job._restore_ids = ids          # see _pre_start
+            cd_base = ss.cooldown_base() if ss is not None and ss.typical_on() and not greedy else 0   # read per segment
+            if carry_win:                       # after a rewind: exact acceptance for the window, the kept thinking counts as the job's own output
+                job.cd = ss.Cooldown(win=carry_win, end=carry_win)
+                job.cd.last = 0                 # same debounce as a trigger at the cut
+                job.rep_extra = len(token_ids)
+                carry_win = 0
             _mine.append(job)
             q = await self._submit(job)
             seg: list[int] = []
@@ -1366,6 +1390,7 @@ class QwenEngine:
             seg_t0 = time.perf_counter()
             hit = None
             redo = False
+            rw_cut = None
             while True:
                 if cancel is not None and cancel.is_set():
                     return                 # generate() drops the job
@@ -1397,6 +1422,42 @@ class QwenEngine:
                         hit = mon.feed(toks, ev.get("text") or "")
                         if hit:
                             break
+                    if cd_base and think_open and not ev.get("eos"):
+                        # EXL3_SPEC_TYPICAL_COOLDOWN / _REWIND: an early loop signal switches this job to exact acceptance for a window and,
+                        # inside the thinking, cuts the reply back to just before the first copy of the repeated span (at most REWIND times)
+                        cut = None
+                        cap = ss.rewind_max() > rewinds and not embs
+                        if ev.get("text"):
+                            if lw is None:
+                                lw = LineWatch()
+                            if lw.feed(ev["text"]):
+                                cd = getattr(job, "cd", None)
+                                if cd is None:
+                                    cd = job.cd = ss.Cooldown()
+                                if cd.trigger(len(seg), cd_base) and cap and lw.first_at is not None:
+                                    cut = max(m[0] for m in gmarks if m[1] <= lw.first_at)
+                        cd = getattr(job, "cd", None)
+                        if cd is not None and cd.rw_abs is not None:
+                            at = cd.rw_abs - int(ids.numel())      # the generator's own signal: absolute sequence index -> index in token_ids
+                            if at < len(token_ids) or not cap:
+                                cd.rw_abs = None
+                                if cap and at >= 1:
+                                    c2 = max(m[0] for m in gmarks if m[0] <= at)
+                                    cut = c2 if cut is None else min(cut, c2)
+                        if cut is not None and cut >= 1 and cut < len(token_ids) and close_id not in token_ids[cut:]:
+                            rw_cut = cut
+                            break
+                    if close_id is not None and close_id in toks:
+                        think_open = False
+                    if ev.get("eos") and final_on and not open_tried and ev.get("eos_reason") == "stop_token" \
+                            and THINK_CLOSE_TAG not in vis and generated - discount < max_tokens:
+                        # EOS inside a think block that never closed: the client would get reasoning only and an empty answer.
+                        # Keep the thinking (cut by final_cut when it loops), force the close and let the model answer, once.
+                        open_tried = True
+                        open_eos = True
+                        final_c = (final_cut(vis) if text_loop(gate_text(vis)) else None) or len(vis)
+                        redo = True
+                        break
                     if ev.get("eos") and final_on and final_tries < FINAL_TRIES and text_loop(gate_text(vis)) \
                             and (THINK_CLOSE_TAG in vis or ev.get("eos_reason") == "max_new_tokens"
                                  or generated - discount >= max_tokens) \
@@ -1413,23 +1474,51 @@ class QwenEngine:
                             if stop_lp is not None:   # the sampled stop token: no content, but its position is scored
                                 stats["logprobs"] = lps + [stop_lp]
                                 stats["logprob_token_ids"] = token_ids + [int(ev["eos_triggering_token_id"])]
-                        if fired:
+                        if fired or rewinds:
                             stats.update(prompt_tokens=int(ids.numel()), new_tokens=generated,
                                          cached_tokens=min(int(stats.get("cached_tokens", 0)), int(ids.numel())),
-                                         loop_guard=fired)
+                                         **({"loop_guard": fired} if fired else {}), **({"spec_rewinds": rewinds} if rewinds else {}))
                             if stats.get("time_generate") is not None:
                                 stats["time_generate"] += spent
                         return
-                if hit or redo:
+                if hit or redo or rw_cut is not None:
                     break
+            if rw_cut is not None:
+                await self._drop(job)
+                keep_tokens, keep_chars = max(m for m in gmarks if m[0] <= rw_cut)
+                n_drop = len(token_ids) - keep_tokens
+                rewinds += 1
+                ss.STATS["rewinds"] += 1
+                ss.STATS["rewound_tokens"] += n_drop
+                print(f"qserve: spec_typical rewind {rewinds}/{ss.rewind_max()}: {n_drop} tokens dropped, thinking kept to {keep_tokens} tokens", file=sys.stderr, flush=True)
+                carry_win = max(getattr(getattr(job, "cd", None), "win", 0), cd_base)
+                spent += time.perf_counter() - seg_t0
+                if len(vis) > keep_chars:
+                    yield Retract(len(vis) - keep_chars)
+                vis, chars = vis[:keep_chars], keep_chars
+                del token_ids[keep_tokens:]
+                del lps[keep_tokens:]
+                gmarks[:] = [m for m in gmarks if m[0] <= keep_tokens and m[1] <= keep_chars]
+                lw = LineWatch()
+                lw.feed(vis)                   # the watch restarts on the kept prefix
+                if mon is not None:            # ... and so does the loop monitor
+                    mon.start_phase("think")
+                    mon.feed(token_ids, vis)
+                extra = self.torch.tensor([token_ids], dtype=ids.dtype)
+                job_ids = self.torch.cat([ids, extra.to(ids.device)], dim=-1)
+                continue
             if redo:
                 self._routes.pop(job.serial_number, None)   # it sent its eos
                 cut_chars = final_c
-                final_tries += 1
                 keep_tokens, keep_chars = max(m for m in gmarks if m[1] <= cut_chars)
-                fired = {"phase": "think", "kind": "final", "cut": keep_tokens, "at": len(token_ids), "period": 0,
+                kind = "open_think" if open_eos else "final"
+                if not open_eos:
+                    final_tries += 1
+                fired = {"phase": "think", "kind": kind, "cut": keep_tokens, "at": len(token_ids), "period": 0,
                          "tokens_streamed": len(token_ids), "kept_tokens": keep_tokens, "tries": final_tries}
-                print(f"qserve: loop guard final in think: gate rule holds on the answer, thinking cut to {keep_tokens} tokens "
+                open_eos = False
+                print(f"qserve: loop guard {kind} in think: " + ("EOS before </think>, close forced" if kind == "open_think" else
+                      "gate rule holds on the answer") + f", thinking kept to {keep_tokens} tokens "
                       f"({keep_chars} chars of {len(vis)}), try {final_tries}", file=sys.stderr, flush=True)
                 spent += time.perf_counter() - seg_t0
                 yield Retract(len(vis) - keep_chars)
@@ -1437,6 +1526,7 @@ class QwenEngine:
                 discount += len(token_ids) - keep_tokens
                 del token_ids[keep_tokens:]
                 token_ids += close_seq
+                think_open = False
                 del lps[keep_tokens:]
                 lps += [None] * len(close_seq)
                 generated += len(close_seq)
@@ -1472,6 +1562,7 @@ class QwenEngine:
                 vis = vis[:chars]
             del token_ids[len(token_ids) - len(seg) + keep_tokens:]
             token_ids += close_seq
+            think_open = False
             del lps[len(token_ids) - len(close_seq):]
             lps += [None] * len(close_seq)
             generated += len(close_seq)
@@ -1511,7 +1602,11 @@ class QwenEngine:
         return [(math.log(max(pl[i], 1e-45)), [(a, math.log(max(b, 1e-45))) for a, b in zip(il[i], tl[i])]) for i in range(n)]
 
     def spec_stats(self) -> dict[str, Any]:
-        return {"speculative": self.spec_on, "draft_policy": self.draft_policy if self.spec_on else "off", "ndt": self.ndt}
+        out = {"speculative": self.spec_on, "draft_policy": self.draft_policy if self.spec_on else "off", "ndt": self.ndt}
+        ss = _spec_sample()
+        if ss is not None:   # relaxed-acceptance loop control, whole process
+            out["spec_typical"] = {**ss.STATS, "rep_refused": ss.REP_REFUSED[0]}
+        return out
 
 
 # ---------------------------------------------------------------------------- HTTP

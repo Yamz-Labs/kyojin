@@ -1,6 +1,7 @@
 #pragma once
 
-// RDNA (gfx1200/gfx1201) fdot2 GEMV for the dense single-matrix forms:
+// RDNA fdot2 GEMV for the dense single-matrix forms, shared by RDNA4
+// (gfx1200/gfx1201) and RDNA3.5 (gfx1150/1151/1152):
 // M == 1, and M == 2..8 split-K.
 //
 // The generic GEMV kernel (quant/exl3_gemv_kernel.cuh) is built on m16n8k16
@@ -18,7 +19,8 @@
 #include <cuda_fp16.h>
 #include <hip/hip_runtime.h>
 
-// True on gfx1200/gfx1201 (the parts whose decode was measured with this core)
+// True on gfx1200/gfx1201 (RDNA4) and gfx1150/1151/1152 (RDNA3.5), the parts
+// whose decode was measured with this shared core.
 bool exl3_gemv_rdna_arch(int device);
 
 // Launch the dot kernel for M == 1..8. A is the already-rotated input

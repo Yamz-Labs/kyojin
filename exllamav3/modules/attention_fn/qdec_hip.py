@@ -19,10 +19,14 @@ _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qdec.hip")
 _CACHE = os.path.expanduser(os.environ.get("EXL3_QDEC_CACHE", "~/.cache/exllamav3"))
 
 
+_family_cache: dict[int, bool] = {}
+
+
 def _gfx115_family(device=None) -> bool:
     """qdec.hip uses gfx11.5-only (RDNA3.5) wave32 WMMA; enable it only on that family.
-    The check is per call, not per process: on a mixed gfx1201+gfx1151 box the model
-    device may be index 1 while device 0 is the other part. An extension without the
+    The check is per device, not per process: on a mixed gfx1201+gfx1151 box the model
+    device may be index 1 while device 0 is the other part. The result is cached per
+    device index because make_cfg runs per layer per chunk. An extension without the
     family probe keeps the historical behavior."""
     if not torch.version.hip:
         return False
@@ -39,7 +43,10 @@ def _gfx115_family(device=None) -> bool:
             idx = device.index if device.index is not None else torch.cuda.current_device()
         else:
             idx = int(device)
-        return ext.exl3_gemv_wmma_family(idx) == 2
+        cached = _family_cache.get(idx)
+        if cached is None:
+            cached = _family_cache[idx] = (ext.exl3_gemv_wmma_family(idx) == 2)
+        return cached
     except Exception:                                   # noqa: BLE001
         return False
 
@@ -132,9 +139,7 @@ def _compile(cfg, arch):
                 VPF=int(cfg.get("vpf", False)), SMM1=int(cfg.get("smm", 0)), SCALE=repr(float(cfg["scale"])) + "f")
     extra = [f"-D{k}={v}" for k, v in defs.items()] + knob("EXL3_QDEC_HIP_FLAGS", "").split()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"] + extra
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     src = open(_SRC, "rb").read()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     path = os.path.join(_CACHE, f"qdec_hip_{arch}_{tag}.hsaco")

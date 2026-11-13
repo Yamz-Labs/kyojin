@@ -5,6 +5,7 @@ import time
 import torch
 
 from ..modules.attn import prepare_for_attn
+from ..modules.module import select_exec_device
 from ..cache.recurrent_util import prepare_for_recurrence
 from ..util.memory import (
     set_memory_fraction_reserve,
@@ -64,6 +65,61 @@ class Model_LSMixin(ABC):
 
     def default_load_params(self, chunk_size):
         return {"input_ids": torch.zeros((1, chunk_size), dtype = torch.long)}
+
+
+    def _load_mapped(
+        self,
+        progressbar: bool,
+        device_map,
+        config: Config,
+        modules: list,
+        verbose: bool,
+        callback = None,
+        max_chunk_size: int = 2048,
+    ):
+        """Load every top-level module straight to the device the map assigns it.
+
+        No autosplit measuring forwards: the boundary is explicit. The part0 reserve is a
+        held device slab while its segment loads, then is dropped at the first part1 module
+        (the freed block stays available to the workspace without changing the allocator's
+        policy or the part1 segment's numerics). The caller releases whatever remains after
+        the last component.
+        """
+        device_map.engage_budget()
+        pin_all = config.infer_params.vision_pinned and getattr(self, "component", "text") == "vision"
+        part0_released = not device_map.enabled
+        with ProgressBar(f"Loading (split)" if progressbar else None, len(modules)) as progress:
+            for idx, module in enumerate(modules):
+                if callback: callback(idx, len(modules))
+                dev = device_map.device_for(module)
+                if not part0_released and dev == device_map.part1:
+                    device_map.release_part0_budget()
+                    part0_released = True
+                defer = module.can_defer_load()
+                if defer:
+                    # Pinned modules leave the arena alone (see _load_single)
+                    config.stc.begin_deferred_load(arena = not pin_all)
+                module.load(dev, max_chunk_size = max_chunk_size)
+                if defer:
+                    config.stc.end_deferred_load()
+                if pin_all:
+                    module.pin_linears()
+                for h in getattr(config, "moe_cpu_hosts", {}).values():
+                    h.commit_module(module.key)
+                progress.update(idx + 1)
+            if callback: callback(len(modules), len(modules))
+        config.stc.close()
+        self.active_devices = [d.index for d in device_map.used_devices if d.type == "cuda"]
+        self.output_device = modules[-1].device
+
+        # The config reaches the drafter and the vision tower too: one bridge (and the
+        # split-active marker that defuses graph capture) covers every component that
+        # shares it.
+        if device_map.enabled:
+            from ..bridge import install_bridge
+            bridge = install_bridge(config, part1 = device_map.part1, part0 = device_map.part0)
+            if bridge is not None and verbose:
+                print(f" -- split: {bridge.describe()}")
 
 
     def _load_autosplit(
@@ -197,6 +253,7 @@ class Model_LSMixin(ABC):
                             if measure:
                                 torch.cuda.reset_peak_memory_stats(load_device)
                                 alloc_before = torch.cuda.memory_allocated(load_device)
+                            select_exec_device(module.device)
                             dummy_state = module.prepare_for_device(dummy_state, params)
                             dummy_state = module.forward(dummy_state, params)
                             for sm in module:
@@ -336,6 +393,7 @@ class Model_LSMixin(ABC):
             params["layer_instance"] = instance
             pf = (idx, instance) == self.last_kv_module_idx_instance
             params["prefill"] = pf
+            select_exec_device(module.device)
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
             if x is None:
@@ -370,6 +428,7 @@ class Model_LSMixin(ABC):
             if span:
                 x = _span_module(module, x, params)
                 continue
+            select_exec_device(module.device)
             x = module.prepare_for_device(x, params)
             x = module.forward(x, params)
         return x
@@ -412,6 +471,7 @@ def _span_module(module, x, params):
     torch.cuda.synchronize()
     _span_state["name"] = f"{module.key}[{params.get('layer_instance')}]"
     t0 = _span_state["t0"] = time.perf_counter()
+    select_exec_device(module.device)
     x = module.prepare_for_device(x, params)
     x = module.forward(x, params)
     torch.cuda.synchronize()

@@ -48,6 +48,23 @@
           inherit (pkgs) lib;
           python = pkgs.python312;
 
+          # A flavor is any tools/<name>/serve.py. The full tools/ tree is
+          # already shipped uncurated in kyojinServe, so this one discovery
+          # rule drives the wrappers, the container entrypoint, the smoke
+          # check and the apps: adding or removing a serve.py cannot leave
+          # one of them behind.
+          flavors =
+            let
+              entries = builtins.readDir ./tools;
+              isFlavor = name: type: type == "directory" && builtins.pathExists (./tools + "/${name}/serve.py");
+              found = builtins.attrNames (lib.filterAttrs isFlavor entries);
+            in
+            assert found != [ ];
+            found;
+          # The documented default; keep it explicit (not head flavors) so a
+          # new flavor cannot silently become the default app.
+          defaultFlavor = "glm";
+
           # The package version, read from upstream's single source of truth
           # (exllamav3/version.py: `__version__ = "x.y.z"`). pyproject-nix
           # reports 0.0.0 for a setuptools-dynamic version, so the packages
@@ -645,7 +662,7 @@
               # mirror the repo-root layout it expects.
               mkdir -p $out/share/exllamav3/util
               cp $src/exllamav3/util/hip_compiler.py $out/share/exllamav3/util/
-              for flavor in glm mimo qwen; do
+              for flavor in ${lib.concatStringsSep " " flavors}; do
                 makeWrapper ${kyojinEnv}/bin/python $out/bin/kyojin-serve-$flavor \
                   --add-flags "$out/share/kyojin/$flavor/serve.py" \
                   --prefix PYTHONPATH : "${pythonSet.exllamav3}/lib/python3.12/site-packages:${rocmProviders}/lib/python3.12/site-packages:$out/share/kyojin" \
@@ -660,7 +677,7 @@
             '';
             meta = {
               description = "kyojin exllamav3 inference server (AMD gfx1151)";
-              mainProgram = "kyojin-serve-glm";
+              mainProgram = "kyojin-serve-${defaultFlavor}";
             };
           };
 
@@ -713,9 +730,9 @@
             set -euo pipefail
             flavor="''${KYOJIN_FLAVOR:-}"
             case "$flavor" in
-              qwen | glm | mimo) ;;
+              ${lib.concatStringsSep " | " flavors}) ;;
               *)
-                echo "kyojin-entrypoint: set KYOJIN_FLAVOR to one of: qwen glm mimo" >&2
+                echo "kyojin-entrypoint: set KYOJIN_FLAVOR to one of: ${lib.concatStringsSep " " flavors}" >&2
                 exit 2
                 ;;
             esac
@@ -746,7 +763,7 @@
               printf '%s' "$repo" > "$marker"
             fi
             echo "kyojin-entrypoint: serving $flavor from $model_dir" >&2
-            exec "''${KYOJIN_BIN:-/bin/kyojin-serve-$flavor}" --model "$model_dir" "$@"
+            exec "''${KYOJIN_BIN:-/bin/kyojin-serve-$flavor}" --host 0.0.0.0 --model "$model_dir" "$@"
           '';
           # huggingface-hub CLI (hf download for the entrypoint). nixpkgs'
           # anyio runs a networked TLS test suite in installCheck that fails
@@ -910,7 +927,7 @@
               "${rocmSdk}/bin/hipcc" --genco --offload-arch=gfx1151 -O3 -ffp-contract=off \
                 -o gr_mix.hsaco exllamav3/modules/gr_fn/gr_mix.hip
               test -s gr_mix.hsaco
-              for flavor in glm mimo qwen; do
+              for flavor in ${lib.concatStringsSep " " flavors}; do
                 grep -q HIP_DEVICE_LIB_PATH ${kyojinServe}/bin/kyojin-serve-$flavor
                 grep -q HIPCC_COMPILE_FLAGS_APPEND ${kyojinServe}/bin/kyojin-serve-$flavor
               done
@@ -950,16 +967,21 @@
                 type = "app";
                 program = "${kyojinServe}/bin/kyojin-serve-${flavor}";
               };
+              serveApps = builtins.listToAttrs (
+                map (flavor: {
+                  name = "kyojin-serve-${flavor}";
+                  value = serveApp flavor;
+                }) flavors
+              );
             in
-            {
-              kyojin-serve-qwen = serveApp "qwen";
-              kyojin-serve-glm = serveApp "glm";
-              kyojin-serve-mimo = serveApp "mimo";
+            assert lib.elem defaultFlavor flavors;
+            serveApps
+            // {
               kyojin-bench = {
                 type = "app";
                 program = "${kyojinBench}/bin/kyojin-bench";
               };
-              default = serveApp "glm";
+              default = serveApp defaultFlavor;
             };
         };
     };

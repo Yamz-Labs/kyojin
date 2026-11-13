@@ -1,5 +1,6 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
+import threading
 import torch
 from ..util.device_copy import to_device
 import os
@@ -10,6 +11,23 @@ from ..model.model_tp_alloc import TPAllocation
 from functools import cached_property
 
 # Use host bounce when moving state from device to device in layer split
+
+# PyTorch guards restore the ambient device after a kernel, but Triton and unguarded extension
+# entry points read it directly. Select the module's device at each transition so those launches
+# stay on the device the tensors live on. Per-thread: CUDA's current device is thread-local too.
+_exec_device = threading.local()
+
+
+def select_exec_device(device) -> None:
+    if device is None:
+        return
+    device = torch.device(device)
+    if device.type != "cuda" or device.index is None:
+        return
+    if getattr(_exec_device, "index", None) != device.index or torch.cuda.current_device() != device.index:
+        torch.cuda.set_device(device.index)
+        _exec_device.index = device.index
+
 
 class Module(ABC):
 
@@ -82,13 +100,23 @@ class Module(ABC):
             module.unload()
 
     def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        select_exec_device(self.device)
         if x.device != self.device:
-            # Pinned CPU sources (e.g. the generator's staged input IDs) upload without
-            # blocking the host; the copy is stream-ordered ahead of the consuming kernels.
-            # Device-to-device moves go through to_device, which bounces them via host memory
-            # on platforms where peer copies corrupt data (probed, or EXLLAMA_NO_P2P_COPY)
-            nb = x.device.type == "cpu" and x.is_pinned()
-            x = to_device(x, self.device, non_blocking = nb)
+            dev = torch.device(self.device) if self.device is not None else None
+            # The contiguous layer split installs a bridge on the config: a front<->main
+            # crossing is host-staged on the devices' own compute streams and never blocks
+            # the host (see exllamav3/bridge.py).
+            bridge = getattr(self.config, "device_bridge", None) if dev is not None else None
+            if bridge is not None and x.device.type == "cuda" and dev.type == "cuda":
+                nbytes = x.numel() * x.element_size()
+                x = bridge.hop_chunk(x, dev) if nbytes >= 2 ** 20 else bridge.hop(x, dev)
+            else:
+                # Pinned CPU sources (e.g. the generator's staged input IDs) upload without
+                # blocking the host; the copy is stream-ordered ahead of the consuming kernels.
+                # Device-to-device moves go through to_device, which bounces them via host memory
+                # on platforms where peer copies corrupt data (probed, or EXLLAMA_NO_P2P_COPY)
+                nb = x.device.type == "cpu" and x.is_pinned()
+                x = to_device(x, self.device, non_blocking = nb)
         return x
 
     def get_qmaps(self):

@@ -3,6 +3,7 @@
 import ctypes, hashlib, os, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import device_arch, device_supported, select_device, GFX115_ARCHS
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ple_hip.hip")
@@ -19,9 +20,7 @@ def compile_hsaco(arch="gfx1151", src_path=None):
     src_path = src_path or _SRC
     src = open(src_path, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off"]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"ple_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
@@ -34,10 +33,12 @@ def compile_hsaco(arch="gfx1151", src_path=None):
     return cache
 
 
-def _load():
-    if "fns" in _state:
-        return _state["fns"]
-    cache = compile_hsaco(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _load(device=None):
+    dev = select_device(device)
+    key = (dev, "")
+    if key in _state:
+        return _state[key]
+    cache = compile_hsaco(device_arch(dev))
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
@@ -50,12 +51,13 @@ def _load():
             raise RuntimeError("ple_hip: no function " + n)
         fns[n] = fn
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state["lib"], _state["fns"], _state["mod"] = lib, fns, mod
+    _state["lib"], _state[key], _state["mod", key] = lib, fns, mod
     return fns
 
 
 def _launch(name, grid, block, args):
-    fn = _load()[name]
+    device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+    fn = _load(device)[name]
     cargs = []
     for a in args:
         if isinstance(a, torch.Tensor):
@@ -68,15 +70,28 @@ def _launch(name, grid, block, args):
             cargs.append(ctypes.c_int(a))
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
     g = tuple(grid) + (1,) * (3 - len(grid))
+    select_device(device)
     r = _state["lib"].hipModuleLaunchKernel(fn, g[0], g[1], g[2], block, 1, 1, 0,
-                                            torch.cuda.current_stream().cuda_stream, params, None)
+                                            torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0:
         raise RuntimeError(f"ple_hip: launch of {name} failed ({r})")
 
 
-def supported(key, value, streams, conv_state, norm_w, conv_w, constant_scale, hc_mult, hidden):
-    """Shapes and dtypes the kernels were proved for (everything else keeps the torch reference)."""
+def supported(*args, **kwargs):
+    """Device gate when called with a device, otherwise the proved-shape gate.
+
+    ``supported(device)`` is the per-device capability test used by the split
+    audit; ``supported(key, value, ...)`` is the original shape/dtype test and
+    additionally refuses devices other than gfx11.5.
+    """
+    if not args or not torch.is_tensor(args[0]):
+        device = args[0] if args else kwargs.get("device")
+        return device_supported(device, GFX115_ARCHS)
+    key, value, streams, conv_state, norm_w, conv_w, constant_scale, hc_mult, hidden = args
+    # Shapes and dtypes the kernels were proved for (everything else keeps the torch reference).
     if hc_mult != HS or hidden != DD or constant_scale != 1.0:
+        return False
+    if not device_supported(key.device, GFX115_ARCHS):
         return False
     ts = (key, value, streams, conv_w) + tuple(norm_w)
     if not all(t.is_cuda and t.is_contiguous() and t.data_ptr() % 16 == 0 for t in ts):

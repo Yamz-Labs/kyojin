@@ -32,10 +32,38 @@ _HIP_FAIL = []  # first failure disables the HIP path for the process
 def _hip_ok(q, k, v, beta, Akk, Aqk, h0):
     if _HIP_FAIL:
         return False
+    try:
+        from .hip.kda_fused_h_hip import supported as _kda_fused_supported
+        if not _kda_fused_supported(q.device):
+            return False
+    except Exception:                                   # noqa: BLE001
+        return False
     bf = torch.bfloat16
     ts = (q, k, v, beta, Akk, Aqk)
     return (all(t.dtype == bf and t.is_contiguous() for t in ts)
             and (h0 is None or h0.is_contiguous()))
+
+
+_fused_stable = {}  # arch gate per device index; read on every KDA prefill chunk
+
+
+def _fused_output_stable(device=None) -> bool:
+    """Whether the fused Triton KDA output path is run-to-run deterministic on this arch.
+
+    Measured nondeterministic on gfx12 (RDNA4): three loads produced three different
+    greedy branches.  Other supported archs keep the fused path.  An unreadable arch
+    is conservatively treated as unstable, so split mode uses the deterministic
+    chain."""
+    try:
+        from exllamav3.util.arch_list import device_arch, device_index, kda_fused_output_unstable
+        idx = device_index(device)
+        ok = _fused_stable.get(idx)
+        if ok is None:
+            ok = _fused_stable[idx] = not kda_fused_output_unstable(device_arch(idx))
+        return ok
+    except Exception:                                   # noqa: BLE001
+        return False
+
 
 # 1 / ln(2) as fla defines it (best fp32 approximation); gates are pre-scaled so the kernels use exp2
 RCP_LN2 = 1.4426950216
@@ -112,7 +140,7 @@ def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, 
             try:
                 return chunk_gdn_hf(q, v, qn, kn, g, beta, scale, initial_state, output_final_state, ckpt=ckpt)
             except Exception as e:
-                print(f" -- EXL3_GDN_HF failed, Triton/HIP chain for the rest of the process: {e!r}", flush=True)
+                print(f" -- EXL3_GDN_HF failed, Triton/HIP chain for the rest of the process: {e}", flush=True)
         if isinstance(ckpt, (list, tuple)) and len(ckpt) > 2:
             # the fused chain below side-writes 2 rows (the HF kernel above takes 8): keep the two deepest, the others stay unwritten
             ckpt = sorted(ckpt, key = lambda c: c["chunk"])[-2:]
@@ -176,6 +204,14 @@ def chunk_kda(
     # or if hipcc/module load fails; default 3, step 12). Chunks under 512 tokens
     # keep the fla chain: the one-program-per-head fused loop is ~0.14 ms slower there (T=255 sweep).
     fuse = int(os.environ.get("EXL3_KDA_FUSE", "3")) if K <= 128 and chunk_size == 64 and T >= 512 else 0
+    if fuse and os.environ.get("KYOJIN_SPLIT_ACTIVE", "0") != "0" and not _fused_output_stable(q.device):
+        # A layer split can run KDA on a gfx12 front and a different main device in one
+        # process. The fused output path is not run-to-run deterministic on gfx12, and
+        # its gfx11.5 HIP kernel cannot be JIT-built there (kda_fused_h_hip.supported()
+        # declines, so _hip_ok already fell back to the Triton fuse path). Force the
+        # deterministic fla chain on that arch only; keep it here, split-side, until the
+        # gfx12 fused kernel lands.
+        fuse = 0
     if fuse:
         # EXL3_KDA_HF=1 (default off, read per call): 16-row-chunk WY kernel (hip/kda_hf.hip, derived from hipfire's GDN kernel,
         # diagonal blocks computed in the kernel); replaces the intra kernels + kda_fused_h_o, incl. the prefix-cache

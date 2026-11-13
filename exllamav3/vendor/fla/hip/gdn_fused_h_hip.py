@@ -5,10 +5,18 @@
 import ctypes, hashlib, os, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import GFX115_ARCHS, device_arch, device_supported, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gdn_fused_h.hip")
 _state = {}
+
+
+def supported(device=None):
+    """gdn_fused_h.hip is a gfx11.5 WMMA kernel; refuse other archs before any hipcc attempt."""
+    if not torch.version.hip:
+        return False
+    return device_supported(device, GFX115_ARCHS)
 
 
 def _hipcc():
@@ -19,9 +27,7 @@ def _compile(defs, arch):
     # hsaco path for these defines (compiled once, cached by source + flags hash); needs no GPU
     src = open(_SRC, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off"] + [x if x.startswith("-") else f"-D{x}" for x in defs.split()]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"gdn_fused_h_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
@@ -32,11 +38,13 @@ def _compile(defs, arch):
     return cache
 
 
-def _load(defs=""):
-    # defs: extra -D defines (timing experiments only, e.g. "ABL=4"); one module per defines string
-    if defs in _state:
-        return _state[defs]
-    cache = _compile(defs, torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _load(defs="", device=None):
+    # defs: extra -D defines (timing experiments only, e.g. "ABL=4"); one module per (device, defines) string
+    dev = select_device(device)
+    key = (dev, defs)
+    if key in _state:
+        return _state[key]
+    cache = _compile(defs, device_arch(dev))
     lib = load_hip_runtime()
     torch.cuda.init()
     mod, fn = ctypes.c_void_p(), ctypes.c_void_p()
@@ -46,8 +54,8 @@ def _load(defs=""):
         raise RuntimeError("gdn_fused_h_hip: hipModuleGetFunction failed")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
     _state["lib"] = lib
-    _state[defs] = fn
-    _state["mod", defs] = mod
+    _state[key] = fn
+    _state["mod", key] = mod
     return fn
 
 
@@ -77,7 +85,7 @@ def chunk_gdn_fwd_fused_hip(q, k, v, g, beta, A, scale, initial_state=None, outp
         assert c["s"].dtype == torch.float32 and c["s"].is_contiguous() and c["s"].shape == (B, HV, K, V)
     if cks:
         defs = (defs + " CKPT=1").strip()
-    fn = _load(defs)
+    fn = _load(defs, v.device)
     o = torch.empty(B, T, HV, V, device=v.device, dtype=v.dtype)
     final_state = k.new_empty(B, HV, K, V, dtype=torch.float32) if output_final_state else None
     h0 = initial_state

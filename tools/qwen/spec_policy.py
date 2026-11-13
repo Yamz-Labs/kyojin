@@ -824,7 +824,8 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
         ra_note(gj, srcs, lens, W)
         if stats is not None:
             stats["ngm"] = stats.get("ngm", 0) + 1; stats["rows"] = stats.get("rows", 0) + N * (W + 1)
-        return torch.tensor(out, dtype=torch.long)
+        t = torch.tensor(out, dtype=torch.long); g.draft_copy_rows = (t, [bool(c) for c in conts])   # rows from the lookup are copies (spec_sample.draft_is_copy)
+        return t
     def multi_conts(gj):
         """The lookup continuation of each decoding request (None = no match), same rule as the single-request round."""
         for k in [k for k in mf if k not in gj]: del mf[k]
@@ -866,7 +867,8 @@ def install(g, dm, model, thf=0.6, thv=0.3, maxd=3, ngram=None, stats=None, rule
             out.append(t + [t[-1] if t else 0] * (W - len(t)))
         if stats is not None:
             stats["ngm"] = stats.get("ngm", 0) + 1; stats["rows"] = stats.get("rows", 0) + N * (W + 1)
-        return torch.tensor(out, dtype=torch.long)
+        t = torch.tensor(out, dtype=torch.long); g.draft_copy_rows = (t, [bool(c) for c in conts])
+        return t
     def wrapped(results):
         st.update(i=0, stop=False, keep=None, mode="mtp", ps=[])
         ra_gj = None

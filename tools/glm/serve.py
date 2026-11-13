@@ -25,6 +25,11 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
+# Shared split helper: pure stdlib at import, it loads exllamav3 lazily after SPEED_ENV.
+from kyojin_serve_split import (  # noqa: E402
+    SplitController, SplitSettings, add_split_arguments, apply_split_env, parse_part0_layers,
+    settings_from_namespace,
+)
 from loopguard import AnswerTap, loop_guard_default  # noqa: E402  (answer-phase loop guard shared with the Qwen server)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
@@ -46,6 +51,21 @@ EH_SIDECAR_DEFAULT = "~/models/glm53-mtp-eh-proj-bf16.safetensors"
 # Name inside the model folder. Not *.safetensors, so the weight loader never indexes it as model weights
 # (same layout trick as uncensor_direction.st); the file is a normal safetensors file.
 EH_SIDECAR_IN_PACK = "mtp_eh_proj.st"
+# GLM adapter tuning, deliberately outside the split core: on RDNA4 (gfx12) the
+# split runs the deterministic fla KDA chain, whose long-context prefill workspace
+# is not yet part of auto-N.  Measured on a 16 GB gfx12 part0 card.  This is a
+# property of this adapter/part0 pair, not of the split; explicit --part0-layers
+# always wins.
+GLM_LONG_CTX = 65536
+GLM_LONG_CTX_AUTO_CAP = 5
+
+
+def _glm_small_kda_part0(part0_arch: str | None) -> bool:
+    """True when this part0 device runs the deterministic split KDA chain."""
+    from exllamav3.util.arch_list import kda_fused_output_unstable
+    return kda_fused_output_unstable(part0_arch)
+
+
 # --sessions > 1 (several requests decode in one step): plain steps take the R-row exact paths (union MoE on the device table, R-row
 # GEMV, batched router) instead of per-expert eager loops, and 2..8-row verify blocks replay as graphs. Box 4 requests, same prompts:
 # plain 26.1 -> 40.7 tok/s aggregate, speculative 38.1 -> 42.5; one request alone and speculative text equal to the solo run unchanged.
@@ -677,7 +697,11 @@ class ResidentEngine:
                  image_cache_format: str = "fp32",
                  image_cache_dir: str | None = IMAGE_CACHE_DIR_DEFAULT,
                  image_cache_dir_max_gb: float = IMAGE_CACHE_DIR_MAX_GB,
-                 image_cache_dir_lock_s: float = IMAGE_CACHE_DIR_LOCK_S):
+                 image_cache_dir_lock_s: float = IMAGE_CACHE_DIR_LOCK_S,
+                 part0_layers: int | str = 0, part0_device: str | None = None,
+                 part1_device: str | None = None,
+                 endcaps: bool = True, part0_reserve_gb: float = 1.2,
+                 split_settings: SplitSettings | None = None):
         import torch
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         from exllamav3.generator import generator as GM
@@ -707,6 +731,33 @@ class ResidentEngine:
         self.max_draft = num_draft
         self.config = Config.from_directory(model_path)
         self.model = Model.from_config(self.config)
+        if split_settings is None:
+            split_settings = SplitSettings(
+                part0_layers = parse_part0_layers(part0_layers),
+                part0_device = part0_device or "auto",
+                part1_device = part1_device or "auto",
+                endcaps = bool(endcaps), part0_reserve_gb = float(part0_reserve_gb))
+        self.split = SplitController(split_settings, logger = lambda m: print(f"serve: {m}", flush=True))
+        self.split_map = None
+        if self.split.enabled:
+            plan = self.split.build_plan()
+            if plan is None or plan.devices.part0 is None:
+                raise ValueError("layer split requested but no usable part0 device")
+            print(f"serve: layer split: {split_settings.describe()}; "
+                  f"part1 {plan.devices.part1} ({plan.devices.part1_arch}), "
+                  f"part0 {plan.devices.part0} ({plan.devices.part0_arch})", flush=True)
+            if split_settings.auto:
+                if _glm_small_kda_part0(plan.devices.part0_arch) and max_ctx > GLM_LONG_CTX:
+                    # Auto-N's byte budget does not yet know the split KDA prefill
+                    # workspace; keep the measured-safe long-context cap until it does.
+                    plan.auto_cap = GLM_LONG_CTX_AUTO_CAP
+                    print(f"serve: layer split: auto-N capped at {GLM_LONG_CTX_AUTO_CAP} layers for "
+                          f"-c > {GLM_LONG_CTX} on this gfx12 part0: the split KDA prefill workspace "
+                          "is not in the byte budget (adapter tuning; pass --part0-layers N to "
+                          "override)", flush=True)
+                else:
+                    print("serve: layer split: auto-N uncapped (part0 does not need the split "
+                          "KDA long-context reserve)", flush=True)
         self.tokenizer = Tokenizer.from_config(self.config)
         if os.environ.get("KYO_TOKCACHE", "8") == "0":
             self.pec = None
@@ -746,13 +797,41 @@ class ResidentEngine:
         kernel_seed.install()   # shipped Triton kernels for this Triton version: nothing to compile on a first start
         jit_log.install()   # EXL3_LOG_JIT=1: one line per Triton compile
         startup_health.stage("target weights")
-        self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+        if self.split.enabled:
+            # Auto-N needs the cache sizes and the target's actual bytes; the cache exists now.
+            self.split_map = self.split.add("text", self.model, config=self.config,
+                                            cache=self.cache, load_order=0)
+            self.split.build()
+            self.split_map = self.split.map("text")
+            if self.split_map is not None and not self.split_map.enabled:
+                raise ValueError("layer split requested but no usable part0 device (or auto-N found no layer that fits)")
+            if split_settings.auto and self.split_map is not None:
+                print(f"serve: layer split: auto-N chose {self.split_map.part0_layers} part0 layer(s) "
+                      f"for -c {ctx}", flush=True)
+            if (self.split_map is not None and self.split_map.part0_layers > GLM_LONG_CTX_AUTO_CAP
+                    and max_ctx > GLM_LONG_CTX
+                    and _glm_small_kda_part0(plan.devices.part0_arch)):
+                print(f"serve: warning: part0 layers > {GLM_LONG_CTX_AUTO_CAP} at -c > {GLM_LONG_CTX} "
+                      "is measured to OOM a 16 GB gfx12 part0 on long prefill (split KDA fallback "
+                      f"workspace); use --part0-layers {GLM_LONG_CTX_AUTO_CAP} for long-context split runs",
+                      flush=True)
+            self.split.engage_budget()
+            self.split.load("text", self.model, progressbar=False,
+                            callback=startup_health.load_callback(), max_chunk_size=4096)
+        else:
+            self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         if num_draft > 0:
             self.draft_model = Model.from_config(self.config, component="mtp")
             self.draft_cache = Cache(self.draft_model, max_num_tokens=ctx + 4096,
                                      max_history=max_history, max_batch_size=slots, **qkw)
             startup_health.stage("drafter weights")
-            self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+            if self.split.enabled:
+                self.split.add("mtp", self.draft_model, config=self.config,
+                               cache=self.draft_cache, load_order=1)
+                self.split.load("mtp", self.draft_model, progressbar=False,
+                                callback=startup_health.load_callback(), max_chunk_size=4096)
+            else:
+                self.draft_model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         else:   # --num-draft 0: plain decode, no drafter
             self.draft_model = self.draft_cache = None
         self.vision = None
@@ -768,6 +847,13 @@ class ResidentEngine:
         if vision:
             self.vision = self._load_vision()
         self.supports_vision = self.vision is not None
+        if self.split.enabled:
+            extra = []
+            if self.draft_model is not None:
+                extra.append(("mtp", self.draft_model, self.draft_cache))
+            if self.vision is not None:
+                extra.append(("vision", self.vision, None))
+            self.split.finalize(self.model, self.cache, extra=extra, ctx=ctx)
         self.vocab_size = int(self.config.vocab_size or self.tokenizer.actual_vocab_size)   # rows of the embedding table
         self.Generator = Generator
         # The loaded model and tokenizer are 1.1 M Python objects and every later gc.collect() walks them all: the Generator
@@ -879,7 +965,13 @@ class ResidentEngine:
         try:
             startup_health.stage("vision tower")
             tower = Model.from_config(self.config, component="vision")
-            tower.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
+            if self.split.enabled:
+                self.split.add("vision", tower, config=self.config, load_order=2)
+                self.split.load("vision", tower, progressbar=False,
+                                callback=startup_health.load_callback())
+            else:
+                tower.load(device="cuda:0", progressbar=False,
+                           callback=startup_health.load_callback())
         except Exception as exc:                                      # noqa: BLE001
             print(f"serve: vision tower not loaded ({type(exc).__name__}: {exc}); image input disabled", flush=True)
             return None
@@ -2134,6 +2226,7 @@ def main() -> None:
     parser.add_argument("--sessions", type=int, default=1,
                         help=f"requests decoded together through the one Generator (1..{MAX_SESSIONS}); default 1 = one request at a time. "
                              "The KV pool (-c) is shared by all sessions")
+    add_split_arguments(parser)
     parser.add_argument("--kv-mode", choices=("tq", "quant", "fp16"), default="tq",
                         help="latent cache format. tq (default): TurboQuant, rotated Lloyd-Max codes + one scale per token, 6 bits unless --cache-bits says otherwise "
                              "(KL below the quant cache, same decode speed); quant: packed per-32 group scales (--cache-bits 4/5/6/8, 8 if none given); fp16: the unpacked 16-bit pages")
@@ -2179,6 +2272,9 @@ def main() -> None:
     parser.add_argument("--default-reasoning-effort", choices=("low", "medium", "high", "max"), default=None,
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
+    split_settings = settings_from_namespace(args)
+    if split_settings.enabled:
+        apply_split_env(split_settings, logger=lambda m: print(f"serve: {m}", flush=True))
     if args.kv_mode == "fp16":
         args.cache_bits = 0
     elif args.cache_bits is None:
@@ -2238,7 +2334,8 @@ def main() -> None:
                               image_cache_bytes=image_cache_bytes, image_cache_items=args.image_cache_items,
                               image_cache_format=args.image_cache_format,
                               image_cache_dir=args.image_cache_dir, image_cache_dir_max_gb=args.image_cache_dir_max_gb,
-                              image_cache_dir_lock_s=args.image_cache_dir_lock_s)
+                              image_cache_dir_lock_s=args.image_cache_dir_lock_s,
+                              split_settings=split_settings)
         engine.row_budget = (5 if args.row_budget is None else args.row_budget) if args.sessions > 1 else 0
         template = Path(args.chat_template or DEFAULT_TEMPLATE).expanduser().read_text(encoding="utf-8")
         print(mem_line("loaded"), flush=True)

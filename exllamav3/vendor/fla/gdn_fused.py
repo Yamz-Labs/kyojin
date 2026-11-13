@@ -13,6 +13,9 @@ _FAIL = []
 def gdn_fuse_ok(q, k, v, g, beta, initial_state, chunk_size):
     if _FAIL or chunk_size != 64:
         return False
+    from .hip.gdn_fused_h_hip import supported
+    if not supported(q.device):
+        return False
     bf = torch.bfloat16
     B, T, H, K = k.shape
     HV, V = v.shape[2], v.shape[-1]

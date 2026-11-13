@@ -5,10 +5,18 @@
 import ctypes, hashlib, os, shutil, subprocess, threading
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import GFX115_ARCHS, device_arch, device_index, device_supported, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kda_fused_h.hip")
 _state = {}
+
+
+def supported(device=None):
+    """kda_fused_h.hip is a gfx11.5 WMMA kernel; refuse other archs before any hipcc attempt."""
+    if not torch.version.hip:
+        return False
+    return device_supported(device, GFX115_ARCHS)
 
 
 def _hipcc():
@@ -19,9 +27,7 @@ def _compile(defs, arch):
     # hsaco path for these defines (compiled once, cached by source + flags hash); needs no GPU
     src = open(_SRC, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off"] + [x if x.startswith("-") else f"-D{x}" for x in defs.split()]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"kda_fused_h_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
@@ -54,11 +60,15 @@ def _precompile_siblings(defs, arch):
     threading.Thread(target=run, name="kda-fused-h-precompile", daemon=True).start()
 
 
-def _load(defs=""):
-    # defs: extra -D defines (timing experiments only, e.g. "ABL=4"); one module per defines string
-    if defs in _state:
-        return _state[defs]
-    arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+def _load(defs="", device=None):
+    # defs: extra -D defines (timing experiments only, e.g. "ABL=4"); one module per (device, defines) string.
+    # The split runs this kernel on the front gfx1201 and the main gfx1151 in one process: each device needs
+    # its own arch build and function handle.
+    dev = select_device(device)
+    key = (dev, defs)
+    if key in _state:
+        return _state[key]
+    arch = device_arch(dev)
     cache = _compile(defs, arch)
     lib = load_hip_runtime()
     torch.cuda.init()
@@ -69,11 +79,11 @@ def _load(defs=""):
         raise RuntimeError("kda_fused_h_hip: hipModuleGetFunction failed")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
     _state["lib"] = lib
-    _state[defs] = fn
-    _state["mod", defs] = mod
+    _state[key] = fn
+    _state["mod", key] = mod
     base = " ".join(t for t in defs.split() if t not in _CK)
-    if ("pre", base) not in _state:
-        _state["pre", base] = True
+    if ("pre", dev, base) not in _state:
+        _state["pre", dev, base] = True
         _precompile_siblings(defs, arch)
     return fn
 
@@ -111,7 +121,7 @@ def chunk_kda_fwd_h_fused_hip(q, k, v, gk, beta, Akk, Aqk, scale, initial_state=
         defs = (defs + " CK4=1").strip()
     elif nslot == 8:
         defs = (defs + " CK8=1").strip()
-    fn = _load(defs)
+    fn = _load(defs, q.device)
     if o is None:
         o = torch.empty_like(v)
     if output_final_state and final_state is None:
@@ -140,10 +150,11 @@ def chunk_kda_fwd_h_fused_hip(q, k, v, gk, beta, Akk, Aqk, scale, initial_state=
     return None, None, o, (final_state if output_final_state else None)
 
 
-def read_prof(defs, n):
+def read_prof(defs, n, device=None):
     # PROF=1 builds only: per-(WG, wave) phase cycle sums, uint32[n * 8 * 9]
     import numpy as np
-    lib, mod = _state["lib"], _state["mod", defs]
+    key = (device_index(device), defs)
+    lib, mod = _state["lib"], _state["mod", key]
     ptr, size = ctypes.c_void_p(), ctypes.c_size_t()
     if lib.hipModuleGetGlobal(ctypes.byref(ptr), ctypes.byref(size), mod, b"kda_prof") != 0:
         raise RuntimeError("kda_prof missing")

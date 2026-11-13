@@ -255,6 +255,12 @@ Prefill strategy for MLA layers: `mha` up-projects past latent tiles from the co
 and attends in MHA form (~2.8× fewer FLOPs per query-past pair); `absorbed` restores the
 single-kernel absorbed-form prefill for A/B testing.
 
+### `EXL3_MLA_DEC` (default: `1`; ROCm gfx11.5)
+
+Batch-1 MLA decode runs the qualifying projections through the fused `exl3_dec` GEMV kernels.
+`0` restores the generic `LinearEXL3.forward` path.
+The fused path is gfx11.5-only and is also turned off by `EXL3_DEC=0` or `EXL3_DEC_DENSE=0`.
+
 ### `EXL3_MLA_DEC_VALU` (default: `1` on HIP)
 
 Decode and verify rows (up to 8) of the MLA absorb and unfold run on the VALU dot2-chain kernels. The output is
@@ -1308,7 +1314,9 @@ The same lane also exports `EXL3_HOST_LEAN`, `EXL3_HOST_CUTS`, `EXL3_LOAD_DEVICE
 | `QWSPEC_NGRAM` | `2,7,16,3` | The same copy lookup for the Qwen server, in the same format. `2,3,5` gives the earlier setting (a 5-token match, 3 copied tokens). `off` turns it off. |
 | `QWSPEC_NGRAM_IDX` | `1` | Builds the lookup index when the request is queued, so its cost lands in the time to first token and not in the first decode round. `0` builds it lazily and also turns off the `cmin` check. |
 | `EXL3_SPEC_SAMPLED` | engine `0`; the GLM server sets `1` | For requests with temperature above 0 and an MTP drafter: the drafter draws its tokens from its own distribution, and the verify keeps each one with probability min(1, p/q), or resamples from the remainder. The output has the same distribution as plain sampling. Greedy requests are untouched. `0` goes back to taking the drafter's top token. The Qwen server does not set it. |
-| `EXL3_SPEC_TYPICAL` | `0` | Relaxed ("typical") acceptance of argmax drafts for sampled requests (temperature above 0, MTP drafter): a draft is also kept when its probability under the sampling law (top-k / top-p cuts, then temperature) is at least min(eps, delta * exp(-H)), H being the entropy of that law; tokens cut by the filters are never kept. Greedy requests and `0` are unchanged bit for bit. `EXL3_SPEC_TYPICAL_EPS` (0.09) and `EXL3_SPEC_TYPICAL_DELTA` (0.3) tune it; `EXL3_SPEC_TYPICAL_FILE` (test only) switches it at run time. Real Hermes turns: Qwen 3.8 Flash-Next iGPU 55.1 to 58.8 tok/s, Qwen 3.8 27B RTX 3090 88.9 to 116.3 tok/s; GSM8K and HumanEval unchanged. |
+| `EXL3_SPEC_TYPICAL` | `0` | Relaxed ("typical") acceptance of argmax drafts for sampled requests (temperature above 0, MTP drafter): a draft is also kept when its probability under the sampling law (top-k / top-p cuts, then temperature) is at least min(eps, delta * exp(-H)), H being the entropy of that law; tokens cut by the filters are never kept. Greedy requests and `0` are unchanged bit for bit. `EXL3_SPEC_TYPICAL_EPS` (0.09) and `EXL3_SPEC_TYPICAL_DELTA` (0.3) tune it; `EXL3_SPEC_TYPICAL_HMAX` (unset = off): entropy gate in nats; a non-matching draft is relaxed only at rows where the entropy H of the sampling law is at most this value, on top of the threshold above (relaxation is then skipped at high-entropy choice points; the repetition check is unchanged). `EXL3_SPEC_TYPICAL_FILE` (test only) switches it at run time. `EXL3_SPEC_TYPICAL_LOOKUP` (`rep`): the relaxed rule applies to every draft source (model head, and copies of the prompt / tool outputs), except for a draft token that would complete an 8-token n-gram already seen at least twice in the job's last 512 generated tokens (`EXL3_SPEC_TYPICAL_REP_N`, `EXL3_SPEC_TYPICAL_REP_W`): that one is accepted by equality only, so a sampled job is not pulled around its own loop. `0`: copied drafts exact, relaxed for model-head drafts only; `1`: relaxed for every source with no check (old behaviour). Greedy requests are unchanged. Real Hermes turns: Qwen 3.8 Flash-Next iGPU 55.1 to 58.8 tok/s, Qwen 3.8 27B RTX 3090 88.9 to 116.3 tok/s; GSM8K and HumanEval unchanged. |
+| `EXL3_SPEC_TYPICAL_COOLDOWN` | `512` | Adaptive loop control for the relaxed acceptance of `EXL3_SPEC_TYPICAL` (tokens, `0` = off, read per round; sampled requests only). When a request shows an early loop signal, it accepts drafts by exact equality (no relaxed rule, model-head and copied drafts alike) for the next window of its own generated tokens, then relaxes again; a re-trigger while the window is open or within the next window doubles it (cap 16384), and signals less than 64 tokens apart count once. Signals: a draft refused by the repetition check above, and (Qwen server) a thinking-text line of at least 40 non-space characters, outside code fences, seen a second time in the last 16K characters. Nothing changes while no signal fires (greedy output and acceptance are byte-identical). Counters in `GET /health` under `spec_typical`: `cooldown_triggers`, `cooldown_tokens`. |
+| `EXL3_SPEC_TYPICAL_REWIND` | `3` | Rewinds per reply when the loop signal above fires inside an open think block (`0` = off, only the exact-acceptance window applies; read per round). The Qwen server cuts the reply back to just before the first copy of the repeated span (the first occurrence of the refused n-gram, or of the repeated line), drops those tokens, continues from there with a new sampling seed and the exact-acceptance window, and the client text is retracted. The kept thinking is replayed through the prompt cache. The dropped tokens still count against `max_tokens`. After the cap the loop guard closes the think block as before. Never applies to the answer or a tool call, to a request without a think block, or when the think state is unknown. Counters in `GET /health` under `spec_typical`: `rewinds`, `rewound_tokens`. |
 | `EXL3_GLM_SLOTS` | `0` (one recurrent state slot per session) | Minimum number of recurrent state slots the GLM server allocates. The default sizes them to `--sessions`, which frees about 6 GiB of GPU memory at one session. `16` restores the earlier layout. |
 | `EXL3_GC_FREEZE` | Qwen server `1`, GLM server `0` | Moves the loaded model and tokenizer objects out of the Python garbage collector before the first generator is built. Without it, rebuilding the generator (for example after a `cache_salt` change) pays a collector pass of about 0.5 s inside the time to first token. `0` leaves them in the collector. |
 
@@ -1400,6 +1408,20 @@ persistent expert-group kernel.
 
 Slice height of the int8 decode GEMV on 4/5-bit weights: taller k-slices, about two work units per SM. `0` restores the
 former rule, `EXL3_GEMV_ROWS=<n>` forces a slice height.
+
+#### `EXL3_DEC` (default `1`; ROCm)
+
+Master switch for the batch-1 `exl3_dec` decode kernels, which fuse both Hadamard stages into one launch on gfx11.5:
+the dense GEMV, the routed-MoE kernels and the fused MLA projections. `0` disables all of them and sends each path to
+its generic fallback. For fine control `EXL3_DEC_DENSE=0` moves only the dense route off `dec` and keeps the routed-MoE kernels;
+`EXL3_MLA_DEC=0` disables only the MLA projection wiring.
+
+#### `EXL3_DEC_DENSE` (default `1`; ROCm)
+
+Turns the fused decode kernels off for the dense layers only, leaving the MoE layers on the fast path. The dense projections
+then use the general-purpose GEMV path, the RDNA fdot2 kernel on gfx12 and gfx11.5. K7 and opt-in K8 projections stay fused
+because the generic path does not cover them. Whether this helps is model-dependent: about +4% decode on a K6 Qwen3.8-Flash-Next pack,
+about -4% on a K3 Qwen 27B pack. Treat it as a per-model A/B switch rather than a new default;  `EXL3_DEC=0` turns everything off.
 
 #### `EXL3_QC_PF_MAXNREG` (default `255` for 8-bit K+V and above, else `0`)
 

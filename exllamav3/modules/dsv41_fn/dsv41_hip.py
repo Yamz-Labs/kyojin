@@ -4,6 +4,7 @@
 import ctypes, hashlib, os, subprocess
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import device_arch, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,9 +24,7 @@ def compile_hsaco(arch="gfx1151", src_path=None):
     src_path = src_path or _SRC
     src = open(src_path, "rb").read() + open(_HDR, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off"]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"dsv41_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
@@ -38,10 +37,12 @@ def compile_hsaco(arch="gfx1151", src_path=None):
     return cache
 
 
-def _load():
-    if "fns" in _state:
-        return _state["fns"]
-    cache = compile_hsaco(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _load(device=None):
+    dev = select_device(device)
+    key = (dev, "")
+    if key in _state:
+        return _state[key]
+    cache = compile_hsaco(device_arch(dev))
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
@@ -54,7 +55,7 @@ def _load():
             raise RuntimeError("dsv41_hip: no function " + n)
         fns[n] = fn
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state["lib"], _state["fns"], _state["mod"] = lib, fns, mod
+    _state["lib"], _state[key], _state["mod", key] = lib, fns, mod
     return fns
 
 
@@ -76,20 +77,22 @@ def _pack(args):
     return cargs, params
 
 
-def _go(name, g, block, params):
+def _go(name, g, block, params, device=None):
     emu = _state.get("emu")          # tests only: CPU emulation of the kernel model (tests/dsv41/hipemu), CPU tensors
     if emu:
         return emu(name, g, block, params)
-    fn = _load()[name]
+    fn = _load(device)[name]
+    select_device(device)
     r = _state["lib"].hipModuleLaunchKernel(fn, g[0], g[1], g[2], block, 1, 1, 0,
-                                            torch.cuda.current_stream().cuda_stream, params, None)
+                                            torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0:
         raise RuntimeError(f"dsv41_hip: launch of {name} failed ({r})")
 
 
 def _launch(name, grid, block, args):
     cargs, params = _pack(args)
-    _go(name, tuple(grid) + (1,) * (3 - len(grid)), block, params)
+    device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+    _go(name, tuple(grid) + (1,) * (3 - len(grid)), block, params, device)
 
 
 class Launch:
@@ -99,6 +102,7 @@ class Launch:
     def __init__(self, name, grid, block, args):
         self.name, self.block = name, block
         self.grid = tuple(grid) + (1,) * (3 - len(grid))
+        self.device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
         self._keep = [a for a in args if isinstance(a, torch.Tensor)]
         self.cargs, self.params = _pack(args)
 
@@ -106,7 +110,7 @@ class Launch:
         self.cargs[i].value = v
 
     def __call__(self):
-        _go(self.name, self.grid, self.block, self.params)
+        _go(self.name, self.grid, self.block, self.params, self.device)
 
 
 def prepare(name, grid, block, args):

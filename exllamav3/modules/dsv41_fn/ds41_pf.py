@@ -2,6 +2,7 @@
 import ctypes, hashlib, os, subprocess
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import device_arch, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ds41_pf.hip")
@@ -12,9 +13,7 @@ _FUNCS = ("ds41_sparse_attn_pf", "ds41_gather_sum", "ds41_rope_rows")
 def compile_hsaco(arch="gfx1151"):
     src = open(_SRC, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc):
-        flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"ds41_pf_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
@@ -27,27 +26,33 @@ def compile_hsaco(arch="gfx1151"):
     return cache
 
 
-def _fn(name):
-    if name in _state:
-        return _state[name]
-    cache = compile_hsaco(torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _fn(name, device=None):
+    dev = select_device(device)
+    key = (dev, "")
+    if key in _state:
+        return _state[key][name]
+    cache = compile_hsaco(device_arch(dev))
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
     if lib.hipModuleLoad(ctypes.byref(mod), cache.encode()) != 0:
         raise RuntimeError("ds41_pf: hipModuleLoad failed")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state.update(lib=lib, mod=mod)
+    fns = {}
     for nm in _FUNCS:
         fn = ctypes.c_void_p()
         if lib.hipModuleGetFunction(ctypes.byref(fn), mod, nm.encode()) != 0:
             raise RuntimeError("ds41_pf: no function " + nm)
-        _state[nm] = fn
-    return _state[name]
+        fns[nm] = fn
+    _state.update(lib=lib)
+    _state[key] = fns
+    _state["mod", key] = mod
+    return fns[name]
 
 
 def _launch(name, grid, block, args):
-    fn = _fn(name)
+    device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+    fn = _fn(name, device)
     cargs = []
     for a in args:
         if isinstance(a, torch.Tensor):
@@ -59,7 +64,9 @@ def _launch(name, grid, block, args):
         else:
             cargs.append(ctypes.c_int(a))
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
-    r = _state["lib"].hipModuleLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    select_device(device)
+    r = _state["lib"].hipModuleLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0,
+                                            torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0:
         raise RuntimeError(f"ds41_pf: launch of {name} failed ({r})")
 
@@ -97,10 +104,11 @@ def sparse_attention(q, kv, sink, idx, scale):
     o = torch.empty_like(q)
     if K == 0 or N == 0:
         return o.zero_()
-    fn = _fn("ds41_sparse_attn_pf")
+    fn = _fn("ds41_sparse_attn_pf", q.device)
     cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, kv, idx, sink, o)] + [ctypes.c_int(K), ctypes.c_int(N), ctypes.c_float(scale)]
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
-    r = _state["lib"].hipModuleLaunchKernel(fn, R, 1, 1, 512, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    r = _state["lib"].hipModuleLaunchKernel(fn, R, 1, 1, 512, 1, 1, 0,
+                                            torch.cuda.current_stream(q.device).cuda_stream, params, None)
     if r != 0:
         raise RuntimeError(f"ds41_pf: launch failed ({r})")
     return o

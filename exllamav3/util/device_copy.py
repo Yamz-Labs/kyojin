@@ -20,6 +20,11 @@ whether the copy can go direct or has to bounce through host memory:
     EXLLAMA_NO_P2P_COPY=0      -> always direct, never probe
 
 Both directions of a pair are probed together, since the fabric can fail one way only.
+A probe that raises (some drivers reject the peer copy instead of corrupting) counts as
+a failed verdict and the pair bounces through host memory.  A later direct-copy failure
+also caches the bounce verdict and retries through the host.  A device OOM is re-raised
+from both the probe and the direct copy: bouncing through host memory would not help an
+exhausted device, so no verdict is cached for it.
 """
 
 _env = os.environ.get("EXLLAMA_NO_P2P_COPY")
@@ -32,16 +37,36 @@ stats = {"direct": 0, "bounced": 0, "probes": 0}
 
 def _probe_direct(src: torch.device, dst: torch.device) -> tuple[bool, bool]:
     """Move random data src -> dst -> src. Returns (src->dst ok, dst->src ok), each judged on
-    the host so the verdict never depends on a peer copy itself."""
-    a = torch.rand(64, dtype = torch.float32, device = src)
-    b = a.to(dst)
-    c = b.to(src)
-    torch.cuda.synchronize(src)
-    torch.cuda.synchronize(dst)
-    a_h = a.cpu()
-    fwd_ok = torch.equal(a_h, b.cpu())
-    bwd_ok = fwd_ok and torch.equal(a_h, c.cpu())
-    return fwd_ok, bwd_ok
+    the host so the verdict never depends on a peer copy itself.
+
+    A probe is diagnostic.  Some drivers raise instead of silently corrupting when the
+    peer path is broken; treat any probe failure as "bounce" rather than letting the
+    diagnostic turn the first real cross-device move into a crash.  A device OOM is
+    re-raised (and caches no verdict): bouncing cannot help an exhausted device.
+    """
+    try:
+        a = torch.rand(64, dtype = torch.float32, device = src)
+        b = a.to(dst)
+        c = b.to(src)
+        torch.cuda.synchronize(src)
+        torch.cuda.synchronize(dst)
+        a_h = a.cpu()
+        fwd_ok = torch.equal(a_h, b.cpu())
+        bwd_ok = fwd_ok and torch.equal(a_h, c.cpu())
+        return fwd_ok, bwd_ok
+    except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
+        raise                                              # let a real OOM surface, do not cache a verdict
+    except Exception as exc:                               # noqa: BLE001 - diagnostic must not crash
+        print(f" !! P2P probe between {src} and {dst} failed "
+              f"({type(exc).__name__}: {exc}); routing through system memory "
+              f"(see EXLLAMA_NO_P2P_COPY)")
+        return False, False
+
+
+def _mark_bounce(src: torch.device, dst: torch.device) -> None:
+    with _lock:
+        _verdicts[(src.index, dst.index)] = True
+        _verdicts[(dst.index, src.index)] = True
 
 
 def needs_bounce(src: torch.device, dst: torch.device) -> bool:
@@ -82,7 +107,21 @@ def to_device(t: torch.Tensor, device: torch.device | str | int, non_blocking: b
         if needs_bounce(t.device, device):
             stats["bounced"] += 1
             return t.cpu().to(device)
+        try:
+            out = t.to(device, non_blocking = non_blocking)
+        except (torch.OutOfMemoryError, torch.cuda.OutOfMemoryError):
+            raise                                          # device OOM is not a fabric fault
+        except RuntimeError as exc:
+            # A probe can pass and a later direct copy can still fail on a flaky link.
+            # Cache the safe verdict and retry through host memory.
+            _mark_bounce(t.device, device)
+            stats["bounced"] += 1
+            print(f" !! Direct copy {t.device} -> {device} failed "
+                  f"({type(exc).__name__}: {exc}); routing through system memory "
+                  f"(see EXLLAMA_NO_P2P_COPY)")
+            return t.cpu().to(device)
         stats["direct"] += 1
+        return out
     return t.to(device, non_blocking = non_blocking)
 
 

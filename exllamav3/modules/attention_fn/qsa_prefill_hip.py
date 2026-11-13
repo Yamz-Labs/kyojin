@@ -2,6 +2,7 @@
 import ctypes, hashlib, os, re, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import device_arch, select_device
 from exllamav3.util.hip_lib import load_hip_runtime
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qsa_prefill.hip")
 _state = {}
@@ -23,8 +24,7 @@ def compile_hsaco(defs = "", arch = "gfx1151", src_path = None, extra = ()):
     require_proof(src_path, defs)
     src = open(src_path, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"] + list(extra) + [x if x.startswith("-") else f"-D{x}" for x in defs.split()]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc): flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"qsa_pf_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
@@ -45,9 +45,11 @@ def hsaco_stats(path):
     g = lambda k: (int(re.search(k + r":\s+(\d+)", t).group(1)) if re.search(k + r":\s+(\d+)", t) else -1)
     return dict(vgpr = g(r"\.vgpr_count"), spill = g(r"\.vgpr_spill_count"), lds = g(r"\.group_segment_fixed_size"))
 
-def _load(defs = ""):
-    if defs in _state: return _state[defs]
-    cache = compile_hsaco(defs, torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _load(defs = "", device = None):
+    dev = select_device(device)
+    key = (dev, defs)
+    if key in _state: return _state[key]
+    cache = compile_hsaco(defs, device_arch(dev))
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
@@ -55,7 +57,7 @@ def _load(defs = ""):
     fn = ctypes.c_void_p()
     if lib.hipModuleGetFunction(ctypes.byref(fn), mod, b"qsa_pf") != 0: raise RuntimeError("qsa_prefill_hip: no function")
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state["lib"] = lib; _state[defs] = fn; _state["mod", defs] = mod
+    _state["lib"] = lib; _state[key] = fn; _state["mod", key] = mod
     return fn
 
 def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = None, defs = ""):
@@ -72,10 +74,12 @@ def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = No
     npages = block_table.shape[-1]
     ntok = k.shape[0]
     assert v.shape[0] == ntok
-    fn = _load(defs)
+    device = q.device
+    fn = _load(defs, device)
+    select_device(device)
     cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, k, v, block_table, indices, out)] + \
             [ctypes.c_int(x) for x in (q.stride(0), out.stride(0), bt_stride, k.stride(0), ntok, npages)] + [ctypes.c_float(sm_scale)]
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
-    r = _state["lib"].hipModuleLaunchKernel(fn, R * 2, 1, 1, 32, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    r = _state["lib"].hipModuleLaunchKernel(fn, R * 2, 1, 1, 32, 1, 1, 0, torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0: raise RuntimeError(f"qsa_prefill_hip: launch failed ({r})")
     return out

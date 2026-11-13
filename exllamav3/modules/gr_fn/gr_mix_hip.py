@@ -3,6 +3,7 @@
 import ctypes, hashlib, os, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
+from exllamav3.util.arch_list import device_arch, device_supported, select_device, GFX115_ARCHS
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gr_mix.hip")
@@ -16,8 +17,7 @@ def compile_hsaco(defs="", arch="gfx1151", src_path=None):
     src_path = src_path or _SRC
     src = open(src_path, "rb").read()
     flags = ["--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off"] + [x if x.startswith("-") else f"-D{x}" for x in defs.split()]
-    gcc = os.environ.get("EXL3_GCC_INSTALL_DIR", "/usr/lib/gcc/x86_64-linux-gnu/13")
-    if os.path.isdir(gcc): flags.append(f"--gcc-install-dir={gcc}")
+    flags += hip_compiler.gcc_flags()
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"gr_mix_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
@@ -28,9 +28,11 @@ def compile_hsaco(defs="", arch="gfx1151", src_path=None):
         os.replace(tmp, cache)
     return cache
 
-def _load(defs=""):
-    if defs in _state: return _state[defs]
-    cache = compile_hsaco(defs, torch.cuda.get_device_properties(0).gcnArchName.split(":")[0])
+def _load(defs="", device=None):
+    dev = select_device(device)
+    key = (dev, defs)
+    if key in _state: return _state[key]
+    cache = compile_hsaco(defs, device_arch(dev))
     lib = load_hip_runtime()
     torch.cuda.init()
     mod = ctypes.c_void_p()
@@ -41,15 +43,23 @@ def _load(defs=""):
         if lib.hipModuleGetFunction(ctypes.byref(fn), mod, n.encode()) != 0: raise RuntimeError("gr_mix_hip: no function " + n)
         fns[n] = fn
     lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
-    _state["lib"] = lib; _state[defs] = fns; _state["mod", defs] = mod
+    _state["lib"] = lib; _state[key] = fns; _state["mod", key] = mod
     return fns
 
 def _launch(fn, grid, block, args):
     P = ctypes.c_void_p
+    device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+    select_device(device)
     cargs = [P(a.data_ptr()) if isinstance(a, torch.Tensor) else ctypes.c_int(a) for a in args]
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
-    r = _state["lib"].hipModuleLaunchKernel(fn, grid[0], grid[1], 1, block, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    r = _state["lib"].hipModuleLaunchKernel(fn, grid[0], grid[1], 1, block, 1, 1, 0,
+                                            torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0: raise RuntimeError(f"gr_mix_hip: launch failed ({r})")
+
+def supported(device=None):
+    """gr_mix.hip is a gfx11.5 WMMA kernel; gfx12 uses its own path."""
+    return device_supported(device, GFX115_ARCHS)
+
 
 def _tile(defs, name):
     d = dict(x.split("=") for x in defs.split() if "=" in x and not x.startswith("-"))
@@ -71,7 +81,7 @@ def gr_g1(normed, proj, t, post, defs=""):
     # the best below that). EXL3_GR_G1_BM64=0 goes back; an explicit defs string always wins
     if not defs and R >= 3072 and os.environ.get("EXL3_GR_G1_BM64", "1") != "0": defs = "BM1=64"
     bn1, bm1 = _tile(defs, "BN1"), _tile(defs, "BM1")
-    _launch(_load(defs)["gr_g1"], ((NTOT + bn1 - 1) // bn1, (R + bm1 - 1) // bm1), 256, [normed, proj, t, post, R, xp])
+    _launch(_load(defs, normed.device)["gr_g1"], ((NTOT + bn1 - 1) // bn1, (R + bm1 - 1) // bm1), 256, [normed, proj, t, post, R, xp])
 
 def gr_g2(t, up, normed, mixed, defs=""):
     """t (R, 320) fp16, up (10240, 320) fp16 contiguous, normed (R*4, 2560) fp16; mixed (R, 2560) fp16 output."""
@@ -79,7 +89,7 @@ def gr_g2(t, up, normed, mixed, defs=""):
     assert t.dtype == up.dtype == normed.dtype == mixed.dtype == torch.half and R >= 1
     assert t.shape[1] == RANK and up.shape == (K1, RANK) and normed.shape == (R * H, DD) and mixed.shape == (R, DD)
     for x in (t, up, normed, mixed): assert x.is_contiguous()
-    _launch(_load(defs)["gr_g2"], (DD // 32, (R + 63) // 64), 256, [t, up, normed, mixed, R])
+    _launch(_load(defs, t.device)["gr_g2"], (DD // 32, (R + 63) // 64), 256, [t, up, normed, mixed, R])
 
 def gr_g2s(t, up, normed, mixed, defs=""):
     """LDS-staged G2 (same contract as gr_g2; normed may also be the (R, K1) token-pitched view gr_g1 reads, stride(0) >= K1)."""
@@ -98,4 +108,4 @@ def gr_g2s(t, up, normed, mixed, defs=""):
     pitch = mixed.stride(0) if R > 1 else DD
     assert mixed.stride(1) == 1 and pitch >= DD and pitch % 8 == 0 and mixed.storage_offset() % 8 == 0, "gr_g2s: mixed layout"
     assert mixed.storage_offset() + (R - 1) * pitch + DD <= mixed.untyped_storage().nbytes() // 2, "gr_g2s: mixed outside its storage"
-    _launch(_load(defs)["gr_g2s"], (DD // 32, (R + 127) // 128), 256, [t, up, normed, mixed, R, pitch, ngp])
+    _launch(_load(defs, t.device)["gr_g2s"], (DD // 32, (R + 127) // 128), 256, [t, up, normed, mixed, R, pitch, ngp])

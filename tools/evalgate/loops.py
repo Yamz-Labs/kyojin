@@ -30,6 +30,27 @@ def is_loop(text):
     return zlib_low(text) and max_span_repeat(text) >= SPAN_MIN
 
 
+LINE_MIN = 40
+DEG_WIN, DEG_STEP, DEG_MIN_LINES, DEG_DISTINCT, DEG_ZMIN, DEG_ZRATIO = 10000, 1000, 20, 0.7, 4000, 0.27
+
+
+def degenerate(text):
+    """Long-period loop rule for thinking text: end offset of the first checkpoint (every DEG_STEP characters, plus the end)
+    where the last DEG_WIN characters are degenerate, else None. Degenerate = at least DEG_MIN_LINES lines of LINE_MIN or more
+    non-space characters with fewer than DEG_DISTINCT of them distinct, or (DEG_ZMIN characters or more) a zlib ratio below
+    DEG_ZRATIO. The tail rules above are blind to loops whose period exceeds their window (a 30-line block repeated).
+    A model that redrafts the same code two or three times while thinking is not a loop: its window stays varied.
+    Calibrated on 51 sampled 12K probe runs: degenerate loops <= 0.26 distinct (zlib <= 0.12), redrafts >= 0.82 (>= 0.31)."""
+    for end in list(range(DEG_STEP, len(text), DEG_STEP)) + [len(text)]:
+        s = text[max(end - DEG_WIN, 0):end]
+        lines = [l.strip() for l in s.split("\n") if len("".join(l.split())) >= LINE_MIN]
+        if len(lines) >= DEG_MIN_LINES and len(set(lines)) < DEG_DISTINCT * len(lines):
+            return end
+        if len(s) >= DEG_ZMIN and len(zlib.compress(s.encode())) / len(s.encode()) < DEG_ZRATIO:
+            return end
+    return None
+
+
 def summarize(recs):
     """recs: run_suite jsonl records (_id, text, hit_cap) -> {n, loops, ids, capped}."""
     ids = sorted(r["_id"] for r in recs if is_loop(r["text"]))
