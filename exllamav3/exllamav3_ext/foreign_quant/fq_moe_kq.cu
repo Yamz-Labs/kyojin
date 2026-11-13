@@ -13,6 +13,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "../util.h"
 #include "fq_gemv.cuh"
+#include "fq_kq_item.cuh"
+#include <cstdlib>
 #include "fq_api.h"
 
 namespace {
@@ -101,6 +103,92 @@ __global__ void fq_moe_kq_upgate_kernel(const uint8_t* __restrict__ aqb,
         float sig = 1.0f / (1.0f + expf(-gh));
         act[(int64_t)s * I + n] = __float2half_rn(sig * gh * uh);
     }
+}
+
+// Q4_K gate+up, v2 loads (bit-identical to fq_moe_kq_upgate_kernel<0>): 32 rows per block, 8 threads per row. Thread j of a
+// row runs the items it = j, j + 8, ... (fq_kq_item_q4_k: 4 consecutive v1 sub-chunks from two 16-byte loads); sub-chunk
+// c = 4 it + qo belongs to v1 lane c & 31 = 4 j + qo, so the four register partials are v1's lane partials 4j .. 4j+3 summed
+// in the same increasing c order. Lane partials go to shared memory and one thread per row adds them lane by lane as v1 does.
+constexpr int FQ_MOE_V2_ROWS = 32;
+constexpr int FQ_MOE_V2_PS = 33;
+__global__ void __launch_bounds__(256) fq_moe_kq_upgate_v2_kernel(const uint8_t* __restrict__ aqb,
+                                        const int64_t* __restrict__ sel,
+                                        const uint8_t* const* __restrict__ gate_bases,
+                                        const uint8_t* const* __restrict__ up_bases,
+                                        int64_t gate_stride,
+                                        int64_t up_stride,
+                                        int64_t qb_stride,
+                                        __half* __restrict__ act,
+                                        int S, int I, int K, int E, int ntiles_u, int topk)
+{
+    __shared__ float pg[FQ_MOE_V2_ROWS * FQ_MOE_V2_PS];
+    __shared__ float pu[FQ_MOE_V2_ROWS * FQ_MOE_V2_PS];
+    const int s = blockIdx.x / ntiles_u;
+    const int t = blockIdx.x % ntiles_u;
+    const int r = threadIdx.x >> 3, j = threadIdx.x & 7;
+    int64_t e = sel[s];
+    e = (e < 0 || e >= E) ? 0 : e;
+    const int n = t * FQ_MOE_V2_ROWS + r;
+    const uint8_t* aq = aqb + (int64_t)(s / topk) * qb_stride;
+    float ag[4] = {0.0f, 0.0f, 0.0f, 0.0f}, au[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (n < I)
+    {
+        const uint8_t* gr = gate_bases[e] + (int64_t)n * gate_stride;
+        const uint8_t* ur = up_bases[e] + (int64_t)n * up_stride;
+        if ((((uintptr_t)gr | (uintptr_t)ur) & 15) == 0)
+        {
+            const int nitems = (K / 256) * 4;
+            for (int it = j; it < nitems; it += 8)
+            {
+                float tg[4], tu[4];
+                fq_kq_item_q4_k(gr, aq, it, tg);
+                fq_kq_item_q4_k(ur, aq, it, tu);
+                #pragma unroll
+                for (int q = 0; q < 4; q++)
+                {
+                    ag[q] = __fadd_rn(ag[q], tg[q]);
+                    au[q] = __fadd_rn(au[q], tu[q]);
+                }
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int q = 0; q < 4; q++)
+            {
+                ag[q] = fq_dot_q4_k_q8(gr, aq, K, 4 * j + q, FQ_GEMV_LANES);
+                au[q] = fq_dot_q4_k_q8(ur, aq, K, 4 * j + q, FQ_GEMV_LANES);
+            }
+        }
+    }
+    #pragma unroll
+    for (int q = 0; q < 4; q++)
+    {
+        pg[r * FQ_MOE_V2_PS + 4 * j + q] = ag[q];
+        pu[r * FQ_MOE_V2_PS + 4 * j + q] = au[q];
+    }
+    __syncthreads();
+    if (n < I && j == 0)
+    {
+        float sg = 0.0f, su = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 32; l++)
+        {
+            sg = __fadd_rn(sg, pg[r * FQ_MOE_V2_PS + l]);
+            su = __fadd_rn(su, pu[r * FQ_MOE_V2_PS + l]);
+        }
+        float gh = __half2float(__float2half_rn(sg));
+        float uh = __half2float(__float2half_rn(su));
+        float sig = 1.0f / (1.0f + expf(-gh));
+        act[(int64_t)s * I + n] = __float2half_rn(sig * gh * uh);
+    }
+}
+
+static bool fq_moe_v2_on()
+{
+    static const char* e = std::getenv("BOLT_FQ_MOE_V2");
+    static const bool on = !(e && e[0] == '0');
+    return on;
 }
 
 // Down kernel: block (s, t) dots down[sel[s]] rows against the
@@ -218,6 +306,18 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
     }
     // Up+gate: 2 floats per thread in shared (g and u side by side).
     size_t shmem_u = (size_t)FQ_GEMV_THREADS * 2 * sizeof(float);
+    if (FMT_UG == 0 && K % 256 == 0 && fq_moe_v2_on())
+    {
+        const int nt2 = (I + FQ_MOE_V2_ROWS - 1) / FQ_MOE_V2_ROWS;
+        fq_moe_kq_upgate_v2_kernel<<<S * nt2, 256, 0, stream>>>(
+            qb_h.data_ptr<uint8_t>(), sel.data_ptr<int64_t>(),
+            reinterpret_cast<const uint8_t* const*>(gate_ptrs.data_ptr<int64_t>()),
+            reinterpret_cast<const uint8_t* const*>(up_ptrs.data_ptr<int64_t>()),
+            gate_stride, up_stride, qb_stride_h,
+            reinterpret_cast<__half*>(act.data_ptr<at::Half>()),
+            S, I, K, E, nt2, topk);
+    }
+    else
     fq_moe_kq_upgate_kernel<FMT_UG><<<S * ntiles_u, FQ_GEMV_THREADS, shmem_u, stream>>>(
         qb_h.data_ptr<uint8_t>(), sel.data_ptr<int64_t>(),
         reinterpret_cast<const uint8_t* const*>(gate_ptrs.data_ptr<int64_t>()),
