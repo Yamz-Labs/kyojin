@@ -2,8 +2,8 @@
 """Vision tower check on the real weights: exllamav3.dsv41.vision.VisionTower (bf16) against the vendored official ViT +
 Aligner. Loads only the 266 tower tensors (about 1 GiB), never the language model.
 
-  python tools/ds41/vision_gpu_check.py --fetch-from worker:~/ds41_work/recipe/conv/pack --weights DIR   # once, read-only ssh
-  ~/ds41_work/bin/gpurun --who ds41vision --need 8 -- python tools/ds41/vision_gpu_check.py --weights DIR
+  python tools/ds41/vision_gpu_check.py --fetch-from worker:$DS41_WORK/recipe/conv/pack --weights DIR   # once, read-only ssh
+  $DS41_WORK/bin/gpurun --who ds41vision --need 8 -- python tools/ds41/vision_gpu_check.py --weights DIR
 
 `--weights DIR` holds `global.safetensors` (or the pack's index + shards) and `config.json`. `--fetch-from host:packdir`
 streams just the tower tensors out of the pack's global.safetensors over ssh into DIR (the pack is only read).

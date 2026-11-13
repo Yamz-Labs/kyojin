@@ -21,7 +21,7 @@
 # Serve default decided 20/10 (briefs/ds41_draftdecide.md, warm runner, 2 ABBA rounds, noisy box): keep draft 4 + auto (best on tool/after-tool, +10 %);
 # no opt-in arm is within 5 % of plain on every workload, so none is made default. Tool context: auto cap 4. No-tool code/follow-up: DS41_DRAFT_WANT=1 was best (+0..16 %).
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-H=${H:-$HOME/ds41_work}
+H=${H:-${DS41_WORK:-./ds41_work}}
 DS41_PACK=${DS41_PACK:-$HOME/models/ds41-1017-yamz}
 DS41_ENGRAM_DIR=${DS41_ENGRAM_DIR-$HOME/models/ds41-1017/engram_fp8}
 DS41_TIER=${DS41_TIER:-auto}

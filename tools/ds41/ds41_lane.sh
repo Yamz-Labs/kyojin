@@ -7,7 +7,7 @@
 set -euo pipefail
 PORT=${1:?port}; shift
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-H=${H:-$HOME/ds41_work}
+H=${H:-${DS41_WORK:-./ds41_work}}
 NEED=${DS41_LANE_NEED_GIB:-40}
 pf=$(journalctl -k -b 0 --no-pager 2>/dev/null | grep -c 'amdgpu.*page fault' || true)
 [ "$pf" -eq 0 ] || { echo "ds41_lane: REFUSED, $pf amdgpu page fault(s) this boot" >&2; exit 97; }

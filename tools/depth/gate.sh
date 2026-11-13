@@ -16,6 +16,6 @@ cd "$HOME"                                        # cwd outside the agent trees:
 python "$HERE/ideal.py" "$MODEL" --cache-bits "$CB" --ndt "$NDT" --depths "$DEPTHS" --json "$OUT/$TAG.ideal.json" > "$OUT/$TAG.ideal.txt"
 cat "$OUT/$TAG.ideal.txt"
 cd "$EXL3_ROOT"
-flock "${GPU_LOCK:-$HOME/ds41_work/gpu.lock}" "${QUIET:-$HOME/ds41_work/cur1510/quiet.sh}" \
+flock "${GPU_LOCK:-${DS41_WORK:-./ds41_work}/gpu.lock}" "${QUIET:-${DS41_WORK:-./ds41_work}/cur1510/quiet.sh}" \
   python "$HERE/depth_profile.py" "$MODEL" --serve "$SERVE" -o "$OUT/$TAG.profile.json" --depths "$DEPTHS" --cache-bits "$CB" --ndt "$NDT" --kernels "$@"
 python "$HERE/compare.py" "$OUT/$TAG.ideal.json" "$OUT/$TAG.profile.json" --tol "${TOL:-0.05}" --floor-ms "${FLOOR_MS:-0.3}" --json "$OUT/$TAG.gate.json"

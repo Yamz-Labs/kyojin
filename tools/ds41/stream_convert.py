@@ -402,9 +402,9 @@ def main(argv=None):
                          "worker --device cuda:0'); prefix the name with 'late:' to feed it only once the layer's "
                          "capture is done. Repeatable")
     sp.add_argument("--worker-ssh", action="append", help="HOST[:CUDA_INDEX]: worker over ssh, code shipped on stdin")
-    sp.add_argument("--ssh-python", default="~/lab/exl3-strix/venv-cuda/bin/python")
+    sp.add_argument("--ssh-python", default=os.environ.get("DS41_SSH_PYTHON", "python3"))
     sp.add_argument("--ssh-pythonpath",
-                    default="~/ds41_work/port1/release/kyojin-cuda-0d725cb-q35")
+                    default=os.environ.get("DS41_SSH_PYTHONPATH", ""))
     sp.add_argument("--ssh-env", default="", help="extra 'VAR=value ...' for the remote worker, e.g. EXL3_QUANT_PROFILE=1")
     sp.add_argument("--ssh-lock", default="/tmp/gpu3090.lock")
     sp.add_argument("--ssh-min-mem-mib", type=int, default=12288)
