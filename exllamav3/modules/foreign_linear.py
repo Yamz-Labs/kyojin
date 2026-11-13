@@ -207,6 +207,18 @@ class ForeignLinear(Module):
                                  self.global_scale, out)
         return out
 
+    def q8_fused_gemv_ok(self, flat: torch.Tensor) -> bool:
+        """True when forward() serves this flat input with the plain ext.fq_gemv_q8_0 launch (the _FUSED branch below)."""
+        R, K = flat.shape[0], self.in_features
+        if self.format != "q8_0" or flat.device != self.packed.device or flat.shape[-1] != K:
+            return False
+        if _ROWS_TRITON and flat.dtype == torch.half and _ROWS_TRITON_Q8 and triton_rows.supported(self.format, R, K):
+            return False
+        if self.format in triton_iq.FUSED or self.format in _GAP_FORMATS or self.format in _KQ_FORMATS or self.format in _IQ_Q8_FN:
+            return False
+        return (_FUSED and 1 <= R <= FUSED_ROWS_MAX and flat.is_contiguous() and flat.dtype in (torch.half, torch.float)
+                and hasattr(ext, "fq_gemv_q8_0") and _GEMV)
+
     def forward(
         self,
         x: torch.Tensor,
