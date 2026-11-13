@@ -225,7 +225,9 @@ _FQ_MOE_IQ = os.environ.get("MCPM_FQ_MOE_IQ", "1") != "0"
 # BOLT_FQ_MMVQ (default 1, CUDA): IQ experts (all 7 IQ formats, gate/up and down) take the llama.cpp mmvq-style slot-parallel decode MoE
 # (fq_mmvq.cu fq_moe_mmvq_grouped) instead of fq_moe_kq.cu. 0 = the previous kernels (A/B).
 _MQ_ID = {"iq2_xxs": 0, "iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5, "iq4_xs": 6}
-_MQ_MOE = os.environ.get("BOLT_FQ_MMVQ", "1") != "0" and bool(torch.version.cuda) and not torch.version.hip and hasattr(ext, "fq_moe_mmvq_grouped")
+# HIP: opt-in (BOLT_FQ_MMVQ_MOE=1) until measured: the Strix Halo IQ MoE path already beats llama.cpp ROCm (35B IQ3_XXS N4 1.13).
+_MQ_MOE = (os.environ.get("BOLT_FQ_MMVQ", "1") != "0" and os.environ.get("BOLT_FQ_MMVQ_MOE", "0" if torch.version.hip else "1") != "0"
+           and hasattr(ext, "fq_moe_mmvq_grouped"))
 # Rows up to which the slot-parallel IQ MoE kernel also serves the prefill-sized forwards (the grouped prefill path dequantizes every expert on every
 # call: 0.25 s per short prompt on the 35B, llama.cpp needs ~30 ms; the slot kernel re-reads one expert per (row, pick) and wins up to ~500 rows).
 _MQ_MOE_MAXR = int(os.environ.get("BOLT_FQ_MMVQ_MOE_MAXR", "256"))

@@ -1,4 +1,4 @@
-// IQ-format decode GEMV, llama.cpp mmvq style (CUDA only): q8_1 activations, integer dp4a dots of the ggml vec_dot_iq*_q8_1
+// IQ-format decode GEMV, llama.cpp mmvq style (CUDA and HIP, wave32): q8_1 activations, integer dp4a dots of the ggml vec_dot_iq*_q8_1
 // functions (ggml_mmvq/ggml_vecdotq_iq.cuh), 1..8 activation columns per launch (weights read once for all columns).
 //
 // The kernel structure follows llama.cpp ggml/src/ggml-cuda/mmvq.cu (mul_mat_vec_q; https://github.com/ggml-org/llama.cpp,
@@ -22,6 +22,11 @@
 #include "fq_api.h"
 #include "ggml_mmvq/ggml_vecdotq_iq.cuh"
 #include "ggml_mmvq/ggml_vecdotq_k.cuh"
+
+#if defined(USE_ROCM)
+// HIP: maskless shuffles (RDNA runs these kernels as wave32, MQ_WARP = 32)
+#define __shfl_xor_sync(mask, var, ...) __shfl_xor(var, __VA_ARGS__)
+#endif
 
 namespace {
 

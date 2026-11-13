@@ -1,4 +1,4 @@
-// llama.cpp mmvq-style IQ decode GEMV (fq_mmvq.cu, CUDA only): q8_1 activations qb [M, K/32*36] (fq_quant_q8_1_rows),
+// llama.cpp mmvq-style IQ decode GEMV (fq_mmvq.cu, CUDA and HIP): q8_1 activations qb [M, K/32*36] (fq_quant_q8_1_rows),
 // packed = raw GGUF bytes [N, K/QK*block_bytes], out [M, N] half or float. Any M (launches of <= 8 columns).
 #pragma once
 #include <torch/extension.h>
