@@ -270,8 +270,8 @@ __global__ void __launch_bounds__(64 * ROWS) fq_gemv_kq_rows_kernel(const uint8_
 
 // BOLT_FQ_KQ_ROWS: output rows per block of the v2 Q4_K / Q6_K kernel (1, 2, 4). 0 = the v1 kernel (A/B); unset = the per-format
 // default measured on the RTX 3090 (Q4_K 4 rows, Q6_K 1 row: its item has ~2x the load instructions, 64-thread blocks keep more
-// of them resident: down 4096x12288 Q6_K 85 % of the DRAM roof at 1 row vs 63 % at 4). HIP default is v1 (v2 is tuned and
-// measured on the 3090 only; BOLT_FQ_KQ_ROWS=4 opts in).
+// of them resident: down 4096x12288 Q6_K 85 % of the DRAM roof at 1 row vs 63 % at 4). HIP default 1 row (Strix Halo, Qwen3-8B
+// Q4_K_M served N1 v1 36.9 -> 1 row 39.1 / 4 rows 39.3 tok/s, same output; 35B-A3B unchanged: 53.3 / 53.3 / 53.1).
 static int fq_kq_rows_env(int fmt)
 {
     static const char* e = std::getenv("BOLT_FQ_KQ_ROWS");
@@ -279,7 +279,7 @@ static int fq_kq_rows_env(int fmt)
     if (forced >= 0)
         return forced;
 #if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
-    return 0;
+    return 1;
 #else
     return fmt == 0 ? 4 : 1;
 #endif
