@@ -546,7 +546,7 @@ __device__ __forceinline__ uint32_t fq_vcmpne4(uint32_t a)
     uint32_t v = 0;
     #pragma unroll
     for (int m = 0; m < 4; m++)
-        v |= ((0u - ((a >> (8 * m)) & 1u)) & 0xFFu) << (8 * m);
+        v |= (((a >> (8 * m)) & 0xFFu) != 0u ? 0xFFu : 0u) << (8 * m);   // any set bit of the byte (the sign masks use bits 0..7)
     return v;
 #endif
 }
