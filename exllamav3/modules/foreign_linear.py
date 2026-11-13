@@ -69,6 +69,15 @@ _KQ_FORMATS = ("q4_k", "q5_k", "q6_k", "iq4_xs")
 # EXL3_IQ3_Q8 (default 1): IQ3_XXS decode rows run the q8_1 dp4a GEMV (fq_gemv_iq3_xxs_q8) instead of the Triton decode
 _IQ3_Q8 = os.environ.get("EXL3_IQ3_Q8", "1") != "0"
 _IQ_Q8_FN = {"iq3_xxs": "fq_gemv_iq3_xxs_q8", "iq2_s": "fq_gemv_iq2_s_q8", "iq3_s": "fq_gemv_iq3_s_q8"}
+# BOLT_FQ_MMVQ (default 1, CUDA): IQ formats decode (1..16 rows) through the llama.cpp mmvq-style kernel (fq_mmvq.cu: ggml vec_dot_iq*_q8_1 dp4a dots,
+# warp-per-row blocks, 1..8 activation columns per launch, weights read once). 0 = the previous paths (A/B).
+_MMVQ_ON = os.environ.get("BOLT_FQ_MMVQ", "1") != "0" and bool(torch.version.cuda) and not torch.version.hip
+_MMVQ_FN = {"iq2_xxs": "fq_mmvq_iq2_xxs", "iq2_xs": "fq_mmvq_iq2_xs", "iq2_s": "fq_mmvq_iq2_s", "iq3_xxs": "fq_mmvq_iq3_xxs",
+            "iq3_s": "fq_mmvq_iq3_s", "iq4_nl": "fq_mmvq_iq4_nl", "iq4_xs": "fq_mmvq_iq4_xs", "q5_k": "fq_mmvq_q5_k"}
+_MMVQ_QK = {"iq4_nl": 32}
+# rows served by the mmvq kernel (8 columns per launch, so R/8 passes over the weights): the old IQ path above 16 rows dequantized the whole weight in torch
+# on every call (1.7 s for the 8B at ANY prompt length). Past ~64 rows the dequant + GEMM path is the better one again.
+_MMVQ_MAXR = int(os.environ.get("BOLT_FQ_MMVQ_MAXR", "64"))
 _KQ_BLOCK_BYTES = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136}
 _KQ_GEMM_ROWS = 16
 _KQ_GEMM = os.environ.get("MCPM_FQ_KQ_GEMM", "1") != "0"
@@ -243,7 +252,17 @@ class ForeignLinear(Module):
         if not flat.is_contiguous():
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
-        if (_ROWS_TRITON and flat.dtype == torch.half and (_ROWS_TRITON_Q8 or self.format != "q8_0")
+        if (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format == "q5_k" else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
+                and hasattr(ext, _MMVQ_FN[self.format])):
+            N = self.out_features
+            out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)
+            dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
+            qb = ext.fq_q8_scratch(dev_idx, R, K)
+            ext.fq_quant_q8_1_rows(flat, qb)
+            getattr(ext, _MMVQ_FN[self.format])(qb, self.packed.reshape(N, -1), out)
+            if out.dtype != dtype:
+                out = out.to(dtype)
+        elif (_ROWS_TRITON and flat.dtype == torch.half and (_ROWS_TRITON_Q8 or self.format != "q8_0")
                 and not (_KQ_MROWS and self.format in _KQ_MROWS_FORMATS)
                 and triton_rows.supported(self.format, R, K)):
             # 2..16 rows (verify / multi-user): weights read once for all rows (the fq_gemv kernels re-read them per row)
