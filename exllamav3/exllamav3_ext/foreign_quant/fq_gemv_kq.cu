@@ -19,6 +19,7 @@
 #include "../util.h"
 #include "fq_gemv.cuh"
 #include "fq_kq_item.cuh"
+#include "fq_kq_wmma.cuh"
 #include "fq_api.h"
 
 namespace {
@@ -573,6 +574,75 @@ static bool fq_kq_mrows_on()
     return on != 0;
 }
 
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+// BOLT_FQ_KQ_WMMA: gfx11 HIP builds run x-rows 2..16 of the Q4_K GEMV on WMMA iu8 (fq_kq_wmma.cuh; per x-row bit-identical to the one-row
+// kernel, like the generic multi-row kernel). 0 = never (generic multi-row kernel), 1 = whenever eligible, unset / other = auto: only where it
+// won on gfx1151 (rule in the function), the other shapes keep the generic kernel. Eligible = Q4_K with
+// K >= 4096 (the one-row kernel's 256 lanes), 16-byte aligned rows.
+static int fq_kq_wmma_mode()
+{
+    static const char* e = std::getenv("BOLT_FQ_KQ_WMMA");
+    static const int mode = e ? ((e[0] == '0' || e[0] == '1') && e[1] == 0 ? e[0] - '0' : 2) : 2;
+    return mode;
+}
+
+static bool fq_kq_wmma_arch()
+{
+    return std::strncmp(at::cuda::getCurrentDeviceProperties()->gcnArchName, "gfx11", 5) == 0;
+}
+
+static bool fq_gemv_kq_wmma_try(const torch::Tensor& qb, const torch::Tensor& packed, torch::Tensor& out, int M, int N, int K,
+                                int64_t pstride, int64_t qb_stride, cudaStream_t stream)
+{
+    const int mode = fq_kq_wmma_mode();
+    if (mode == 0 || M < 2 || M > 16 || K < 4096 || K % 256 != 0 || (uintptr_t)qb.data_ptr() % 4 != 0 || qb_stride % 4 != 0 ||
+        (uintptr_t)packed.data_ptr() % 16 != 0 || pstride % 16 != 0)
+        return false;
+    if (mode == 2)
+    {
+        // measured on gfx1151 (Qwen3-8B shapes, cold, x-rows 1..16; the WMMA kernel's cost steps with ceil(R / 4)): thin matrices and deep K
+        // (one wave walks all K positions serially) are latency bound there, so they need many x-rows to amortise it
+        bool wins;
+        if (K > 6144)
+            wins = M >= 13;                      // 4096x12288: 1.25x at R = 16, 0.8-1.0x below
+        else if (N < 2048)
+            wins = M >= 8;                       // 1024x4096: 1.15x at R = 8
+        else if (N < 8192)
+            wins = true;                         // 4096x4096: 1.2x at R = 2 .. 2.2x at R = 16
+        else
+            wins = M >= 6;                       // 12288x4096: 1.09x at R = 6, 1.3x at R = 8, 2.0x at R = 16
+        if (!wins)
+            return false;
+    }
+    if (!fq_kq_wmma_arch())
+        return false;
+    auto topt = torch::TensorOptions().device(qb.device());
+    const int nitems = (K / 256) * 4;
+    const int P = (M + 3) / 4, TPW = P == 1 ? 4 : (P == 2 ? 2 : 1);
+    torch::Tensor frag = torch::empty({(int64_t)P * nitems * 128}, topt.dtype(torch::kInt32));
+    torch::Tensor tab = torch::empty({(int64_t)P * nitems * 40}, topt.dtype(torch::kFloat));
+    const int64_t total = (int64_t)P * 4 * nitems;
+    fq_kq_wpack_q4_kernel<<<(unsigned)((total + 127) / 128), 128, 0, stream>>>(
+        qb.data_ptr<uint8_t>(), reinterpret_cast<uint4*>(frag.data_ptr<int32_t>()), tab.data_ptr<float>(), M, nitems, qb_stride, total);
+    const unsigned grid = (unsigned)((((N + 31) / 32) + TPW - 1) / TPW), block = 32 * P * TPW;
+    auto go = [&](auto* op)
+    {
+        using O = std::decay_t<decltype(*op)>;
+        if (M <= 2)
+            fq_gemv_kq_wmma_q4_kernel<O, 2, 2><<<grid, block, 0, stream>>>(packed.data_ptr<uint8_t>(), reinterpret_cast<const uint4*>(frag.data_ptr<int32_t>()),
+                                                                          tab.data_ptr<float>(), op, M, N, pstride, nitems, P, TPW);
+        else
+            fq_gemv_kq_wmma_q4_kernel<O, 4, 2><<<grid, block, 0, stream>>>(packed.data_ptr<uint8_t>(), reinterpret_cast<const uint4*>(frag.data_ptr<int32_t>()),
+                                                                          tab.data_ptr<float>(), op, M, N, pstride, nitems, P, TPW);
+    };
+    if (out.dtype() == torch::kHalf)
+        go(reinterpret_cast<__half*>(out.data_ptr<at::Half>()));
+    else
+        go(out.data_ptr<float>());
+    return true;
+}
+#endif
+
 template <typename OUT, int FMT, int WROWS, int RT, int WT>
 static void fq_gemv_kq_mrows_go(int M, const uint32_t* rec, const uint8_t* packed, OUT* out, int N, int K, int64_t pstride,
                                 int nwin, int nt, cudaStream_t stream)
@@ -658,6 +728,13 @@ static void fq_gemv_kq_launch(torch::Tensor qb, torch::Tensor packed, torch::Ten
     size_t shmem = (size_t)nt * sizeof(float);
     at::cuda::CUDAGuard guard(qb.device());
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+    if constexpr (FMT == 0)
+    {
+        if (fq_gemv_kq_wmma_try(qb, packed, out, M, N, K, pstride, qb_stride, stream))
+            return;
+    }
+#endif
     if constexpr (FMT == 0 || FMT == 2)
     {
         if (M >= 2 && M <= 16 && fq_kq_mrows_on() && K % 256 == 0 && (uintptr_t)packed.data_ptr() % ((FMT == 0) ? 16 : 2) == 0 &&
