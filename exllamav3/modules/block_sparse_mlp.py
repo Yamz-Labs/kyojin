@@ -1985,6 +1985,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         final_hidden_states = routed_v.view(x.shape) if R > 1 else routed_v   # rows -> [jobs, q, K] like the per-expert path
         if self.shared_experts is not None:
             se_params = {**params, "moe_valu": True} if _MOE_VALU else params
+            if R == 1 and h.data_ptr() == x.data_ptr() and h.dtype == x.dtype:
+                # the routed call above left q8_1(x) in fq_q8_scratch(dev, 1, K): the shared gate+up reads it (mlp._fq_gu_cat)
+                se_params = {**se_params, "fq_q8_x": x.data_ptr()}
             se = self.shared_experts.forward(x, se_params)
             if self.shared_gate is not None and torch.version.hip and _SHGATE_FUSE and R <= 16 and \
                     se.dtype in (torch.half, torch.float) and x.dtype == torch.half and se.is_contiguous() and x.is_contiguous() and \

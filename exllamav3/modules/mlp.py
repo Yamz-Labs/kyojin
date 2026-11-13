@@ -457,7 +457,12 @@ def _vf_plain_exl3(l, dim: int) -> bool:
 _FQ_GU_CAT = os.environ.get("EXL3_FQ_GU_CAT", "1") != "0"
 
 
-def _fq_gu_cat(mlp, s, x):
+# EXL3_MOE_Q8_REUSE (default 1): the MoE shared expert reuses the routed call's q8_1(x) (only with the q8q8 path, BOLT_FQ_Q8Q8)
+_Q8_REUSE = os.environ.get("EXL3_MOE_Q8_REUSE", "1") != "0" and os.environ.get("BOLT_FQ_Q8Q8", "1") != "0"
+_Q8_REUSE_SAID = [False]
+
+
+def _fq_gu_cat(mlp, s, x, params = None):
     """Gate + up of a foreign Q8_0 slice in ONE fq_gemv_q8_0 at 1 row: the row-stacked [gate; up] weights cached once, one q8
     quantization of x and one launch instead of two of each. Each output row is the same dot over the same quantized x, so g and u
     are bit-identical to the two separate calls. Returns (g, u) views or None (any other case keeps the two calls)."""
@@ -479,7 +484,14 @@ def _fq_gu_cat(mlp, s, x):
         w = (gm.packed.data_ptr(), torch.cat([gm.packed.reshape(N, -1), um.packed.reshape(N, -1)], 0).contiguous())
         cache[s] = w
     out = torch.empty((1, 2 * N), dtype = torch.half, device = x.device)
-    ext.fq_gemv_q8_0(x.reshape(1, K), w[1].reshape(2 * N, -1, 34), out)
+    if _Q8_REUSE and params is not None and params.get("fq_q8_x") == x.data_ptr() and hasattr(ext, "fq_gemv_q8_0_q8"):
+        # q8_1(x) already in the cached scratch (written by the routed MoE call on the same x): same bytes fq_gemv_q8_0 would make
+        ext.fq_gemv_q8_0_q8(ext.fq_q8_scratch(x.device.index, 1, K), w[1].reshape(2 * N, -1, 34), out)
+        if not _Q8_REUSE_SAID[0]:
+            _Q8_REUSE_SAID[0] = True
+            print(" -- MoE shared expert reuses the routed q8_1(x)", flush = True)
+    else:
+        ext.fq_gemv_q8_0(x.reshape(1, K), w[1].reshape(2 * N, -1, 34), out)
     shp = x.shape[:-1] + (N,)
     return out[:, :N].view(shp), out[:, N:].view(shp)
 
@@ -821,7 +833,7 @@ class GatedMLP(Module):
                     self.bc.run_bszN(xv, d.view(xv.shape))
 
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
-                    gu = _fq_gu_cat(self, s, x) if bsz * q_len == 1 else None
+                    gu = _fq_gu_cat(self, s, x, params) if bsz * q_len == 1 else None
                     if gu is not None:
                         g, u = gu
                     else:
