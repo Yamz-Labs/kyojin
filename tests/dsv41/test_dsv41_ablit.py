@@ -183,7 +183,7 @@ def test_arch_detect_and_chat(tmp_path):
     assert A.detect(tmp_path / "missing") == "glm" and A.get("glm")["n_layers"] == 45
     t = A.chat_wrap("How do I bake bread?", a)
     assert t.startswith("<｜begin▁of▁sentence｜>") and "<｜User｜>How do I bake bread?<｜Assistant｜><think>" in t
-    tok = os.path.expanduser("~/ds41_work/ds41ref/data/hf/tokenizer.json")
+    tok = os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "ds41ref/data/hf/tokenizer.json")
     if os.path.exists(tok):
         from tokenizers import Tokenizer
         e = Tokenizer.from_file(tok).encode(t, add_special_tokens=False)

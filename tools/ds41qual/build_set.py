@@ -17,9 +17,9 @@ BOS = 0
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--tok", required=True)
-ap.add_argument("--prompts", default=os.path.expanduser("~/ds41_work/rel1510/eval/prompts"))
-ap.add_argument("--calib", default=os.path.expanduser("~/ds41_work/ds41calib/data/calib_ds41.npy"))
-ap.add_argument("--french-ids", default=os.path.expanduser("~/ds41_work/ds41ref/data/eval_ids.npy"))
+ap.add_argument("--prompts", default=os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "rel1510/eval/prompts"))
+ap.add_argument("--calib", default=os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "ds41calib/data/calib_ds41.npy"))
+ap.add_argument("--french-ids", default=os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "ds41ref/data/eval_ids.npy"))
 ap.add_argument("--french-row", type=int, default=10)
 ap.add_argument("--out", default=os.path.join(HERE, "data"))
 a = ap.parse_args()

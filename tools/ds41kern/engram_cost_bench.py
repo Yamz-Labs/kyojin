@@ -15,8 +15,8 @@ from engram_prefetch_bench import open_store, LAYERS, PAD, med
 from exllamav3.dsv41.engram import EngramLayout, compute_multipliers
 from exllamav3.modules.dsv41_fn.engram_prefetch import EngramPrefetcher
 
-DATA = os.path.expanduser("~/ds41_work/recipe/bench/data")
-TMAP = os.path.expanduser("~/ds41_work/ds41eng-scratch/tmap.npy")
+DATA = os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "recipe/bench/data")
+TMAP = os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "ds41eng-scratch/tmap.npy")
 SHORT_ROWS = {0: "chat", 2: "en", 4: "code", 15: "zh", 16: "tool"}
 
 

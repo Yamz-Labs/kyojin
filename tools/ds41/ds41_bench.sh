@@ -3,8 +3,8 @@
 # $DS41_OUT (JSON) and a summary at the end. Stages: prefill (2048 / 16384 tok/s), decode (plain), dspark (tok/s, accepted
 # per round, speedup), quality (top-1 + KL vs the teacher files), longctx (needle in a 16K haystack).
 #   tools/ds41/ds41_bench.sh [stage ...]            default: all, in that order
-#   DS41_TEACHER=<dir with teacher/row_XXX.npz>   default ~/ds41_work/ds41ready_data/teacher
-#       (worker: ~/ds41_work/recipe/teacher/out/teacher/ via: rsync -a worker:ds41_work/recipe/teacher/out/teacher $DS41_TEACHER/)
+#   DS41_TEACHER=<dir with teacher/row_XXX.npz>   default $DS41_WORK/ds41ready_data/teacher
+#       (worker: $DS41_WORK/recipe/teacher/out/teacher/ via: rsync -a worker:ds41_work/recipe/teacher/out/teacher $DS41_TEACHER/)
 #   DS41_OUT=<json>  DS41_DRAFT=4  DS41_NEW=64  DS41_QROWS=<rows per quality ticket, 0 = budget only>  DS41_QMAX=<tickets, 12>
 #   DS41_LAYERS=N first N trunk layers; DS41_EXTRA="--lens 512,1024 --ctx 4096 --trunc 512" extra ds41_bench.py flags (dry runs);
 #   DS41_TICKET=0 no gpurun per stage

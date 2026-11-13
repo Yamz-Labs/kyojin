@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # usage: same env knobs as ds41_tier_arm.sh; ds41_session_arm.sh ARM [extra ds41_session.py flags]
 set -u
-H=${H:-$HOME/ds41_work}
+H=${H:-${DS41_WORK:-./ds41_work}}
 if [ -z "${DS41_INTICKET:-}" ]; then DS41_INTICKET=1 exec "$H/bin/gpurun" --need "${DS41_NEED_GB:-20}" --grace 600 --who "${DS41_WHO:-ds41sess}" bash "${BASH_SOURCE[0]}" "$@"; fi
 ARM=$1; shift
 export DS41_VALIDATE=0 DS41_VALIDATED=1

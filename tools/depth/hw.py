@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Measure the box roofline once: read bandwidth (GB/s) and dense fp16 GEMM peak (TFLOPS). Writes hw.json.
-Run on a quiet GPU:  flock ~/ds41_work/gpu.lock ~/ds41_work/cur1510/quiet.sh python tools/depth/hw.py"""
+Run on a quiet GPU:  flock $DS41_WORK/gpu.lock $DS41_WORK/cur1510/quiet.sh python tools/depth/hw.py"""
 import json, os, sys, time
 import torch
 

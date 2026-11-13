@@ -19,7 +19,7 @@ for p in (str(REPO), str(REPO / "tests" / "dsv41")):      # appended: a PYTHONPA
         sys.path.append(p)
 import luce_eval as le  # noqa: E402
 
-DATA = Path(os.environ.get("LUCE_DATA", "~/ds41_work/luce_data")).expanduser()
+DATA = Path(os.environ.get("LUCE_DATA", "ds41_work/luce_data")).expanduser()
 
 
 def test_metrics_closed_form():

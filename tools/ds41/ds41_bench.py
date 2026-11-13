@@ -21,7 +21,7 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-H = os.path.expanduser("~/ds41_work")
+H = os.environ.get("DS41_WORK", "ds41_work")
 
 
 def load_json(p):
