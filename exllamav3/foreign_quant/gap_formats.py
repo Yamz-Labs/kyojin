@@ -44,6 +44,51 @@ def _f16(b: torch.Tensor) -> torch.Tensor:
     return b.contiguous().view(torch.float16).float()          # [..., 2] bytes -> [..., 1]
 
 
+_Q51_TRITON = __import__("os").environ.get("EXL3_Q51_TRITON", "1") != "0"
+_q51_kernel = None
+
+
+def _dequant_q5_1_triton(raw: torch.Tensor) -> torch.Tensor:
+    """raw [rows, nb * 24] uint8 Q5_1 blocks -> [rows, nb * 32] half, bit-identical to the torch chain below."""
+    global _q51_kernel
+    import triton
+    import triton.language as tl
+    if _q51_kernel is None:
+        @triton.jit
+        def k(src, dst, nblk, BLOCKS: tl.constexpr):
+            pid = tl.program_id(0)
+            bi = pid * BLOCKS + tl.arange(0, BLOCKS)                      # block ids
+            ok = bi < nblk
+            j = tl.arange(0, 32)                                          # element in block
+            base = bi.to(tl.int64) * 24
+            b0 = tl.load(src + base + 0, mask = ok, other = 0).to(tl.uint32)
+            b1 = tl.load(src + base + 1, mask = ok, other = 0).to(tl.uint32)
+            b2 = tl.load(src + base + 2, mask = ok, other = 0).to(tl.uint32)
+            b3 = tl.load(src + base + 3, mask = ok, other = 0).to(tl.uint32)
+            b4 = tl.load(src + base + 4, mask = ok, other = 0).to(tl.uint32)
+            b5 = tl.load(src + base + 5, mask = ok, other = 0).to(tl.uint32)
+            b6 = tl.load(src + base + 6, mask = ok, other = 0).to(tl.uint32)
+            b7 = tl.load(src + base + 7, mask = ok, other = 0).to(tl.uint32)
+            d = (b0 | (b1 << 8)).to(tl.uint16).to(tl.float16, bitcast = True).to(tl.float32)
+            mm = (b2 | (b3 << 8)).to(tl.uint16).to(tl.float16, bitcast = True).to(tl.float32)
+            qh = b0 * 0 + (b4 | (b5 << 8) | (b6 << 16) | (b7 << 24))
+            qs = tl.load(src + base[:, None] + 8 + (j % 16)[None, :], mask = ok[:, None], other = 0).to(tl.uint32)
+            lo = tl.where((j < 16)[None, :], qs & 15, qs >> 4)
+            hb = (qh[:, None] >> j[None, :].to(tl.uint32)) & 1
+            v = (lo | (hb << 4)).to(tl.float32)
+            t = d[:, None] * v
+            o = t + mm[:, None]
+            tl.store(dst + bi.to(tl.int64)[:, None] * 32 + j[None, :], o.to(tl.float16), mask = ok[:, None])
+        _q51_kernel = k
+    rows, w = raw.shape
+    assert w % 24 == 0
+    nblk = rows * (w // 24)
+    out = torch.empty((rows, (w // 24) * 32), dtype = torch.half, device = raw.device)
+    B = 64
+    _q51_kernel[(triton.cdiv(nblk, B),)](raw.contiguous(), out, nblk, BLOCKS = B, enable_fp_fusion = False)
+    return out
+
+
 def _bits(x: torch.Tensor, n: int) -> torch.Tensor:
     """[...] integer -> [..., n] bits, least significant first."""
     sh = torch.arange(n, device=x.device, dtype=torch.int64)
@@ -134,6 +179,8 @@ def dequant(fmt: str, raw: torch.Tensor) -> torch.Tensor:
         sgn = 1.0 - 2.0 * _bits(sg, 8).float()                  # [nb, 32, 8]
         out = (db.repeat_interleave(2, 1).unsqueeze(-1) * grid * sgn).reshape(nb, 256)
         return out.reshape(raw.shape[0], -1).half()
+    if fmt == "q5_1" and raw.is_cuda and _Q51_TRITON:
+        return _dequant_q5_1_triton(raw)
     d = _f16(b[:, 0:2])                                         # [nb, 1]
     if fmt == "q5_1":       # [d fp16][m fp16][qh u32][qs 16]: x = d * (low nibble | high bit << 4) + m
         m = _f16(b[:, 2:4])
