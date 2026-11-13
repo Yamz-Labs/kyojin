@@ -122,3 +122,15 @@ rm ~/.cache/torch_extensions/*/exllamav3_ext/lock
 Then run the command that hung again. If `ls` prints `No such file or directory`, there is no stale lock, and the hang has another cause.
 
 If `TORCH_EXTENSIONS_DIR` is set, the lock is under that directory instead.
+
+## NaN rows or `HSA memory fault` only when other GPU processes share the device (ROCm)
+
+Symptom: with several GPU processes on one AMD device (for example the model plus small helper models), a request now and then fails with a row of NaN or a nonfinite value deep in the model, or an HSA memory fault during prefill. The same request passes when the helpers are stopped or after a reboot.
+
+Workaround, tested by a user on two Strix Halo machines (issue #188): limit the HIP hardware queues of the model process:
+
+```bash
+GPU_MAX_HW_QUEUES=1 python tools/qwen/serve.py ...
+```
+
+This serializes the streams of that process, so it can cost some speed when the engine overlaps copies and compute. It is a workaround, not a diagnosis: a related ROCm report (ROCm/rocm-systems#5815) describes copies that return stale data with several processes on one GPU. If the failures stay with the helpers stopped and the default queue count, look for a missing stream or event wait in your own code instead.
