@@ -46,6 +46,9 @@ def child(mode):
             gemv(fmt, w, x, torch.half); torch.cuda.synchronize()
         names = [e.key for e in prof.key_averages()]
         ran = any("fq_gemv_kq_mrows_kernel" in k for k in names)
+        if not names:                                      # torch.profiler sees no kernel at all (ROCm): nothing to check here
+            print(f"kernel check {fmt} mode {mode}: skipped, the profiler returned no kernel (check with rocprofv3 --kernel-trace)", flush=True)
+            continue
         n[0] += 1
         if ran != (mode == "mrows"):
             print(f"MISMATCH kernel check {fmt} mode {mode}: multi-row kernel ran = {ran}; kernels {names}", flush=True); bad[0] += 1
