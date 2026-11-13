@@ -106,4 +106,49 @@ __device__ __forceinline__ void fq_kq_item_q6_k(const uint8_t* __restrict__ wr, 
     }
 }
 
+// Q5_K item (same grid as the Q4_K item): 256-block b = it >> 2, group g = it & 3; dst[qo] = fq_dot_q5_k_q8's chunk value
+// c = 16 b + 4 g + qo (bo = 2 g). qs words come from two 16-byte loads at 48 + 32 g, the high-bit words from the two 16-byte
+// loads at 16 and 32 (shared by all g, shifted by bo as in the v1 dot). 176-byte blocks: rows 16-byte aligned.
+__device__ __forceinline__ void fq_kq_item_q5_k(const uint8_t* __restrict__ wr, const uint8_t* __restrict__ aq,
+                                                int it, float* __restrict__ dst)
+{
+    const int b = it >> 2, g = it & 3, bo = 2 * g;
+    const uint8_t* blk = wr + (size_t)b * FQ_Q5_K_BYTES;
+    const uint32_t hd = *reinterpret_cast<const uint32_t*>(blk);
+    const float dm0 = fq_h2f_lo(hd);
+    const float dm1 = fq_h2f_lo(hd >> 16);
+    uint8_t sc[2], m[2];
+    fq_q4k_scales(blk + 4, g, sc, m);
+    const uint4 la = *reinterpret_cast<const uint4*>(blk + 48 + 32 * g);
+    const uint4 lb = *reinterpret_cast<const uint4*>(blk + 48 + 32 * g + 16);
+    const uint4 ha = *reinterpret_cast<const uint4*>(blk + 16);
+    const uint4 hb = *reinterpret_cast<const uint4*>(blk + 32);
+    const uint32_t l0[4] = {la.x, la.y, la.z, la.w}, l1[4] = {lb.x, lb.y, lb.z, lb.w};
+    const uint32_t h0[4] = {ha.x, ha.y, ha.z, ha.w}, h1[4] = {hb.x, hb.y, hb.z, hb.w};
+    const int32_t* a0 = reinterpret_cast<const int32_t*>(aq + (size_t)(b * 8 + bo) * FQ_Q8_1_BYTES);
+    const int32_t* a1 = a0 + FQ_Q8_1_BYTES / 4;
+    const float d8[2] = {fq_h2f_lo((uint32_t)a0[0]), fq_h2f_lo((uint32_t)a1[0])};
+    #pragma unroll
+    for (int qo = 0; qo < 4; qo++)
+    {
+        const uint32_t vh0 = h0[qo] >> bo, vh1 = h1[qo] >> bo;
+        float sumf_d = 0.0f, sumf_m = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 2; i++)
+        {
+            const int32_t* a = i ? a1 : a0;
+            const uint32_t v0i = ((l0[qo] >> (4 * i)) & 0x0F0F0F0Fu) | (((vh0 >> i) << 4) & 0x10101010u);
+            const uint32_t v1i = ((l1[qo] >> (4 * i)) & 0x0F0F0F0Fu) | (((vh1 >> i) << 4) & 0x10101010u);
+            const int32_t u0 = a[1 + qo], u1 = a[5 + qo];
+            int dot1 = fq_dp4a((int32_t)v0i, u0, 0);
+            dot1 = fq_dp4a((int32_t)v1i, u1, dot1);
+            int dot2 = fq_dp4a(0x01010101, u0, 0);
+            dot2 = fq_dp4a(0x01010101, u1, dot2);
+            sumf_d = __fadd_rn(sumf_d, __fmul_rn(d8[i], (float)(dot1 * sc[i])));
+            sumf_m = __fadd_rn(sumf_m, __fmul_rn(d8[i], (float)(dot2 * m[i])));
+        }
+        dst[qo] = __fadd_rn(__fmul_rn(dm0, sumf_d), -__fmul_rn(dm1, sumf_m));
+    }
+}
+
 }  // namespace

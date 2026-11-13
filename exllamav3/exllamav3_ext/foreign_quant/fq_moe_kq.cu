@@ -184,6 +184,82 @@ __global__ void __launch_bounds__(256) fq_moe_kq_upgate_v2_kernel(const uint8_t*
     }
 }
 
+// Down, v2 items (bit-identical to fq_moe_kq_down_kernel<FMT>, FMT 0 Q4_K / 1 Q5_K / 2 Q6_K): 32 rows per block, 8 threads per
+// row, thread j runs items j, j + 8, ...; the item's four values belong to v1 lanes 4 j + q (Q4_K / Q5_K) or j + 8 q (Q6_K),
+// each added in increasing sub-chunk order as v1 does; then one thread per row adds the 32 lane partials lane by lane.
+template <int FMT>
+__global__ void __launch_bounds__(256) fq_moe_kq_down_v2_kernel(const uint8_t* __restrict__ aqb,
+                                      int64_t qb_stride,
+                                      const int64_t* __restrict__ sel,
+                                      const uint8_t* __restrict__ const* down_bases,
+                                      int64_t down_stride,
+                                      float* __restrict__ partial,
+                                      int S, int I, int K, int E, int ntiles_d)
+{
+    __shared__ float pp[FQ_MOE_V2_ROWS * FQ_MOE_V2_PS];
+    const int s = blockIdx.x / ntiles_d;
+    const int t = blockIdx.x % ntiles_d;
+    const int r = threadIdx.x >> 3, j = threadIdx.x & 7;
+    int64_t e = sel[s];
+    e = (e < 0 || e >= E) ? 0 : e;
+    const int n = t * FQ_MOE_V2_ROWS + r;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (n < K)
+    {
+        const uint8_t* dr = down_bases[e] + (int64_t)n * down_stride;
+        const uint8_t* aq = aqb + (int64_t)s * qb_stride;
+        const uintptr_t amask = (FMT == 2) ? 1 : 15;
+        if (((uintptr_t)dr & amask) == 0)
+        {
+            const int nitems = (I / 256) * ((FMT == 2) ? 8 : 4);
+            for (int it = j; it < nitems; it += 8)
+            {
+                float tv[4];
+                if constexpr (FMT == 0) fq_kq_item_q4_k(dr, aq, it, tv);
+                else if constexpr (FMT == 1) fq_kq_item_q5_k(dr, aq, it, tv);
+                else fq_kq_item_q6_k(dr, aq, it, tv);
+                #pragma unroll
+                for (int q = 0; q < 4; q++)
+                    acc[q] = __fadd_rn(acc[q], tv[q]);
+            }
+        }
+        else
+        {
+            #pragma unroll
+            for (int q = 0; q < 4; q++)
+            {
+                const int l = (FMT == 2) ? (j + 8 * q) : (4 * j + q);
+                if constexpr (FMT == 0) acc[q] = fq_dot_q4_k_q8(dr, aq, I, l, FQ_GEMV_LANES);
+                else if constexpr (FMT == 1) acc[q] = fq_dot_q5_k_q8(dr, aq, I, l, FQ_GEMV_LANES);
+                else acc[q] = fq_dot_q6_k_q8(dr, aq, I, l, FQ_GEMV_LANES);
+            }
+        }
+    }
+    #pragma unroll
+    for (int q = 0; q < 4; q++)
+        pp[r * FQ_MOE_V2_PS + ((FMT == 2) ? (j + 8 * q) : (4 * j + q))] = acc[q];
+    __syncthreads();
+    if (n < K && j == 0)
+    {
+        float sp = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 32; l++)
+            sp = __fadd_rn(sp, pp[r * FQ_MOE_V2_PS + l]);
+        partial[(int64_t)s * K + n] = sp;
+    }
+}
+
+template <int FMT>
+static void fq_moe_kq_down_v2_launch(const uint8_t* aq, int64_t qb_stride, const int64_t* sel, const uint8_t* const* bases,
+                                     int64_t down_stride, float* partial, int S, int I, int K, int E, cudaStream_t stream)
+{
+    if constexpr (FMT <= 2)
+    {
+        const int nt2 = (K + FQ_MOE_V2_ROWS - 1) / FQ_MOE_V2_ROWS;
+        fq_moe_kq_down_v2_kernel<FMT><<<S * nt2, 256, 0, stream>>>(aq, qb_stride, sel, bases, down_stride, partial, S, I, K, E, nt2);
+    }
+}
+
 static bool fq_moe_v2_on()
 {
     static const char* e = std::getenv("BOLT_FQ_MOE_V2");
@@ -329,6 +405,11 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
     fq_quant_q8_1_rows(act, qb_act);
     int64_t qb_stride_a = (int64_t)(I / FQ_Q8_1_GROUP) * FQ_Q8_1_BYTES;
     size_t shmem_d = (size_t)FQ_GEMV_THREADS * sizeof(float);
+    if (FMT_D <= 2 && I % 256 == 0 && fq_moe_v2_on())
+        fq_moe_kq_down_v2_launch<FMT_D>(qb_act.data_ptr<uint8_t>(), qb_stride_a, sel.data_ptr<int64_t>(),
+                                        reinterpret_cast<const uint8_t* const*>(down_ptrs.data_ptr<int64_t>()),
+                                        down_stride, partial.data_ptr<float>(), S, I, K, E, stream);
+    else
     fq_moe_kq_down_kernel<FMT_D><<<S * ntiles_d, FQ_GEMV_THREADS, shmem_d, stream>>>(
         qb_act.data_ptr<uint8_t>(), qb_stride_a, sel.data_ptr<int64_t>(),
         reinterpret_cast<const uint8_t* const*>(down_ptrs.data_ptr<int64_t>()),
