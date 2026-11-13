@@ -12,7 +12,7 @@ from exllamav3.foreign_quant import gap_formats
 
 FMTS = {  # name: (block bytes, elements per block, mmvq id)
     "iq2_xxs": (66, 256, 0), "iq2_xs": (74, 256, 1), "iq2_s": (82, 256, 2), "iq3_xxs": (98, 256, 3),
-    "iq3_s": (110, 256, 4), "iq4_nl": (18, 32, 5), "iq4_xs": (136, 256, 6),
+    "iq3_s": (110, 256, 4), "iq4_nl": (18, 32, 5), "iq4_xs": (136, 256, 6), "q5_k": (176, 256, 7),
 }
 
 
@@ -22,6 +22,8 @@ def make_weights(fmt, n, k, seed, dscale=1.0):
     w = torch.randint(0, 256, (n, k // qk, bb), generator=g, dtype=torch.uint8)
     d = ((torch.rand(n, k // qk, generator=g) * 0.02 + 0.001) * dscale).half().view(torch.uint8).reshape(n, k // qk, 2)
     w[:, :, 0:2] = d
+    if fmt == "q5_k":                     # half2 (d, dmin)
+        w[:, :, 2:4] = d
     return w.reshape(n, -1).cuda()
 
 
@@ -31,9 +33,9 @@ def dequant(fmt, w, n, k):
         out = torch.empty((n, k), dtype=torch.half, device="cuda")
         ext.fq_dequant_iq2_xxs(w.reshape(n, k // 256, 66), out)
         return out.float()
-    if fmt == "iq4_xs":
+    if fmt in ("iq4_xs", "q5_k"):
         out = torch.empty((n, k), dtype=torch.half, device="cuda")
-        ext.fq_dequant_iq4_xs(w, out)
+        getattr(ext, f"fq_dequant_{fmt}")(w, out)
         return out.float()
     return gap_formats.dequant(fmt, w).float().reshape(n, k)
 
@@ -46,7 +48,7 @@ def q8_dequant(qb, m, k):
 
 
 OLD = {"iq2_xxs": "fq_gemv_iq2_xxs_q8", "iq3_xxs": "fq_gemv_iq3_xxs_q8", "iq2_s": "fq_gemv_iq2_s_q8", "iq3_s": "fq_gemv_iq3_s_q8",
-       "iq4_xs": "fq_gemv_iq4_xs_q8"}
+       "iq4_xs": "fq_gemv_iq4_xs_q8", "q5_k": "fq_gemv_q5_k_q8"}
 worst_old = [0.0]
 
 
@@ -80,6 +82,21 @@ def test_dense():
                         worst_old[0] = max(worst_old[0], d)
         print(f"dense {fmt}: ok")
     print(f"dense worst fp32-out rel err vs dequant reference {worst:.2e}, vs previous q8 kernels {worst_old[0]:.2e}")
+
+
+def test_dequant():
+    for fmt, (bb, qk, i) in FMTS.items():
+        if fmt == "q5_k":
+            continue
+        n, k = 96, 1024
+        w = make_weights(fmt, n, k, 11)
+        ref = dequant(fmt, w, n, k).half()
+        out = torch.empty((n, k), dtype=torch.half, device="cuda")
+        ext.fq_dequant_iq(w, out, i)
+        torch.cuda.synchronize()
+        bad = int((out.view(torch.int16) != ref.view(torch.int16)).sum())
+        print(f"dequant {fmt}: {bad} of {n * k} fp16 values differ from the reference")
+        assert bad == 0, f"{fmt}: fq_dequant_iq differs from the reference"
 
 
 def moe_case(fug, fd, K, I, E, R, topk, seed):
@@ -128,13 +145,14 @@ def test_moe():
     cases = [("iq2_s", "iq3_xxs"), ("iq2_s", "iq4_xs"), ("iq3_xxs", "iq3_xxs"), ("iq2_xs", "iq3_s"), ("iq4_nl", "iq4_nl"), ("iq2_xxs", "iq2_xxs"),
              ("iq3_s", "iq2_xs"), ("iq4_xs", "iq4_xs")]
     for fug, fd in cases:
-        for R in (1, 4, 8):
+        for R in (1, 4, 8, 40):
             rel = moe_case(fug, fd, 1024, 512, 8, R, 4, 3)
             print(f"moe ug={fug} down={fd} R={R}: rel err {rel:.2e}")
             assert rel < 5e-3, f"{fug}/{fd} R={R}: rel err {rel}"
 
 
 if __name__ == "__main__":
+    test_dequant()
     test_dense()
     test_moe()
     print("PASS")

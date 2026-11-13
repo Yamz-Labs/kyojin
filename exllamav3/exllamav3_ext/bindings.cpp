@@ -648,6 +648,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_mmvq_iq4_xs", &fq_mmvq_iq4_xs, "fq_mmvq_iq4_xs",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_dequant_iq", &fq_dequant_iq, "fq_dequant_iq", py::arg("packed"), py::arg("out"), py::arg("fmt"));
     m.def("fq_moe_mmvq_grouped", &fq_moe_mmvq_grouped, "fq_moe_mmvq_grouped",
           py::arg("h"), py::arg("sel"), py::arg("wts"), py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
           py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"), py::arg("type_ug"), py::arg("type_down"),
