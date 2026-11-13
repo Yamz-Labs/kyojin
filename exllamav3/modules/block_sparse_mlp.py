@@ -214,6 +214,10 @@ _SHGATE_FUSE = os.environ.get("EXL3_SHGATE_FUSE", "1") != "0"
 
 # MCPM_FQ_MOE_IQ (default 1): IQ3_XXS / IQ2_S experts take the grouped q8_1 decode MoE (fq_moe_kq.cu FMT 4 / 5)
 _FQ_MOE_IQ = os.environ.get("MCPM_FQ_MOE_IQ", "1") != "0"
+# BOLT_FQ_MMVQ (default 1, CUDA): IQ experts (all 7 IQ formats, gate/up and down) take the llama.cpp mmvq-style slot-parallel decode MoE
+# (fq_mmvq.cu fq_moe_mmvq_grouped) instead of fq_moe_kq.cu. 0 = the previous kernels (A/B).
+_MQ_ID = {"iq2_xxs": 0, "iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5, "iq4_xs": 6}
+_MQ_MOE = os.environ.get("BOLT_FQ_MMVQ", "1") != "0" and bool(torch.version.cuda) and not torch.version.hip and hasattr(ext, "fq_moe_mmvq_grouped")
 
 @dataclass
 class FusedBuffers:
@@ -1762,6 +1766,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # gate/up share one format, down has its own (unsloth UD: gate/up Q4_K + down Q5_K)
         fmt = fmt_d = None
         _ug_ok = ("q4_k", "q5_k", "q6_k", "iq4_xs") + (("iq3_xxs", "iq2_s") if _FQ_MOE_IQ else ())
+        if _FQ_MOE_IQ and _MQ_MOE:
+            _ug_ok = _ug_ok + ("iq2_xs", "iq3_s", "iq4_nl", "iq2_xxs")
         for m in self.gates + self.ups:
             if not isinstance(m, ForeignLinear) or m.format not in _ug_ok:
                 return None
@@ -1779,6 +1785,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         fmt_d = self.downs[0].format
         if any(m.format != fmt for m in self.gates + self.ups) or any(m.format != fmt_d for m in self.downs):
             return None
+        if (fmt in ("iq2_xs", "iq3_s", "iq4_nl", "iq2_xxs") or fmt_d in ("iq2_xs", "iq3_s", "iq4_nl", "iq2_xxs")) and                 not (fmt in _MQ_ID and fmt_d in _MQ_ID):
+            return None   # only the mmvq MoE kernel has these formats
         if self.router_pre_norm is not None or self.routed_pre_norm is not None:
             return None
         if self.routed_post_norm is not None:
@@ -1961,7 +1969,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         h = y.reshape(R, -1)
         dev = h.device
         K = h.shape[1]
-        _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136, "iq3_xxs": 98, "iq2_s": 82, "q8_0": 34, "q5_1": 24}
+        _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136, "iq3_xxs": 98, "iq2_s": 82, "q8_0": 34, "q5_1": 24,
+               "iq2_xs": 74, "iq3_s": 110, "iq4_nl": 18, "iq2_xxs": 66}
+        _QK = lambda f: 32 if f in ("q8_0", "q5_1", "iq4_nl") else 256
         bb = _BB[fmt]
         bb_d = _BB[fmt_d]
         tbl = getattr(self, "_fq_kq_ptrs", None)
@@ -1976,9 +1986,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self._fq_kq_ptrs = tbl
         _, gate_ptrs, up_ptrs, down_ptrs, _ = tbl
         I = self.intermediate_size
-        gate_stride = (K // 256) * bb
+        gate_stride = (K // _QK(fmt)) * bb
         up_stride = gate_stride
-        down_stride = (I // (32 if fmt_d in ("q8_0", "q5_1") else 256)) * bb_d
+        down_stride = (I // _QK(fmt_d)) * bb_d
         # buffers sized once for the largest row count (stable pointers for CUDA graphs); the kernel gets row-prefix views
         if getattr(self, "_fq_kq_partial", None) is None or \
                 self._fq_kq_partial.shape != (FQ_GROUPED_MAX_ROWS * S, K) or self._fq_kq_partial.device != dev:
@@ -1988,7 +1998,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         routed_v = self._fq_kq_routed[:R]
         _FN = {"q4_k": "fq_moe_q4k_grouped_q8", "q5_k": "fq_moe_q5k_grouped_q8",
                "q6_k": "fq_moe_q6k_grouped_q8", "iq4_xs": "fq_moe_iq4xs_grouped_q8"}
-        if fmt == fmt_d and fmt in _FN:
+        if _MQ_MOE and fmt in _MQ_ID and fmt_d in _MQ_ID and K % _QK(fmt) == 0 and I % _QK(fmt_d) == 0 and I % 32 == 0:
+            ext.fq_moe_mmvq_grouped(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride,
+                                    _MQ_ID[fmt], _MQ_ID[fmt_d], partial_v, routed_v)
+        elif fmt == fmt_d and fmt in _FN:
             getattr(ext, _FN[fmt])(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
                                    gate_stride, up_stride, down_stride,
                                    partial_v, routed_v)
