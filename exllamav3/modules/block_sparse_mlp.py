@@ -215,6 +215,10 @@ def _aligned_expert_layout(flat: torch.Tensor, num_tokens: int, top_k: int, num_
 _SHGATE_FUSE = os.environ.get("EXL3_SHGATE_FUSE", "1") != "0"
 
 
+# EXL3_MOE_SH_FUSE (default 1): a Q8_0 shared expert runs inside the grouped q8_1 decode MoE launches (extra slot per row,
+# gate in the combine): 5 launches less per MoE layer; 0 keeps the separate shared-expert path
+_MOE_SH_FUSE = os.environ.get("EXL3_MOE_SH_FUSE", "1") != "0"
+_MOE_SH_SAID = [False]
 # MCPM_FQ_MOE_IQ (default 1): IQ3_XXS / IQ2_S experts take the grouped q8_1 decode MoE (fq_moe_kq.cu FMT 4 / 5)
 _FQ_MOE_IQ = os.environ.get("MCPM_FQ_MOE_IQ", "1") != "0"
 
@@ -1984,18 +1988,26 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         down_stride = (I // (32 if fmt_d in ("q8_0", "q5_1") else 256)) * bb_d
         # buffers sized once for the largest row count (stable pointers for CUDA graphs); the kernel gets row-prefix views
         if getattr(self, "_fq_kq_partial", None) is None or \
-                self._fq_kq_partial.shape != (FQ_GROUPED_MAX_ROWS * S, K) or self._fq_kq_partial.device != dev:
-            # partial sums: scratch consumed inside this call -> one buffer per (device, shape) for every MoE layer
-            key = (str(dev), FQ_GROUPED_MAX_ROWS * S, K)
+                self._fq_kq_partial.shape != (FQ_GROUPED_MAX_ROWS * (S + 1), K) or self._fq_kq_partial.device != dev:
+            # partial sums: scratch consumed inside this call -> one buffer per (device, shape) for every MoE layer;
+            # + one row per token for the shared expert fused into the same launches (_fq_sh_fused)
+            key = (str(dev), FQ_GROUPED_MAX_ROWS * (S + 1), K)
             if key not in _FQ_KQ_PARTIAL:
-                _FQ_KQ_PARTIAL[key] = torch.empty((FQ_GROUPED_MAX_ROWS * S, K), dtype=torch.float, device=dev)
+                _FQ_KQ_PARTIAL[key] = torch.empty((FQ_GROUPED_MAX_ROWS * (S + 1), K), dtype=torch.float, device=dev)
             self._fq_kq_partial = _FQ_KQ_PARTIAL[key]
             self._fq_kq_routed = torch.empty((FQ_GROUPED_MAX_ROWS, K), dtype=torch.float, device=dev)
         partial_v = self._fq_kq_partial[:R * S]
+        sh = self._fq_sh_fused(x, h, K, I, fmt, fmt_d) if h.data_ptr() == x.data_ptr() and h.dtype == x.dtype else None
         routed_v = self._fq_kq_routed[:R]
         _FN = {"q4_k": "fq_moe_q4k_grouped_q8", "q5_k": "fq_moe_q5k_grouped_q8",
                "q6_k": "fq_moe_q6k_grouped_q8", "iq4_xs": "fq_moe_iq4xs_grouped_q8"}
-        if fmt == fmt_d and fmt in _FN:
+        if sh is not None:
+            # shared expert in the same launches (extra slot per row); its gate row and the add are in the combine
+            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3, "iq3_xxs": 4, "iq2_s": 5, "q8_0": 6, "q5_1": 7}
+            ext.fq_moe_kq_grouped_mixed_sh_q8(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
+                                              gate_stride, up_stride, down_stride, _FID[fmt], _FID[fmt_d],
+                                              self._fq_kq_partial[:R * (S + 1)], routed_v, *sh)
+        elif fmt == fmt_d and fmt in _FN:
             getattr(ext, _FN[fmt])(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
                                    gate_stride, up_stride, down_stride,
                                    partial_v, routed_v)
@@ -2005,7 +2017,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                            gate_stride, up_stride, down_stride, _FID[fmt], _FID[fmt_d],
                                            partial_v, routed_v)
         final_hidden_states = routed_v.view(x.shape) if R > 1 else routed_v   # rows -> [jobs, q, K] like the per-expert path
-        if self.shared_experts is not None:
+        if self.shared_experts is not None and sh is None:
             se_params = {**params, "moe_valu": True} if _MOE_VALU else params
             if R == 1 and h.data_ptr() == x.data_ptr() and h.dtype == x.dtype:
                 # the routed call above left q8_1(x) in fq_q8_scratch(dev, 1, K): the shared gate+up reads it (mlp._fq_gu_cat)
@@ -2034,6 +2046,42 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
+
+    def _fq_sh_fused(self, x, h, K, I, fmt, fmt_d):
+        """(sh_gate, sh_up, sh_down, sh_wg) when the shared expert can run inside the grouped routed launches: Q8_0 gate / up /
+        down of the routed intermediate size, half input, optional scalar sigmoid gate (fp32 row), no post-norm; else None.
+        EXL3_MOE_SH_FUSE=0 keeps the separate shared-expert path."""
+        if not _MOE_SH_FUSE or not hasattr(ext, "fq_moe_kq_grouped_mixed_sh_q8"):
+            return None
+        se = self.shared_experts
+        if se is None or self.shared_experts_post_norm is not None or h.dtype != torch.half or not h.is_contiguous():
+            return None
+        c = getattr(self, "_fq_sh_cache", None)
+        if c is None:
+            c = False
+            try:
+                g, u, d = se.gates[0], se.ups[0], se.downs[0]
+                if len(se.gates) == 1 and all(getattr(m, "format", None) == "q8_0" and getattr(m, "packed", None) is not None
+                                              for m in (g, u, d)) and \
+                        g.in_features == K and u.in_features == K and g.out_features == I and u.out_features == I and \
+                        d.in_features == I and d.out_features == K:
+                    wg = torch.empty(0, dtype = torch.float, device = h.device)
+                    ok = True
+                    if self.shared_gate is not None:
+                        w = self.shared_gate.inner.weight
+                        ok = w.dim() == 2 and w.shape[1] == 1 and w.shape[0] == K
+                        if ok:
+                            wg = w.to(torch.float).reshape(-1).contiguous()
+                    if ok:
+                        c = (g.packed.reshape(-1).contiguous(), u.packed.reshape(-1).contiguous(),
+                             d.packed.reshape(-1).contiguous(), wg)
+                        if not _MOE_SH_SAID[0]:
+                            _MOE_SH_SAID[0] = True
+                            print(" -- MoE shared expert fused into the grouped launches", flush = True)
+            except AttributeError:
+                c = False
+            self._fq_sh_cache = c
+        return c or None
 
     def _shgate_hip(self, x):
         """sigmoid(x . w_gate) for the shared expert gate: a (1, K) x (K, 1) fp32 matmul costs ~64 us on ROCm (hipBLAS GEMV), an

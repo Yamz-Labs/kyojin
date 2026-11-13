@@ -33,26 +33,35 @@ __global__ void fq_moe_kq_upgate_kernel(const uint8_t* __restrict__ aqb,
                                         int64_t up_stride,
                                         int64_t qb_stride,
                                         __half* __restrict__ act,
-                                        int S, int I, int K, int E, int ntiles_u, int topk)
+                                        int S, int I, int K, int E, int ntiles_u, int topk,
+                                        const uint8_t* __restrict__ sh_gate = nullptr,
+                                        const uint8_t* __restrict__ sh_up = nullptr,
+                                        int64_t sh_stride = 0)
 {
     int b = blockIdx.x;
     int s = b / ntiles_u;
     int t = b % ntiles_u;
     int grp = threadIdx.x / FQ_GEMV_LANES;
     int lane = threadIdx.x % FQ_GEMV_LANES;
-    int64_t e = sel[s];
+    const bool shs = s >= S;   // shared-expert slot of row s - S (sh_gate set): Q8_0 gate / up
+    int64_t e = shs ? 0 : sel[s];
     e = (e < 0 || e >= E) ? 0 : e;
     int n = t * FQ_GEMV_OUT_PER_BLOCK + grp;
-    const uint8_t* aq = aqb + (int64_t)(s / topk) * qb_stride;   // assignment s = row * topk + j reads h row s / topk
+    const uint8_t* aq = aqb + (int64_t)(shs ? s - S : s / topk) * qb_stride;   // assignment s = row * topk + j reads h row s / topk
 
     extern __shared__ float red[];
 
     float g = 0.0f, u = 0.0f;
     if (n < I)
     {
-        const uint8_t* gr = gate_bases[e] + (int64_t)n * gate_stride;
-        const uint8_t* ur = up_bases[e] + (int64_t)n * up_stride;
-        if constexpr (FMT == 0)
+        const uint8_t* gr = shs ? sh_gate + (int64_t)n * sh_stride : gate_bases[e] + (int64_t)n * gate_stride;
+        const uint8_t* ur = shs ? sh_up + (int64_t)n * sh_stride : up_bases[e] + (int64_t)n * up_stride;
+        if (shs)
+        {
+            g = fq_dot_q8_0_q8(gr, aq, K, lane, FQ_GEMV_LANES);
+            u = fq_dot_q8_0_q8(ur, aq, K, lane, FQ_GEMV_LANES);
+        }
+        else if constexpr (FMT == 0)
         {
             g = fq_dot_q4_k_q8(gr, aq, K, lane, FQ_GEMV_LANES);
             u = fq_dot_q4_k_q8(ur, aq, K, lane, FQ_GEMV_LANES);
@@ -119,19 +128,28 @@ __global__ void __launch_bounds__(256) fq_moe_kq_upgate_v2_kernel(const uint8_t*
                                         int64_t up_stride,
                                         int64_t qb_stride,
                                         __half* __restrict__ act,
-                                        int S, int I, int K, int E, int ntiles_u, int topk)
+                                        int S, int I, int K, int E, int ntiles_u, int topk,
+                                        const uint8_t* __restrict__ sh_gate = nullptr,
+                                        const uint8_t* __restrict__ sh_up = nullptr,
+                                        int64_t sh_stride = 0)
 {
     __shared__ float pg[FQ_MOE_V2_ROWS * FQ_MOE_V2_PS];
     __shared__ float pu[FQ_MOE_V2_ROWS * FQ_MOE_V2_PS];
     const int s = blockIdx.x / ntiles_u;
     const int t = blockIdx.x % ntiles_u;
     const int r = threadIdx.x >> 3, j = threadIdx.x & 7;
-    int64_t e = sel[s];
+    const bool shs = s >= S;   // shared-expert slot of row s - S: Q8_0 gate / up, 8 lanes per row
+    int64_t e = shs ? 0 : sel[s];
     e = (e < 0 || e >= E) ? 0 : e;
     const int n = t * FQ_MOE_V2_ROWS + r;
-    const uint8_t* aq = aqb + (int64_t)(s / topk) * qb_stride;
+    const uint8_t* aq = aqb + (int64_t)(shs ? s - S : s / topk) * qb_stride;
     float ag[4] = {0.0f, 0.0f, 0.0f, 0.0f}, au[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (n < I)
+    if (n < I && shs)
+    {
+        ag[0] = fq_dot_q8_0_q8(sh_gate + (int64_t)n * sh_stride, aq, K, j, 8);
+        au[0] = fq_dot_q8_0_q8(sh_up + (int64_t)n * sh_stride, aq, K, j, 8);
+    }
+    else if (n < I)
     {
         const uint8_t* gr = gate_bases[e] + (int64_t)n * gate_stride;
         const uint8_t* ur = up_bases[e] + (int64_t)n * up_stride;
@@ -194,17 +212,22 @@ __global__ void __launch_bounds__(256) fq_moe_kq_down_v2_kernel(const uint8_t* _
                                       const uint8_t* __restrict__ const* down_bases,
                                       int64_t down_stride,
                                       float* __restrict__ partial,
-                                      int S, int I, int K, int E, int ntiles_d)
+                                      int S, int I, int K, int E, int ntiles_d,
+                                      const uint8_t* __restrict__ sh_down = nullptr,
+                                      int64_t sh_stride = 0)
 {
     __shared__ float pp[FQ_MOE_V2_ROWS * FQ_MOE_V2_PS];
     const int s = blockIdx.x / ntiles_d;
     const int t = blockIdx.x % ntiles_d;
     const int r = threadIdx.x >> 3, j = threadIdx.x & 7;
-    int64_t e = sel[s];
+    const bool shs = s >= S;   // shared-expert slot (act row s): Q8_0 down, 8 lanes per row
+    int64_t e = shs ? 0 : sel[s];
     e = (e < 0 || e >= E) ? 0 : e;
     const int n = t * FQ_MOE_V2_ROWS + r;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (n < K)
+    if (n < K && shs)
+        acc[0] = fq_dot_q8_0_q8(sh_down + (int64_t)n * sh_stride, aqb + (int64_t)s * qb_stride, I, j, 8);
+    else if (n < K)
     {
         const uint8_t* dr = down_bases[e] + (int64_t)n * down_stride;
         const uint8_t* aq = aqb + (int64_t)s * qb_stride;
@@ -251,12 +274,14 @@ __global__ void __launch_bounds__(256) fq_moe_kq_down_v2_kernel(const uint8_t* _
 
 template <int FMT>
 static void fq_moe_kq_down_v2_launch(const uint8_t* aq, int64_t qb_stride, const int64_t* sel, const uint8_t* const* bases,
-                                     int64_t down_stride, float* partial, int S, int I, int K, int E, cudaStream_t stream)
+                                     int64_t down_stride, float* partial, int S, int I, int K, int E, cudaStream_t stream,
+                                     int Sg = 0, const uint8_t* sh_down = nullptr, int64_t sh_stride = 0)
 {
     if constexpr (FMT <= 2)
     {
         const int nt2 = (K + FQ_MOE_V2_ROWS - 1) / FQ_MOE_V2_ROWS;
-        fq_moe_kq_down_v2_kernel<FMT><<<S * nt2, 256, 0, stream>>>(aq, qb_stride, sel, bases, down_stride, partial, S, I, K, E, nt2);
+        fq_moe_kq_down_v2_kernel<FMT><<<(Sg ? Sg : S) * nt2, 256, 0, stream>>>(aq, qb_stride, sel, bases, down_stride, partial, S, I, K, E, nt2,
+                                                                              sh_down, sh_stride);
     }
 }
 
@@ -317,14 +342,17 @@ __global__ void fq_moe_kq_down_kernel(const uint8_t* __restrict__ aqb,
                                       const uint8_t* __restrict__ const* down_bases,
                                       int64_t down_stride,
                                       float* __restrict__ partial,
-                                      int S, int I, int K, int E, int ntiles_d)
+                                      int S, int I, int K, int E, int ntiles_d,
+                                      const uint8_t* __restrict__ sh_down = nullptr,
+                                      int64_t sh_stride = 0)
 {
     int b = blockIdx.x;
     int s = b / ntiles_d;
     int t = b % ntiles_d;
     int grp = threadIdx.x / FQ_GEMV_LANES;
     int lane = threadIdx.x % FQ_GEMV_LANES;
-    int64_t e = sel[s];
+    const bool shs = s >= S;   // shared-expert slot (act row s): Q8_0 down
+    int64_t e = shs ? 0 : sel[s];
     e = (e < 0 || e >= E) ? 0 : e;
     int n = t * FQ_GEMV_OUT_PER_BLOCK + grp;
 
@@ -333,9 +361,11 @@ __global__ void fq_moe_kq_down_kernel(const uint8_t* __restrict__ aqb,
     float p = 0.0f;
     if (n < K)
     {
-        const uint8_t* dr = down_bases[e] + (int64_t)n * down_stride;
+        const uint8_t* dr = shs ? sh_down + (int64_t)n * sh_stride : down_bases[e] + (int64_t)n * down_stride;
         const uint8_t* aq = aqb + (int64_t)s * qb_stride;
-        if constexpr (FMT == 0)
+        if (shs)
+            p = fq_dot_q8_0_q8(dr, aq, I, lane, FQ_GEMV_LANES);
+        else if constexpr (FMT == 0)
             p = fq_dot_q4_k_q8(dr, aq, I, lane, FQ_GEMV_LANES);
         else if constexpr (FMT == 1)
             p = fq_dot_q5_k_q8(dr, aq, I, lane, FQ_GEMV_LANES);
@@ -369,8 +399,30 @@ __global__ void fq_moe_kq_down_kernel(const uint8_t* __restrict__ aqb,
 // Weighted fold (same as fq_moe_q8.cu's): out[k] = sum_s w[s]*partial[s,k].
 __global__ void fq_moe_kq_combine_kernel(const float* __restrict__ partial,
                                          const __half* __restrict__ wts,
-                                         float* __restrict__ out, int S, int K)
+                                         float* __restrict__ out, int S, int K,
+                                         const float* __restrict__ sh_partial = nullptr,   // [R, K] shared-expert rows
+                                         const __half* __restrict__ x = nullptr,           // [R, K] MoE input (shared gate)
+                                         const float* __restrict__ wg = nullptr)           // [K] shared gate row or nullptr
 {
+    // shared expert: g = sigmoid(x_r . wg) (1 without a gate), the same for every block of row r
+    __shared__ float gred[256];
+    float g = 1.0f;
+    if (sh_partial != nullptr && wg != nullptr)
+    {
+        const __half* xr = x + (int64_t)blockIdx.y * K;
+        float d = 0.0f;
+        for (int i = threadIdx.x; i < K; i += blockDim.x)
+            d = fmaf(__half2float(xr[i]), wg[i], d);
+        gred[threadIdx.x] = d;
+        __syncthreads();
+        for (int w = blockDim.x / 2; w > 0; w >>= 1)
+        {
+            if ((int)threadIdx.x < w) gred[threadIdx.x] += gred[threadIdx.x + w];
+            __syncthreads();
+        }
+        g = 1.0f / (1.0f + expf(-gred[0]));
+    }
+    const float* shr = sh_partial != nullptr ? sh_partial + (int64_t)blockIdx.y * K : nullptr;
     // blockIdx.y = row r: its S = topk assignments are partial[r*S .. r*S+S), weights wts[r*S ..)
     partial += (int64_t)blockIdx.y * S * K;
     wts += (int64_t)blockIdx.y * S;
@@ -385,9 +437,21 @@ __global__ void fq_moe_kq_combine_kernel(const float* __restrict__ partial,
                 acc = __fadd_rn(acc, __fmul_rn(partial[(int64_t)s * K + k],
                                               __half2float(wts[s])));
         }
+        if (shr != nullptr) acc = fmaf(g, shr[k], acc);
     out[k] = acc;
     }
 }
+
+// Shared expert fused into the grouped launches (all null: none). Q8_0 gate / up / down, intermediate I.
+struct FqMoeSh
+{
+    const uint8_t* gate = nullptr;
+    const uint8_t* up = nullptr;
+    const uint8_t* down = nullptr;
+    int64_t ug_stride = 0;
+    int64_t d_stride = 0;
+    const float* wg = nullptr;
+};
 
 template <int FMT_UG, int FMT_D>
 static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
@@ -395,7 +459,7 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
                                      torch::Tensor down_ptrs,
                                      int64_t gate_stride, int64_t up_stride,
                                      int64_t down_stride, int64_t block_bytes,  // block_bytes = down's format
-                                     torch::Tensor partial, torch::Tensor out)
+                                     torch::Tensor partial, torch::Tensor out, FqMoeSh sh = FqMoeSh())
 {
     int K = (int)h.size(1);
     int R = (int)h.size(0);
@@ -409,20 +473,22 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
     int I = (int)(down_stride / block_bytes) * ((FMT_D >= 6) ? 32 : FQ_Q4_K_GROUP);   // ids 6 / 7: 32-element blocks
     at::cuda::CUDAGuard guard(h.device());
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int Sg = S + (sh.gate != nullptr ? R : 0);   // routed slots + one shared-expert slot per row
+    TORCH_CHECK(partial.size(0) >= Sg, "fq_moe_kq: partial must hold the shared-expert rows too");
     int ntiles_u = (I + FQ_GEMV_OUT_PER_BLOCK - 1) / FQ_GEMV_OUT_PER_BLOCK;
     int ntiles_d = (K + FQ_GEMV_OUT_PER_BLOCK - 1) / FQ_GEMV_OUT_PER_BLOCK;
     torch::Tensor qb_h = fq_q8_scratch(h.get_device(), R, K);
     fq_quant_q8_1_rows(h, qb_h);
     int64_t qb_stride_h = (int64_t)(K / FQ_Q8_1_GROUP) * FQ_Q8_1_BYTES;
     static thread_local std::map<std::tuple<int, int, int>, torch::Tensor> act_cache;
-    auto key = std::make_tuple((int)h.get_device(), S, I);
+    auto key = std::make_tuple((int)h.get_device(), Sg, I);
     auto it = act_cache.find(key);
     torch::Tensor act;
     if (it != act_cache.end())
         act = it->second;
     else
     {
-        act = torch::empty({S, I}, torch::dtype(torch::kHalf).device(h.device()));
+        act = torch::empty({Sg, I}, torch::dtype(torch::kHalf).device(h.device()));
         act_cache[key] = act;
     }
     // Up+gate: 2 floats per thread in shared (g and u side by side).
@@ -430,40 +496,42 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
     if (FMT_UG == 0 && K % 256 == 0 && fq_moe_v2_on())
     {
         const int nt2 = (I + FQ_MOE_V2_ROWS - 1) / FQ_MOE_V2_ROWS;
-        fq_moe_kq_upgate_v2_kernel<<<S * nt2, 256, 0, stream>>>(
+        fq_moe_kq_upgate_v2_kernel<<<Sg * nt2, 256, 0, stream>>>(
             qb_h.data_ptr<uint8_t>(), sel.data_ptr<int64_t>(),
             reinterpret_cast<const uint8_t* const*>(gate_ptrs.data_ptr<int64_t>()),
             reinterpret_cast<const uint8_t* const*>(up_ptrs.data_ptr<int64_t>()),
             gate_stride, up_stride, qb_stride_h,
             reinterpret_cast<__half*>(act.data_ptr<at::Half>()),
-            S, I, K, E, nt2, topk);
+            S, I, K, E, nt2, topk, sh.gate, sh.up, sh.ug_stride);
     }
     else
-    fq_moe_kq_upgate_kernel<FMT_UG><<<S * ntiles_u, FQ_GEMV_THREADS, shmem_u, stream>>>(
+    fq_moe_kq_upgate_kernel<FMT_UG><<<Sg * ntiles_u, FQ_GEMV_THREADS, shmem_u, stream>>>(
         qb_h.data_ptr<uint8_t>(), sel.data_ptr<int64_t>(),
         reinterpret_cast<const uint8_t* const*>(gate_ptrs.data_ptr<int64_t>()),
         reinterpret_cast<const uint8_t* const*>(up_ptrs.data_ptr<int64_t>()),
         gate_stride, up_stride, qb_stride_h,
         reinterpret_cast<__half*>(act.data_ptr<at::Half>()),
-        S, I, K, E, ntiles_u, topk);
-    torch::Tensor qb_act = fq_q8_scratch(h.get_device(), S, I);
+        S, I, K, E, ntiles_u, topk, sh.gate, sh.up, sh.ug_stride);
+    torch::Tensor qb_act = fq_q8_scratch(h.get_device(), Sg, I);
     fq_quant_q8_1_rows(act, qb_act);
     int64_t qb_stride_a = (int64_t)(I / FQ_Q8_1_GROUP) * FQ_Q8_1_BYTES;
     size_t shmem_d = (size_t)FQ_GEMV_THREADS * sizeof(float);
     if (FMT_D <= 2 && I % 256 == 0 && fq_moe_v2_on())
         fq_moe_kq_down_v2_launch<FMT_D>(qb_act.data_ptr<uint8_t>(), qb_stride_a, sel.data_ptr<int64_t>(),
                                         reinterpret_cast<const uint8_t* const*>(down_ptrs.data_ptr<int64_t>()),
-                                        down_stride, partial.data_ptr<float>(), S, I, K, E, stream);
+                                        down_stride, partial.data_ptr<float>(), S, I, K, E, stream, Sg, sh.down, sh.d_stride);
     else
-    fq_moe_kq_down_kernel<FMT_D><<<S * ntiles_d, FQ_GEMV_THREADS, shmem_d, stream>>>(
+    fq_moe_kq_down_kernel<FMT_D><<<Sg * ntiles_d, FQ_GEMV_THREADS, shmem_d, stream>>>(
         qb_act.data_ptr<uint8_t>(), qb_stride_a, sel.data_ptr<int64_t>(),
         reinterpret_cast<const uint8_t* const*>(down_ptrs.data_ptr<int64_t>()),
-        down_stride, partial.data_ptr<float>(), S, I, K, E, ntiles_d);
+        down_stride, partial.data_ptr<float>(), S, I, K, E, ntiles_d, sh.down, sh.d_stride);
     int nblocks = (K + 255) / 256;
     fq_moe_kq_combine_kernel<<<dim3(nblocks, R), 256, 0, stream>>>(
         partial.data_ptr<float>(),
         reinterpret_cast<const __half*>(wts.data_ptr<at::Half>()),
-        out.data_ptr<float>(), topk, K);
+        out.data_ptr<float>(), topk, K,
+        sh.gate != nullptr ? partial.data_ptr<float>() + (int64_t)S * K : nullptr,
+        sh.gate != nullptr ? reinterpret_cast<const __half*>(h.data_ptr<at::Half>()) : nullptr, sh.wg);
 }
 
 void fq_moe_q4k_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
@@ -517,23 +585,42 @@ template <int FU>
 static void fq_moe_kq_dispatch_d(int fd, torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
                                  torch::Tensor gp, torch::Tensor up, torch::Tensor dp,
                                  int64_t gs, int64_t us, int64_t ds, torch::Tensor partial,
-                                 torch::Tensor out)
+                                 torch::Tensor out, FqMoeSh sh = FqMoeSh())
 {
     switch (fd)
     {
-        case 0: fq_moe_kq_grouped_launch<FU, 0>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[0], partial, out); break;
-        case 1: fq_moe_kq_grouped_launch<FU, 1>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[1], partial, out); break;
-        case 2: fq_moe_kq_grouped_launch<FU, 2>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[2], partial, out); break;
-        case 3: fq_moe_kq_grouped_launch<FU, 3>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[3], partial, out); break;
-        case 4: fq_moe_kq_grouped_launch<FU, 4>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[4], partial, out); break;
-        case 5: fq_moe_kq_grouped_launch<FU, 5>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[5], partial, out); break;
-        case 6: fq_moe_kq_grouped_launch<FU, 6>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[6], partial, out); break;
-        case 7: fq_moe_kq_grouped_launch<FU, 7>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[7], partial, out); break;
+        case 0: fq_moe_kq_grouped_launch<FU, 0>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[0], partial, out, sh); break;
+        case 1: fq_moe_kq_grouped_launch<FU, 1>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[1], partial, out, sh); break;
+        case 2: fq_moe_kq_grouped_launch<FU, 2>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[2], partial, out, sh); break;
+        case 3: fq_moe_kq_grouped_launch<FU, 3>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[3], partial, out, sh); break;
+        case 4: fq_moe_kq_grouped_launch<FU, 4>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[4], partial, out, sh); break;
+        case 5: fq_moe_kq_grouped_launch<FU, 5>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[5], partial, out, sh); break;
+        case 6: fq_moe_kq_grouped_launch<FU, 6>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[6], partial, out, sh); break;
+        case 7: fq_moe_kq_grouped_launch<FU, 7>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[7], partial, out, sh); break;
         default: TORCH_CHECK(false, "fq_moe_kq: bad down format ", fd);
     }
 }
 
 // Mixed per-projection formats (unsloth UD: gate/up Q4_K + down Q5_K). fmt ids: 0 q4_k, 1 q5_k, 2 q6_k, 3 iq4_xs, 4 iq3_xxs, 5 iq2_s.
+static void fq_moe_kq_grouped_mixed_impl(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
+                                torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
+                                torch::Tensor down_ptrs,
+                                int64_t gate_stride, int64_t up_stride, int64_t down_stride,
+                                int64_t fmt_ug, int64_t fmt_down,
+                                torch::Tensor partial, torch::Tensor out, FqMoeSh sh)
+{
+    switch (fmt_ug)
+    {
+        case 0: fq_moe_kq_dispatch_d<0>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
+        case 1: fq_moe_kq_dispatch_d<1>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
+        case 2: fq_moe_kq_dispatch_d<2>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
+        case 3: fq_moe_kq_dispatch_d<3>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
+        case 4: fq_moe_kq_dispatch_d<4>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
+        case 5: fq_moe_kq_dispatch_d<5>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
+        default: TORCH_CHECK(false, "fq_moe_kq: bad gate/up format ", fmt_ug);
+    }
+}
+
 void fq_moe_kq_grouped_mixed_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
                                 torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
                                 torch::Tensor down_ptrs,
@@ -541,14 +628,35 @@ void fq_moe_kq_grouped_mixed_q8(torch::Tensor h, torch::Tensor sel, torch::Tenso
                                 int64_t fmt_ug, int64_t fmt_down,
                                 torch::Tensor partial, torch::Tensor out)
 {
-    switch (fmt_ug)
+    fq_moe_kq_grouped_mixed_impl(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride,
+                                 fmt_ug, fmt_down, partial, out, FqMoeSh());
+}
+
+// Same + the shared expert (Q8_0 gate / up [I, K] and down [K, I] packed rows, optional fp32 gate row [K]) in the same launches:
+// partial needs S + R rows; out = routed + sigmoid(x . sh_wg) * shared (no gate: + shared).
+void fq_moe_kq_grouped_mixed_sh_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
+                                   torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
+                                   torch::Tensor down_ptrs,
+                                   int64_t gate_stride, int64_t up_stride, int64_t down_stride,
+                                   int64_t fmt_ug, int64_t fmt_down,
+                                   torch::Tensor partial, torch::Tensor out,
+                                   torch::Tensor sh_gate, torch::Tensor sh_up, torch::Tensor sh_down,
+                                   torch::Tensor sh_wg)
+{
+    TORCH_CHECK(sh_gate.dtype() == torch::kUInt8 && sh_up.dtype() == torch::kUInt8 && sh_down.dtype() == torch::kUInt8,
+                "fq_moe_kq: shared expert weights must be packed Q8_0 bytes");
+    TORCH_CHECK(sh_gate.is_contiguous() && sh_up.is_contiguous() && sh_down.is_contiguous(), "fq_moe_kq: shared weights contiguous");
+    FqMoeSh sh;
+    sh.gate = sh_gate.data_ptr<uint8_t>();
+    sh.up = sh_up.data_ptr<uint8_t>();
+    sh.down = sh_down.data_ptr<uint8_t>();
+    sh.ug_stride = (int64_t)(h.size(1) / 32) * FQ_Q8_0_BYTES;
+    sh.d_stride = sh_down.numel() / h.size(1);
+    if (sh_wg.numel() > 0)
     {
-        case 0: fq_moe_kq_dispatch_d<0>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
-        case 1: fq_moe_kq_dispatch_d<1>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
-        case 2: fq_moe_kq_dispatch_d<2>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
-        case 3: fq_moe_kq_dispatch_d<3>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
-        case 4: fq_moe_kq_dispatch_d<4>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
-        case 5: fq_moe_kq_dispatch_d<5>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out); break;
-        default: TORCH_CHECK(false, "fq_moe_kq: bad gate/up format ", fmt_ug);
+        TORCH_CHECK(sh_wg.dtype() == torch::kFloat && sh_wg.is_contiguous() && sh_wg.numel() == h.size(1), "fq_moe_kq: sh_wg [K] fp32");
+        sh.wg = sh_wg.data_ptr<float>();
     }
+    fq_moe_kq_grouped_mixed_impl(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride,
+                                 fmt_ug, fmt_down, partial, out, sh);
 }
