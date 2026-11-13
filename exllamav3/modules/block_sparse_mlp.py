@@ -1786,7 +1786,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         K = self.expert_size
         I = self.intermediate_size
-        if K % 256 != 0 or I % 256 != 0:
+        # down with 32-element blocks (q8_0 / q5_1) only needs I % 32 (tests/test_moe_down32.py: I = 640)
+        if K % 256 != 0 or I % (32 if fmt_d in ("q8_0", "q5_1") else 256) != 0:
             return None
         if self.gates[0].in_features != K or self.gates[0].out_features != I:
             return None
