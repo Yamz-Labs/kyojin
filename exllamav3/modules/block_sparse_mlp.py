@@ -66,10 +66,10 @@ UNION_ROWS = max(MAX_BSZN, ROW_INV_MAX_ROWS) if torch.version.hip else MAX_BSZN
 # HIP build with no exl3_mgemm / exl3_moe (Strix) runs every multi-row decode step through the per-expert torch loop.
 _UNION_BATCH = os.environ.get("EXL3_MOE_UNION_BATCH", "0") != "0"
 # Rows (users / session slots) the grouped KQ MoE kernel takes in one call; above it the per-expert / prefill paths amortize
-# each expert over its rows. MCPM_FQ_GROUPED_MAX_ROWS=1 is the old batch-1-only gate. CUDA default 128: a short new prompt
+# each expert over its rows. MCPM_FQ_GROUPED_MAX_ROWS=1 is the old batch-1-only gate. Default 128: a short new prompt
 # (<= 128 tokens, as when users join a multi-user batch) goes through the grouped kernel instead of dequantising every expert for
-# a GEMM (RTX 3090, 35B-A3B UD-Q4_K_XL at 8 users: N4 +16 %, N8 +18 %). HIP keeps 32 (not measured there).
-FQ_GROUPED_MAX_ROWS = int(os.environ.get("MCPM_FQ_GROUPED_MAX_ROWS", "32" if torch.version.hip else "128"))
+# a GEMM (35B-A3B UD-Q4_K_XL at 8 users: RTX 3090 N4 +16 %, N8 +18 %; Strix Halo N8 with different prompts +7 %, other cells equal).
+FQ_GROUPED_MAX_ROWS = int(os.environ.get("MCPM_FQ_GROUPED_MAX_ROWS", "128"))
 _FQ_KQ_PARTIAL: dict = {}   # (device, rows * top-k, hidden) -> shared grouped-MoE partial-sum scratch
 # Row capacity of the fused decode kernels (exl3_moe_coop): up to this many token rows (bounded by 256 slots = rows * top_k) take
 # them instead of the prefill-shaped exl3_moe kernel or row chunks; rows <= MAX_BSZN run exactly as before. The kernels group the
