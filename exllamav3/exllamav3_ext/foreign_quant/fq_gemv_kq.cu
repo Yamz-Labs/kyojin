@@ -559,7 +559,7 @@ static void fq_gemv_kq_rows_dispatch(int rows, int M, const uint8_t* qb, const u
 }
 
 // BOLT_FQ_KQ_MROWS: x-rows 2..16 of the Q4_K / Q6_K decode GEMV run the multi-row kernel (weights read once for all rows). 0 = the
-// per-row launch of the one-row kernels (A/B). Default on CUDA; HIP default off (opt-in until measured on gfx1151).
+// per-row launch of the one-row kernels (A/B). Default on (CUDA and HIP).
 // BOLT_FQ_KQ_MR_ROWS / BOLT_FQ_KQ_MR_RT force the output rows per block (1, 2, 4) / x-rows per pass (2, 4, 8, 16) for tuning.
 static int fq_kq_mrows_env(const char* name, int dflt)
 {
@@ -569,12 +569,7 @@ static int fq_kq_mrows_env(const char* name, int dflt)
 
 static bool fq_kq_mrows_on()
 {
-    static const int on = fq_kq_mrows_env("BOLT_FQ_KQ_MROWS",
-#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
-                                          0);
-#else
-                                          1);
-#endif
+    static const int on = fq_kq_mrows_env("BOLT_FQ_KQ_MROWS", 1);
     return on != 0;
 }
 
