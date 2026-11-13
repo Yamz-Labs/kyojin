@@ -215,9 +215,10 @@ def _aligned_expert_layout(flat: torch.Tensor, num_tokens: int, top_k: int, num_
 _SHGATE_FUSE = os.environ.get("EXL3_SHGATE_FUSE", "1") != "0"
 
 
-# EXL3_MOE_SH_FUSE (default 1): a Q8_0 shared expert runs inside the grouped q8_1 decode MoE launches (extra slot per row,
+# EXL3_MOE_SH_FUSE (default 1 on HIP, 0 on CUDA): a Q8_0 shared expert runs inside the grouped q8_1 decode MoE launches (extra slot per row,
 # gate in the combine): 5 launches less per MoE layer; 0 keeps the separate shared-expert path
-_MOE_SH_FUSE = os.environ.get("EXL3_MOE_SH_FUSE", "1") != "0"
+# Default on for HIP only: Strix Halo 35B-A3B N4 +6 %, N8 +5 %; on the RTX 3090 it measured N4 -1.4 % (8 sessions), so CUDA keeps the separate path.
+_MOE_SH_FUSE = os.environ.get("EXL3_MOE_SH_FUSE", "1" if torch.version.hip else "0") != "0"
 _MOE_SH_SAID = [False]
 # MCPM_FQ_MOE_IQ (default 1): IQ3_XXS / IQ2_S experts take the grouped q8_1 decode MoE (fq_moe_kq.cu FMT 4 / 5)
 _FQ_MOE_IQ = os.environ.get("MCPM_FQ_MOE_IQ", "1") != "0"
