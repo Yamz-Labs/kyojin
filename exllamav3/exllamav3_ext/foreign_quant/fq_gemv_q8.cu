@@ -8,6 +8,7 @@
 // shared-memory reduction, __fmul_rn/__fadd_rn + fq_dp4a only).
 #include <cuda_fp16.h>
 #include <map>
+#include <cstdlib>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -241,6 +242,82 @@ __global__ void fq_gemv_q8_q8_kernel(const uint8_t* __restrict__ aqb,
     }
 }
 
+// Multi-row Q8_0 q8 dot (BOLT_FQ_Q8_MROWS, default on for 2..16 x-rows): one block per column n, rows
+// m0 .. m0 + mc - 1 (mc <= 8, grid.y = row groups). Each weight 32-block is loaded once and dotted against
+// every row. Per row: same chunk loop per thread and same sequential reduction as fq_gemv_q8_q8_kernel,
+// so each output is bit-identical to the 1-row kernel.
+template <typename OUT>
+__global__ void fq_gemv_q8_q8_mrows_kernel(const uint8_t* __restrict__ aqb,
+                                           const uint8_t* __restrict__ packed,
+                                           OUT* __restrict__ out,
+                                           int M, int N, int K, int64_t packed_stride,
+                                           int64_t qb_stride)
+{
+    constexpr int MR = 8;
+    int n = blockIdx.x;
+    int m0 = blockIdx.y * MR;
+    int mc = min(MR, M - m0);
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
+
+    extern __shared__ float red[];   // [MR][nt]
+
+    float acc[MR];
+    #pragma unroll
+    for (int r = 0; r < MR; r++) acc[r] = 0.0f;
+
+    const uint8_t* wr = packed + (int64_t)n * packed_stride;
+    int nchunks = K / 32;
+    for (int c = tid; c < nchunks; c += nt)
+    {
+        const uint8_t* blk = wr + (size_t)c * FQ_Q8_0_BYTES;
+        __half dwh;
+        memcpy(&dwh, blk, 2);
+        float dw = __half2float(dwh);
+        const uint16_t* w16 = reinterpret_cast<const uint16_t*>(blk + 2);
+        int32_t w4[8];
+        #pragma unroll
+        for (int j2 = 0; j2 < 8; j2++)
+            w4[j2] = (int32_t)(w16[j2 * 2] | ((uint32_t)w16[j2 * 2 + 1] << 16));
+        #pragma unroll
+        for (int r = 0; r < MR; r++)
+        {
+            if (r < mc)
+            {
+                const uint8_t* ab = aqb + (int64_t)(m0 + r) * qb_stride + (size_t)c * FQ_Q8_1_BYTES;
+                __half dah;
+                memcpy(&dah, ab, 2);
+                float da = __half2float(dah);
+                const int32_t* aq32 = reinterpret_cast<const int32_t*>(ab + 4);
+                int sumi = 0;
+                #pragma unroll
+                for (int j2 = 0; j2 < 8; j2++)
+                    sumi = fq_dp4a(w4[j2], aq32[j2], sumi);
+                acc[r] = __fadd_rn(acc[r], __fmul_rn(__fmul_rn(dw, da), (float)sumi));
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < MR; r++) red[r * nt + tid] = acc[r];
+    __syncthreads();
+    if (tid < mc)
+    {
+        float s = 0.0f;
+        for (int l = 0; l < nt; l++)
+            s = __fadd_rn(s, red[tid * nt + l]);
+        if constexpr (std::is_same<OUT, __half>::value)
+            out[(int64_t)(m0 + tid) * N + n] = __float2half_rn(s);
+        else
+            out[(int64_t)(m0 + tid) * N + n] = s;
+    }
+}
+
+static bool fq_q8_mrows_on()
+{
+    static const int on = [] { const char* e = getenv("BOLT_FQ_Q8_MROWS"); return e ? atoi(e) : 1; }();
+    return on != 0;
+}
+
 // Cached global q8_1 scratch: [M][nb32(K)] 36B blocks. One buffer serves
 // all layers of a decode step (single stream: no two dots live at once;
 // allocated on first use = outside CUDA-graph capture, like act_cache).
@@ -364,11 +441,17 @@ void fq_gemv_q8_0_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out)
     size_t shmem = (size_t)nt * sizeof(float);
     at::cuda::CUDAGuard guard(qb.device());
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+    bool mrows = M >= 2 && M <= 16 && fq_q8_mrows_on();
     auto launch = [&](auto* op)
     {
-        fq_gemv_q8_q8_kernel<std::decay_t<decltype(*op)>> <<<M * N, nt, shmem, stream>>>(
-            qb.data_ptr<uint8_t>(), packed.data_ptr<uint8_t>(),
-            op, M, N, K, pstride, qb_stride);
+        if (mrows)
+            fq_gemv_q8_q8_mrows_kernel<std::decay_t<decltype(*op)>> <<<dim3(N, (M + 7) / 8), nt, 8 * shmem, stream>>>(
+                qb.data_ptr<uint8_t>(), packed.data_ptr<uint8_t>(),
+                op, M, N, K, pstride, qb_stride);
+        else
+            fq_gemv_q8_q8_kernel<std::decay_t<decltype(*op)>> <<<M * N, nt, shmem, stream>>>(
+                qb.data_ptr<uint8_t>(), packed.data_ptr<uint8_t>(),
+                op, M, N, K, pstride, qb_stride);
     };
     if (out.dtype() == torch::kHalf)
         launch(reinterpret_cast<__half*>(out.data_ptr<at::Half>()));

@@ -65,9 +65,12 @@ UNION_ROWS = max(MAX_BSZN, ROW_INV_MAX_ROWS) if torch.version.hip else MAX_BSZN
 # EXL3_MOE_UNION_BATCH=1: the R-row union decode also serves plain multi-user decode steps (2..8 rows), not only DFlash verify. Without it a
 # HIP build with no exl3_mgemm / exl3_moe (Strix) runs every multi-row decode step through the per-expert torch loop.
 _UNION_BATCH = os.environ.get("EXL3_MOE_UNION_BATCH", "0") != "0"
-# Rows (users / session slots) the grouped KQ MoE kernel takes in one call: top-8 x 32 rows = 256 assignments; above it the
-# per-expert / prefill paths amortize each expert over its rows. MCPM_FQ_GROUPED_MAX_ROWS=1 is the old batch-1-only gate.
-FQ_GROUPED_MAX_ROWS = int(os.environ.get("MCPM_FQ_GROUPED_MAX_ROWS", "32"))
+# Rows (users / session slots) the grouped KQ MoE kernel takes in one call; above it the per-expert / prefill paths amortize
+# each expert over its rows. MCPM_FQ_GROUPED_MAX_ROWS=1 is the old batch-1-only gate. CUDA default 128: a short new prompt
+# (<= 128 tokens, as when users join a multi-user batch) goes through the grouped kernel instead of dequantising every expert for
+# a GEMM (RTX 3090, 35B-A3B UD-Q4_K_XL at 8 users: N4 +16 %, N8 +18 %). HIP keeps 32 (not measured there).
+FQ_GROUPED_MAX_ROWS = int(os.environ.get("MCPM_FQ_GROUPED_MAX_ROWS", "32" if torch.version.hip else "128"))
+_FQ_KQ_PARTIAL: dict = {}   # (device, rows * top-k, hidden) -> shared grouped-MoE partial-sum scratch
 # Row capacity of the fused decode kernels (exl3_moe_coop): up to this many token rows (bounded by 256 slots = rows * top_k) take
 # them instead of the prefill-shaped exl3_moe kernel or row chunks; rows <= MAX_BSZN run exactly as before. The kernels group the
 # slots by expert, so each picked expert is decoded once for all of its rows. CUDA only; EXL3_MOE_COOP_ROWS=8 restores the old cap
@@ -1982,7 +1985,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # buffers sized once for the largest row count (stable pointers for CUDA graphs); the kernel gets row-prefix views
         if getattr(self, "_fq_kq_partial", None) is None or \
                 self._fq_kq_partial.shape != (FQ_GROUPED_MAX_ROWS * S, K) or self._fq_kq_partial.device != dev:
-            self._fq_kq_partial = torch.empty((FQ_GROUPED_MAX_ROWS * S, K), dtype=torch.float, device=dev)
+            # partial sums: scratch consumed inside this call -> one buffer per (device, shape) for every MoE layer
+            key = (str(dev), FQ_GROUPED_MAX_ROWS * S, K)
+            if key not in _FQ_KQ_PARTIAL:
+                _FQ_KQ_PARTIAL[key] = torch.empty((FQ_GROUPED_MAX_ROWS * S, K), dtype=torch.float, device=dev)
+            self._fq_kq_partial = _FQ_KQ_PARTIAL[key]
             self._fq_kq_routed = torch.empty((FQ_GROUPED_MAX_ROWS, K), dtype=torch.float, device=dev)
         partial_v = self._fq_kq_partial[:R * S]
         routed_v = self._fq_kq_routed[:R]
