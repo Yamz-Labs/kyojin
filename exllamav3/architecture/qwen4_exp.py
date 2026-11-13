@@ -120,7 +120,7 @@ class Qwen4ExpConfig(Qwen3_5VLMoeBaseConfig):
             elif gname.endswith("conv1d.weight"):
                 ov[ek] = raw(gname).unsqueeze(1).contiguous() # (C, K) -> (C, 1, K)
             elif gname.endswith("ffn_gate_inp_shexp.weight"):
-                ov[ek] = raw(gname).reshape(1, -1).contiguous()
+                ov[ek] = raw(gname).reshape(-1, 1).contiguous()   # Linear override: engine orientation [in, out]
             elif (".hc_" in gname or gname.startswith("output_hc_")) and gname.endswith(("_down.weight", "_up.weight")):
                 ov[ek] = q8(gname)                            # hyper-connection mixers are read raw by the module
         for i, lt in enumerate(self.layer_types):

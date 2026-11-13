@@ -229,6 +229,10 @@ def write_config_dir(gguf_path: str, outdir: str) -> str:
     try:
         cfg = hf_config(g)
         write_tokenizer_files(g, outdir)
+        # servers expect the chat template as its own file (the GGUF carries it in tokenizer.chat_template)
+        if g.meta.get("tokenizer.chat_template"):
+            with open(os.path.join(outdir, "chat_template.jinja"), "w", encoding="utf8") as f:
+                f.write(g.meta["tokenizer.chat_template"])
     finally:
         g.close()
     with open(os.path.join(outdir, "config.json"), "w", encoding="utf8") as f:
