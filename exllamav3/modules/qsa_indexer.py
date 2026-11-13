@@ -58,18 +58,23 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
     return torch.cat((x_rope * cos + rot * sin, x_pass), dim = -1)
 
 
-_PF_HIP = {"ok": None}
-def _pf_hip_ready() -> bool:
-    """EXL3_QSA_PF_HIP (default 1, 0 = Triton pair): first use loads the proven HIP prefill kernel; a missing compiler or proof disables it with a warning."""
-    if _PF_HIP["ok"] is None:
+_PF_HIP = {"ok": {}}
+def _pf_hip_ready(device) -> bool:
+    """EXL3_QSA_PF_HIP (default 1, 0 = Triton pair): per-device first use loads the
+    proven HIP prefill kernel; a missing compiler or proof disables it only on that device."""
+    from exllamav3.util.arch_list import device_index
+    idx = device_index(device)
+    ok = _PF_HIP["ok"].get(idx)
+    if ok is None:
         try:
             from .attention_fn.qsa_prefill_hip import _load
-            _load()
-            _PF_HIP["ok"] = True
+            _load("", device)
+            ok = True
         except Exception as e:
-            print(f" !! QSA prefill HIP kernel unavailable, using the Triton pair: {str(e)[:200]}")
-            _PF_HIP["ok"] = False
-    return _PF_HIP["ok"]
+            print(f" !! QSA prefill HIP kernel unavailable on cuda:{idx}, using the Triton pair: {str(e)[:200]}")
+            ok = False
+        _PF_HIP["ok"][idx] = ok
+    return ok
 
 
 def tile_candidates(scores, tile_idx, t0):
@@ -885,7 +890,7 @@ class QSAIndexer(Module):
             q_rows = tq.rotate(q_rows)
         if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and qc is None and bsz == 1 and seq >= 64 and seq <= 4096 * 4
                 and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
-                and q_rows.dtype == torch.half and k_arg.dtype == torch.half and _pf_hip_ready()):
+                and q_rows.dtype == torch.half and k_arg.dtype == torch.half and _pf_hip_ready(q.device)):
             # one wave per (row, kv head) HIP kernel, bit-identical to the Triton pair (fp16 cache, prefill chunks only)
             from .attention_fn.qsa_prefill_hip import qsa_prefill_hip
             o = qsa_prefill_hip(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
@@ -893,7 +898,7 @@ class QSAIndexer(Module):
         if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and os.environ.get("EXL3_QSA_PF_DEQ", "1") == "1" and qc is not None
                 and tq is None and qc[2] == 8 and qc[3] == 8 and bsz == 1 and seq >= 64 and seq <= 4096 * 4
                 and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
-                and q_rows.dtype == torch.half and _pf_hip_ready()):
+                and q_rows.dtype == torch.half and _pf_hip_ready(q.device)):
             # stage the used pages as rotated-domain fp16 (one elementwise pass), run the proven fp16 HIP kernel on q rotated by H32/sqrt(32), rotate the output back
             from .attention_fn.qdeq_triton import qsa_prefill_q8
             n_used = (int(cache_seqlens_cpu.max().item()) + seq + page_size - 1) // page_size
@@ -902,7 +907,7 @@ class QSAIndexer(Module):
         if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and os.environ.get("EXL3_QSA_PF_DEQ", "1") == "1" and qc is not None
                 and tq is not None and bsz == 1 and seq >= 64 and seq <= 4096 * 4
                 and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
-                and q_rows.dtype == torch.half and _pf_hip_ready()):
+                and q_rows.dtype == torch.half and _pf_hip_ready(q.device)):
             # TurboQuant prefill chunk: stage the used pages as rotated-domain fp16 (codebook lookup, one pass), run the fp16 HIP kernel
             # on the rotated q, rotate the output back (the Triton split kernel below is ~70x slower per chunk on this shape)
             from .attention_fn.qsa_prefill_hip import qsa_prefill_hip

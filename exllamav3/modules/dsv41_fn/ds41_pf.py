@@ -64,7 +64,9 @@ def _launch(name, grid, block, args):
         else:
             cargs.append(ctypes.c_int(a))
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
-    r = _state["lib"].hipModuleLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    select_device(device)
+    r = _state["lib"].hipModuleLaunchKernel(fn, grid, 1, 1, block, 1, 1, 0,
+                                            torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0:
         raise RuntimeError(f"ds41_pf: launch of {name} failed ({r})")
 
@@ -105,7 +107,8 @@ def sparse_attention(q, kv, sink, idx, scale):
     fn = _fn("ds41_sparse_attn_pf", q.device)
     cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, kv, idx, sink, o)] + [ctypes.c_int(K), ctypes.c_int(N), ctypes.c_float(scale)]
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
-    r = _state["lib"].hipModuleLaunchKernel(fn, R, 1, 1, 512, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    r = _state["lib"].hipModuleLaunchKernel(fn, R, 1, 1, 512, 1, 1, 0,
+                                            torch.cuda.current_stream(q.device).cuda_stream, params, None)
     if r != 0:
         raise RuntimeError(f"ds41_pf: launch failed ({r})")
     return o

@@ -74,10 +74,12 @@ def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = No
     npages = block_table.shape[-1]
     ntok = k.shape[0]
     assert v.shape[0] == ntok
-    fn = _load(defs, q.device)
+    device = q.device
+    fn = _load(defs, device)
+    select_device(device)
     cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, k, v, block_table, indices, out)] + \
             [ctypes.c_int(x) for x in (q.stride(0), out.stride(0), bt_stride, k.stride(0), ntok, npages)] + [ctypes.c_float(sm_scale)]
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
-    r = _state["lib"].hipModuleLaunchKernel(fn, R * 2, 1, 1, 32, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    r = _state["lib"].hipModuleLaunchKernel(fn, R * 2, 1, 1, 32, 1, 1, 0, torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0: raise RuntimeError(f"qsa_prefill_hip: launch failed ({r})")
     return out

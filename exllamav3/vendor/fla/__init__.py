@@ -43,6 +43,28 @@ def _hip_ok(q, k, v, beta, Akk, Aqk, h0):
     return (all(t.dtype == bf and t.is_contiguous() for t in ts)
             and (h0 is None or h0.is_contiguous()))
 
+
+_fused_stable = {}  # arch gate per device index; read on every KDA prefill chunk
+
+
+def _fused_output_stable(device=None) -> bool:
+    """Whether the fused Triton KDA output path is run-to-run deterministic on this arch.
+
+    Measured nondeterministic on gfx12 (RDNA4): three loads produced three different
+    greedy branches.  Other supported archs keep the fused path.  An unreadable arch
+    is conservatively treated as unstable, so split mode uses the deterministic
+    chain."""
+    try:
+        from exllamav3.util.arch_list import device_arch, device_index, kda_fused_output_unstable
+        idx = device_index(device)
+        ok = _fused_stable.get(idx)
+        if ok is None:
+            ok = _fused_stable[idx] = not kda_fused_output_unstable(device_arch(idx))
+        return ok
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
 # 1 / ln(2) as fla defines it (best fp32 approximation); gates are pre-scaled so the kernels use exp2
 RCP_LN2 = 1.4426950216
 
@@ -182,6 +204,14 @@ def chunk_kda(
     # or if hipcc/module load fails; default 3, step 12). Chunks under 512 tokens
     # keep the fla chain: the one-program-per-head fused loop is ~0.14 ms slower there (T=255 sweep).
     fuse = int(os.environ.get("EXL3_KDA_FUSE", "3")) if K <= 128 and chunk_size == 64 and T >= 512 else 0
+    if fuse and os.environ.get("KYOJIN_SPLIT_ACTIVE", "0") != "0" and not _fused_output_stable(q.device):
+        # A layer split can run KDA on a gfx12 front and a different main device in one
+        # process. The fused output path is not run-to-run deterministic on gfx12, and
+        # its gfx11.5 HIP kernel cannot be JIT-built there (kda_fused_h_hip.supported()
+        # declines, so _hip_ok already fell back to the Triton fuse path). Force the
+        # deterministic fla chain on that arch only; keep it here, split-side, until the
+        # gfx12 fused kernel lands.
+        fuse = 0
     if fuse:
         # EXL3_KDA_HF=1 (default off, read per call): 16-row-chunk WY kernel (hip/kda_hf.hip, derived from hipfire's GDN kernel,
         # diagonal blocks computed in the kernel); replaces the intra kernels + kda_fused_h_o, incl. the prefix-cache

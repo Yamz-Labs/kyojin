@@ -45,8 +45,9 @@ def _launch(name, grid, block, args):
     device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
     fn = _load(device)[name]
     cargs, params = H._pack(args)
+    select_device(device)
     r = _state["lib"].hipModuleLaunchKernel(fn, grid[0], grid[1], 1, block, 1, 1, 0,
-                                            torch.cuda.current_stream().cuda_stream, params, None)
+                                            torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0:
         raise RuntimeError(f"dsv41_idx: launch of {name} failed ({r})")
 

@@ -9,7 +9,11 @@ reason, the loop-guard verdicts used by tools/qwen/serve.py, the worst 20-gram
 repetition count and whether EOS was reached.
 
   python tools/strix_halo/coherence_suite.py -m <model>
-  HIP_VISIBLE_DEVICES=1 python tools/strix_halo/coherence_suite.py -m <model> -n 512
+  python tools/strix_halo/coherence_suite.py -m <model> -n 512
+
+On the single-gfx1151 target no device variable is needed. On a multi-GPU box set
+HIP_VISIBLE_DEVICES to the index whose gcnArchName matches the intended device; the
+index order is a driver/boot property, so do not assume a fixed value.
 
 The model must fit the visible device (use the layer-split sibling for larger packs).
 

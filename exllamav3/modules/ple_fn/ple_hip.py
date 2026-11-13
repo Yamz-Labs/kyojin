@@ -3,7 +3,7 @@
 import ctypes, hashlib, os, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
-from exllamav3.util.arch_list import device_arch, select_device
+from exllamav3.util.arch_list import device_arch, device_supported, select_device, GFX115_ARCHS
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ple_hip.hip")
@@ -70,15 +70,28 @@ def _launch(name, grid, block, args):
             cargs.append(ctypes.c_int(a))
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
     g = tuple(grid) + (1,) * (3 - len(grid))
+    select_device(device)
     r = _state["lib"].hipModuleLaunchKernel(fn, g[0], g[1], g[2], block, 1, 1, 0,
-                                            torch.cuda.current_stream().cuda_stream, params, None)
+                                            torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0:
         raise RuntimeError(f"ple_hip: launch of {name} failed ({r})")
 
 
-def supported(key, value, streams, conv_state, norm_w, conv_w, constant_scale, hc_mult, hidden):
-    """Shapes and dtypes the kernels were proved for (everything else keeps the torch reference)."""
+def supported(*args, **kwargs):
+    """Device gate when called with a device, otherwise the proved-shape gate.
+
+    ``supported(device)`` is the per-device capability test used by the split
+    audit; ``supported(key, value, ...)`` is the original shape/dtype test and
+    additionally refuses devices other than gfx11.5.
+    """
+    if not args or not torch.is_tensor(args[0]):
+        device = args[0] if args else kwargs.get("device")
+        return device_supported(device, GFX115_ARCHS)
+    key, value, streams, conv_state, norm_w, conv_w, constant_scale, hc_mult, hidden = args
+    # Shapes and dtypes the kernels were proved for (everything else keeps the torch reference).
     if hc_mult != HS or hidden != DD or constant_scale != 1.0:
+        return False
+    if not device_supported(key.device, GFX115_ARCHS):
         return False
     ts = (key, value, streams, conv_w) + tuple(norm_w)
     if not all(t.is_cuda and t.is_contiguous() and t.data_ptr() % 16 == 0 for t in ts):

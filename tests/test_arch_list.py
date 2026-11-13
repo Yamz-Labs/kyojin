@@ -68,3 +68,14 @@ Name: gfx1100
     arch_list.maybe_set_arch_list_env()
 
     assert arch_list.os.environ["PYTORCH_ROCM_ARCH"] == "gfx1201;gfx1100;gfx1030"
+
+
+def test_kda_fused_output_unstable_is_shared_and_conservative():
+    assert arch_list.kda_fused_output_unstable("gfx1201")
+    assert arch_list.kda_fused_output_unstable("gfx1200")
+    assert not arch_list.kda_fused_output_unstable("gfx1151")
+    assert not arch_list.kda_fused_output_unstable("gfx1100")
+    # An unreadable arch is conservative by default, explicit opt-out for callers.
+    assert arch_list.kda_fused_output_unstable("")
+    assert arch_list.kda_fused_output_unstable(None)
+    assert not arch_list.kda_fused_output_unstable("", unknown = False)

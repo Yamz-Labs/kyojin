@@ -59,6 +59,25 @@ def select_device(device=None) -> int:
 
 
 GFX115_ARCHS = frozenset(("gfx1150", "gfx1151", "gfx1152"))
+
+# Arches where the fused KDA output path is known nondeterministic in split mode.
+# gfx12 today; the split gate and the adapters that size the fallback workspace
+# must use this one predicate so they cannot drift.
+KDA_FUSED_UNSTABLE_PREFIXES = ("gfx12",)
+
+
+def kda_fused_output_unstable(arch: str | None, unknown: bool = True) -> bool:
+    """Whether the fused KDA output path is known unsafe on this arch.
+
+    An unreadable/empty arch is conservatively treated as unstable by default, so
+    split mode takes the deterministic chain and adapters size its workspace.
+    """
+    key = (arch or "").strip().lower()
+    if not key:
+        return bool(unknown)
+    return key.startswith(KDA_FUSED_UNSTABLE_PREFIXES)
+
+
 _support_cache = {}
 
 

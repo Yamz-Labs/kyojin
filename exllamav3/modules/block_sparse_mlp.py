@@ -223,7 +223,11 @@ _side_state: dict = {}
 def _side(device):
     st = _side_state.get(device)
     if st is None:
-        st = _side_state[device] = (torch.cuda.Stream(device = device), torch.cuda.Event(), torch.cuda.Event())
+        # Events belong to the device that records them. Creating them on the
+        # ambient device breaks a split layer whose side stream is on the other GPU.
+        with torch.cuda.device(device):
+            st = (torch.cuda.Stream(device = device), torch.cuda.Event(), torch.cuda.Event())
+        _side_state[device] = st
     return st
 
 

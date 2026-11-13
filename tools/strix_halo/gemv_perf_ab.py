@@ -64,8 +64,11 @@ launch as well as per config, so no first-launch-time decision can see an
 inherited value.
 
 Example:
-    HIP_VISIBLE_DEVICES=1 python tools/strix_halo/gemv_perf_ab.py \
+    python tools/strix_halo/gemv_perf_ab.py \
         -m <model> --mode both --census --top 40 --sweep --verify --repeats 6
+
+Select the GPU with HIP_VISIBLE_DEVICES=<index> if several are visible; pick the
+index whose gcnArchName matches. Enumeration order is a driver/boot property.
 """
 import argparse
 import contextlib

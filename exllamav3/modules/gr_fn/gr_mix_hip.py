@@ -3,7 +3,7 @@
 import ctypes, hashlib, os, shutil, subprocess
 import torch
 from exllamav3.util import hip_compiler
-from exllamav3.util.arch_list import device_arch, select_device
+from exllamav3.util.arch_list import device_arch, device_supported, select_device, GFX115_ARCHS
 from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gr_mix.hip")
@@ -48,10 +48,18 @@ def _load(defs="", device=None):
 
 def _launch(fn, grid, block, args):
     P = ctypes.c_void_p
+    device = next((a.device for a in args if isinstance(a, torch.Tensor)), None)
+    select_device(device)
     cargs = [P(a.data_ptr()) if isinstance(a, torch.Tensor) else ctypes.c_int(a) for a in args]
     params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
-    r = _state["lib"].hipModuleLaunchKernel(fn, grid[0], grid[1], 1, block, 1, 1, 0, torch.cuda.current_stream().cuda_stream, params, None)
+    r = _state["lib"].hipModuleLaunchKernel(fn, grid[0], grid[1], 1, block, 1, 1, 0,
+                                            torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0: raise RuntimeError(f"gr_mix_hip: launch failed ({r})")
+
+def supported(device=None):
+    """gr_mix.hip is a gfx11.5 WMMA kernel; gfx12 uses its own path."""
+    return device_supported(device, GFX115_ARCHS)
+
 
 def _tile(defs, name):
     d = dict(x.split("=") for x in defs.split() if "=" in x and not x.startswith("-"))
