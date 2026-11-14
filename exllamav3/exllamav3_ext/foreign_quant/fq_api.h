@@ -27,6 +27,8 @@ void fq_gemv_iq2_xxs_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor ou
 void fq_gemv_nvfp4_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor scales,
                       double global_scale, torch::Tensor out);
 void fq_gemv_q8_0_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
+// FP8 E4M3 decode GEMV (fq_gemv_fp8.cu): x half [M, K], q uint8 [N, K], s float32 [N] (per row) or [ceil(N/bo), s_cols] (grid), out float32 [M, N].
+void fq_gemv_fp8(torch::Tensor x, torch::Tensor q, torch::Tensor s, torch::Tensor out, int64_t s_cols, int64_t bo, int64_t bi, bool grid);
 // q8_1-activation grouped MoE (fq_moe_q8.cu), same args/contract as above.
 bool fq_use_q8moe();
 void fq_moe_iq2xxs_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,

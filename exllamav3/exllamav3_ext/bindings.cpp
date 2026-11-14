@@ -613,6 +613,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("x"), py::arg("qb"));
     m.def("fq_gemv_iq2_xxs_q8", &fq_gemv_iq2_xxs_q8, "fq_gemv_iq2_xxs_q8",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_fp8", &fq_gemv_fp8, "fq_gemv_fp8",
+          py::arg("x"), py::arg("q"), py::arg("s"), py::arg("out"), py::arg("s_cols"), py::arg("bo"), py::arg("bi"), py::arg("grid"));
     m.def("fq_gemv_nvfp4_q8", &fq_gemv_nvfp4_q8, "fq_gemv_nvfp4_q8",
           py::arg("qb"), py::arg("packed"), py::arg("scales"), py::arg("global_scale"), py::arg("out"));
     m.def("fq_gemv_q8_0_q8", &fq_gemv_q8_0_q8, "fq_gemv_q8_0_q8",

@@ -1,12 +1,14 @@
 """FP8 (E4M3) linears served as stored: per-row / per-tensor scale (`weight_scale`) or the 2D block grid (`weight_scale_inv`,
 DeepSeek / Qwen-FP8 / GLM / MiniMax layout). One byte per weight is read instead of the two of the fp16 dequant.
 
-Decode GEMV (<= MAX_ROWS rows): one Triton kernel for ROCm and CUDA (no extension build). E4M3 -> fp16 is exact by bit placement:
+Decode GEMV (<= MAX_ROWS rows): the C++ fq_gemv_fp8 (ROCm and CUDA) when the extension has it, else one Triton kernel. E4M3 -> fp16 is exact by bit placement:
 half(bits = sign << 8 | (b & 0x7F) << 7) * 256 (normals and subnormals; the 0x7F NaN code is never stored by real checkpoints).
 With the block grid, BN rows of a tile share one block row and each BK chunk one block column, so the block scale is one
 scalar per (tile, chunk) applied to the chunk's partial sum. Wider batches: fp16 dequant of the matrix + matmul.
 """
 from __future__ import annotations
+
+import os
 
 import torch
 import triton
@@ -158,11 +160,32 @@ def moe_fused(h, tabs, sel, wts, I, K, grid, block, S, sc_gu, sc_d):
     return y
 
 
+def _ext_gemv():
+    """The C++ FP8 GEMV (fq_gemv_fp8.cu: one warp per output column, 16-byte lanes = long DRAM bursts), or None (old build /
+    BOLT_FP8_GEMV_EXT=0 = the Triton kernel below). Triton streamed cold weights at 42-55 GB/s on gfx1151 (k60)."""
+    if os.environ.get("BOLT_FP8_GEMV_EXT", "1") == "0":
+        return None
+    try:
+        from ...ext import exllamav3_ext as ext
+        return getattr(ext, "fq_gemv_fp8", None)
+    except Exception:
+        return None
+
+
+_EXT = []
+
+
 def gemv(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, grid: bool, block: tuple[int, int]) -> torch.Tensor:
     """x half [R, K] (R <= MAX_ROWS), q uint8 [N, K], s float32 [N] (per row) or [ceil(N/bo), ceil(K/bi)] (grid) -> float32 [R, N]."""
     R, K = x.shape
     N = q.shape[0]
     y = torch.empty((R, N), dtype=torch.float32, device=x.device)
+    if not _EXT:
+        _EXT.append(_ext_gemv())
+    f = _EXT[0]
+    if f is not None and K % 16 == 0 and (not grid or block[1] % 16 == 0) and x.data_ptr() % 16 == 0 and q.data_ptr() % 16 == 0:
+        f(x, q, s, y, s.shape[1] if grid else 1, block[0], block[1], grid)
+        return y
     _gemv_fp8[(triton.cdiv(N, BN),)](x, q, s, y, R, K, N, s.shape[1] if grid else 1, GRID=grid, BO=block[0], BI=block[1],
                                      BN=BN, BK=BK, RP=16, num_warps=4)
     return y
