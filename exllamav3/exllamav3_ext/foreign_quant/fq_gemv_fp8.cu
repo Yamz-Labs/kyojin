@@ -1,11 +1,13 @@
 // FP8 (E4M3, stored as is) decode GEMV in C++ (CUDA and HIP, wave32 on RDNA). Replaces the Triton _gemv_fp8 for 1..16 activation rows:
 // the Triton tile read 64 rows x 128 B per iteration and streamed DRAM at 42-55 GB/s on gfx1151 once the weights fall out of the 32 MB
-// MALL (every served step). Here one warp owns one output column n and walks its K bytes in 16-byte lanes (512 contiguous bytes per warp
-// iteration), so a weight row is one long burst. Each weight chunk is decoded once and dotted against up to FQ_FP8_MR activation rows.
+// MALL (every served step). Here one warp owns one output column and walks its K bytes in 16-byte lanes (512 contiguous bytes per
+// warp step = long DRAM bursts), each lane keeping U loads in flight (BOLT_FP8_U1 for 1 x-row, BOLT_FP8_UM for 2..16 x-rows in groups
+// of 4); each weight chunk is decoded once for all the rows of its group.
 // E4M3 -> fp16 by the same bit move as quant/fp8.py (sign | exponent-mantissa << 7, x 256), fp32 accumulation; scales per output row
 // (s[N], applied at the end) or per [bo x bi] block (s[ceil(N/bo), s_cols], bi % 16 == 0, applied per 16-byte chunk) as the Triton kernel.
 #include <cuda_fp16.h>
 #include <cstdint>
+#include <cstdlib>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -18,7 +20,6 @@
 
 #define FQ_FP8_WARP 32
 #define FQ_FP8_WARPS 4
-#define FQ_FP8_MR 8
 
 __device__ __forceinline__ float fq_e4m3_f(uint32_t b)
 {
@@ -26,10 +27,12 @@ __device__ __forceinline__ float fq_e4m3_f(uint32_t b)
     return __half2float(__ushort_as_half(h)) * 256.0f;
 }
 
-template <int MR>
+template <int MR, int U>
 __global__ void fq_gemv_fp8_kernel(const __half* __restrict__ x, const uint8_t* __restrict__ q, const float* __restrict__ s,
                                    float* __restrict__ out, int M, int N, int K, int s_cols, int bo, int bi, bool grid)
 {
+    // One warp per output column; each lane issues U 16-byte weight loads (chunks k, k + 512, ...) before it consumes them, so a lane
+    // keeps U requests in flight instead of one; each weight chunk is decoded once and dotted against up to MR x-rows.
     int lane = threadIdx.x % FQ_FP8_WARP;
     int n = blockIdx.x * FQ_FP8_WARPS + threadIdx.x / FQ_FP8_WARP;
     int m0 = blockIdx.y * MR;
@@ -38,43 +41,53 @@ __global__ void fq_gemv_fp8_kernel(const __half* __restrict__ x, const uint8_t* 
 
     const uint8_t* wr = q + (int64_t)n * K;
     const float* srow = grid ? s + (int64_t)(n / bo) * s_cols : nullptr;
+    constexpr int STEP = FQ_FP8_WARP * 16;
     float acc[MR];
     #pragma unroll
     for (int r = 0; r < MR; r++) acc[r] = 0.0f;
 
-    for (int k = lane * 16; k < K; k += FQ_FP8_WARP * 16)
+    for (int k0 = lane * 16; k0 < K; k0 += STEP * U)
     {
-        uint4 w = *reinterpret_cast<const uint4*>(wr + k);
-        float wf[16];
-        uint32_t wv[4] = {w.x, w.y, w.z, w.w};
+        uint4 wv4[U];
         #pragma unroll
-        for (int j = 0; j < 4; j++)
+        for (int u = 0; u < U; u++)
+            if (k0 + u * STEP < K) wv4[u] = *reinterpret_cast<const uint4*>(wr + k0 + u * STEP);
+        #pragma unroll
+        for (int u = 0; u < U; u++)
         {
+            int k = k0 + u * STEP;
+            if (k >= K) break;
+            float wf[16];
+            uint32_t wv[4] = {wv4[u].x, wv4[u].y, wv4[u].z, wv4[u].w};
             #pragma unroll
-            for (int b = 0; b < 4; b++) wf[j * 4 + b] = fq_e4m3_f((wv[j] >> (8 * b)) & 0xFFu);
-        }
-        float sc = grid ? srow[k / bi] : 1.0f;
-        #pragma unroll
-        for (int r = 0; r < MR; r++)
-        {
-            if (r < mc)
+            for (int j = 0; j < 4; j++)
             {
-                const uint4* xr = reinterpret_cast<const uint4*>(x + (int64_t)(m0 + r) * K + k);
-                uint4 xa = xr[0], xb = xr[1];
-                const __half2* h2a = reinterpret_cast<const __half2*>(&xa);
-                const __half2* h2b = reinterpret_cast<const __half2*>(&xb);
-                float sum = 0.0f;
                 #pragma unroll
-                for (int j = 0; j < 4; j++)
+                for (int b = 0; b < 4; b++) wf[j * 4 + b] = fq_e4m3_f((wv[j] >> (8 * b)) & 0xFFu);
+            }
+            float sc = grid ? srow[k / bi] : 1.0f;
+            #pragma unroll
+            for (int r = 0; r < MR; r++)
+            {
+                if (r < mc)
                 {
-                    float2 fa = __half22float2(h2a[j]);
-                    float2 fb = __half22float2(h2b[j]);
-                    sum = fmaf(wf[2 * j], fa.x, sum);
-                    sum = fmaf(wf[2 * j + 1], fa.y, sum);
-                    sum = fmaf(wf[8 + 2 * j], fb.x, sum);
-                    sum = fmaf(wf[8 + 2 * j + 1], fb.y, sum);
+                    const uint4* xr = reinterpret_cast<const uint4*>(x + (int64_t)(m0 + r) * K + k);
+                    uint4 xa = xr[0], xb = xr[1];
+                    const __half2* h2a = reinterpret_cast<const __half2*>(&xa);
+                    const __half2* h2b = reinterpret_cast<const __half2*>(&xb);
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < 4; j++)
+                    {
+                        float2 fa = __half22float2(h2a[j]);
+                        float2 fb = __half22float2(h2b[j]);
+                        sum = fmaf(wf[2 * j], fa.x, sum);
+                        sum = fmaf(wf[2 * j + 1], fa.y, sum);
+                        sum = fmaf(wf[8 + 2 * j], fb.x, sum);
+                        sum = fmaf(wf[8 + 2 * j + 1], fb.y, sum);
+                    }
+                    acc[r] = fmaf(sum, sc, acc[r]);
                 }
-                acc[r] = fmaf(sum, sc, acc[r]);
             }
         }
     }
@@ -86,6 +99,21 @@ __global__ void fq_gemv_fp8_kernel(const __half* __restrict__ x, const uint8_t* 
         for (int o = FQ_FP8_WARP / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o, FQ_FP8_WARP);
         if (lane == 0 && r < mc) out[(int64_t)(m0 + r) * N + n] = grid ? v : v * s[n];
     }
+}
+
+template <int MR, int U>
+static void fq_gemv_fp8_launch(const __half* xp, torch::Tensor q, torch::Tensor s, torch::Tensor out, int M, int N, int K,
+                               int s_cols, int bo, int bi, bool grid, cudaStream_t stream)
+{
+    dim3 g((N + FQ_FP8_WARPS - 1) / FQ_FP8_WARPS, (M + MR - 1) / MR);
+    fq_gemv_fp8_kernel<MR, U><<<g, dim3(FQ_FP8_WARP * FQ_FP8_WARPS), 0, stream>>>(xp, q.data_ptr<uint8_t>(), s.data_ptr<float>(),
+                                                                                out.data_ptr<float>(), M, N, K, s_cols, bo, bi, grid);
+}
+
+static int fq_fp8_env(const char* name, int dflt)
+{
+    const char* e = getenv(name);
+    return e ? atoi(e) : dflt;
 }
 
 void fq_gemv_fp8(torch::Tensor x, torch::Tensor q, torch::Tensor s, torch::Tensor out, int64_t s_cols, int64_t bo, int64_t bi, bool grid)
@@ -101,17 +129,19 @@ void fq_gemv_fp8(torch::Tensor x, torch::Tensor q, torch::Tensor s, torch::Tenso
     TORCH_CHECK(((uintptr_t)x.data_ptr() % 16) == 0 && ((uintptr_t)q.data_ptr() % 16) == 0, "fq_gemv_fp8: x and q must be 16-byte aligned");
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const __half* xp = reinterpret_cast<const __half*>(x.data_ptr());
-    dim3 block(FQ_FP8_WARP * FQ_FP8_WARPS);
+    static const int u1 = fq_fp8_env("BOLT_FP8_U1", 4);       // weight loads in flight per lane, 1 x-row
+    static const int um = fq_fp8_env("BOLT_FP8_UM", 4);       // same, 2..16 x-rows (groups of 4)
+    int sc = (int)s_cols, ibo = (int)bo, ibi = (int)bi;
     if (M == 1)
     {
-        dim3 g((N + FQ_FP8_WARPS - 1) / FQ_FP8_WARPS, 1);
-        fq_gemv_fp8_kernel<1><<<g, block, 0, stream>>>(xp, q.data_ptr<uint8_t>(), s.data_ptr<float>(), out.data_ptr<float>(),
-                                                       M, N, K, (int)s_cols, (int)bo, (int)bi, grid);
+        if (u1 >= 4) fq_gemv_fp8_launch<1, 4>(xp, q, s, out, M, N, K, sc, ibo, ibi, grid, stream);
+        else if (u1 >= 2) fq_gemv_fp8_launch<1, 2>(xp, q, s, out, M, N, K, sc, ibo, ibi, grid, stream);
+        else fq_gemv_fp8_launch<1, 1>(xp, q, s, out, M, N, K, sc, ibo, ibi, grid, stream);
     }
     else
     {
-        dim3 g((N + FQ_FP8_WARPS - 1) / FQ_FP8_WARPS, (M + FQ_FP8_MR - 1) / FQ_FP8_MR);
-        fq_gemv_fp8_kernel<FQ_FP8_MR><<<g, block, 0, stream>>>(xp, q.data_ptr<uint8_t>(), s.data_ptr<float>(), out.data_ptr<float>(),
-                                                               M, N, K, (int)s_cols, (int)bo, (int)bi, grid);
+        if (um >= 4) fq_gemv_fp8_launch<4, 4>(xp, q, s, out, M, N, K, sc, ibo, ibi, grid, stream);
+        else if (um >= 2) fq_gemv_fp8_launch<4, 2>(xp, q, s, out, M, N, K, sc, ibo, ibi, grid, stream);
+        else fq_gemv_fp8_launch<4, 1>(xp, q, s, out, M, N, K, sc, ibo, ibi, grid, stream);
     }
 }
