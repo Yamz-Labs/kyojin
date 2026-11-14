@@ -222,6 +222,9 @@ _MOE_SH_FUSE = os.environ.get("EXL3_MOE_SH_FUSE", "1" if torch.version.hip else 
 _MOE_SH_SAID = [False]
 # MCPM_FQ_MOE_IQ (default 1): IQ3_XXS / IQ2_S experts take the grouped q8_1 decode MoE (fq_moe_kq.cu FMT 4 / 5)
 _FQ_MOE_IQ = os.environ.get("MCPM_FQ_MOE_IQ", "1") != "0"
+# HIP routed MMQ prefill MoE (rocm/gmmq, from Gufo / llama.cpp), default on with ROCm: Strix Halo Qwen3.8-Flash-Next UD-Q4_K_XL GGUF
+# served 8K prefill 13.5-15.8 -> 10.8 s, decode flat, N1 md5 identical, perplexity 3.1671 -> 3.1797. 0 = the grouped Triton path.
+_FQ_PF_GMMQ = os.environ.get("MCPM_FQ_PF_GMMQ", "1" if torch.version.hip else "0") == "1"
 # BOLT_FQ_MMVQ (default 1, CUDA): IQ experts (all 7 IQ formats, gate/up and down) take the llama.cpp mmvq-style slot-parallel decode MoE
 # (fq_mmvq.cu fq_moe_mmvq_grouped) instead of fq_moe_kq.cu. 0 = the previous kernels (A/B).
 _MQ_ID = {"iq2_xxs": 0, "iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5, "iq4_xs": 6}
@@ -2158,6 +2161,62 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         ext.fq_mlp_shared_iq2xxs(xr, up.packed.reshape(I, -1, 66), h)
         return down.forward(h, params)
 
+    def _forward_foreign_prefill_gmmq(self, x, y, fmts, selected_experts, routing_weights, params, out_dtype, eshape):
+        """HIP routed MMQ prefill MoE (MCPM_FQ_PF_GMMQ=1, rows >= MCPM_FQ_PF_GMMQ_MIN): llama.cpp's MMQ (q8_1 activations,
+        integer dots on the raw GGUF blocks, via Gufo's gfx1151 port, rocm/gmmq) for gate, up and down, with a per-expert
+        pointer table; SwiGLU and the routing-weighted sum in torch. Gate/up Q4_K / Q5_K, down Q4_K / Q5_K / Q5_1 / Q8_0.
+        Returns the block output or None (the caller falls back)."""
+        G = {"q4_k": 12, "q5_k": 13, "q5_1": 7, "q8_0": 8}
+        R = y.shape[0]
+        if not torch.version.hip or fmts[0] not in ("q4_k", "q5_k") or fmts[1] not in G or self.act_limit or \
+                self.activation_fn not in ("silu", None) or R < int(os.environ.get("MCPM_FQ_PF_GMMQ_MIN", "64")):
+            return None
+        if (self.num_local_experts or self.num_experts) != self.num_experts or not hasattr(ext, "fq_mmq_moe"):
+            return None
+        top_k = self.num_experts_per_tok
+        if tuple(selected_experts.shape) != (R, top_k):
+            return None
+        E, dev, K, I = self.num_experts, y.device, y.shape[1], self.intermediate_size
+        tbl = getattr(self, "_fq_gmmq_ptrs", None)
+        if tbl is None or tbl[0] != self.gates[0].packed.data_ptr() or tbl[4] != dev:
+            mk = lambda ms: torch.tensor([m.packed.data_ptr() for m in ms], dtype=torch.int64, device=dev)
+            tbl = (self.gates[0].packed.data_ptr(), mk(self.gates), mk(self.ups), mk(self.downs), dev)
+            self._fq_gmmq_ptrs = tbl
+        _, g_p, u_p, d_p, _ = tbl
+        yc = y.contiguous()
+        ids = selected_experts.to(torch.int32).contiguous()
+        # grid hints (Gufo RouteHints): the column grid stops at the largest expert bucket (else every one of the E experts
+        # launches tiles over all R * top_k rows), and the tile width minimises sum(ceil(c / w) * (w + 16)) over the buckets
+        counts = torch.bincount(ids.view(-1), minlength=E)
+        nz = counts[counts > 0].to(torch.int64)
+        ws = torch.arange(16, 81, 16, device=dev)
+        cost = ((nz[None, :] + ws[:, None] - 1) // ws[:, None] * (ws[:, None] + 16)).sum(1)
+        hint = torch.stack((counts.max().to(torch.int64), ws[cost.argmin()])).tolist()      # one host sync per layer
+        max_rows, cols = int(hint[0]), int(hint[1])
+        g = torch.empty((R * top_k, I), dtype=torch.float, device=dev)
+        u = torch.empty((R * top_k, I), dtype=torch.float, device=dev)
+        ext.fq_mmq_moe(yc, ids, g_p, G[fmts[0]], I, g, cols, max_rows)
+        ext.fq_mmq_moe(yc, ids, u_p, G[fmts[0]], I, u, cols, max_rows)
+        a = (torch.nn.functional.silu(g) * u).to(torch.half)
+        del g, u
+        dn = torch.empty((R * top_k, K), dtype=torch.float, device=dev)
+        ext.fq_mmq_moe(a, ids.view(-1, 1), d_p, G[fmts[1]], K, dn, cols, max_rows)
+        w = routing_weights.to(torch.float).reshape(R, top_k, 1)
+        if os.environ.get("MCPM_FQ_PF_GMMQ_CHECK") == "1":       # debug: where do non-finite values appear (y, a, dn)
+            bad = lambda t: int((~torch.isfinite(t)).sum())
+            print(f"gmmq_check R={R} fmts={fmts} y={bad(yc)} a={bad(a)} amax={float(a.float().abs().max()):.1f} "
+                  f"dn={bad(dn)} dnmax={float(dn.abs().nan_to_num(0).max()):.1f} max_rows={max_rows} cols={cols}", flush=True)
+        final_hidden_states = (dn.view(R, top_k, K) * w).sum(1).reshape(eshape)
+        if self.shared_experts:
+            y_se = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+            if self.shared_gate:
+                ext.add_sigmoid_gate(y_se, self.shared_gate.forward(x, params), final_hidden_states)
+            else:
+                final_hidden_states += y_se
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states
+
     def _forward_foreign_prefill_grouped(self, x, y, selected_experts, routing_weights,
                                          params, out_dtype, eshape):
         """MiniCPM IQ4_XS prefill MoE (rows >= MCPM_FQ_PF_GROUPED_MIN): two fused
@@ -2171,6 +2230,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         R = y.shape[0]
         fmts = self._fq_grouped_kq_ok(y)
+        if _FQ_PF_GMMQ and fmts is not None:
+            r = self._forward_foreign_prefill_gmmq(x, y, fmts, selected_experts, routing_weights, params, out_dtype, eshape)
+            if r is not None:
+                return r
         _KQ = {"q4_k": 0, "q5_k": 1, "q6_k": 2}
         _KQ_DN = {**_KQ, "q8_0": 3, "q5_1": 4} if os.environ.get("MCPM_FQ_PF_DN32", "1") != "0" else _KQ
         # Q4_K/Q5_K/Q6_K gate-up; down also Q8_0 / Q5_1 (unsloth UD packs: before, those layers took the per-expert loop in prefill)

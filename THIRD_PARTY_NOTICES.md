@@ -2,6 +2,11 @@
 
 ## llama.cpp / ggml (MIT License)
 
+exllamav3/exllamav3_ext/rocm/gmmq/ (routed MMQ prefill MoE for HIP) is adapted from Gufo (https://github.com/gufo-org/gufo,
+commit 07e1191, path src/models/qwen38_flash_next/kernels/rocm/mmq/, MIT License, Copyright (c) 2026 Gufo contributors), itself
+adapted from llama.cpp (commit 5c0e946, ggml/src/ggml-cuda mmq / mmid / quantize, MIT License, Copyright (c) 2023-2026 The ggml
+authors). Each file keeps its licence header and lists its changes. Gufo's MIT licence text is the same as the one below.
+
 Parts of exllamav3/exllamav3_ext/foreign_quant/ggml_mmvq/ and foreign_quant/fq_mmvq.cu are derived from
 llama.cpp (https://github.com/ggml-org/llama.cpp, commit 7182ef7):
 
