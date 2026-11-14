@@ -14,26 +14,31 @@ FMTS = {  # name: (block bytes, elements per block, mmvq id)
     "iq2_xxs": (66, 256, 0), "iq2_xs": (74, 256, 1), "iq2_s": (82, 256, 2), "iq3_xxs": (98, 256, 3),
     "iq3_s": (110, 256, 4), "iq4_nl": (18, 32, 5), "iq4_xs": (136, 256, 6), "q5_k": (176, 256, 7),
 }
+# dense-only K-quant entries (llama.cpp vec_dot_q4_K / q6_K_q8_1 in fq_mmvq.cu; no grouped MoE id)
+KQ_DENSE = {"q4_k": (144, 256, 8), "q6_k": (210, 256, 9)}
 
 
 def make_weights(fmt, n, k, seed, dscale=1.0):
-    bb, qk, _ = FMTS[fmt]
+    bb, qk, _ = {**FMTS, **KQ_DENSE}[fmt]
     g = torch.Generator().manual_seed(seed)
     w = torch.randint(0, 256, (n, k // qk, bb), generator=g, dtype=torch.uint8)
     d = ((torch.rand(n, k // qk, generator=g) * 0.02 + 0.001) * dscale).half().view(torch.uint8).reshape(n, k // qk, 2)
-    w[:, :, 0:2] = d
-    if fmt == "q5_k":                     # half2 (d, dmin)
+    if fmt == "q6_k":                     # d is the last field of block_q6_K
+        w[:, :, 208:210] = d
+    else:
+        w[:, :, 0:2] = d
+    if fmt in ("q5_k", "q4_k"):           # half2 (d, dmin)
         w[:, :, 2:4] = d
     return w.reshape(n, -1).cuda()
 
 
 def dequant(fmt, w, n, k):
-    bb, qk, _ = FMTS[fmt]
+    bb, qk, _ = {**FMTS, **KQ_DENSE}[fmt]
     if fmt == "iq2_xxs":
         out = torch.empty((n, k), dtype=torch.half, device="cuda")
         ext.fq_dequant_iq2_xxs(w.reshape(n, k // 256, 66), out)
         return out.float()
-    if fmt in ("iq4_xs", "q5_k"):
+    if fmt in ("iq4_xs", "q5_k", "q4_k", "q6_k"):
         out = torch.empty((n, k), dtype=torch.half, device="cuda")
         getattr(ext, f"fq_dequant_{fmt}")(w, out)
         return out.float()
@@ -48,13 +53,13 @@ def q8_dequant(qb, m, k):
 
 
 OLD = {"iq2_xxs": "fq_gemv_iq2_xxs_q8", "iq3_xxs": "fq_gemv_iq3_xxs_q8", "iq2_s": "fq_gemv_iq2_s_q8", "iq3_s": "fq_gemv_iq3_s_q8",
-       "iq4_xs": "fq_gemv_iq4_xs_q8", "q5_k": "fq_gemv_q5_k_q8"}
+       "iq4_xs": "fq_gemv_iq4_xs_q8", "q5_k": "fq_gemv_q5_k_q8", "q4_k": "fq_gemv_q4_k_q8", "q6_k": "fq_gemv_q6_k_q8"}
 worst_old = [0.0]
 
 
 def test_dense():
     worst = 0.0
-    for fmt, (bb, qk, _) in FMTS.items():
+    for fmt, (bb, qk, _) in {**FMTS, **KQ_DENSE}.items():
         for n, k in ((1024, 4096), (777, 2048), (512, 512)):
             w = make_weights(fmt, n, k, 7)
             wd = dequant(fmt, w, n, k)

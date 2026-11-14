@@ -78,6 +78,10 @@ _IQ_Q8_FN = {"iq3_xxs": "fq_gemv_iq3_xxs_q8", "iq2_s": "fq_gemv_iq2_s_q8", "iq3_
 _MMVQ_ON = os.environ.get("BOLT_FQ_MMVQ", "1") != "0"
 _MMVQ_FN = {"iq2_xxs": "fq_mmvq_iq2_xxs", "iq2_xs": "fq_mmvq_iq2_xs", "iq2_s": "fq_mmvq_iq2_s", "iq3_xxs": "fq_mmvq_iq3_xxs",
             "iq3_s": "fq_mmvq_iq3_s", "iq4_nl": "fq_mmvq_iq4_nl", "iq4_xs": "fq_mmvq_iq4_xs", "q5_k": "fq_mmvq_q5_k"}
+# BOLT_FQ_MMVQ_KQ: Q4_K / Q6_K decode rows (1..15) also through the mmvq kernel (llama.cpp vec_dot_q4_K / q6_K_q8_1). Default on for
+# CUDA (RTX 3090, 8B Q4_K_M served: N8 +28 %, N4 +11 %, N1 +4 %), off on ROCm until measured there; 0 / 1 forces.
+if os.environ.get("BOLT_FQ_MMVQ_KQ", "1" if (torch.version.cuda and not torch.version.hip) else "0") == "1":
+    _MMVQ_FN.update({"q4_k": "fq_mmvq_q4_k", "q6_k": "fq_mmvq_q6_k"})
 _MMVQ_QK = {"iq4_nl": 32}
 _DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}   # fq_dequant_iq format ids (the others have native dequants already)
 # rows served by the mmvq kernel (8 columns per launch, so R/8 passes over the weights): the old IQ path above 16 rows dequantized the whole weight in torch
@@ -262,7 +266,7 @@ class ForeignLinear(Module):
         if not flat.is_contiguous():
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
-        if (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format == "q5_k" else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
+        if (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format in ("q5_k", "q4_k", "q6_k") else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
                 and hasattr(ext, _MMVQ_FN[self.format])):
             N = self.out_features
             out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)
