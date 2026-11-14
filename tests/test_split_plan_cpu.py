@@ -278,6 +278,7 @@ def test_auto_n_is_capped_for_long_context(split_modules, monkeypatch):
     gib = dm.GIB
     model = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
     cfg = FakeConfig({f"layer.{i}": gib for i in range(4)})
+    monkeypatch.setenv("KYOJIN_AUTON_SAFETY_GB", "0.25")
     monkeypatch.setattr(dm.torch.cuda, "get_device_properties", lambda dev: FakeProps(16 * gib))
     plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
                         part0_reserve_gb = 1.0, auto_cap = 2, logger = lambda *_a: None)
@@ -296,6 +297,7 @@ def test_auto_n_uses_actual_bytes_cache_and_reserve(split_modules, monkeypatch):
     ] + [FakeModule("final_norm")])
     cfg = FakeConfig(sizes)
     cache = FakeCache(per_layer = gib // 5)                    # 0.2 GiB per layer, only 16 keys exist
+    monkeypatch.setenv("KYOJIN_AUTON_SAFETY_GB", "0.25")       # pin the arithmetic below
     monkeypatch.setattr(dm.torch.cuda, "get_device_properties", lambda dev: FakeProps(6 * gib))
 
     plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
@@ -313,6 +315,55 @@ def test_auto_n_uses_actual_bytes_cache_and_reserve(split_modules, monkeypatch):
     plan_off.add("text", model, config = cfg, cache = cache)
     plan_off.build()
     assert plan_off.part0_layers == 3
+
+
+def test_auto_n_subtracts_a_predeclared_whole_component(split_modules, monkeypatch):
+    """MTP/vision are declared before build() so auto-N can subtract them from part0."""
+    dm, _bridge, _split = split_modules
+    gib = dm.GIB
+    text = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
+    text_cfg = FakeConfig({f"layer.{i}": gib for i in range(4)})
+    mtp = FakeModel([FakeModule("mtp.block.0", layer_idx = 0), FakeModule("mtp.head")])
+    mtp_cfg = FakeConfig({"mtp.block.0": 2 * gib, "mtp.head": gib // 2})
+    mtp_cache = FakeCache()
+    mtp_cache.layers[(0, 0)] = FakeCacheLayer(3 * gib // 4)     # one 0.75 GiB drafter layer
+    monkeypatch.setenv("KYOJIN_AUTON_SAFETY_GB", "0.25")        # pin the arithmetic below
+    monkeypatch.setattr(dm.torch.cuda, "get_device_properties", lambda dev: FakeProps(6 * gib))
+
+    # Budget 6 - 1 reserve - 0.25 safety = 4.75 GiB: text alone fits all 4 layers.
+    plain = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
+                         part0_reserve_gb = 1.0, logger = lambda *_a: None)
+    plain.add("text", text, config = text_cfg)
+    plain.build()
+    assert plain.part0_layers == 4
+
+    # The 2.5 GiB drafter is a whole component on part0 with endcaps on, so the text
+    # map can only use 4.75 - 2.5 = 2.25 GiB -> N=2.
+    with_mtp = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
+                            part0_reserve_gb = 1.0, logger = lambda *_a: None)
+    with_mtp.add("mtp", mtp, config = mtp_cfg)
+    with_mtp.add("text", text, config = text_cfg)
+    with_mtp.build()
+    assert with_mtp.part0_layers == 2
+    assert with_mtp.map("mtp").part0_layers == 1
+
+    # The drafter cache is part of the same footprint: 2.5 GiB weights + 0.75 GiB cache
+    # leaves 1.5 GiB -> N=1.  A test with weights only would miss that second term.
+    with_cache = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = "auto",
+                              part0_reserve_gb = 1.0, logger = lambda *_a: None)
+    with_cache.add("mtp", mtp, config = mtp_cfg, cache = mtp_cache)
+    with_cache.add("text", text, config = text_cfg)
+    with_cache.build()
+    assert with_cache.part0_layers == 1
+
+    # Endcaps off puts the drafter on part1, so it does not consume the text budget.
+    off = dm.SplitPlan(_devices(dm), endcaps = False, part0_layers = "auto",
+                       part0_reserve_gb = 1.0, logger = lambda *_a: None)
+    off.add("mtp", mtp, config = mtp_cfg)
+    off.add("text", text, config = text_cfg)
+    off.build()
+    assert off.part0_layers == 4
+    assert not off.map("mtp").enabled
 
 
 def test_part0_reserve_is_a_slab_not_an_allocator_cap(split_modules, monkeypatch):
@@ -565,6 +616,83 @@ def test_harness_part0_layers_are_explicit_flags(monkeypatch):
                                       "--long-ctx-part0-layers", "3"])
     args = mod.parse_args()
     assert args.part0_layers == 3 and args.part0_layers_defaulted is True
+
+
+def test_harness_acceptance_flags_and_interval(monkeypatch):
+    mod = _load_split_eval()
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--bench-depth", "8192",
+                                      "--bench-acceptance", "--bench-prompt", "summary"])
+    args = mod.parse_args()
+    assert args.bench_depth == 8192 and args.bench_acceptance
+    assert args.bench_prompt == "summary"
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--vision-image", "doc/cat.png"])
+    assert mod.parse_args().vision_image == "doc/cat.png"
+    # Wilson interval: 0/0 has no interval, a larger sample is tighter than a small one.
+    assert mod.acceptance_ci95(0, 0) is None
+    small = mod.acceptance_ci95(1, 1)
+    large = mod.acceptance_ci95(500, 500)
+    assert small[0] < large[0] <= large[1] < small[1]
+    lo, hi = mod.acceptance_ci95(75, 25)
+    assert 65.0 < lo < 75.0 < hi < 85.0
+
+
+def test_harness_acceptance_needs_depth(monkeypatch):
+    mod = _load_split_eval()
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--bench-acceptance"])
+    with pytest.raises(SystemExit):
+        mod.parse_args()
+
+
+def test_harness_vision_image_rejects_no_vision(monkeypatch):
+    mod = _load_split_eval()
+    monkeypatch.setattr(sys, "argv", ["split_eval.py", "--vision-image", "doc/cat.png",
+                                      "--no-vision"])
+    with pytest.raises(SystemExit):
+        mod.parse_args()
+
+
+def test_harness_compare_checks_every_summary_run(tmp_path, capsys):
+    import json
+    mod = _load_split_eval()
+    long = lambda ids_b: {
+        "prompt": "summary-set", "ids": [1, 2], "accepted": 90, "rejected": 10,
+        "acceptance": 90.0,
+        "runs": [
+            {"instruction": "first", "ids": [1, 2]},
+            {"instruction": "second", "ids": ids_b},
+        ],
+    }
+    a = {"prompts": [], "long": long([3, 4])}
+    b = {"prompts": [], "long": long([3, 5])}
+    for name, rec in (("a.json", a), ("b.json", b)):
+        (tmp_path / name).write_text(json.dumps(rec))
+    mod.compare(str(tmp_path / "a.json"), str(tmp_path / "b.json"))
+    out = capsys.readouterr().out
+    assert "long run 1 DIVERGED" in out
+    assert "long runs: IDENTICAL" not in out
+
+
+def test_harness_compare_skips_small_acceptance_samples(tmp_path, capsys):
+    import json
+    mod = _load_split_eval()
+    rec = {"prompts": [], "long": {
+        "prompt": "summary-set", "ids": [1], "accepted": 40, "rejected": 10,
+        "acceptance": 80.0, "runs": [{"instruction": "only", "ids": [1]}]}}
+    (tmp_path / "a.json").write_text(json.dumps(rec))
+    (tmp_path / "b.json").write_text(json.dumps(rec))
+    mod.compare(str(tmp_path / "a.json"), str(tmp_path / "b.json"))
+    out = capsys.readouterr().out
+    assert "acceptance: sample too small" in out
+    assert "acceptance: first" not in out
+
+    passkey = {"prompts": [], "long": {
+        "prompt": "passkey", "ids": [1], "accepted": 15, "rejected": 1,
+        "acceptance": 93.75, "runs": None}}
+    (tmp_path / "a.json").write_text(json.dumps(passkey))
+    (tmp_path / "b.json").write_text(json.dumps(passkey))
+    mod.compare(str(tmp_path / "a.json"), str(tmp_path / "b.json"))
+    out = capsys.readouterr().out
+    assert "acceptance: skipped (passkey" in out
 
 
 def test_adapter_unsafe_env_is_applied_and_logged(split_modules, monkeypatch):
