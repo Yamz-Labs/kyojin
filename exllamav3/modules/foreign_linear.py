@@ -32,6 +32,10 @@ _ROWS_TRITON = os.environ.get("BOLT_FQ_ROWS_TRITON", "1") != "0"
 # 87 ms N8 step on the 35B-A3B UD-Q4_K_XL, 75 % of device time); the C++ q8_1 GEMV (fq_gemv_q8_0) takes 70-80 us. HIP keeps the Triton kernel.
 # BOLT_FQ_ROWS_TRITON_Q8=1 restores it on CUDA (A/B).
 _ROWS_TRITON_Q8 = os.environ.get("BOLT_FQ_ROWS_TRITON_Q8", "0" if (torch.version.cuda and not torch.version.hip) else "1") != "0"
+# NVFP4 2..16 rows on the C++ multi-row q8 kernel (fq_gemv_q8_nvfp4_mrows_kernel: weights read once, bit-identical to one row) instead
+# of the Triton rows kernel, which streams cold weights at ~22 GB/s on gfx1151 (Ornith-1.5-9B N4: 1.14 ms per MLP GEMV). ROCm default;
+# CUDA keeps the Triton rows kernel. Same switch as the C++ side.
+_NVFP4_MROWS = os.environ.get("BOLT_FQ_NVFP4_MROWS", "1" if torch.version.hip else "0") != "0"
 
 # Q4_K / Q6_K rows 2..16: the C++ multi-row q8_1 GEMV (fq_gemv_kq.cu fq_gemv_kq_mrows_kernel: weights read once for all rows, per-row result bit-identical to
 # the one-row kernel) instead of the Triton rows kernel (fp16 activations, Triton speed). Default on CUDA; HIP keeps Triton until measured on gfx1151.
@@ -270,6 +274,7 @@ class ForeignLinear(Module):
                 out = out.to(dtype)
         elif (_ROWS_TRITON and flat.dtype == torch.half and (_ROWS_TRITON_Q8 or self.format != "q8_0")
                 and not (_KQ_MROWS and self.format in _KQ_MROWS_FORMATS)
+                and not (_NVFP4_MROWS and self.format == "nvfp4")
                 and triton_rows.supported(self.format, R, K)):
             # 2..16 rows (verify / multi-user): weights read once for all rows (the fq_gemv kernels re-read them per row)
             out = triton_rows.gemv(self.format, flat, self.packed.reshape(self.out_features, -1), self.scales.reshape(self.out_features, -1)
