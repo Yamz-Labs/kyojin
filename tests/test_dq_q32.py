@@ -4,13 +4,19 @@ import os
 import sys
 
 import numpy as np
-import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-if not torch.cuda.is_available():
-    pytest.skip("needs a GPU (CUDA or ROCm)", allow_module_level=True)
+if __name__ != "__main__":
+    import pytest
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU (CUDA or ROCm)", allow_module_level=True)
+    parametrize = pytest.mark.parametrize
+else:
+    def parametrize(*_a, **_k):
+        return lambda f: f
 
 from exllamav3.modules import fq_moe_prefill_kq as M  # noqa: E402
 
@@ -34,7 +40,7 @@ def _ref(fmt, raw, N, K):
     return out.astype(np.float16)
 
 
-@pytest.mark.parametrize("fmt", [M.FMT_Q8_0, M.FMT_Q5_1])
+@parametrize("fmt", [M.FMT_Q8_0, M.FMT_Q5_1])
 def test_dq_q32(fmt):
     rng = np.random.default_rng(0)
     E, N, K = 3, 40, 128
