@@ -21,7 +21,7 @@
 #include "../util.h"
 #include "fq_api.h"
 #include "ggml_mmvq/ggml_vecdotq_iq.cuh"
-#include "ggml_mmvq/ggml_vecdotq_k.cuh"
+#include "ggml_mmvq/ggml_vecdotq_k46.cuh"
 
 #if defined(USE_ROCM)
 // HIP: maskless shuffles (RDNA runs these kernels as wave32, MQ_WARP = 32)
@@ -32,7 +32,7 @@ namespace {
 
 using namespace ggml_iq;
 
-enum { MQ_IQ2_XXS = 0, MQ_IQ2_XS = 1, MQ_IQ2_S = 2, MQ_IQ3_XXS = 3, MQ_IQ3_S = 4, MQ_IQ4_NL = 5, MQ_IQ4_XS = 6, MQ_Q5_K = 7, MQ_NTYPES = 8 };
+enum { MQ_IQ2_XXS = 0, MQ_IQ2_XS = 1, MQ_IQ2_S = 2, MQ_IQ3_XXS = 3, MQ_IQ3_S = 4, MQ_IQ4_NL = 5, MQ_IQ4_XS = 6, MQ_Q5_K = 7, MQ_Q4_K = 8, MQ_Q6_K = 9, MQ_NTYPES = 10 };
 
 // qk = weight elements per block, qi = ints per block (ggml QI*), vdr = ints per lane per call, bb = block bytes
 template <int T> struct MqTraits;
@@ -50,6 +50,8 @@ MQ_TRAITS(MQ_IQ3_S, 256, 16, VDR_IQ3_S_Q8_1_MMVQ, 110, vec_dot_iq3_s_q8_1);
 MQ_TRAITS(MQ_IQ4_NL, 32, 4, VDR_IQ4_NL_Q8_1_MMVQ, 18, vec_dot_iq4_nl_q8_1);
 MQ_TRAITS(MQ_IQ4_XS, 256, 32, VDR_IQ4_XS_Q8_1_MMVQ, 136, vec_dot_iq4_xs_q8_1);
 MQ_TRAITS(MQ_Q5_K, 256, 32, VDR_Q5_K_Q8_1_MMVQ, 176, vec_dot_q5_K_q8_1);
+MQ_TRAITS(MQ_Q4_K, 256, 32, VDR_Q4_K_Q8_1_MMVQ, 144, vec_dot_q4_K_q8_1);
+MQ_TRAITS(MQ_Q6_K, 256, 32, VDR_Q6_K_Q8_1_MMVQ, 210, vec_dot_q6_K_q8_1);
 #undef MQ_TRAITS
 
 constexpr int MQ_WARP = 32;
@@ -487,6 +489,8 @@ void fq_mmvq_iq3_s(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { 
 void fq_mmvq_iq4_nl(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ4_NL>(qb, packed, out); }
 void fq_mmvq_iq4_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ4_XS>(qb, packed, out); }
 void fq_mmvq_q5_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q5_K>(qb, packed, out); }
+void fq_mmvq_q4_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q4_K>(qb, packed, out); }
+void fq_mmvq_q6_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q6_K>(qb, packed, out); }
 
 // Standalone grouped decode MoE for IQ experts (any of the 7 IQ formats for gate/up and for down; type ids = MQ_* order:
 // 0 iq2_xxs, 1 iq2_xs, 2 iq2_s, 3 iq3_xxs, 4 iq3_s, 5 iq4_nl, 6 iq4_xs). Same arguments and results as fq_moe_kq_grouped_mixed_q8:

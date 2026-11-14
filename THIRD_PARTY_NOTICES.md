@@ -10,6 +10,8 @@ llama.cpp (https://github.com/ggml-org/llama.cpp, commit 7182ef7):
 - ggml_vecdotq_iq.cuh: the vec_dot_iq*_q8_1 functions and helpers from ggml/src/ggml-cuda/vecdotq.cuh (only ggml_cuda_dp4a renamed to __dp4a,
   CUDA-only helpers).
 - fq_mmvq.cu: kernel structure after ggml/src/ggml-cuda/mmvq.cu (mul_mat_vec_q, mul_mat_vec_q_moe).
+- ggml_vecdotq_k46.cuh: vec_dot_q4_K_q8_1 and vec_dot_q6_K_q8_1 (with their _impl helpers) and the block_q4_K / block_q6_K layouts,
+  from llama.cpp commit 61dbf49 (only ggml_cuda_dp4a renamed to ggml_dp4a).
 
 MIT License
 
