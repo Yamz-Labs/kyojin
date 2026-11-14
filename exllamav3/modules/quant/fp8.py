@@ -1,7 +1,7 @@
 """FP8 (E4M3) linears served as stored: per-row / per-tensor scale (`weight_scale`) or the 2D block grid (`weight_scale_inv`,
 DeepSeek / Qwen-FP8 / GLM / MiniMax layout). One byte per weight is read instead of the two of the fp16 dequant.
 
-Decode GEMV (<= MAX_ROWS rows): the C++ fq_gemv_fp8 (ROCm and CUDA) when the extension has it, else one Triton kernel. E4M3 -> fp16 is exact by bit placement:
+Decode GEMV (<= MAX_ROWS rows): the C++ fq_gemv_fp8 on ROCm when the extension has it, else (and on CUDA) one Triton kernel. E4M3 -> fp16 is exact by bit placement:
 half(bits = sign << 8 | (b & 0x7F) << 7) * 256 (normals and subnormals; the 0x7F NaN code is never stored by real checkpoints).
 With the block grid, BN rows of a tile share one block row and each BK chunk one block column, so the block scale is one
 scalar per (tile, chunk) applied to the chunk's partial sum. Wider batches: fp16 dequant of the matrix + matmul.
@@ -162,8 +162,9 @@ def moe_fused(h, tabs, sel, wts, I, K, grid, block, S, sc_gu, sc_d):
 
 def _ext_gemv():
     """The C++ FP8 GEMV (fq_gemv_fp8.cu: one warp per output column, 16-byte lanes = long DRAM bursts), or None (old build /
-    BOLT_FP8_GEMV_EXT=0 = the Triton kernel below). Triton streamed cold weights at 42-55 GB/s on gfx1151 (k60)."""
-    if os.environ.get("BOLT_FP8_GEMV_EXT", "1") == "0":
+    the Triton kernel below). Default on ROCm only: there Triton streamed cold weights at 42-55 GB/s (gfx1151) vs 75-136 for the
+    C++ kernel; on CUDA Triton already reads at 640-740 GB/s (RTX 3090) and beats it at 4-8 rows. BOLT_FP8_GEMV_EXT=1 / 0 forces."""
+    if os.environ.get("BOLT_FP8_GEMV_EXT", "1" if torch.version.hip else "0") == "0":
         return None
     try:
         from ...ext import exllamav3_ext as ext
