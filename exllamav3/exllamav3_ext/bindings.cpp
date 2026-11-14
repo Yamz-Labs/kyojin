@@ -118,6 +118,7 @@
 #include "generator/dry.cuh"
 #include "ngram.cuh"
 #include "sam.h"
+#include "rocm/gmmq/gmmq.h"
 
 #endif
 
@@ -476,6 +477,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 #if defined(USE_ROCM)
     m.def("mla_absorb_dec", &mla_absorb_dec, "mla_absorb_dec");
     m.def("mla_unfold_dec", &mla_unfold_dec, "mla_unfold_dec");
+    // routed (MoE) llama.cpp MMQ via Gufo (rocm/gmmq): out [T * n_used, M] fp32, row t * n_used + slot
+    m.def("fq_mmq_moe", &fq_mmq_moe, "fq_mmq_moe",
+          py::arg("x"), py::arg("ids"), py::arg("w_ptrs"), py::arg("fmt"), py::arg("M"), py::arg("out"),
+          py::arg("tile_cols") = 0, py::arg("max_expert_rows") = 0);
 #endif
     m.def("kda_gb_norm", &kda_gb_norm, "kda_gb_norm");
     m.def("kda_inter_off", &kda_inter_off, "kda_inter_off");
