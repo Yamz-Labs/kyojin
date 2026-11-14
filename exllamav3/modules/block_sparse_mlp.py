@@ -2172,7 +2172,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         R = y.shape[0]
         fmts = self._fq_grouped_kq_ok(y)
         _KQ = {"q4_k": 0, "q5_k": 1, "q6_k": 2}
-        use_kq = fmts is not None and fmts[0] in _KQ and fmts[1] in _KQ   # Q4_K/Q5_K/Q6_K (mixed gate-up/down ok)
+        _KQ_DN = {**_KQ, "q8_0": 3, "q5_1": 4} if os.environ.get("MCPM_FQ_PF_DN32", "1") != "0" else _KQ
+        # Q4_K/Q5_K/Q6_K gate-up; down also Q8_0 / Q5_1 (unsloth UD packs: before, those layers took the per-expert loop in prefill)
+        use_kq = fmts is not None and fmts[0] in _KQ and fmts[1] in _KQ_DN
         # IQ packs (gate/up IQ2_S + down IQ3_XXS / IQ4_XS): grouped dequant + fp16 grouped GEMM (fq_moe_prefill_iq.py)
         use_iq = _FQ_MOE_IQ and fmts is not None and not use_kq and set(fmts) <= {"iq3_xxs", "iq2_s", "iq4_xs"} and \
             fmts != ("iq4_xs", "iq4_xs")
@@ -2230,12 +2232,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         dn = torch.empty((M, K), dtype=torch.half, device=dev)
         if use_kq:
             xs = y.index_select(0, token_sorted)
-            if os.environ.get("MCPM_FQ_PF_FUSED", "0") == "1":   # weights decoded inside the GEMM tile (no fp16 scratch)
+            if os.environ.get("MCPM_FQ_PF_FUSED", "0") == "1" and fmts[1] in _KQ:   # weights decoded inside the GEMM tile (no fp16 scratch)
                 gmm_kq(xs, gu_ptrs, a, tile_e, tile_r0, offs, I, K, E, _KQ[fmts[0]], swiglu=True, BM=bm)
-                gmm_kq(a, dn_ptrs, dn, tile_e, tile_r0, offs, K, I, E, _KQ[fmts[1]], wrow=weight_sorted, BM=bm)
+                gmm_kq(a, dn_ptrs, dn, tile_e, tile_r0, offs, K, I, E, _KQ_DN[fmts[1]], wrow=weight_sorted, BM=bm)
             else:
                 moe_kq_prefill(xs, gu_ptrs, dn_ptrs, a, dn, tile_e, tile_r0, offs, weight_sorted, E, I, K,
-                               _KQ[fmts[0]], _KQ[fmts[1]], bm)
+                               _KQ[fmts[0]], _KQ_DN[fmts[1]], bm)
         elif use_iq:
             from .fq_moe_prefill_iq import moe_iq_prefill, FMT_ID
             xs = y.index_select(0, token_sorted)
