@@ -205,6 +205,108 @@ __global__ void fq_gemv_q8_nvfp4_kernel(const uint8_t* __restrict__ aqb,
     }
 }
 
+// Four doubled-e2m1 int8 x4 words of one 16-element NVFP4 group (8 packed bytes at prc): the same expansion as fq_dot_nvfp4_q8
+// (__byte_perm on CUDA, the bank-spread table elsewhere), so a dot built on it is bit-identical to that one.
+__device__ __forceinline__ void fq_nvfp4_group_w(const uint8_t* __restrict__ prc, const int8_t* __restrict__ e2m1db,
+                                                 int32_t& w0, int32_t& w1, int32_t& w2, int32_t& w3)
+{
+#if defined(__CUDA_ARCH__)
+    uint32_t q4a = reinterpret_cast<const uint32_t*>(prc)[0];
+    uint32_t q4b = reinterpret_cast<const uint32_t*>(prc)[1];
+    int2 e01 = fq_e2m1_expand_8(q4a);
+    int2 e23 = fq_e2m1_expand_8(q4b);
+    w0 = e01.x; w1 = e01.y; w2 = e23.x; w3 = e23.y;
+#else
+    uint32_t b[16];
+    #pragma unroll
+    for (int j = 0; j < 16; j++)
+    {
+        uint8_t pbyte = prc[j >> 1];
+        uint8_t nib = (j & 1) ? (pbyte >> 4) & 0xF : pbyte & 0xF;
+        b[j] = (uint32_t)(uint8_t)e2m1db[((uint32_t)nib << 3) | (uint32_t)(j & 7)];
+    }
+    w0 = (int32_t)(b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
+    w1 = (int32_t)(b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24));
+    w2 = (int32_t)(b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24));
+    w3 = (int32_t)(b[12] | (b[13] << 8) | (b[14] << 16) | (b[15] << 24));
+#endif
+}
+
+// Multi-row NVFP4 q8 dot (BOLT_FQ_NVFP4_MROWS, default on for 2..16 x-rows): one block per column n, rows m0 .. m0 + mc - 1 (mc <= 8,
+// grid.y = row groups). Each 16-element weight group is expanded once and dotted against every row (the one-row kernel re-read the whole
+// matrix per x-row: 4 rows cost 3-4x one row cold). Per row: same chunk loop per thread, same scale product, same sequential reduction as
+// fq_gemv_q8_nvfp4_kernel, so each output is bit-identical to the one-row kernel.
+template <typename OUT>
+__global__ void fq_gemv_q8_nvfp4_mrows_kernel(const uint8_t* __restrict__ aqb,
+                                              const uint8_t* __restrict__ packed,
+                                              const uint8_t* __restrict__ scales,
+                                              float global,
+                                              OUT* __restrict__ out,
+                                              int M, int N, int K, int64_t packed_stride,
+                                              int64_t scales_stride, int64_t qb_stride)
+{
+    constexpr int MR = 8;
+    int n = blockIdx.x;
+    int m0 = blockIdx.y * MR;
+    int mc = min(MR, M - m0);
+    int tid = threadIdx.x;
+    int nt = blockDim.x;
+
+    extern __shared__ uint8_t sh[];
+    int8_t* e2m1db = reinterpret_cast<int8_t*>(sh);
+    float* red = reinterpret_cast<float*>(e2m1db + 128);   // [MR][nt]
+
+    fq_e2m1db_build(e2m1db);
+    __syncthreads();
+    float acc[MR];
+    #pragma unroll
+    for (int r = 0; r < MR; r++) acc[r] = 0.0f;
+
+    const uint8_t* pr = packed + (int64_t)n * packed_stride;
+    const uint8_t* sr = scales + (int64_t)n * scales_stride;
+    int nchunks = K / 32;
+    for (int c = tid; c < nchunks; c += nt)
+    {
+        for (int g = 0; g < 2; g++)
+        {
+            float sw = __fmul_rn(__uint_as_float(FQ_E4M3_BITS[sr[c * 2 + g]]), 0.5f);
+            int32_t w0, w1, w2, w3;
+            fq_nvfp4_group_w(pr + (size_t)c * 16 + g * 8, e2m1db, w0, w1, w2, w3);
+            #pragma unroll
+            for (int r = 0; r < MR; r++)
+            {
+                if (r < mc)
+                {
+                    const uint8_t* ab = aqb + (int64_t)(m0 + r) * qb_stride + (size_t)c * FQ_Q8_1_BYTES;
+                    __half dah;
+                    memcpy(&dah, ab, 2);
+                    float d = __fmul_rn(sw, __half2float(dah));
+                    const int32_t* aq32 = reinterpret_cast<const int32_t*>(ab + 4 + g * 16);
+                    int sumi = 0;
+                    sumi = fq_dp4a(w0, aq32[0], sumi);
+                    sumi = fq_dp4a(w1, aq32[1], sumi);
+                    sumi = fq_dp4a(w2, aq32[2], sumi);
+                    sumi = fq_dp4a(w3, aq32[3], sumi);
+                    acc[r] = __fadd_rn(acc[r], __fmul_rn(d, (float)sumi));
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < MR; r++) red[r * nt + tid] = __fmul_rn(acc[r], global);
+    __syncthreads();
+    if (tid < mc)
+    {
+        float s = 0.0f;
+        for (int l = 0; l < nt; l++)
+            s = __fadd_rn(s, red[tid * nt + l]);
+        if constexpr (std::is_same<OUT, __half>::value)
+            out[(int64_t)(m0 + tid) * N + n] = __float2half_rn(s);
+        else
+            out[(int64_t)(m0 + tid) * N + n] = s;
+    }
+}
+
 // Row-per-block Q8_0 q8 dot: same grid; the dot is fq_dot_q8_0_q8
 // (8 dp4a per 32-block, weights are int8, no tables).
 template <typename OUT>
@@ -404,8 +506,17 @@ void fq_gemv_nvfp4_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor scal
     size_t shmem = 128 * sizeof(int8_t) + (size_t)nt * sizeof(float);
     at::cuda::CUDAGuard guard(qb.device());
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+    static const int mrows = [] { const char* e = getenv("BOLT_FQ_NVFP4_MROWS"); return e ? atoi(e) : 1; }();
     auto launch = [&](auto* op)
     {
+        if (M >= 2 && M <= 16 && mrows)
+        {
+            size_t shm = 128 * sizeof(int8_t) + (size_t)8 * nt * sizeof(float);
+            fq_gemv_q8_nvfp4_mrows_kernel<std::decay_t<decltype(*op)>> <<<dim3(N, (M + 7) / 8), nt, shm, stream>>>(
+                qb.data_ptr<uint8_t>(), packed.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
+                (float)global_scale, op, M, N, K, pstride, sstride, qb_stride);
+            return;
+        }
         fq_gemv_q8_nvfp4_kernel<std::decay_t<decltype(*op)>> <<<M * N, nt, shmem, stream>>>(
             qb.data_ptr<uint8_t>(), packed.data_ptr<uint8_t>(), scales.data_ptr<uint8_t>(),
             (float)global_scale, op, M, N, K, pstride, sstride, qb_stride);
