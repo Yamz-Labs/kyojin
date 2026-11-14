@@ -662,6 +662,9 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
 # "96000:0.45,0.2,4,0.8,0.6" (spec_policy.py) is the matching cap. EXL3_DRAFT_VOCAB=0 and QWSPEC_* set in the environment win.
 # SERVE_ENV entries tuned on gfx1151 for conversation resume and HIP kernels, not validated on NVIDIA (the 3090 numbers were
 # measured without them): CUDA starts without them, the environment still wins.
+# HIP (gfx1151) values that differ from SERVE_ENV: 8192-row prefill chunks (Strix served A/B, Qwen3.8-Flash-Next UD-Q4_K_XL GGUF:
+# 8K prefill 19.0 -> 15.0 and 17.5 -> 13.2 s vs 2048, N1 md5 identical; one MoE pass per 8192 rows instead of two).
+HIP_SERVE_ENV_OVERRIDE = {"EXL3_PREFILL_CHUNK": "8192"}
 HIP_ONLY_SERVE_ENV = frozenset(("EXL3_BRANCH_CKPT", "EXL3_GDN_HF", "EXL3_MOE_WMMA_MIN_ROWS", "EXL3_NC2_ABLIT_F16", "EXL3_NC2_ASYNC_STASH",
                                 "EXL3_NC2_ATTN_F16", "EXL3_GEMV_R_WIDE8", "EXL3_REPLY_FIRST", "EXL3_TAIL_DENSE", "EXL3_TAIL_MAXGAP",
                                 "EXL3_TAIL_REPLY", "EXL3_TAIL_SUB", "EXL3_TOPK_PAR"))
@@ -783,7 +786,7 @@ class QwenEngine:
         for k, v in SERVE_ENV:
             if on_cuda and k in HIP_ONLY_SERVE_ENV:
                 continue
-            os.environ.setdefault(k, v)
+            os.environ.setdefault(k, HIP_SERVE_ENV_OVERRIDE.get(k, v) if not on_cuda else v)
         check_latched_env()
         print("qserve:", configure_hc_sidecar(model_path), flush=True)
         print("qserve:", configure_draft2s(model_path), flush=True)
