@@ -16,10 +16,12 @@ FMTS = {  # name: (block bytes, elements per block, mmvq id)
 }
 # dense-only K-quant entries (llama.cpp vec_dot_q4_K / q6_K_q8_1 in fq_mmvq.cu; no grouped MoE id)
 KQ_DENSE = {"q4_k": (144, 256, 8), "q6_k": (210, 256, 9)}
+# few-row MMQ formats (fq_mmq_few.cu, llama.cpp PR #31533 port): name -> (block bytes, elements per block, fq_mmq_few fmt id)
+MMQ_FEW = {"q8_0": (34, 32, 0), "q4_k": (144, 256, 1), "q5_k": (176, 256, 2), "q6_k": (210, 256, 3)}
 
 
 def make_weights(fmt, n, k, seed, dscale=1.0):
-    bb, qk, _ = {**FMTS, **KQ_DENSE}[fmt]
+    bb, qk, _ = {**FMTS, **KQ_DENSE, **MMQ_FEW}[fmt]
     g = torch.Generator().manual_seed(seed)
     w = torch.randint(0, 256, (n, k // qk, bb), generator=g, dtype=torch.uint8)
     d = ((torch.rand(n, k // qk, generator=g) * 0.02 + 0.001) * dscale).half().view(torch.uint8).reshape(n, k // qk, 2)
@@ -33,7 +35,11 @@ def make_weights(fmt, n, k, seed, dscale=1.0):
 
 
 def dequant(fmt, w, n, k):
-    bb, qk, _ = {**FMTS, **KQ_DENSE}[fmt]
+    bb, qk, _ = {**FMTS, **KQ_DENSE, **MMQ_FEW}[fmt]
+    if fmt == "q8_0":
+        out = torch.empty((n, k), dtype=torch.half, device="cuda")
+        ext.fq_dequant_q8_0(w.reshape(n, k // 32, 34), out)
+        return out.float()
     if fmt == "iq2_xxs":
         out = torch.empty((n, k), dtype=torch.half, device="cuda")
         ext.fq_dequant_iq2_xxs(w.reshape(n, k // 256, 66), out)
@@ -146,6 +152,60 @@ def moe_case(fug, fd, K, I, E, R, topk, seed):
     return float((out - ref).norm() / ref.norm())
 
 
+def few_q8(x, ds4):
+    """llama.cpp quantize_mmq_few_q8_1 in torch: q = roundf(x * 127/amax) per 32 values, d = 1/(127/amax), stored as half for DS4 (Q4_K / Q5_K)."""
+    m, k = x.shape
+    xb = x.float().reshape(m, k // 32, 32)
+    d_inv = 127.0 / xb.abs().amax(-1, keepdim=True)
+    v = xb * d_inv
+    q = torch.nan_to_num(torch.sign(v) * torch.floor(v.abs() + 0.5))
+    d = 1.0 / d_inv
+    if ds4:
+        d = d.half().float()
+    return (q * d).reshape(m, k)
+
+
+def test_mmq_few():
+    """fq_mmq_few vs (1) fp32 dequantized weights x the same q8_1 activations emulated in torch: only the float summation order and, for
+    Q4_K / Q5_K, the half (d * sum) of the min term differ -> rel < 2e-3; (2) the existing decode kernels (fq_mmvq_<fmt>, fq_gemv_q8_0 for
+    Q8_0), which quantize the activations with d = amax/127 stored as half -> a few q values off by one, rel < 5e-3."""
+    if not hasattr(ext, "fq_mmq_few") or torch.cuda.get_device_capability()[0] < 8:
+        print("mmq_few: skipped (needs a CUDA sm_80+ build)")
+        return
+    worst_ref = worst_old = 0.0
+    for fmt, (bb, qk, fid) in MMQ_FEW.items():
+        for n, k in ((1024, 4096), (777, 2048), (3000, 4096)):   # 777: partial row tile; 3000 >= 82 SMs * 32: the 32-row tiles (9..16 rows)
+            w = make_weights(fmt, n, k, 5)
+            wd = dequant(fmt, w, n, k)
+            for m in range(2, 25):
+                x = (torch.randn(m, k, generator=torch.Generator().manual_seed(m)) * 0.5).half().cuda()
+                ref = few_q8(x, fmt in ("q4_k", "q5_k")) @ wd.t()
+                out = torch.empty((m, n), dtype=torch.float, device="cuda")
+                scratch = ext.fq_q8_scratch(torch.cuda.current_device(), 8 * ((m + 7) // 8), k)
+                assert ext.fq_mmq_few(x, scratch, w, out, fid), f"{fmt} [{n}x{k}] m={m}: not served"
+                torch.cuda.synchronize()
+                rel = float((out - ref).norm() / ref.norm())
+                assert rel < 2e-3, f"{fmt} [{n}x{k}] m={m}: rel err {rel:.2e} vs dequant reference"
+                worst_ref = max(worst_ref, rel)
+                o = torch.empty((m, n), dtype=torch.float, device="cuda")
+                if fmt == "q8_0":
+                    ext.fq_gemv_q8_0(x, w.reshape(n, -1, 34), o)
+                else:
+                    qb = ext.fq_q8_scratch(torch.cuda.current_device(), m, k)
+                    ext.fq_quant_q8_1_rows(x, qb)
+                    getattr(ext, f"fq_mmvq_{fmt}")(qb, w, o)
+                torch.cuda.synchronize()
+                d = float((out - o).norm() / o.norm())
+                assert d < 5e-3, f"{fmt} [{n}x{k}] m={m}: differs from the existing kernel by {d:.2e}"
+                worst_old = max(worst_old, d)
+                oh = torch.empty((m, n), dtype=torch.half, device="cuda")
+                ext.fq_mmq_few(x, scratch, w, oh, fid)
+                torch.cuda.synchronize()
+                assert torch.equal(oh, out.half()), f"{fmt} m={m}: half output != rounded float output"
+        print(f"mmq_few {fmt}: ok")
+    print(f"mmq_few worst rel err vs dequant reference {worst_ref:.2e}, vs existing kernels {worst_old:.2e}")
+
+
 def test_moe():
     cases = [("iq2_s", "iq3_xxs"), ("iq2_s", "iq4_xs"), ("iq3_xxs", "iq3_xxs"), ("iq2_xs", "iq3_s"), ("iq4_nl", "iq4_nl"), ("iq2_xxs", "iq2_xxs"),
              ("iq3_s", "iq2_xs"), ("iq4_xs", "iq4_xs")]
@@ -159,5 +219,6 @@ def test_moe():
 if __name__ == "__main__":
     test_dequant()
     test_dense()
+    test_mmq_few()
     test_moe()
     print("PASS")

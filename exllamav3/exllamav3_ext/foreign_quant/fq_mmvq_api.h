@@ -20,3 +20,8 @@ void fq_moe_mmvq_grouped(torch::Tensor h, torch::Tensor sel, torch::Tensor wts, 
                          torch::Tensor partial, torch::Tensor out);
 // Dequantize IQ blocks to fp16 [N, K] (K % 256 == 0); fmt = MQ type id as above (0..6). Port of ggml convert.cu dequantize_block_iq*.
 void fq_dequant_iq(torch::Tensor packed, torch::Tensor out, int64_t fmt);
+#if !defined(USE_ROCM)
+// Few-row MMQ (fq_mmq_few.cu, CUDA sm_80+, port of llama.cpp PR #31533): out[R, N] = x[R, K] (half) @ W^T, R 1..24, raw GGUF rows
+// packed [N, K/256 * unit bytes], fmt 0 Q8_0, 1 Q4_K, 2 Q5_K, 3 Q6_K; scratch >= ceil(R/8)*K*9 bytes. False = not served (nothing launched).
+bool fq_mmq_few(torch::Tensor x, torch::Tensor scratch, torch::Tensor packed, torch::Tensor out, int fmt);
+#endif
