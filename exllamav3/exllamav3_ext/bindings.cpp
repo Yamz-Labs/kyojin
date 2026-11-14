@@ -663,6 +663,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_mmvq_q6_k", &fq_mmvq_q6_k, "fq_mmvq_q6_k",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
+#if !defined(USE_ROCM)
+    m.def("fq_mmq_few", &fq_mmq_few, "fq_mmq_few",
+          py::arg("x"), py::arg("scratch"), py::arg("packed"), py::arg("out"), py::arg("fmt"));
+#endif
 // grouped KQ/IQ4_XS decode MoE (fq_moe_kq.cu): portable dp4a kernels, built on ROCm too
     m.def("fq_moe_q4k_grouped_q8", &fq_moe_q4k_grouped_q8, "fq_moe_q4k_grouped_q8",
           py::arg("h"), py::arg("sel"), py::arg("wts"),

@@ -82,6 +82,12 @@ _MMVQ_FN = {"iq2_xxs": "fq_mmvq_iq2_xxs", "iq2_xs": "fq_mmvq_iq2_xs", "iq2_s": "
 # CUDA (RTX 3090, 8B Q4_K_M served: N8 +28 %, N4 +11 %, N1 +4 %), off on ROCm until measured there; 0 / 1 forces.
 if os.environ.get("BOLT_FQ_MMVQ_KQ", "1" if (torch.version.cuda and not torch.version.hip) else "0") == "1":
     _MMVQ_FN.update({"q4_k": "fq_mmvq_q4_k", "q6_k": "fq_mmvq_q6_k"})
+# BOLT_FQ_MMQ_FEW: Q8_0 / Q4_K / Q5_K / Q6_K rows from a per-format minimum up to 24 through the few-row int8-MMA kernel (fq_mmq_few.cu,
+# llama.cpp PR #31533 port, thresholds tuned there on an RTX 5090). CUDA only (sm_80+), off on ROCm; 0 / 1 forces. RTX 3090 served, 8 sessions:
+# 8B Q4_K_M N4 +15 %, N8 +54 % (different prompts) / +77 % (same prompt), N1 and 8K prefill unchanged; 35B-A3B GGUF N8 +21 % / +26 %.
+_MMQ_FEW = os.environ.get("BOLT_FQ_MMQ_FEW", "1" if (torch.version.cuda and not torch.version.hip) else "0") == "1"
+_MMQ_FEW_FMT = {"q8_0": 0, "q4_k": 1, "q5_k": 2, "q6_k": 3}
+_MMQ_FEW_MINR = {"q5_k": 3, "q4_k": 4, "q6_k": 4, "q8_0": 5}
 _MMVQ_QK = {"iq4_nl": 32}
 _DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}   # fq_dequant_iq format ids (the others have native dequants already)
 # rows served by the mmvq kernel (8 columns per launch, so R/8 passes over the weights): the old IQ path above 16 rows dequantized the whole weight in torch
@@ -266,7 +272,19 @@ class ForeignLinear(Module):
         if not flat.is_contiguous():
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
-        if (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format in ("q5_k", "q4_k", "q6_k") else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
+        if (_MMQ_FEW and self.format in _MMQ_FEW_FMT and _MMQ_FEW_MINR[self.format] <= R <= 24 and flat.dtype == torch.half
+                and K % 256 == 0 and K >= 2048 and hasattr(ext, "fq_mmq_few")):
+            N = self.out_features
+            out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)
+            dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
+            if ext.fq_mmq_few(flat, ext.fq_q8_scratch(dev_idx, 8 * ((R + 7) // 8), K), self.packed.reshape(N, -1), out, _MMQ_FEW_FMT[self.format]):
+                if out.dtype != dtype:
+                    out = out.to(dtype)
+            else:
+                out = None
+        if out is not None:
+            pass
+        elif (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format in ("q5_k", "q4_k", "q6_k") else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
                 and hasattr(ext, _MMVQ_FN[self.format])):
             N = self.out_features
             out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)
