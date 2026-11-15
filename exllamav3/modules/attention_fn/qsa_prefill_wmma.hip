@@ -55,13 +55,14 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
     const int g = blockIdx.x & 1, row0 = (blockIdx.x >> 1) * NR;
 
     __shared__ uint32_t sBlk[MAXU];
-    __shared__ uint32_t sVm[MAXU];                       // bit 4 * row + (token & 3): token visible to that row
-    __shared__ __attribute__((aligned(16))) char sBig[NCOL * LDQ * 2];   // sort buffer, then q, then output staging
-    __shared__ __attribute__((aligned(16))) half_t sKV[256 * LDT];       // K tile [16][LDQ] (first 8448 B) or V^T [256][LDT]
-    __shared__ __attribute__((aligned(16))) half_t sP[NCOL * LDT];
+    __shared__ uint16_t sVm[MAXU];                       // bit 4 * row + (token & 3): token visible to that row
+    // one aliased region: sort buffer (start-up) | K tile / V^T | P | partial scores (loop) | output staging (end)
+    __shared__ __attribute__((aligned(16))) char sBig[16384 + 1280];
+    half_t* const sKV = (half_t*) sBig;                                  // K tile [16][LDQ] (8448 B) or V^T [256][LDT] (12288 B)
+    half_t* const sP = (half_t*) (sBig + 12288);                         // NCOL * LDT halves = 2304 B
+    float* const sSp = (float*) (sBig + 14592);                          // 3 * 32 * 8 floats = 3072 B
     __shared__ float sAlpha[NCOL];
     __shared__ float sL[NCOL];
-    __shared__ __attribute__((aligned(16))) float sSp[3 * 32 * 8];
     __shared__ uint32_t sCnt[256];
 
     // ---- union of the 4 rows' selected blocks ----
@@ -126,14 +127,15 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
     const int ntile = (nU + 3) >> 2;
 #endif
 
-    // ---- q -> LDS ----
-    half_t* sQ = (half_t*) sBig;
-    for (int c = tid; c < NCOL * 32; c += 256) {
-        const int col = c >> 5, ch = c & 31, rho = col / GRP, h = col - rho * GRP;
-        const int row = min(row0 + rho, R - 1);
-        *(v4u*) (sQ + col * LDQ + ch * 8) = *(const v4u*) (q + IX_Q(row, g * GRP + h, ch * 8, q_stride));
+    // ---- q B fragments of this wave (column tile ct, half dh of the head dim) straight from global ----
+    v16h qf[8];
+    {
+        const int ctq = w % 3, dhq = w / 3, colq = 16 * ctq + n, rhoq = colq / GRP, hq = colq - rhoq * GRP;
+        const int rowq = min(row0 + rhoq, R - 1);
+#pragma unroll
+        for (int ks = 0; ks < 8; ++ks) qf[ks] = (w < 6) ? ld16h(q + IX_Q(rowq, g * GRP + hq, 16 * (dhq * 8 + ks), q_stride)) : (v16h) {0};
     }
-    sync_lds();
+    sync_lds();   // sort buffer dead before the first K tile lands in the same LDS
 
     v8f acc[2][3];
 #pragma unroll
@@ -184,7 +186,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
             for (int ks = 0; ks < 8; ++ks) {
                 const int kq = dh * 8 + ks;
 #ifndef NOS
-                S = wmma(ld16h(sK + n * LDQ + 16 * kq), ld16h(sQ + (16 * ct + n) * LDQ + 16 * kq), S);
+                S = wmma(ld16h(sK + n * LDQ + 16 * kq), qf[ks], S);
 #endif
             }
             if (dh) *(v8f*) (sSp + (ct * 32 + lane) * 8) = S;
@@ -255,23 +257,28 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
         sync_lds();                                              // sKV / sP free
     }
 
-    // ---- epilogue: acc / l, staged in LDS, coalesced stores ----
+    // ---- epilogue: acc / l, staged in LDS in two halves of 24 columns, coalesced stores ----
     if (w < 3 && hh == 0) sL[16 * w + n] = l;
-    sync_lds();
     half_t* sO = (half_t*) sBig;
+    for (int ph = 0; ph < 2; ++ph) {
+        sync_lds();
 #pragma unroll
-    for (int dt = 0; dt < 2; ++dt)
+        for (int dt = 0; dt < 2; ++dt)
 #pragma unroll
-        for (int ct = 0; ct < 3; ++ct) {
-            const float lv = sL[16 * ct + n];
+            for (int ct = 0; ct < 3; ++ct) {
+                const int col = 16 * ct + n;
+                if (col / 24 == ph) {
+                    const float lv = sL[col];
 #pragma unroll
-            for (int r = 0; r < 8; ++r)
-                sO[(16 * ct + n) * LDQ + 16 * (2 * w + dt) + 2 * r + hh] = (half_t) (lv > 0.0f ? acc[dt][ct][r] / lv : 0.0f);
+                    for (int r = 0; r < 8; ++r)
+                        sO[(col - 24 * ph) * LDQ + 16 * (2 * w + dt) + 2 * r + hh] = (half_t) (lv > 0.0f ? acc[dt][ct][r] / lv : 0.0f);
+                }
+            }
+        sync_lds();
+        for (int c = tid; c < 24 * 32; c += 256) {
+            const int cl = c >> 5, ch = c & 31, col = cl + 24 * ph, rho = col / GRP, h = col - rho * GRP;
+            const int row = row0 + rho;
+            if (row < R) *(v4u*) (o + IX_O(row, g * GRP + h, ch * 8, o_stride)) = *(const v4u*) (sO + cl * LDQ + ch * 8);
         }
-    sync_lds();
-    for (int c = tid; c < NCOL * 32; c += 256) {
-        const int col = c >> 5, ch = c & 31, rho = col / GRP, h = col - rho * GRP;
-        const int row = row0 + rho;
-        if (row < R) *(v4u*) (o + IX_O(row, g * GRP + h, ch * 8, o_stride)) = *(const v4u*) (sO + col * LDQ + ch * 8);
     }
 }
