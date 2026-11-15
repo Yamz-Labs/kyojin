@@ -821,6 +821,10 @@ class QwenEngine:
                 os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
                 os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
                 os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
+                # decode-priority chunk of 0.4 s instead of 1.5 s, as on CUDA (gfx1151, Qwen3.8 Flash-Next EXL3, 8 sessions, a short
+                # request beside a ~90K-token prompt): the short stream decodes at 28-30 tok/s instead of 14-15, the long prompt's
+                # first token 81.3 / 84.1 s instead of 81.2 / 81.5 s
+                os.environ.setdefault("EXL3_CIL_DPRIO_CHUNK_S", "0.4")
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
