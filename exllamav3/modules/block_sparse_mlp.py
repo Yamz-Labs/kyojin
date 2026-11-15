@@ -236,9 +236,10 @@ _FQ_PF_ROUTED_F16 = os.environ.get("MCPM_FQ_PF_ROUTED_F16", "1" if torch.version
 _FQ_PF_ROUTED_F16_COMBINE = os.environ.get("MCPM_FQ_PF_ROUTED_F16_COMBINE", "1" if torch.version.hip else "0") == "1"
 # MCPM_FQ_PF_ROUTED_F16_SHARED=1: the gated shared expert joins the combine kernel (rocm/routed_f16 fq_routed_f16_combine_shared, Gufo's
 # MoeEpilogueVec4Kernel shared-expert term): the shared expert's half output is not widened to float, the shared-gate GEMM (N = 1), sigmoid,
-# multiply and add passes disappear (about 3 ms of the 6 per layer at 8K rows). Needs the combine flag. Default 0 until measured; gfx1151 only
-# (the routed F16 path's gate). 0 = the separate gate GEMM + torch tail.
-_FQ_PF_ROUTED_F16_SHARED = os.environ.get("MCPM_FQ_PF_ROUTED_F16_SHARED", "0") == "1"
+# multiply and add passes disappear (about 3 ms of the 6 per layer at 8K rows). Needs the combine flag; gfx1151 only (the routed F16 path's
+# gate). Default on with ROCm: a drop-one ABBA against the other three prefill-glue levers (Strix Halo Qwen3.8-Flash-Next GGUF, 8K prefill)
+# showed a reproducible ~3-4 % extra gain (6.34-6.42 -> 6.12-6.20 s). 0 = the separate gate GEMM + torch tail.
+_FQ_PF_ROUTED_F16_SHARED = os.environ.get("MCPM_FQ_PF_ROUTED_F16_SHARED", "1" if torch.version.hip else "0") == "1"
 _ROUTED_F16_ARCH = {}
 
 

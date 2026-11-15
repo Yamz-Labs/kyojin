@@ -51,8 +51,9 @@ _FUSED = os.environ.get("BOLT_FQ_FUSED", "1") != "0"
 # and the mamba projections fell back to full dequant+matmul).
 # BOLT_FQ_GEMV=0 restores the fq_gemm_* path for A/B.
 _GEMV = os.environ.get("BOLT_FQ_GEMV", "1") != "0"
-# Row chunk of the unfused dequant+matmul path (transient fp16 bound).
-_UNFUSED_ROWS = int(os.environ.get("BOLT_FQ_UNFUSED_ROWS", "8192"))
+# Row chunk of the unfused dequant+matmul path (transient fp16 bound). Default 16384 with ROCm (gfx1151 Strix Halo: fewer, bigger GEMMs cut
+# dequant kernel-launch overhead at long prefill without moving the tolerance). CUDA keeps 8192 until measured there.
+_UNFUSED_ROWS = int(os.environ.get("BOLT_FQ_UNFUSED_ROWS", "16384" if torch.version.hip else "8192"))
 # NVFP4 E2M1 pair-table dot (fq_gemv.cuh: one shared float2 load per pair
 # instead of two replicated-e2m1 loads + nibble math). BOLT_FQ_PAIR=0
 # restores the direct dot for A/B.
@@ -430,13 +431,14 @@ class ForeignLinear(Module):
 
 
 def pfe_f16_ok(m, x: torch.Tensor) -> bool:
-    """EXL3_PFE_FOREIGN=1 (default 0, ROCm): a prefill projection that is a ForeignLinear (directly or as a Linear's _ForeignInner, the GGUF load)
-    with a float default output may be asked for half instead (out_dtype=torch.half): its fp16 GEMM output holds the values the float path widens
-    (`mmout.to(float)`), and the consumers that already take half from the EXL3 projections (the GDN conv's in-kernel cast, the gated norm's z,
-    the HC residual apply's y) widen in-kernel. Drops one full fp32 write + read per projection (the f16 -> f32 copy kernel), and with a half
-    output the N-chunk slice copies move half the bytes. Prefill GEMM widths only (rows >= 1024); decode kernels that accumulate straight into a
-    float output keep their dtype."""
-    if os.environ.get("EXL3_PFE_FOREIGN", "0") != "1" or not torch.version.hip:
+    """EXL3_PFE_FOREIGN=1 (default on with ROCm, gfx1151 only): a prefill projection that is a ForeignLinear (directly or as a Linear's
+    _ForeignInner, the GGUF load) with a float default output may be asked for half instead (out_dtype=torch.half): its fp16 GEMM output
+    holds the values the float path widens (`mmout.to(float)`), and the consumers that already take half from the EXL3 projections (the
+    GDN conv's in-kernel cast, the gated norm's z, the HC residual apply's y) widen in-kernel. Drops one full fp32 write + read per
+    projection (the f16 -> f32 copy kernel), and with a half output the N-chunk slice copies move half the bytes. Prefill GEMM widths only
+    (rows >= 1024); decode kernels that accumulate straight into a float output keep their dtype. 0 = the float path."""
+    if os.environ.get("EXL3_PFE_FOREIGN", "1" if torch.version.hip else "0") != "1" or not torch.version.hip or \
+            "gfx1151" not in torch.cuda.get_device_properties(x.device).gcnArchName:
         return False
     if isinstance(m, ForeignLinear):
         fl, wrap = m, None
