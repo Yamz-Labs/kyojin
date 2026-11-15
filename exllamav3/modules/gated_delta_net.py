@@ -1916,7 +1916,13 @@ class GatedDeltaNet(Module):
 
             # Delta rule
             _nk, _kd, _mq = self.num_k_heads, self.k_dim, mixed_qkv
-            if self.blocked_gqa and not self.kda:
+            # EXL3_GDN_BLOCKED_KERNEL (default 1 with ROCm): chunk prefill of blocked-GQA files without the q / k duplication copy
+            # (302 MB per GDN layer per 8K chunk on the 35B-A3B GGUF): the HIP HF kernel pairs v head h with q / k head h % H; any
+            # other chunk path duplicates inside vendor/fla (bit-equal)
+            _blk = (self.blocked_gqa and not self.kda and seqlen >= self.num_v_heads and not save_history
+                    and os.environ.get("EXL3_GDN_BLOCKED_KERNEL", "1" if torch.version.hip else "0") == "1"
+                    and os.environ.get("EXL3_GDN_PF", "1") == "1" and _mq.dim() == 3)
+            if self.blocked_gqa and not self.kda and not _blk:
                 # Blocked pairing for grouped-v files: duplicate q/k heads
                 # blocked ([q,q] not interleaved) AFTER the depthwise conv and
                 # run the rule plain (nk == nv, no repeat). Bitwise vs repeat
@@ -1946,6 +1952,7 @@ class GatedDeltaNet(Module):
                 params = params,
                 channelwise_g = self.kda,
                 g_cumsum = g_cumsum,
+                blocked_gqa = _blk,
             )
             if ck is not None:
                 params.pop("kda_ckpt")

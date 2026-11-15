@@ -45,14 +45,14 @@ def _compile_tail(lines, n=12):
     return out
 
 
-def _load(device=None):
+def _load(device=None, blocked=False):
     dev = select_device(device)
-    key = (dev, "")
+    key = (dev, "blocked" if blocked else "")
     if key in _state:
         return _state[key]
     arch = device_arch(dev)
     src = open(_SRC, "rb").read()
-    flags = ["--genco", f"--offload-arch={arch}", "-O3", "-DKYO_RAW=1", *_gcc_flag()]
+    flags = ["--genco", f"--offload-arch={arch}", "-O3", "-DKYO_RAW=1", *(["-DKYO_BLOCKED=1"] if blocked else []), *_gcc_flag()]
     tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
     cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"gdn_hf_{arch}_{tag}.hsaco")
     if not os.path.isfile(cache):
@@ -107,11 +107,12 @@ def gdn_hf_ok(q_raw, v, qn, kn, g, beta, initial_state):
     return ok
 
 
-def chunk_gdn_hf(q_raw, v, qn, kn, g, beta, scale, initial_state, output_final_state, ckpt=None):
+def chunk_gdn_hf(q_raw, v, qn, kn, g, beta, scale, initial_state, output_final_state, ckpt=None, blocked=False):
     """Returns (o [1, T, HV, 128] bf16, final_state or None). ckpt: None, a dict or a list of <= 8 dicts {"s": fp32 [1, HV, K, V]
-    contiguous, "chunk": n} (gdn_fused_h_hip contract): the state after row 64 n is written to ck["s"] and ck["ok"] set."""
+    contiguous, "chunk": n} (gdn_fused_h_hip contract): the state after row 64 n is written to ck["s"] and ck["ok"] set.
+    blocked: v head vh pairs with q / k head vh % H (blocked GQA, GGUF grouped-v files) instead of vh // (HV / H)."""
     try:
-        fn = _load(v.device)
+        fn = _load(v.device, blocked)
     except Exception:
         _state["fail"] = True     # no hipcc / no module: the Triton chain for the rest of the process
         raise
