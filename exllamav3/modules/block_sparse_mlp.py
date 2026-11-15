@@ -225,6 +225,22 @@ _FQ_MOE_IQ = os.environ.get("MCPM_FQ_MOE_IQ", "1") != "0"
 # HIP routed MMQ prefill MoE (rocm/gmmq, from Gufo / llama.cpp), default on with ROCm: Strix Halo Qwen3.8-Flash-Next UD-Q4_K_XL GGUF
 # served 8K prefill 13.5-15.8 -> 10.8 s, decode flat, N1 md5 identical, perplexity 3.1671 -> 3.1797. 0 = the grouped Triton path.
 _FQ_PF_GMMQ = os.environ.get("MCPM_FQ_PF_GMMQ", "1" if torch.version.hip else "0") == "1"
+# HIP routed F16-WMMA prefill MoE (rocm/routed_f16, Gufo's RoutedPairF16 / RoutedDownF16 kernels, gfx1151 only), default on with ROCm:
+# F16 operands instead of gmmq's q8_1 integer dots. Strix Halo Qwen3.8-Flash-Next UD-Q4_K_XL GGUF served 8K prefill median
+# 10.6 -> 7.8 s, decode flat, greedy md5 identical, perplexity 3.5401 -> 3.5404. Rows >= MCPM_FQ_PF_ROUTED_F16_MIN (default 1024);
+# fewer rows and other GPUs keep gmmq. 0 = gmmq.
+_FQ_PF_ROUTED_F16 = os.environ.get("MCPM_FQ_PF_ROUTED_F16", "1" if torch.version.hip else "0") == "1"
+_ROUTED_F16_ARCH = {}
+
+
+def _routed_f16_arch(device) -> bool:
+    """The routed F16 kernels are compiled for gfx1151 only (other targets get an empty kernel): route there only."""
+    if not torch.version.hip:
+        return False
+    i = device.index if device.index is not None else torch.cuda.current_device()
+    if i not in _ROUTED_F16_ARCH:
+        _ROUTED_F16_ARCH[i] = getattr(torch.cuda.get_device_properties(i), "gcnArchName", "").startswith("gfx1151")
+    return _ROUTED_F16_ARCH[i]
 # BOLT_FQ_MMVQ (default 1, CUDA): IQ experts (all 7 IQ formats, gate/up and down) take the llama.cpp mmvq-style slot-parallel decode MoE
 # (fq_mmvq.cu fq_moe_mmvq_grouped) instead of fq_moe_kq.cu. 0 = the previous kernels (A/B).
 _MQ_ID = {"iq2_xxs": 0, "iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5, "iq4_xs": 6}
@@ -2161,6 +2177,50 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         ext.fq_mlp_shared_iq2xxs(xr, up.packed.reshape(I, -1, 66), h)
         return down.forward(h, params)
 
+    def _forward_foreign_prefill_routed_f16(self, x, y, fmts, selected_experts, routing_weights, params, out_dtype, eshape):
+        """HIP routed F16-WMMA prefill MoE (MCPM_FQ_PF_ROUTED_F16=1, gfx1151, rows >= MCPM_FQ_PF_ROUTED_F16_MIN): Gufo's paired
+        gate/up + SwiGLU and down kernels (rocm/routed_f16) over 128-row expert tiles; the routing-weighted sum in torch.
+        Gate/up Q4_K / Q5_K, down Q5_1 / Q8_0. Returns the block output or None (the caller falls back to gmmq)."""
+        G = {"q4_k": 12, "q5_k": 13, "q5_1": 7, "q8_0": 8}
+        R = y.shape[0]
+        if not _routed_f16_arch(y.device) or fmts[0] not in ("q4_k", "q5_k") or fmts[1] not in ("q5_1", "q8_0") or self.act_limit or \
+                self.activation_fn not in ("silu", None) or R < int(os.environ.get("MCPM_FQ_PF_ROUTED_F16_MIN", "1024")):
+            return None
+        if (self.num_local_experts or self.num_experts) != self.num_experts or not hasattr(ext, "fq_routed_f16_moe"):
+            return None
+        top_k = self.num_experts_per_tok
+        K, I, E, dev = y.shape[1], self.intermediate_size, self.num_experts, y.device
+        if tuple(selected_experts.shape) != (R, top_k) or K % 256 or I % 64 or E > 1024 or \
+                "gfx1151" not in torch.cuda.get_device_properties(dev).gcnArchName:
+            return None
+        tbl = getattr(self, "_fq_gmmq_ptrs", None)
+        if tbl is None or tbl[0] != self.gates[0].packed.data_ptr() or tbl[4] != dev:
+            mk = lambda ms: torch.tensor([m.packed.data_ptr() for m in ms], dtype=torch.int64, device=dev)
+            tbl = (self.gates[0].packed.data_ptr(), mk(self.gates), mk(self.ups), mk(self.downs), dev)
+            self._fq_gmmq_ptrs = tbl
+        _, g_p, u_p, d_p, _ = tbl
+        ids = selected_experts.to(torch.int32).contiguous()
+        counts = torch.bincount(ids.view(-1), minlength=E)
+        nt = (counts + 127) // 128
+        total = int(nt.sum())                                  # one host sync per layer
+        first = torch.cumsum(nt, 0) - nt
+        eidx = torch.repeat_interleave(torch.arange(E, device=dev), nt, output_size=total)
+        tiles = (eidx | ((torch.arange(total, device=dev) - first[eidx]) << 16)).to(torch.int32)
+        dn = torch.empty((R * top_k, K), dtype=torch.half, device=dev)
+        ext.fq_routed_f16_moe(y.to(torch.half).contiguous(), ids, counts.to(torch.int32), tiles, g_p, u_p, d_p,
+                              G[fmts[0]], G[fmts[1]], I, dn)
+        w = routing_weights.to(torch.float).reshape(R, top_k, 1)
+        final_hidden_states = (dn.view(R, top_k, K) * w).sum(1).reshape(eshape)
+        if self.shared_experts:
+            y_se = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+            if self.shared_gate:
+                ext.add_sigmoid_gate(y_se, self.shared_gate.forward(x, params), final_hidden_states)
+            else:
+                final_hidden_states += y_se
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states
+
     def _forward_foreign_prefill_gmmq(self, x, y, fmts, selected_experts, routing_weights, params, out_dtype, eshape):
         """HIP routed MMQ prefill MoE (MCPM_FQ_PF_GMMQ=1, rows >= MCPM_FQ_PF_GMMQ_MIN): llama.cpp's MMQ (q8_1 activations,
         integer dots on the raw GGUF blocks, via Gufo's gfx1151 port, rocm/gmmq) for gate, up and down, with a per-expert
@@ -2230,6 +2290,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         R = y.shape[0]
         fmts = self._fq_grouped_kq_ok(y)
+        if _FQ_PF_ROUTED_F16 and fmts is not None:
+            r = self._forward_foreign_prefill_routed_f16(x, y, fmts, selected_experts, routing_weights, params, out_dtype, eshape)
+            if r is not None:
+                return r
         if _FQ_PF_GMMQ and fmts is not None:
             r = self._forward_foreign_prefill_gmmq(x, y, fmts, selected_experts, routing_weights, params, out_dtype, eshape)
             if r is not None:
