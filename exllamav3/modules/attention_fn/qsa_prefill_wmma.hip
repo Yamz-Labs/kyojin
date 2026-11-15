@@ -120,7 +120,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
     const int nU = (int) sCnt[255];
     if (tid < 8) { sBlk[nU + tid] = 0; sVm[nU + tid] = 0; }
     sync_lds();
+#ifdef NOLOOP
+    const int ntile = 0;
+#else
     const int ntile = (nU + 3) >> 2;
+#endif
 
     // ---- q -> LDS ----
     half_t* sQ = (half_t*) sBig;
@@ -140,6 +144,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
     const float sl2 = scale * 1.44269504088896341f;
     const int kk = tid & 15, dch = tid >> 4;
 
+#ifdef NOGLOB
+#define GLD(p_) ((v4u) {1, 2, 3, 4})
+#else
+#define GLD(p_) (*(const v4u*) (p_))
+#endif
     auto key_tok = [&](int i) -> int {
         const int blk = (int) sBlk[4 * i + (kk >> 2)];
         const int t0 = blk * 4;
@@ -149,8 +158,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
     v4u kr0 = {0, 0, 0, 0}, kr1 = {0, 0, 0, 0}, vr0, vr1;
     if (ntile > 0) {
         const int tk = key_tok(0);
-        kr0 = *(const v4u*) (kc + IX_KV(tk, g, dch * 16, tok_stride));
-        kr1 = *(const v4u*) (kc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
+        kr0 = GLD(kc + IX_KV(tk, g, dch * 16, tok_stride));
+        kr1 = GLD(kc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
     }
     half_t* sK = sKV;
 
@@ -164,8 +173,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
             const bool any = ((vm >> (kk & 3)) & 0x1111u) != 0u;
             vr0 = (v4u) {0, 0, 0, 0}; vr1 = (v4u) {0, 0, 0, 0};
             if (any) {
-                vr0 = *(const v4u*) (vc + IX_KV(tk, g, dch * 16, tok_stride));
-                vr1 = *(const v4u*) (vc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
+                vr0 = GLD(vc + IX_KV(tk, g, dch * 16, tok_stride));
+                vr1 = GLD(vc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
             }
         }
         v8f S = (v8f) {0, 0, 0, 0, 0, 0, 0, 0};
@@ -174,7 +183,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
 #pragma unroll
             for (int ks = 0; ks < 8; ++ks) {
                 const int kq = dh * 8 + ks;
+#ifndef NOS
                 S = wmma(ld16h(sK + n * LDQ + 16 * kq), ld16h(sQ + (16 * ct + n) * LDQ + 16 * kq), S);
+#endif
             }
             if (dh) *(v8f*) (sSp + (ct * 32 + lane) * 8) = S;
         }
@@ -218,8 +229,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
         }
         if (i + 1 < ntile) {                                     // next K tile, in flight behind the PV step
             const int tk = key_tok(i + 1);
-            kr0 = *(const v4u*) (kc + IX_KV(tk, g, dch * 16, tok_stride));
-            kr1 = *(const v4u*) (kc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
+            kr0 = GLD(kc + IX_KV(tk, g, dch * 16, tok_stride));
+            kr1 = GLD(kc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
         }
         sync_lds();                                              // V^T visible
         {
@@ -233,7 +244,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
 #pragma unroll
                 for (int ct = 0; ct < 3; ++ct) {
                     v8f c = acc[dt][ct] * al[ct];
+#ifndef NOPV
                     acc[dt][ct] = wmma(A, Bp[ct], c);
+#else
+                    acc[dt][ct] = c;
+#endif
                 }
             }
         }
