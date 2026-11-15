@@ -157,28 +157,28 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
         const int pg = bt[PGC(t0 / PAGE, npages)];
         return TOKC(pg * PAGE + (t0 % PAGE) + (kk & 3), ntok);
     };
-    v4u kr0 = {0, 0, 0, 0}, kr1 = {0, 0, 0, 0}, vr0, vr1;
-    if (ntile > 0) {
-        const int tk = key_tok(0);
-        kr0 = GLD(kc + IX_KV(tk, g, dch * 16, tok_stride));
-        kr1 = GLD(kc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
-    }
+    auto load_tile = [&](int i, v4u& k0, v4u& k1, v4u& v0, v4u& v1) {
+        const int tk = key_tok(i);
+        const uint32_t vm = sVm[4 * i + (kk >> 2)];
+        const bool any = ((vm >> (kk & 3)) & 0x1111u) != 0u;
+        k0 = GLD(kc + IX_KV(tk, g, dch * 16, tok_stride));
+        k1 = GLD(kc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
+        v0 = (v4u) {0, 0, 0, 0}; v1 = (v4u) {0, 0, 0, 0};
+        if (any) {
+            v0 = GLD(vc + IX_KV(tk, g, dch * 16, tok_stride));
+            v1 = GLD(vc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
+        }
+    };
+    v4u ka0 = {0, 0, 0, 0}, ka1 = {0, 0, 0, 0}, va0 = {0, 0, 0, 0}, va1 = {0, 0, 0, 0};
+    v4u kb0 = {0, 0, 0, 0}, kb1 = {0, 0, 0, 0}, vb0 = {0, 0, 0, 0}, vb1 = {0, 0, 0, 0};
+    if (ntile > 0) load_tile(0, ka0, ka1, va0, va1);
     half_t* sK = sKV;
 
-    for (int i = 0; i < ntile; ++i) {
+    auto tile = [&](int i, v4u& kr0, v4u& kr1, v4u& vr0, v4u& vr1, v4u& kn0, v4u& kn1, v4u& vn0, v4u& vn1) {
         *(v4u*) (sK + kk * LDQ + dch * 16) = kr0;
         *(v4u*) (sK + kk * LDQ + dch * 16 + 8) = kr1;
+        if (i + 1 < ntile) load_tile(i + 1, kn0, kn1, vn0, vn1);   // whole next tile in flight behind this tile's work
         sync_lds();                                              // K tile visible
-        {
-            const int tk = key_tok(i);
-            const uint32_t vm = sVm[4 * i + (kk >> 2)];
-            const bool any = ((vm >> (kk & 3)) & 0x1111u) != 0u;
-            vr0 = (v4u) {0, 0, 0, 0}; vr1 = (v4u) {0, 0, 0, 0};
-            if (any) {
-                vr0 = GLD(vc + IX_KV(tk, g, dch * 16, tok_stride));
-                vr1 = GLD(vc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
-            }
-        }
         v8f S = (v8f) {0, 0, 0, 0, 0, 0, 0, 0};
         if (w < 6) {                                             // scores: wave = (column tile, half of the head dim)
             const int ct = w % 3, dh = w / 3;
@@ -229,11 +229,6 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
 #pragma unroll
             for (int j = 0; j < 8; ++j) { sV[(dch * 16 + j) * LDT + kk] = a0[j]; sV[(dch * 16 + 8 + j) * LDT + kk] = a1[j]; }
         }
-        if (i + 1 < ntile) {                                     // next K tile, in flight behind the PV step
-            const int tk = key_tok(i + 1);
-            kr0 = GLD(kc + IX_KV(tk, g, dch * 16, tok_stride));
-            kr1 = GLD(kc + IX_KV(tk, g, dch * 16 + 8, tok_stride));
-        }
         sync_lds();                                              // V^T visible
         {
             float al[3];
@@ -255,6 +250,10 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
             }
         }
         sync_lds();                                              // sKV / sP free
+    };
+    for (int i = 0; i < ntile; i += 2) {
+        tile(i, ka0, ka1, va0, va1, kb0, kb1, vb0, vb1);
+        if (i + 1 < ntile) tile(i + 1, kb0, kb1, vb0, vb1, ka0, ka1, va0, va1);
     }
 
     // ---- epilogue: acc / l, staged in LDS in two halves of 24 columns, coalesced stores ----
