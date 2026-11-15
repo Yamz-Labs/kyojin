@@ -674,7 +674,13 @@ void cuda_recurrent_gated_delta_rule_kernel
     }
 }
 
-template <bool save_history, int V_SPLIT, bool CHANNELWISE = false, bool RS_REG = false>
+// State storage type: float (default) or bfloat16 (EXL3_GDN_STATE_BF16). Compute stays fp32; bf16 is round-to-nearest on store.
+__device__ __forceinline__ float gdn_st_load(const float* p) { return *p; }
+__device__ __forceinline__ float gdn_st_load(const bfloat16* p) { return __bfloat162float(*p); }
+__device__ __forceinline__ void gdn_st_store(float* p, float v) { *p = v; }
+__device__ __forceinline__ void gdn_st_store(bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+
+template <bool save_history, int V_SPLIT, bool CHANNELWISE = false, bool RS_REG = false, typename ST = float>
 __global__ __launch_bounds__(128 * SUBK)
 void cuda_recurrent_gated_delta_rule_kernel_128
 (
@@ -684,7 +690,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
                                                 // [bsz, seqlen, heads, 128] log-decay per
                                                 // k-channel when CHANNELWISE (KDA)
     const bfloat16* __restrict__ beta,          // [bsz, seqlen, (group * num_k_heads)]
-    float* __restrict__ recurrent_state,        // [num_slots, max_history + 1, (group * num_k_heads), 128, 128]
+    ST* __restrict__ recurrent_state,           // [num_slots, max_history + 1, (group * num_k_heads), 128, 128]
     bfloat16* __restrict__ core_attn_out,       // [bsz, seqlen, num_v_heads, 128]
     const int bsz,
     const int seqlen,
@@ -718,13 +724,13 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     g +=                (size_t) bi * seqlen * (group * num_k_heads) * (CHANNELWISE ? HEAD_DIM : 1);
     beta +=             bi * seqlen * (group * num_k_heads);
     int state_slot = slots ? slots[bi] : bi;
-    float* slot_state = recurrent_state + (size_t) state_slot * slot_size;
-    float* final_state = slot_state;
+    ST* slot_state = recurrent_state + (size_t) state_slot * slot_size;
+    ST* final_state = slot_state;
     // EXL3_STATE_REBASE: commit index of the slot state. 0 unless a speculative round rewound: the
     // accepted state then lives at history index base without being copied back to index 0. The
     // per-step snapshots are still written to 1..seqlen-1 and the final state to index 0.
     const int state_base_i = state_base ? state_base[state_slot] : 0;
-    float* committed_state = slot_state + (size_t) state_base_i * state_size;
+    ST* committed_state = slot_state + (size_t) state_base_i * state_size;
     core_attn_out +=    bi * seqlen * num_v_heads * HEAD_DIM;
 
     int t = threadIdx.x;
@@ -753,14 +759,14 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * HEAD_DIM) + head * HEAD_DIM + v_start;
         bfloat16* out = core_attn_out + head * HEAD_DIM + v_start;
 
-        float* gl_rs_r;
-        float* gl_rs_w;
+        ST* gl_rs_r;
+        ST* gl_rs_w;
         if constexpr (save_history)
         {
             bool first = (s == 0);
             bool last = (s == seqlen - 1);
-            float* history_r = first ? nullptr : slot_state + (size_t) s * state_size;
-            float* history_w = last  ? final_state : slot_state + (size_t) (s + 1) * state_size;
+            ST* history_r = first ? nullptr : slot_state + (size_t) s * state_size;
+            ST* history_w = last  ? final_state : slot_state + (size_t) (s + 1) * state_size;
             gl_rs_r = first ? committed_state + head * HEAD_STATE_SIZE
                             : history_r       + head * HEAD_STATE_SIZE;
             gl_rs_w = history_w               + head * HEAD_STATE_SIZE;
@@ -777,9 +783,9 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         {
             if (s == 0 && t < V_CHUNK_DIM)
             {
-                const float* p = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
+                const ST* p = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
                 if (qwg_abl & 2) { _Pragma("unroll") for (int i = 0; i < BTS; ++i) rs[i] = 0.01f * (float) (i + t); }
-                else             { _Pragma("unroll") for (int i = 0; i < BTS; ++i) rs[i] = p[i * HEAD_DIM]; }
+                else             { _Pragma("unroll") for (int i = 0; i < BTS; ++i) rs[i] = gdn_st_load(p + i * HEAD_DIM); }
             }
         }
 
@@ -824,7 +830,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             float sum = 0.0f;
             float* sh_k_rd = sh_k + bt * BTS;
             float* sh_g_rd = sh_g + bt * BTS;
-            float* rs_rd = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
+            ST* rs_rd = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
 
             #pragma unroll
             for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
@@ -832,7 +838,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
                 #pragma unroll
                 for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++, sh_g_rd++)
                 {
-                    const float st = RS_REG ? rs[i * 8 + j] : *rs_rd;
+                    const float st = RS_REG ? rs[i * 8 + j] : gdn_st_load(rs_rd);
                     if constexpr (CHANNELWISE)
                         // Decay folded per k-channel: kv_mem reads the decayed state
                         sum = sum + *sh_k_rd * *sh_g_rd * st;
@@ -857,8 +863,8 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             float* sh_k_rd = sh_k + bt * BTS;
             float* sh_g_rd = sh_g + bt * BTS;
             float* sh_q_rd = sh_q + bt * BTS;
-            float* rs_r = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
-            float* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
+            ST* rs_r = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
+            ST* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
 
             #pragma unroll
             for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
@@ -866,9 +872,9 @@ void cuda_recurrent_gated_delta_rule_kernel_128
                 #pragma unroll
                 for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_g_rd++, sh_q_rd++)
                 {
-                    float state = RS_REG ? rs[i * 8 + j] : *rs_r;
+                    float state = RS_REG ? rs[i * 8 + j] : gdn_st_load(rs_r);
                     state = state * (CHANNELWISE ? *sh_g_rd : g_h) + *sh_k_rd * v * beta_h;
-                    if (!(qwg_abl & 1)) *rs_w = state;
+                    if (!(qwg_abl & 1)) gdn_st_store(rs_w, state);
                     if constexpr (RS_REG) rs[i * 8 + j] = state;
                     v_out = v_out + *sh_q_rd * state;
                 }
@@ -956,7 +962,11 @@ void cuda_recurrent_gated_delta_rule_gr
     TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16);
     TORCH_CHECK_DTYPE(g, kFloat);
     TORCH_CHECK_DTYPE(beta, kBFloat16);
-    TORCH_CHECK_DTYPE(recurrent_state, kFloat);
+    // bf16 state storage (EXL3_GDN_STATE_BF16): GDN 128x128 only, see the dispatch below
+    const bool state_bf16 = recurrent_state.scalar_type() == at::kBFloat16;
+    if (!state_bf16) TORCH_CHECK_DTYPE(recurrent_state, kFloat);
+    TORCH_CHECK(!state_bf16 || (!channelwise && k_head_dim == 128 && v_head_dim == 128),
+                "bf16 recurrent_state is only supported for GDN with 128x128 heads");
     TORCH_CHECK_DTYPE(core_attn_out, kBFloat16);
     TORCH_CHECK_DTYPE_OPT(slots, kInt);
 
@@ -1018,11 +1028,11 @@ void cuda_recurrent_gated_delta_rule_gr
 #else
     #define QWG_D_ARG nullptr
 #endif
-    #define KERNEL_ARGS                         \
+    #define KERNEL_ARGS_T(SP)                   \
         (const bfloat16*) mixed_qkv.data_ptr(), \
         (const float*) g.data_ptr(),            \
         (const bfloat16*) beta.data_ptr(),      \
-        (float*) recurrent_state.data_ptr(),    \
+        (SP) recurrent_state.data_ptr(),        \
         (bfloat16*) core_attn_out.data_ptr(),   \
         bsz,                                    \
         seqlen,                                 \
@@ -1035,12 +1045,25 @@ void cuda_recurrent_gated_delta_rule_gr
         history_stride,                         \
         QWG_D_ARG,                              \
         state_base_ptr
+    #define KERNEL_ARGS KERNEL_ARGS_T(float*)
 
     // recurrent_state is kernel param 3, slots is param 12 and state_base is param 15, patched when
     // running in a graph
     #define LAUNCH_RULE(...)                                                              \
     {                                                                                     \
         __VA_ARGS__<<<blocks, threads, 0, stream>>>(KERNEL_ARGS);                         \
+        if (graph)                                                                        \
+        {                                                                                 \
+            graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_state, 3);              \
+            graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_slots, 12);             \
+            graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_base, 15);              \
+            graph->record_param((void*) &__VA_ARGS__, GP_end, 0);                         \
+        }                                                                                 \
+    }
+
+    #define LAUNCH_RULE_BF(...)                                                           \
+    {                                                                                     \
+        __VA_ARGS__<<<blocks, threads, 0, stream>>>(KERNEL_ARGS_T(bfloat16*));            \
         if (graph)                                                                        \
         {                                                                                 \
             graph->record_param((void*) &__VA_ARGS__, GP_gdn_rule_state, 3);              \
@@ -1057,7 +1080,24 @@ void cuda_recurrent_gated_delta_rule_gr
     // history launch (the thread rewrites exactly the values it reads, so no reload of the history it just wrote)
     const char* rsg_env = getenv("EXL3_GDN_RS_REG_GDN");
     const bool rs_reg_gdn = rsg_env ? atoi(rsg_env) != 0 : true;   // default ON; =0 restores the reload path
-    if (channelwise)
+    if (state_bf16)
+    {
+        if (!history)
+        {
+            if (v_split == 4 && rs_reg_gdn) LAUNCH_RULE_BF(cuda_recurrent_gated_delta_rule_kernel_128<false, 4, false, true, bfloat16>)
+            else if (v_split == 4)          LAUNCH_RULE_BF(cuda_recurrent_gated_delta_rule_kernel_128<false, 4, false, false, bfloat16>)
+            else if (rs_reg_gdn)            LAUNCH_RULE_BF(cuda_recurrent_gated_delta_rule_kernel_128<false, 1, false, true, bfloat16>)
+            else                            LAUNCH_RULE_BF(cuda_recurrent_gated_delta_rule_kernel_128<false, 1, false, false, bfloat16>)
+        }
+        else
+        {
+            if (v_split == 4 && rs_reg_gdn) LAUNCH_RULE_BF(cuda_recurrent_gated_delta_rule_kernel_128<true, 4, false, true, bfloat16>)
+            else if (v_split == 4)          LAUNCH_RULE_BF(cuda_recurrent_gated_delta_rule_kernel_128<true, 4, false, false, bfloat16>)
+            else if (rs_reg_gdn)            LAUNCH_RULE_BF(cuda_recurrent_gated_delta_rule_kernel_128<true, 1, false, true, bfloat16>)
+            else                            LAUNCH_RULE_BF(cuda_recurrent_gated_delta_rule_kernel_128<true, 1, false, false, bfloat16>)
+        }
+    }
+    else if (channelwise)
     {
         if (!history)
         {
@@ -1111,6 +1151,8 @@ void cuda_recurrent_gated_delta_rule_gr
         else TORCH_CHECK(false, "Max head dim exceeded");
     }
     #undef LAUNCH_RULE
+    #undef LAUNCH_RULE_BF
+    #undef KERNEL_ARGS_T
     #undef KERNEL_ARGS
 
     cuda_check(cudaPeekAtLastError());

@@ -200,6 +200,10 @@ def gated_delta_rule_fn(
         core_attn_out = []
         for i, s in enumerate(recurrent_slots_cpu.tolist()):
             state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
+            # bf16 state storage (EXL3_GDN_STATE_BF16): the chunk kernels run on an fp32 copy, rounded back on save
+            state_lp = state if state is not None and state.dtype != torch.float else None
+            if state_lp is not None:
+                state = state_lp.float()
             if pf:
                 core_attn, new_state = chunk_gated_delta_rule_pf(
                     q[i:i + 1], k[i:i + 1], v[i:i + 1], g = g[i:i + 1], beta = beta[i:i + 1],
@@ -215,7 +219,7 @@ def gated_delta_rule_fn(
                     use_qk_l2norm_in_kernel = True,
                 )
             if save_state and state is not None:
-                state.copy_(new_state)
+                (state_lp if state_lp is not None else state).copy_(new_state)
             core_attn_out.append(core_attn)
 
         core_attn_out = core_attn_out[0] if pf and len(core_attn_out) == 1 else torch.cat(core_attn_out, dim = 0)
