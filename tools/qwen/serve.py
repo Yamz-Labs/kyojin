@@ -804,6 +804,10 @@ class QwenEngine:
                 os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
                 os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
                 os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
+                # decode-priority chunk of 0.4 s of the leader's own s/row instead of 1.5 s (RTX 3090, 27B, 2 sessions, a short request
+                # beside a ~90K-token prompt): the short stream decodes at 56-64 tok/s instead of 21-25, the long prompt's first token is
+                # unchanged (94-95 s); 0.2 s gives the same as 0.4
+                os.environ.setdefault("EXL3_CIL_DPRIO_CHUNK_S", "0.4")
         if sessions > 1 and not on_cuda:   # speculative rounds of N requests verify N * (depth + 1) rows: cap the depth so they stay in one 8-row forward
             # (NVIDIA keeps the spec_policy default: a 16-row budget for a dense model, no cap for a MoE model)
             os.environ.setdefault("QWSPEC_LOAD_ROWS", os.environ.get("EXL3_ROW_INV_GROUP_ROWS") or "8")
