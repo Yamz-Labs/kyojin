@@ -119,6 +119,7 @@
 #include "ngram.cuh"
 #include "sam.h"
 #include "rocm/gmmq/gmmq.h"
+#include "rocm/routed_f16/routed_f16.h"
 
 #endif
 
@@ -481,6 +482,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fq_mmq_moe", &fq_mmq_moe, "fq_mmq_moe",
           py::arg("x"), py::arg("ids"), py::arg("w_ptrs"), py::arg("fmt"), py::arg("M"), py::arg("out"),
           py::arg("tile_cols") = 0, py::arg("max_expert_rows") = 0);
+    // routed F16-WMMA prefill MoE (Gufo kernels, rocm/routed_f16, gfx1151): gate + up + SwiGLU + down in one op
+    m.def("fq_routed_f16_moe", &fq_routed_f16_moe, "fq_routed_f16_moe",
+          py::arg("x"), py::arg("ids"), py::arg("counts"), py::arg("tiles"), py::arg("gate_ptrs"), py::arg("up_ptrs"),
+          py::arg("down_ptrs"), py::arg("gate_fmt"), py::arg("down_fmt"), py::arg("I"), py::arg("out"));
 #endif
     m.def("kda_gb_norm", &kda_gb_norm, "kda_gb_norm");
     m.def("kda_inter_off", &kda_inter_off, "kda_inter_off");
