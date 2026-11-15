@@ -9,6 +9,8 @@
 // one contiguous [E, M, K] tensor; only the 128-token-tile kernels are kept; the host side is a torch op
 // (fq_routed_f16_moe) that takes the tile list built by the caller. The kernel bodies are otherwise unchanged and depend
 // on the gfx1151 (RDNA3.5, wave32) WMMA lane layout.
+// fq_routed_f16_combine is the routing-weighted top-k reduction of the down rows, after Gufo's MoeEpilogueVec4Kernel<__half> (same
+// kernels.hip.cpp; the shared-expert term is left to the caller): one pass in registers instead of torch's F32 broadcast multiply + sum.
 #if defined(USE_ROCM)
 
 #include <ATen/cuda/CUDAContext.h>
@@ -743,6 +745,30 @@ __global__ void RoutedScatterKernel(const std::int32_t* __restrict__ ids,
   rows_token[c] = static_cast<std::int32_t>(slot / k);
   rows_slot[c] = static_cast<std::int32_t>(slot);
 }
+
+// out[t, i] (F32) = sum over s of weights[t, s] * float(rows[t, s, i]), s in order (Gufo MoeEpilogueVec4Kernel<__half>, without the shared
+// expert). Four adjacent lanes per thread, grid (T, ceil(K / (4 * kThreads))).
+__global__ void RoutedCombineKernel(const __half* __restrict__ rows, const float* __restrict__ weights, float* __restrict__ out,
+                                    std::uint32_t top_k, std::uint32_t dim) {
+  const std::uint32_t t = blockIdx.x;
+  const std::uint32_t i = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
+  if (i >= dim) {
+    return;
+  }
+  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+  const __half* src = rows + static_cast<std::size_t>(t) * top_k * dim + i;
+  for (std::uint32_t s = 0; s < top_k; ++s) {
+    const float w = weights[static_cast<std::size_t>(t) * top_k + s];
+    const uint2 raw = *reinterpret_cast<const uint2*>(src + static_cast<std::size_t>(s) * dim);
+    const __half2 lo = *reinterpret_cast<const __half2*>(&raw.x);
+    const __half2 hi = *reinterpret_cast<const __half2*>(&raw.y);
+    a0 = __fadd_rn(a0, __fmul_rn(w, __low2float(lo)));
+    a1 = __fadd_rn(a1, __fmul_rn(w, __high2float(lo)));
+    a2 = __fadd_rn(a2, __fmul_rn(w, __low2float(hi)));
+    a3 = __fadd_rn(a3, __fmul_rn(w, __high2float(hi)));
+  }
+  *reinterpret_cast<float4*>(out + static_cast<std::size_t>(t) * dim + i) = float4{a0, a1, a2, a3};
+}
 }  // namespace
 #endif
 }  // namespace kyo_routed_f16
@@ -802,6 +828,25 @@ void fq_routed_f16_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor counts,
                        (const std::int32_t *) rows_slot.data_ptr(), (const std::int32_t *) rows_slot.data_ptr(),
                        (__half *) out.data_ptr(), (std::size_t) K, (std::size_t) I);
     TORCH_CHECK(hipGetLastError() == hipSuccess, "fq_routed_f16_moe: launch failed");
+}
+
+// out[t, :] (F32) = sum_s weights[t, s] * rows[t * top_k + s, :]; rows: half [T * top_k, K] (the fq_routed_f16_moe output), weights: float [T, top_k].
+void fq_routed_f16_combine(torch::Tensor rows, torch::Tensor weights, torch::Tensor out)
+{
+    using namespace kyo_routed_f16;
+    const at::cuda::OptionalCUDAGuard device_guard(rows.device());
+    TORCH_CHECK(rows.is_cuda() && rows.dim() == 2 && rows.is_contiguous() && rows.dtype() == torch::kHalf, "rows must be half [T * top_k, K]");
+    TORCH_CHECK(weights.is_cuda() && weights.dim() == 2 && weights.is_contiguous() && weights.dtype() == torch::kFloat, "weights must be float [T, top_k]");
+    const int64_t T = weights.size(0), top_k = weights.size(1), K = rows.size(1);
+    TORCH_CHECK(rows.size(0) == T * top_k && K % 4 == 0, "rows must be [T * top_k, K] with K % 4 == 0");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.dtype() == torch::kFloat && out.dim() == 2 && out.size(0) == T && out.size(1) == K,
+                "out must be float [T, K]");
+    if (T == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    hipLaunchKernelGGL(RoutedCombineKernel, dim3((unsigned) T, (unsigned) ((K / 4 + kThreads - 1) / kThreads)), dim3(kThreads), 0, stream,
+                       (const __half *) rows.data_ptr(), (const float *) weights.data_ptr(), (float *) out.data_ptr(), (std::uint32_t) top_k,
+                       (std::uint32_t) K);
+    TORCH_CHECK(hipGetLastError() == hipSuccess, "fq_routed_f16_combine: launch failed");
 }
 
 #endif

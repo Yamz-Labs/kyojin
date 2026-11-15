@@ -230,6 +230,10 @@ _FQ_PF_GMMQ = os.environ.get("MCPM_FQ_PF_GMMQ", "1" if torch.version.hip else "0
 # 10.6 -> 7.8 s, decode flat, greedy md5 identical, perplexity 3.5401 -> 3.5404. Rows >= MCPM_FQ_PF_ROUTED_F16_MIN (default 1024);
 # fewer rows and other GPUs keep gmmq. 0 = gmmq.
 _FQ_PF_ROUTED_F16 = os.environ.get("MCPM_FQ_PF_ROUTED_F16", "1" if torch.version.hip else "0") == "1"
+# MCPM_FQ_PF_ROUTED_F16_COMBINE=1: the routing-weighted top-k sum of the routed F16 down rows in one HIP kernel (Gufo's MoeEpilogueVec4Kernel,
+# rocm/routed_f16) instead of torch's F32 broadcast multiply (R x top_k x K floats) + sum. Default on with ROCm; gfx1151 only (the routed F16
+# path's gate). Strix Halo Flash-Next GGUF: 8K prefill 7.50 -> 7.10 s, 157K-token prompt first token 117-120 -> 107-108 s. 0 = torch sum.
+_FQ_PF_ROUTED_F16_COMBINE = os.environ.get("MCPM_FQ_PF_ROUTED_F16_COMBINE", "1" if torch.version.hip else "0") == "1"
 _ROUTED_F16_ARCH = {}
 
 
@@ -2209,8 +2213,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         dn = torch.empty((R * top_k, K), dtype=torch.half, device=dev)
         ext.fq_routed_f16_moe(y.to(torch.half).contiguous(), ids, counts.to(torch.int32), tiles, g_p, u_p, d_p,
                               G[fmts[0]], G[fmts[1]], I, dn)
-        w = routing_weights.to(torch.float).reshape(R, top_k, 1)
-        final_hidden_states = (dn.view(R, top_k, K) * w).sum(1).reshape(eshape)
+        if _FQ_PF_ROUTED_F16_COMBINE and hasattr(ext, "fq_routed_f16_combine") and K % 4 == 0:
+            final_hidden_states = torch.empty((R, K), dtype=torch.float, device=dev)
+            ext.fq_routed_f16_combine(dn, routing_weights.to(torch.float).reshape(R, top_k).contiguous(), final_hidden_states)
+            final_hidden_states = final_hidden_states.reshape(eshape)
+        else:
+            w = routing_weights.to(torch.float).reshape(R, top_k, 1)
+            final_hidden_states = (dn.view(R, top_k, K) * w).sum(1).reshape(eshape)
         if self.shared_experts:
             y_se = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
             if self.shared_gate:

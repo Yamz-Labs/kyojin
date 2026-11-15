@@ -142,6 +142,36 @@ def test_hip_routed_f16():
     assert res
 
 
+def run_combine(ext):
+    """ext.fq_routed_f16_combine against an fp64 reference sum_s w[t, s] * rows[t, s, :] and against torch's F32 multiply + sum (the path it replaces)."""
+    dev = torch.device("cuda")
+    ok = True
+    for T, top_k, K in ((1, 10, 2560), (7, 10, 2560), (600, 10, 2560), (4096, 10, 2560), (33, 8, 640)):
+        g = torch.Generator(device="cpu").manual_seed(T * 31 + K)
+        rows = (torch.randn(T * top_k, K, generator=g) * 3).half().to(dev)
+        w = torch.rand(T, top_k, generator=g).float().to(dev)
+        out = torch.empty(T, K, dtype=torch.float, device=dev)
+        ext.fq_routed_f16_combine(rows, w, out)
+        torch.cuda.synchronize()
+        ref = (rows.view(T, top_k, K).double() * w.double().unsqueeze(-1)).sum(1)
+        old = (rows.view(T, top_k, K) * w.reshape(T, top_k, 1)).sum(1)
+        e_ref = ((out.double() - ref).abs().max() / ref.abs().max()).item()
+        e_old = ((out - old).abs().max() / ref.abs().max()).item()
+        print(f"combine T={T:5d} top_k={top_k} K={K}: rel err vs fp64 {e_ref:.2e}, vs torch path {e_old:.2e}")
+        ok &= e_ref < 1e-6 and e_old < 1e-6
+    return ok
+
+
+def test_hip_routed_f16_combine():
+    ext = _ext()
+    if ext is None or not hasattr(ext, "fq_routed_f16_combine"):
+        return
+    assert run_combine(ext)
+
+
 if __name__ == "__main__":
+    ext0 = _ext()
+    if ext0 is not None and hasattr(ext0, "fq_routed_f16_combine"):
+        assert run_combine(ext0)
     res = run_all()
     sys.exit(0 if res in (True, None) else 1)

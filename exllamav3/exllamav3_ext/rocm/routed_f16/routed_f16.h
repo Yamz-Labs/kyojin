@@ -8,3 +8,7 @@
 void fq_routed_f16_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor counts, torch::Tensor tiles,
                        torch::Tensor gate_ptrs, torch::Tensor up_ptrs, torch::Tensor down_ptrs, int64_t gate_fmt,
                        int64_t down_fmt, int64_t I, torch::Tensor out);
+
+// out[t, :] (float) = sum_s weights[t, s] * rows[t * top_k + s, :], s in order (rows half [T * top_k, K], weights float [T, top_k]); the weighted
+// top-k reduction after fq_routed_f16_moe (Gufo MoeEpilogueVec4Kernel<__half> without the shared expert).
+void fq_routed_f16_combine(torch::Tensor rows, torch::Tensor weights, torch::Tensor out);
