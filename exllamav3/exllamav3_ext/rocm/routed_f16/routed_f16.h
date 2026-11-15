@@ -12,3 +12,8 @@ void fq_routed_f16_moe(torch::Tensor x, torch::Tensor ids, torch::Tensor counts,
 // out[t, :] (float) = sum_s weights[t, s] * rows[t * top_k + s, :], s in order (rows half [T * top_k, K], weights float [T, top_k]); the weighted
 // top-k reduction after fq_routed_f16_moe (Gufo MoeEpilogueVec4Kernel<__half> without the shared expert).
 void fq_routed_f16_combine(torch::Tensor rows, torch::Tensor weights, torch::Tensor out);
+
+// fq_routed_f16_combine plus the gated shared expert in the same pass: out[t, :] = sum_s weights[t, s] * rows[t * top_k + s, :] + shared[t, :] * sigmoid(f16(x[t, :] . gate_w)).
+// shared half [T, K]; x half [T, K] (unit column stride, any row pitch); gate_w half [K]. Gufo MoeEpilogueVec4Kernel<__half> with the shared-expert term.
+void fq_routed_f16_combine_shared(torch::Tensor rows, torch::Tensor weights, torch::Tensor shared, torch::Tensor x, torch::Tensor gate_w,
+                                  torch::Tensor out);

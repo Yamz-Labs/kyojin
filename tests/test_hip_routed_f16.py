@@ -136,6 +136,8 @@ def run_all():
 
 def test_hip_routed_f16():
     import pytest
+    if ext0 is not None and hasattr(ext0, "fq_routed_f16_combine_shared"):
+        assert run_combine_shared(ext0)
     res = run_all()
     if res is None:
         pytest.skip("ROCm gfx1151 op (fq_routed_f16_moe) not available")
@@ -169,9 +171,45 @@ def test_hip_routed_f16_combine():
     assert run_combine(ext)
 
 
+def run_combine_shared(ext):
+    """ext.fq_routed_f16_combine_shared against an fp64 reference sum_s w[t, s] * rows[t, s, :] + shared[t, :] * sigmoid(f16(x[t, :] . gate_w)) and
+    against the separate torch path it replaces (combine, F32 widen, gate matmul in half, sigmoid, multiply, add). x is a row-padded view in one case."""
+    dev = torch.device("cuda")
+    ok = True
+    for T, top_k, K, pad in ((1, 10, 2560, 0), (7, 10, 2560, 0), (600, 10, 2560, 64), (4096, 10, 2560, 0), (33, 8, 640, 0)):
+        g = torch.Generator(device="cpu").manual_seed(T * 17 + K)
+        rows = (torch.randn(T * top_k, K, generator=g) * 3).half().to(dev)
+        w = torch.rand(T, top_k, generator=g).float().to(dev)
+        sh = torch.randn(T, K, generator=g).half().to(dev)
+        xb = torch.randn(T, K + pad, generator=g).half().to(dev)
+        x = xb[:, :K]
+        gw = (torch.randn(K, 1, generator=g) * 0.05).half().to(dev)
+        out = torch.empty(T, K, dtype=torch.float, device=dev)
+        ext.fq_routed_f16_combine_shared(rows, w, sh, x, gw.view(-1), out)
+        torch.cuda.synchronize()
+        gate = (x.double() @ gw.double()).half().double()
+        ref = (rows.view(T, top_k, K).double() * w.double().unsqueeze(-1)).sum(1) + sh.double() * torch.sigmoid(gate)
+        old = (rows.view(T, top_k, K) * w.reshape(T, top_k, 1)).sum(1)
+        old.add_(sh.float() * torch.sigmoid((x @ gw).float()))
+        e_ref = ((out.double() - ref).abs().max() / ref.abs().max()).item()
+        e_old = ((out - old).abs().max() / ref.abs().max()).item()
+        print(f"combine_shared T={T:5d} top_k={top_k} K={K} pad={pad}: rel err vs fp64 {e_ref:.2e}, vs torch path {e_old:.2e}")
+        ok &= e_ref < 1e-4 and e_old < 1e-4   # 1e-4: the gate dot is rounded to F16, a one-ulp flip vs the GEMM's summation order moves a few rows by <= ~1e-4 of the max
+    return ok
+
+
+def test_hip_routed_f16_combine_shared():
+    ext = _ext()
+    if ext is None or not hasattr(ext, "fq_routed_f16_combine_shared"):
+        return
+    assert run_combine_shared(ext)
+
+
 if __name__ == "__main__":
     ext0 = _ext()
     if ext0 is not None and hasattr(ext0, "fq_routed_f16_combine"):
         assert run_combine(ext0)
+    if ext0 is not None and hasattr(ext0, "fq_routed_f16_combine_shared"):
+        assert run_combine_shared(ext0)
     res = run_all()
     sys.exit(0 if res in (True, None) else 1)

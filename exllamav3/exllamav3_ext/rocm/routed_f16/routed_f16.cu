@@ -11,6 +11,7 @@
 // on the gfx1151 (RDNA3.5, wave32) WMMA lane layout.
 // fq_routed_f16_combine is the routing-weighted top-k reduction of the down rows, after Gufo's MoeEpilogueVec4Kernel<__half> (same
 // kernels.hip.cpp; the shared-expert term is left to the caller): one pass in registers instead of torch's F32 broadcast multiply + sum.
+// fq_routed_f16_combine_shared adds that shared-expert term (and the shared gate's dot product) to the same pass, as Gufo's MoeEpilogueVec4Kernel does.
 #if defined(USE_ROCM)
 
 #include <ATen/cuda/CUDAContext.h>
@@ -769,6 +770,66 @@ __global__ void RoutedCombineKernel(const __half* __restrict__ rows, const float
   }
   *reinterpret_cast<float4*>(out + static_cast<std::size_t>(t) * dim + i) = float4{a0, a1, a2, a3};
 }
+
+// RoutedCombineKernel with the gated shared expert fused in (Gufo MoeEpilogueVec4Kernel<__half> with its shared-expert term, the gate taken as in
+// Kyojin's torch path): out[t, :] = sum_s weights[t, s] * rows[t, s, :] + shared[t, :] * sigmoid(round_f16(x[t, :] . w)). One block per token:
+// the gate dot product (F32 accumulation, rounded to F16 like the linear's output the torch path widens), then the top-k sum in registers, then the
+// shared term, so the F32 widen of the shared output, the gate GEMM (N = 1), the sigmoid / multiply / add passes and one F32 round trip of
+// the output are gone.
+__global__ void RoutedCombineSharedKernel(const __half* __restrict__ rows, const float* __restrict__ weights,
+                                          const __half* __restrict__ shared, const __half* __restrict__ x,
+                                          const __half* __restrict__ w, float* __restrict__ out, std::uint32_t top_k,
+                                          std::uint32_t dim, std::size_t x_pitch) {
+  __shared__ float part[kThreads / 32];
+  __shared__ float s_gate;
+  const std::size_t t = blockIdx.x;
+  // gate: x[t, :] . w, four adjacent lanes per thread
+  float dot = 0.0f;
+  const __half* xr = x + t * x_pitch;
+  for (std::uint32_t i = threadIdx.x * 4; i < dim; i += kThreads * 4) {
+    const uint2 xr_raw = *reinterpret_cast<const uint2*>(xr + i);
+    const uint2 w_raw = *reinterpret_cast<const uint2*>(w + i);
+    const __half2 x0 = *reinterpret_cast<const __half2*>(&xr_raw.x), x1 = *reinterpret_cast<const __half2*>(&xr_raw.y);
+    const __half2 w0 = *reinterpret_cast<const __half2*>(&w_raw.x), w1 = *reinterpret_cast<const __half2*>(&w_raw.y);
+    dot = __fmaf_rn(__low2float(x0), __low2float(w0), dot);
+    dot = __fmaf_rn(__high2float(x0), __high2float(w0), dot);
+    dot = __fmaf_rn(__low2float(x1), __low2float(w1), dot);
+    dot = __fmaf_rn(__high2float(x1), __high2float(w1), dot);
+  }
+  for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor(dot, o);
+  if ((threadIdx.x & 31u) == 0) part[threadIdx.x >> 5] = dot;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float sum = 0.0f;
+    for (unsigned q = 0; q < kThreads / 32; ++q) sum += part[q];
+    const float gate = __half2float(__float2half_rn(sum));
+    s_gate = 1.0f / (1.0f + expf(-gate));
+  }
+  __syncthreads();
+  const float g = s_gate;
+  for (std::uint32_t i = threadIdx.x * 4; i < dim; i += kThreads * 4) {
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    const __half* src = rows + t * top_k * dim + i;
+    for (std::uint32_t s = 0; s < top_k; ++s) {
+      const float wt = weights[t * top_k + s];
+      const uint2 raw = *reinterpret_cast<const uint2*>(src + static_cast<std::size_t>(s) * dim);
+      const __half2 lo = *reinterpret_cast<const __half2*>(&raw.x);
+      const __half2 hi = *reinterpret_cast<const __half2*>(&raw.y);
+      a0 = __fadd_rn(a0, __fmul_rn(wt, __low2float(lo)));
+      a1 = __fadd_rn(a1, __fmul_rn(wt, __high2float(lo)));
+      a2 = __fadd_rn(a2, __fmul_rn(wt, __low2float(hi)));
+      a3 = __fadd_rn(a3, __fmul_rn(wt, __high2float(hi)));
+    }
+    const uint2 sraw = *reinterpret_cast<const uint2*>(shared + t * dim + i);
+    const __half2 slo = *reinterpret_cast<const __half2*>(&sraw.x);
+    const __half2 shi = *reinterpret_cast<const __half2*>(&sraw.y);
+    a0 = __fadd_rn(a0, __fmul_rn(__low2float(slo), g));
+    a1 = __fadd_rn(a1, __fmul_rn(__high2float(slo), g));
+    a2 = __fadd_rn(a2, __fmul_rn(__low2float(shi), g));
+    a3 = __fadd_rn(a3, __fmul_rn(__high2float(shi), g));
+    *reinterpret_cast<float4*>(out + t * dim + i) = float4{a0, a1, a2, a3};
+  }
+}
 }  // namespace
 #endif
 }  // namespace kyo_routed_f16
@@ -847,6 +908,35 @@ void fq_routed_f16_combine(torch::Tensor rows, torch::Tensor weights, torch::Ten
                        (const __half *) rows.data_ptr(), (const float *) weights.data_ptr(), (float *) out.data_ptr(), (std::uint32_t) top_k,
                        (std::uint32_t) K);
     TORCH_CHECK(hipGetLastError() == hipSuccess, "fq_routed_f16_combine: launch failed");
+}
+
+
+// out[t, :] (F32) = sum_s weights[t, s] * rows[t * top_k + s, :] + shared[t, :] * sigmoid(f16(x[t, :] . gate_w)): fq_routed_f16_combine with the gated shared expert
+// fused (see RoutedCombineSharedKernel). rows half [T * top_k, K], weights float [T, top_k], shared half [T, K] (contiguous), x half [T, K] with
+// unit column stride and any row pitch, gate_w half, K elements.
+void fq_routed_f16_combine_shared(torch::Tensor rows, torch::Tensor weights, torch::Tensor shared, torch::Tensor x, torch::Tensor gate_w,
+                                  torch::Tensor out)
+{
+    using namespace kyo_routed_f16;
+    const at::cuda::OptionalCUDAGuard device_guard(rows.device());
+    TORCH_CHECK(rows.is_cuda() && rows.dim() == 2 && rows.is_contiguous() && rows.dtype() == torch::kHalf, "rows must be half [T * top_k, K]");
+    TORCH_CHECK(weights.is_cuda() && weights.dim() == 2 && weights.is_contiguous() && weights.dtype() == torch::kFloat, "weights must be float [T, top_k]");
+    const int64_t T = weights.size(0), top_k = weights.size(1), K = rows.size(1);
+    TORCH_CHECK(rows.size(0) == T * top_k && K % 4 == 0, "rows must be [T * top_k, K] with K % 4 == 0");
+    TORCH_CHECK(shared.is_cuda() && shared.is_contiguous() && shared.dtype() == torch::kHalf && shared.dim() == 2 && shared.size(0) == T && shared.size(1) == K,
+                "shared must be half [T, K]");
+    TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.dtype() == torch::kHalf && x.size(0) == T && x.size(1) == K && x.stride(1) == 1 &&
+                x.stride(0) % 4 == 0 && ((std::uintptr_t) x.data_ptr() % 8) == 0, "x must be half [T, K], unit column stride, 8-byte aligned rows");
+    TORCH_CHECK(gate_w.is_cuda() && gate_w.is_contiguous() && gate_w.dtype() == torch::kHalf && gate_w.numel() == K, "gate_w must be half with K elements");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.dtype() == torch::kFloat && out.dim() == 2 && out.size(0) == T && out.size(1) == K,
+                "out must be float [T, K]");
+    if (T == 0) return;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    hipLaunchKernelGGL(RoutedCombineSharedKernel, dim3((unsigned) T), dim3(kThreads), 0, stream,
+                       (const __half *) rows.data_ptr(), (const float *) weights.data_ptr(), (const __half *) shared.data_ptr(),
+                       (const __half *) x.data_ptr(), (const __half *) gate_w.data_ptr(), (float *) out.data_ptr(), (std::uint32_t) top_k,
+                       (std::uint32_t) K, (std::size_t) x.stride(0));
+    TORCH_CHECK(hipGetLastError() == hipSuccess, "fq_routed_f16_combine_shared: launch failed");
 }
 
 #endif

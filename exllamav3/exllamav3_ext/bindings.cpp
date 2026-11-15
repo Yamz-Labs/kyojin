@@ -487,6 +487,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("x"), py::arg("ids"), py::arg("counts"), py::arg("tiles"), py::arg("gate_ptrs"), py::arg("up_ptrs"),
           py::arg("down_ptrs"), py::arg("gate_fmt"), py::arg("down_fmt"), py::arg("I"), py::arg("out"));
     m.def("fq_routed_f16_combine", &fq_routed_f16_combine, "fq_routed_f16_combine", py::arg("rows"), py::arg("weights"), py::arg("out"));
+    m.def("fq_routed_f16_combine_shared", &fq_routed_f16_combine_shared, "fq_routed_f16_combine_shared", py::arg("rows"), py::arg("weights"), py::arg("shared"), py::arg("x"), py::arg("gate_w"), py::arg("out"));
 #endif
     m.def("kda_gb_norm", &kda_gb_norm, "kda_gb_norm");
     m.def("kda_inter_off", &kda_inter_off, "kda_inter_off");
