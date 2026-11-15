@@ -59,12 +59,13 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
 
 
 _PF_HIP = {"ok": {}}
-_dump_n = [0]
+_dump_n = {}
 def _qsa_dump(q, k, v, ind, bt, scale, layer):
     """debug: QSA_DUMP=dir saves (q, indices) of chosen calls (QSA_DUMP_CALLS=comma list of call numbers) and k / v / bt at the last one"""
     d = os.environ["QSA_DUMP"]; calls = [int(x) for x in os.environ.get("QSA_DUMP_CALLS", "0").split(",")]
-    n = _dump_n[0]; _dump_n[0] += 1
-    if n % 10 != 0 and False: return
+    tgt = _dump_n.setdefault("t", id(layer))
+    if id(layer) != tgt: return
+    n = _dump_n.get("n", 0); _dump_n["n"] = n + 1
     if n in calls:
         torch.save(dict(q = q.cpu(), idx = ind.cpu(), scale = scale, n = n), os.path.join(d, f"call{n}.pt"))
         if n == calls[-1]:
