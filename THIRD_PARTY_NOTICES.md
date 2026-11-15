@@ -9,7 +9,7 @@ authors). Each file keeps its licence header and lists its changes. Gufo's MIT l
 
 exllamav3/exllamav3_ext/rocm/routed_f16/ (routed F16-WMMA prefill MoE for HIP gfx1151) is adapted from Gufo (https://github.com/gufo-org/gufo,
 commit 07e1191, src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp: RoutedPairF16Kernel, RoutedDownF16Kernel, RoutedPadBoundsKernel,
-RoutedScatterKernel and their device helpers, and MoeEpilogueVec4Kernel for fq_routed_f16_combine, MIT License, Copyright (c) 2026 gufo contributors). The file keeps its licence header and lists
+RoutedScatterKernel and their device helpers, and MoeEpilogueVec4Kernel for fq_routed_f16_combine and fq_routed_f16_combine_shared (its shared-expert term and gate), MIT License, Copyright (c) 2026 gufo contributors). The file keeps its licence header and lists
 its changes.
 
 Parts of exllamav3/exllamav3_ext/foreign_quant/ggml_mmvq/ and foreign_quant/fq_mmvq.cu are derived from

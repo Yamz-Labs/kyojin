@@ -1323,6 +1323,9 @@ class GatedDeltaNet(Module):
         # buffer holds the same values and the consumer widens in-kernel: drops the widen copy, bit-exact
         if os.environ.get(env, "1") != "1" or "capture" in params or "quant_preserve" in params:
             return False
+        from .foreign_linear import pfe_f16_ok
+        if pfe_f16_ok(m, x):
+            return True
         from .quant import exl3 as _exl3
         rows = x.numel() // x.shape[-1]
         if not (_exl3._f32_via_f16 and rows >= _exl3._f32_via_f16_min_rows):

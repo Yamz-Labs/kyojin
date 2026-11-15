@@ -1088,6 +1088,10 @@ class Attention(Module):
                     and not m.lora_a_tensors and m.pre_scale == 1.0 and m.post_scale == 1.0 \
                     and m.softcap == 0.0 and m.out_features == m.out_features_unpadded:
                 o_dt = torch.half
+        if o_dt is None and params.get("pfe_y_half") and "capture" not in params and "quant_preserve" not in params:
+            from .foreign_linear import pfe_f16_ok
+            if pfe_f16_ok(self.o_proj, o):
+                o_dt = torch.half
         x = self.o_proj.forward(o, params, o_dt)
         return x
 

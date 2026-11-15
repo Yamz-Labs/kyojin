@@ -427,3 +427,27 @@ class ForeignLinear(Module):
         if self.softcap != 0.0:
             ext.softcap(out, out, self.softcap)
         return out
+
+
+def pfe_f16_ok(m, x: torch.Tensor) -> bool:
+    """EXL3_PFE_FOREIGN=1 (default 0, ROCm): a prefill projection that is a ForeignLinear (directly or as a Linear's _ForeignInner, the GGUF load)
+    with a float default output may be asked for half instead (out_dtype=torch.half): its fp16 GEMM output holds the values the float path widens
+    (`mmout.to(float)`), and the consumers that already take half from the EXL3 projections (the GDN conv's in-kernel cast, the gated norm's z,
+    the HC residual apply's y) widen in-kernel. Drops one full fp32 write + read per projection (the f16 -> f32 copy kernel), and with a half
+    output the N-chunk slice copies move half the bytes. Prefill GEMM widths only (rows >= 1024); decode kernels that accumulate straight into a
+    float output keep their dtype."""
+    if os.environ.get("EXL3_PFE_FOREIGN", "0") != "1" or not torch.version.hip:
+        return False
+    if isinstance(m, ForeignLinear):
+        fl, wrap = m, None
+    else:
+        inner = getattr(m, "inner", None)
+        fl, wrap = getattr(inner, "fl", None), m
+        if not isinstance(fl, ForeignLinear) or type(inner).__name__ != "_ForeignInner" or inner.bias is not None:
+            return False
+    if wrap is not None and (getattr(wrap, "lora_a_tensors", None) or wrap.pre_scale != 1.0 or wrap.post_scale != 1.0 or wrap.softcap != 0.0
+                             or wrap.out_features != wrap.out_features_unpadded or wrap.trim_padded_out):
+        return False
+    rows = x.numel() // x.shape[-1]
+    return rows >= 1024 and (wrap.out_dtype if wrap is not None else None) in (None, torch.float) and \
+        (fl.out_dtype or (wrap.out_dtype if wrap is not None else None)) == torch.float and fl.post_scale == 1.0 and fl.softcap == 0.0

@@ -347,7 +347,13 @@ class PLELayer(Module):
         if os.environ.get("EXL3_PFE_PLE", "1") != "0":
             # gated is a local temp that is dead after the conv: add in place, no 84 MB fresh allocation
             # (same fp32 elementwise sum, bit-identical)
-            delta = gated.add_(conv_out.view(bsz, seq, H, D))
+            co = conv_out.view(bsz, seq, H, D)
+            if os.environ.get("EXL3_PLE_CONTIG", "0") == "1" and not co.is_contiguous():
+                # EXL3_PLE_CONTIG=1 (default 0): conv_out is the transposed view of the (bsz, ch, seq) conv result, so the in-place add below
+                # reads it with a ch-sized stride (uncoalesced, a strided broadcast kernel: ~100 ms per 8K chunk); one transpose copy first
+                # makes it a plain vectorized add. Same fp32 sum, bit-identical.
+                co = co.contiguous()
+            delta = gated.add_(co)
         else:
             delta = gated + conv_out.view(bsz, seq, H, D)
         return delta, conv_stream

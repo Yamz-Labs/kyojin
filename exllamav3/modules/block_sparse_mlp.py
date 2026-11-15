@@ -234,6 +234,11 @@ _FQ_PF_ROUTED_F16 = os.environ.get("MCPM_FQ_PF_ROUTED_F16", "1" if torch.version
 # rocm/routed_f16) instead of torch's F32 broadcast multiply (R x top_k x K floats) + sum. Default on with ROCm; gfx1151 only (the routed F16
 # path's gate). Strix Halo Flash-Next GGUF: 8K prefill 7.50 -> 7.10 s, 157K-token prompt first token 117-120 -> 107-108 s. 0 = torch sum.
 _FQ_PF_ROUTED_F16_COMBINE = os.environ.get("MCPM_FQ_PF_ROUTED_F16_COMBINE", "1" if torch.version.hip else "0") == "1"
+# MCPM_FQ_PF_ROUTED_F16_SHARED=1: the gated shared expert joins the combine kernel (rocm/routed_f16 fq_routed_f16_combine_shared, Gufo's
+# MoeEpilogueVec4Kernel shared-expert term): the shared expert's half output is not widened to float, the shared-gate GEMM (N = 1), sigmoid,
+# multiply and add passes disappear (about 3 ms of the 6 per layer at 8K rows). Needs the combine flag. Default 0 until measured; gfx1151 only
+# (the routed F16 path's gate). 0 = the separate gate GEMM + torch tail.
+_FQ_PF_ROUTED_F16_SHARED = os.environ.get("MCPM_FQ_PF_ROUTED_F16_SHARED", "0") == "1"
 _ROUTED_F16_ARCH = {}
 
 
@@ -2213,15 +2218,42 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         dn = torch.empty((R * top_k, K), dtype=torch.half, device=dev)
         ext.fq_routed_f16_moe(y.to(torch.half).contiguous(), ids, counts.to(torch.int32), tiles, g_p, u_p, d_p,
                               G[fmts[0]], G[fmts[1]], I, dn)
-        if _FQ_PF_ROUTED_F16_COMBINE and hasattr(ext, "fq_routed_f16_combine") and K % 4 == 0:
+        fused_sh = False
+        y_se = None
+        if _FQ_PF_ROUTED_F16_COMBINE and _FQ_PF_ROUTED_F16_SHARED and hasattr(ext, "fq_routed_f16_combine_shared") and K % 4 == 0 and \
+                self.shared_experts and self.shared_gate:
+            # the shared expert's down GEMM output stays half (the widen to float moves into the combine kernel), the gate GEMM (N = 1),
+            # sigmoid, multiply and add become the combine kernel's tail (fq_routed_f16_combine_shared)
+            gw = getattr(getattr(self.shared_gate, "inner", None), "weight", None)
+            if gw is not None and gw.dtype == torch.half and gw.numel() == K and gw.is_contiguous():
+                # nc2_down_half: the shared down GEMM keeps its fp16 output (the widen is in the combine kernel); out_dtype half keeps it at the end
+                y_se = self.shared_experts.forward(x, {**params, "moe_valu": True, "nc2_down_half": True} if _MOE_VALU else {**params, "nc2_down_half": True},
+                                                   out_dtype=torch.half)
+                try:
+                    x2 = x.view(R, K)
+                except RuntimeError:
+                    x2 = None
+                if x2 is not None and x2.dtype == torch.half and y_se.dtype == torch.half and y_se.is_contiguous() and y_se.numel() == R * K and x2.stride(1) == 1 \
+                        and x2.stride(0) % 4 == 0 and x2.data_ptr() % 8 == 0:
+                    final_hidden_states = torch.empty((R, K), dtype=torch.float, device=dev)
+                    ext.fq_routed_f16_combine_shared(dn, routing_weights.to(torch.float).reshape(R, top_k).contiguous(), y_se.view(R, K), x2,
+                                                     gw.view(-1), final_hidden_states)
+                    final_hidden_states = final_hidden_states.reshape(eshape)
+                    fused_sh = True
+                else:
+                    y_se = y_se.to(torch.float)
+        if fused_sh:
+            pass
+        elif _FQ_PF_ROUTED_F16_COMBINE and hasattr(ext, "fq_routed_f16_combine") and K % 4 == 0:
             final_hidden_states = torch.empty((R, K), dtype=torch.float, device=dev)
             ext.fq_routed_f16_combine(dn, routing_weights.to(torch.float).reshape(R, top_k).contiguous(), final_hidden_states)
             final_hidden_states = final_hidden_states.reshape(eshape)
         else:
             w = routing_weights.to(torch.float).reshape(R, top_k, 1)
             final_hidden_states = (dn.view(R, top_k, K) * w).sum(1).reshape(eshape)
-        if self.shared_experts:
-            y_se = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
+        if self.shared_experts and not fused_sh:
+            if y_se is None:
+                y_se = self.shared_experts.forward(x, {**params, "moe_valu": True} if _MOE_VALU else params)
             if self.shared_gate:
                 ext.add_sigmoid_gate(y_se, self.shared_gate.forward(x, params), final_hidden_states)
             else:
