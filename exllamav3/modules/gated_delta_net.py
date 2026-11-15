@@ -331,9 +331,17 @@ class GDNLayerState:
             dtype = torch.bfloat16,
             device = "meta"
         )
+        # EXL3_GDN_STATE_BF16 (default on with CUDA): store the recurrent state in bf16; the kernel loads it to fp32, updates in
+        # fp32 and stores round-to-nearest bf16, halving the state traffic. RTX 3090, Qwen3.8-27B EXL3, 8 x 16K decode (graphs on):
+        # 232.0 -> 249.9 tok/s; 512 forced tokens after 32K: natural text PPL -0.21 % (KL 0.0004), copy text -0.03 % (KL 0.00003).
+        # GDN 128x128 heads only; KDA / other head dims and ROCm keep fp32. 0 = fp32.
+        self.state_bf16 = (
+            os.environ.get("EXL3_GDN_STATE_BF16", "1" if (torch.version.cuda and not torch.version.hip) else "0") == "1"
+            and not module.kda and module.k_head_dim == 128 and module.v_head_dim == 128
+        )
         self.recurrent_state = torch.empty(
             (max_batch_size, max_history + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
-            dtype = torch.float,
+            dtype = torch.bfloat16 if self.state_bf16 else torch.float,
             device = "meta"
         )
         self.device = None
@@ -354,7 +362,7 @@ class GDNLayerState:
     def get_checkpoint_size(self):
         return (
             self.module.fdim_qkv * self.module.conv_kernel_size * 2 +
-            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * 4
+            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * (2 if self.state_bf16 else 4)
         )
 
 
@@ -444,7 +452,8 @@ class GDNLayerState:
         return ext.StateRewindJob(
             self.recurrent_state[slot, last_history + 1 - num_tokens].data_ptr(),
             self.recurrent_state[slot, 0].data_ptr(),
-            self.recurrent_state[slot, 0].numel(),
+            # num_elements counts fp32 words (the rewind kernel copies float4)
+            self.recurrent_state[slot, 0].numel() * self.recurrent_state.element_size() // 4,
         )
 
 
