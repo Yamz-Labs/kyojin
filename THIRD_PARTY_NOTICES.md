@@ -12,6 +12,12 @@ commit 07e1191, src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp: Route
 RoutedScatterKernel and their device helpers, and MoeEpilogueVec4Kernel for fq_routed_f16_combine and fq_routed_f16_combine_shared (its shared-expert term and gate), MIT License, Copyright (c) 2026 gufo contributors). The file keeps its licence header and lists
 its changes.
 
+exllamav3/modules/attention_fn/qsa_prefill_wmma.hip (4-row union WMMA sparse prefill attention for HIP) follows the structure of Gufo's
+WmmaCausalAttentionKernel (https://github.com/gufo-org/gufo, path src/models/qwen38_flash_next/kernels/rocm/kernels.hip.cpp, MIT License,
+Copyright (c) 2026 Gufo contributors): several query rows per block, 16-key tiles gathered once from the union of the rows' selections,
+K / V tile prefetch in registers, V staged transposed in LDS. The code itself is written for Kyojin's index-list selection (LDS bitonic
+union, per-row visibility masks); no Gufo source is copied.
+
 Parts of exllamav3/exllamav3_ext/foreign_quant/ggml_mmvq/ and foreign_quant/fq_mmvq.cu are derived from
 llama.cpp (https://github.com/ggml-org/llama.cpp, commit 7182ef7):
 

@@ -46,7 +46,13 @@ __device__ __forceinline__ __attribute__((convergent)) void sync_lds() {   // LD
     asm volatile("" ::: "memory");
 }
 
-extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
+#ifndef NVGPR
+#define NVGPR 192
+#endif
+#ifndef WPE
+#define WPE 8                // 8 waves per SIMD = 2 blocks per CU (192 VGPRs)
+#endif
+extern "C" __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(WPE))) __attribute__((amdgpu_num_vgpr(NVGPR))) void qsa_pf_wmma(
     const half_t* __restrict__ q, const half_t* __restrict__ kc, const half_t* __restrict__ vc,
     const int* __restrict__ bt, const int* __restrict__ idx, half_t* __restrict__ o,
     int q_stride, int o_stride, int tok_stride, int ntok, int npages, int R, float scale)
@@ -82,9 +88,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
         }
         sSort[e] = key;
     }
+    sync_lds();
     for (int k = 2; k <= SORTN; k <<= 1)
         for (int j = k >> 1; j > 0; j >>= 1) {
-            sync_lds();
+            if (j >= 32) sync_lds();                  // pairs of a step with j < 32 stay inside one wave: LDS order is enough
+            else asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
             for (int p = tid; p < SORTN / 2; p += 256) {
                 const int i = ((p & ~(j - 1)) << 1) | (p & (j - 1)), i2 = i | j;
                 const uint32_t a = sSort[i], b = sSort[i2];
