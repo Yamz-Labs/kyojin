@@ -74,7 +74,11 @@ extern "C" __global__ void gated_delta_chunk_gate_wmma(
     ) {
     const int vh = blockIdx.x;
     const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
+#ifdef KYO_BLOCKED
+    const int kh = vh % key_heads;                      // blocked GQA pairing (GGUF grouped-v files): v head vh reads k head vh mod H
+#else
     const int kh = vh / (value_heads / key_heads);
+#endif
     const int v_offset = 2 * key_heads * 128 + vh * 128;
     const int value_width = value_heads * 128;
     const size_t state_base = (size_t)vh * 128 * 128;

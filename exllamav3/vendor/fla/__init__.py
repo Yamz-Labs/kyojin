@@ -116,10 +116,28 @@ def chunk_gated_delta_rule(
     return o.to(q.dtype), final_state
 
 
-def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False, ckpt=None):
+def chunk_gated_delta_rule_pf(q, k, v, g, beta, scale=None, initial_state=None, output_final_state=False, ckpt=None, blocked=False):
     """chunk_gated_delta_rule(use_qk_l2norm_in_kernel=True, chunk_size=64) for q, k, v given as (possibly strided) views of the conv
     output; g (fp32) and beta (bf16) contiguous. Bitwise equal to the guarded entry; no copies of q, k, v when the views are plain
     token-pitch slices."""
+    # blocked=True (EXL3_GDN_BLOCKED_KERNEL): q / k carry H < HV heads paired BLOCKED with v (v head h <-> q / k head h % H, the
+    # GGUF grouped-v layout). The HIP HF kernel reads them that way directly; every other path gets the same blocked
+    # duplication the caller used to make (bit-equal: same per-head data)
+    if blocked and q.shape[2] != v.shape[2]:
+        _r = v.shape[2] // q.shape[2]
+        if _gdn_pf.strided_ok(q) and _gdn_pf.strided_ok(k) and q.shape[-1] == 128 and q.dtype == torch.bfloat16:
+            from .hip.gdn_hf_hip import gdn_hf_ok, chunk_gdn_hf
+            with torch.cuda.device(q.device.index):
+                qn = _gdn_pf.l2norm_strided(q)
+                kn = _gdn_pf.l2norm_strided(k)
+                if gdn_hf_ok(q, v, qn, kn, g.contiguous(), beta.contiguous(), None if initial_state is None else initial_state.contiguous()):
+                    sc = scale if scale is not None else q.shape[-1] ** -0.5
+                    try:
+                        return chunk_gdn_hf(q, v, qn, kn, g.contiguous(), beta.contiguous(), sc, initial_state, output_final_state, ckpt=ckpt, blocked=True)
+                    except Exception as e:
+                        print(f" -- EXL3_GDN_HF blocked failed, duplicated q / k for the rest of the process: {e}", flush=True)
+        q = torch.cat([q] * _r, dim = 2)
+        k = torch.cat([k] * _r, dim = 2)
     if not (_gdn_pf.strided_ok(q) and _gdn_pf.strided_ok(k) and q.shape[-1] == 128 and q.dtype == torch.bfloat16):
         return chunk_gated_delta_rule(q, k, v, g=g, beta=beta, scale=scale, initial_state=initial_state,
                                       output_final_state=output_final_state, use_qk_l2norm_in_kernel=True)

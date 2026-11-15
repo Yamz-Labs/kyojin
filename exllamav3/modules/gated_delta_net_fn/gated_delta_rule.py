@@ -104,7 +104,9 @@ def gated_delta_rule_fn(
     channelwise_g: bool = False,
     g_cumsum: bool = False,
     recurrent_base: torch.Tensor = None,
+    blocked_gqa: bool = False,
 ):
+    # blocked_gqa: q / k hold num_k_heads < num_v_heads heads paired blocked with v (chunk prefill path only, see vendor/fla)
     # g_cumsum: g already holds fla's chunk-local cumsum (EXL3_KDA_G_FUSED); only valid on the chunk path
     if params is None:
         params = {}
@@ -208,8 +210,9 @@ def gated_delta_rule_fn(
                 core_attn, new_state = chunk_gated_delta_rule_pf(
                     q[i:i + 1], k[i:i + 1], v[i:i + 1], g = g[i:i + 1], beta = beta[i:i + 1],
                     initial_state = state, output_final_state = save_state,
-                    ckpt = params.get("kda_ckpt") if bsz == 1 else None)
+                    ckpt = params.get("kda_ckpt") if bsz == 1 else None, blocked = blocked_gqa)
             else:
+                assert not blocked_gqa, "blocked_gqa needs the EXL3_GDN_PF chunk path"
                 core_attn, new_state = chunk_gated_delta_rule(
                     q[i:i + 1], k[i:i + 1], v[i:i + 1],
                     g = g[i:i + 1],
