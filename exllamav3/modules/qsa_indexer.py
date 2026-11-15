@@ -59,6 +59,18 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
 
 
 _PF_HIP = {"ok": {}}
+_dump_n = [0]
+def _qsa_dump(q, k, v, ind, bt, scale, layer):
+    """debug: QSA_DUMP=dir saves (q, indices) of chosen calls (QSA_DUMP_CALLS=comma list of call numbers) and k / v / bt at the last one"""
+    d = os.environ["QSA_DUMP"]; calls = [int(x) for x in os.environ.get("QSA_DUMP_CALLS", "0").split(",")]
+    n = _dump_n[0]; _dump_n[0] += 1
+    if n % 10 != 0 and False: return
+    if n in calls:
+        torch.save(dict(q = q.cpu(), idx = ind.cpu(), scale = scale, n = n), os.path.join(d, f"call{n}.pt"))
+        if n == calls[-1]:
+            torch.save(dict(k = k.cpu(), v = v.cpu(), bt = bt.cpu()), os.path.join(d, "kv.pt"))
+            os._exit(0)
+
 def _pf_hip_ready(device) -> bool:
     """EXL3_QSA_PF_HIP (default 1, 0 = Triton pair): per-device first use loads the
     proven HIP prefill kernel; a missing compiler or proof disables it only on that device."""
@@ -892,8 +904,12 @@ class QSAIndexer(Module):
                 and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
                 and q_rows.dtype == torch.half and k_arg.dtype == torch.half and _pf_hip_ready(q.device)):
             # one wave per (row, kv head) HIP kernel, bit-identical to the Triton pair (fp16 cache, prefill chunks only)
-            from .attention_fn.qsa_prefill_hip import qsa_prefill_hip
-            o = qsa_prefill_hip(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
+            from .attention_fn.qsa_prefill_hip import qsa_prefill_hip, qsa_prefill_wmma, wmma_enabled
+            if os.environ.get("QSA_DUMP"): _qsa_dump(q_rows, k_arg, v_arg, indices, block_table[0].int().contiguous(), attn.sm_scale, layer)
+            if wmma_enabled(q.device):
+                o = qsa_prefill_wmma(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
+            else:
+                o = qsa_prefill_hip(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
             return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
         if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and os.environ.get("EXL3_QSA_PF_DEQ", "1") == "1" and qc is not None
                 and tq is None and qc[2] == 8 and qc[3] == 8 and bsz == 1 and seq >= 64 and seq <= 4096 * 4

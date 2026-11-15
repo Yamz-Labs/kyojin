@@ -83,3 +83,58 @@ def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = No
     r = _state["lib"].hipModuleLaunchKernel(fn, R * 2, 1, 1, 32, 1, 1, 0, torch.cuda.current_stream(device).cuda_stream, params, None)
     if r != 0: raise RuntimeError(f"qsa_prefill_hip: launch failed ({r})")
     return out
+
+
+# ---- 4-row union WMMA variant (qsa_prefill_wmma.hip), EXL3_HIP_ATTN_WMMA ----
+_WMMA_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qsa_prefill_wmma.hip")
+
+def wmma_enabled(device = None) -> bool:
+    v = os.environ.get("EXL3_HIP_ATTN_WMMA", "0")
+    return v == "1"
+
+def _load_wmma(device = None, defs = ""):
+    dev = select_device(device)
+    key = (dev, "wmma", defs)
+    if key in _state: return _state[key]
+    src = open(_WMMA_SRC, "rb").read()
+    flags = ["--genco", f"--offload-arch={device_arch(dev)}", "-O3", "-ffp-contract=off", "--no-gpu-bundle-output"] + [x if x.startswith("-") else f"-D{x}" for x in defs.split()]
+    flags += hip_compiler.gcc_flags()
+    tag = hashlib.sha1(src + " ".join(flags).encode() + b"\0" + hip_compiler.key().encode()).hexdigest()[:16]
+    cache = os.path.join(os.path.expanduser("~/.cache/exllamav3"), f"qsa_pfw_{device_arch(dev)}_{tag}.hsaco")
+    if not os.path.isfile(cache):
+        os.makedirs(os.path.dirname(cache), exist_ok = True)
+        tmp = cache + f".{os.getpid()}.tmp"
+        r = subprocess.run([_hipcc(), *flags, "-o", tmp, _WMMA_SRC], capture_output = True, text = True)
+        if r.returncode: raise RuntimeError(r.stderr[-3000:])
+        os.replace(tmp, cache)
+    lib = load_hip_runtime()
+    torch.cuda.init()
+    mod = ctypes.c_void_p()
+    if lib.hipModuleLoad(ctypes.byref(mod), cache.encode()) != 0: raise RuntimeError("qsa_prefill_wmma: hipModuleLoad failed")
+    fn = ctypes.c_void_p()
+    if lib.hipModuleGetFunction(ctypes.byref(fn), mod, b"qsa_pf_wmma") != 0: raise RuntimeError("qsa_prefill_wmma: no function")
+    lib.hipModuleLaunchKernel.argtypes = [ctypes.c_void_p] + [ctypes.c_uint] * 7 + [ctypes.c_void_p] * 3
+    _state["lib"] = lib; _state[key] = fn; _state["mod", key] = mod
+    return fn
+
+def qsa_prefill_wmma(q, k, v, indices, sm_scale, block_table, page_size, out = None, defs = ""):
+    """Same contract as qsa_prefill_hip (1-D block table, fp16, Qwen shape) through the 4-row union kernel."""
+    R, H, hd = q.shape
+    assert (H, hd, k.shape[1], page_size, indices.shape[1]) == (24, 256, 2, 256, 2080), "qsa_prefill_wmma: Qwen shape only"
+    assert q.dtype == k.dtype == v.dtype == torch.half and q.stride(2) == 1 and q.stride(1) == hd
+    assert k.stride(1) == hd and k.stride(2) == 1 and k.stride() == v.stride() and indices.is_contiguous() and indices.dtype == torch.int32
+    assert indices.shape[0] == R and R >= 1
+    assert q.stride(0) % 8 == 0 and q.data_ptr() % 16 == 0 and k.data_ptr() % 16 == 0 and v.data_ptr() % 16 == 0 and k.stride(0) % 8 == 0
+    assert indices.data_ptr() % 16 == 0 and block_table.dim() == 1 and block_table.is_contiguous() and block_table.dtype == torch.int32
+    if out is None: out = torch.empty((R, H, hd), dtype = torch.half, device = q.device)
+    assert out.stride(2) == 1 and out.stride(1) == hd and out.stride(0) % 8 == 0 and out.data_ptr() % 16 == 0
+    ntok = k.shape[0]; assert v.shape[0] == ntok
+    device = q.device
+    fn = _load_wmma(device, defs)
+    select_device(device)
+    cargs = [ctypes.c_void_p(a.data_ptr()) for a in (q, k, v, block_table, indices, out)] + \
+            [ctypes.c_int(x) for x in (q.stride(0), out.stride(0), k.stride(0), ntok, block_table.shape[-1], R)] + [ctypes.c_float(sm_scale)]
+    params = (ctypes.c_void_p * len(cargs))(*[ctypes.cast(ctypes.byref(a), ctypes.c_void_p) for a in cargs])
+    r = _state["lib"].hipModuleLaunchKernel(fn, ((R + 3) // 4) * 2, 1, 1, 256, 1, 1, 0, torch.cuda.current_stream(device).cuda_stream, params, None)
+    if r != 0: raise RuntimeError(f"qsa_prefill_wmma: launch failed ({r})")
+    return out
