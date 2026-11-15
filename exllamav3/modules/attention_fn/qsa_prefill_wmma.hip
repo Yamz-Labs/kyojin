@@ -57,10 +57,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
     __shared__ uint32_t sBlk[MAXU];
     __shared__ uint16_t sVm[MAXU];                       // bit 4 * row + (token & 3): token visible to that row
     // one aliased region: sort buffer (start-up) | K tile / V^T | P | partial scores (loop) | output staging (end)
-    __shared__ __attribute__((aligned(16))) char sBig[16384 + 1280];
-    half_t* const sKV = (half_t*) sBig;                                  // K tile [16][LDQ] (8448 B) or V^T [256][LDT] (12288 B)
-    half_t* const sP = (half_t*) (sBig + 12288);                         // NCOL * LDT halves = 2304 B
-    float* const sSp = (float*) (sBig + 14592);                          // 3 * 32 * 8 floats = 3072 B
+    __shared__ __attribute__((aligned(16))) char sBig[26112];
+    half_t* const sKV = (half_t*) sBig;                                  // K tile [16][LDQ] (8448 B)
+    half_t* const sV = (half_t*) (sBig + 8448);                          // V^T [256][LDT] (12288 B)
+    half_t* const sP = (half_t*) (sBig + 20736);                         // NCOL * LDT halves = 2304 B
+    float* const sSp = (float*) (sBig + 23040);                          // 3 * 32 * 8 floats = 3072 B
     __shared__ float sAlpha[NCOL];
     __shared__ float sL[NCOL];
     __shared__ uint32_t sCnt[256];
@@ -177,8 +178,14 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
     auto tile = [&](int i, v4u& kr0, v4u& kr1, v4u& vr0, v4u& vr1, v4u& kn0, v4u& kn1, v4u& vn0, v4u& vn1) {
         *(v4u*) (sK + kk * LDQ + dch * 16) = kr0;
         *(v4u*) (sK + kk * LDQ + dch * 16 + 8) = kr1;
+        {   // V^T into the same LDS (one key per lane group: conflict-free writes)
+            const half_t* a0 = (const half_t*) &vr0;
+            const half_t* a1 = (const half_t*) &vr1;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { sV[(dch * 16 + j) * LDT + kk] = a0[j]; sV[(dch * 16 + 8 + j) * LDT + kk] = a1[j]; }
+        }
         if (i + 1 < ntile) load_tile(i + 1, kn0, kn1, vn0, vn1);   // whole next tile in flight behind this tile's work
-        sync_lds();                                              // K tile visible
+        sync_lds();                                              // K tile and V^T visible
         v8f S = (v8f) {0, 0, 0, 0, 0, 0, 0, 0};
         if (w < 6) {                                             // scores: wave = (column tile, half of the head dim)
             const int ct = w % 3, dh = w / 3;
@@ -222,14 +229,6 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
             if (hh == 0) sAlpha[col] = alpha;
         }
         sync_lds();                                              // P, alpha; K tile no longer read
-        {   // V^T into the same LDS (one key per lane group: conflict-free writes)
-            half_t* sV = sKV;
-            const half_t* a0 = (const half_t*) &vr0;
-            const half_t* a1 = (const half_t*) &vr1;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) { sV[(dch * 16 + j) * LDT + kk] = a0[j]; sV[(dch * 16 + 8 + j) * LDT + kk] = a1[j]; }
-        }
-        sync_lds();                                              // V^T visible
         {
             float al[3];
             v16h Bp[3];
@@ -237,7 +236,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void qsa_pf_wmma(
             for (int ct = 0; ct < 3; ++ct) { al[ct] = sAlpha[16 * ct + n]; Bp[ct] = ld16h(sP + (16 * ct + n) * LDT); }
 #pragma unroll
             for (int dt = 0; dt < 2; ++dt) {
-                const v16h A = ld16h(sKV + (16 * (2 * w + dt) + n) * LDT);
+                const v16h A = ld16h(sV + (16 * (2 * w + dt) + n) * LDT);
 #pragma unroll
                 for (int ct = 0; ct < 3; ++ct) {
                     v8f c = acc[dt][ct] * al[ct];
