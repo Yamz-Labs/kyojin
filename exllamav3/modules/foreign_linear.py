@@ -79,10 +79,14 @@ _IQ_Q8_FN = {"iq3_xxs": "fq_gemv_iq3_xxs_q8", "iq2_s": "fq_gemv_iq2_s_q8", "iq3_
 _MMVQ_ON = os.environ.get("BOLT_FQ_MMVQ", "1") != "0"
 _MMVQ_FN = {"iq2_xxs": "fq_mmvq_iq2_xxs", "iq2_xs": "fq_mmvq_iq2_xs", "iq2_s": "fq_mmvq_iq2_s", "iq3_xxs": "fq_mmvq_iq3_xxs",
             "iq3_s": "fq_mmvq_iq3_s", "iq4_nl": "fq_mmvq_iq4_nl", "iq4_xs": "fq_mmvq_iq4_xs", "q5_k": "fq_mmvq_q5_k"}
-# BOLT_FQ_MMVQ_KQ: Q4_K / Q6_K decode rows (1..15) also through the mmvq kernel (llama.cpp vec_dot_q4_K / q6_K_q8_1). Default on for
-# CUDA (RTX 3090, 8B Q4_K_M served: N8 +28 %, N4 +11 %, N1 +4 %), off on ROCm until measured there; 0 / 1 forces.
-if os.environ.get("BOLT_FQ_MMVQ_KQ", "1" if (torch.version.cuda and not torch.version.hip) else "0") == "1":
-    _MMVQ_FN.update({"q4_k": "fq_mmvq_q4_k", "q6_k": "fq_mmvq_q6_k", "q3_k": "fq_mmvq_q3_k"})
+# BOLT_FQ_MMVQ_KQ: K-quant decode rows (1..15) through the mmvq kernel (llama.cpp vec_dot_q*_K_q8_1). Gate is per format:
+# BOLT_FQ_MMVQ_KQ_FMTS = comma list of q4_k,q6_k,q3_k. Default CUDA: all three (RTX 3090, 8B Q4_K_M served: N8 +28 %, N4 +11 %, N1 +4 %);
+# default ROCm: q3_k only (the other K-quants keep their measured HIP path). BOLT_FQ_MMVQ_KQ=0 turns all off, =1 forces all three.
+_KQ_ON = torch.version.cuda and not torch.version.hip
+_KQ_MMVQ_FMTS = {"0": (), "1": ("q4_k", "q6_k", "q3_k")}.get(
+    os.environ.get("BOLT_FQ_MMVQ_KQ", ""),
+    tuple(f for f in os.environ.get("BOLT_FQ_MMVQ_KQ_FMTS", "q4_k,q6_k,q3_k" if _KQ_ON else "q3_k").split(",") if f))
+_MMVQ_FN.update({f: "fq_mmvq_" + f for f in _KQ_MMVQ_FMTS if f in ("q4_k", "q6_k", "q3_k")})
 # BOLT_FQ_MMQ_FEW: Q8_0 / Q4_K / Q5_K / Q6_K rows from a per-format minimum up to 24 through the few-row int8-MMA kernel (fq_mmq_few.cu,
 # llama.cpp PR #31533 port, thresholds tuned there on an RTX 5090). CUDA only (sm_80+), off on ROCm; 0 / 1 forces. RTX 3090 served, 8 sessions:
 # 8B Q4_K_M N4 +15 %, N8 +54 % (different prompts) / +77 % (same prompt), N1 and 8K prefill unchanged; 35B-A3B GGUF N8 +21 % / +26 %.
@@ -95,7 +99,7 @@ _MMQ_FEW_MINR = {"q5_k": 3, "q4_k": 4, "q6_k": 4, "q8_0": 5, "q3_k": 4, "iq4_xs"
 _MMQ_FEW_CAPTURE_ONLY = () if os.environ.get("BOLT_FQ_MMQ_FEW_IQ4XS_ANY", "0") == "1" else ("iq4_xs",)
 _MMVQ_QK = {"iq4_nl": 32}
 _DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}
-if torch.version.cuda and not torch.version.hip:
+if os.environ.get("BOLT_FQ_DEQ_Q3K", "1") != "0":   # CUDA and HIP
     _DEQ_IQ_ID["q3_k"] = 10   # native Q3_K dequant (prefill dequant + GEMM; the torch gap_dequant is ~2.5x slower at 8K)   # fq_dequant_iq format ids (the others have native dequants already)
 # rows served by the mmvq kernel (8 columns per launch, so R/8 passes over the weights): the old IQ path above 16 rows dequantized the whole weight in torch
 # on every call (1.7 s for the 8B at ANY prompt length). Past ~64 rows the dequant + GEMM path is the better one again.
