@@ -223,7 +223,8 @@ class Qwen3_5MTPModel(Model):
         self.target_embed = weakref.ref(target_embed)
 
         # lm_head is the last module
-        assert isinstance(target.modules[-1], Linear), "Expected Linear lm_head as last target module"
+        from ..modules.foreign_linear import ForeignLinear   # GGUF body: the head is a ForeignLinear
+        assert isinstance(target.modules[-1], (Linear, ForeignLinear)), "Expected Linear lm_head as last target module"
         self.target_lm_head = weakref.ref(target.modules[-1])
 
         target_norm = target.modules[target.logit_layer_idx - 1]

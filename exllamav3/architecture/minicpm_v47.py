@@ -138,9 +138,11 @@ class MiniCPMV47Config(Config):
         # MTP head and vision tower are separate concerns (draft file)
         self.model_classes.pop("mtp", None)
         self.model_classes.pop("vision", None)
+        self.mtp_num_hidden_layers = 0
 
         # GGUF backing store + engine->gguf name map
         self.gguf = GGUFCollection(_gguf_path(directory))
+        self._attach_mtp_head(directory)
         nm: dict[str, str] = {}
         for i in range(self.num_hidden_layers):
             _map_layer(nm, i)
@@ -154,6 +156,19 @@ class MiniCPMV47Config(Config):
         # Embedding: dequant IQ4_XS token_embd to fp16 once (1 GB), served
         # as an in-memory override (vectorized numpy, no per-block Python).
         self._load_embedding_override()
+
+    def _attach_mtp_head(self, directory):
+        """Qwen3.5/3.6 MoE MTP head beside the GGUF body. KYO_GGUF_MTP (or <model dir>/mtp) = a directory with the head's mtp.*
+        tensors as safetensors (tools/qwen/gguf_mtp_fetch.py). It is served by the same config.stc, the head runs on the body's
+        last hidden state and the body's embedding / lm_head (qwen3_5_mtp.py attach_to). Off (no head) without it."""
+        d = os.environ.get("KYO_GGUF_MTP") or os.path.join(directory or "", "mtp")
+        if self.num_experts is None or not os.path.isdir(d) or not any(f.endswith(".safetensors") for f in os.listdir(d)):
+            return
+        from ..loader.safetensors import SafetensorsCollection
+        from .qwen3_5_mtp import Qwen3_5MoeMTPModel
+        self.gguf.aux = SafetensorsCollection(d)
+        self.mtp_num_hidden_layers = 1
+        self.model_classes["mtp"] = Qwen3_5MoeMTPModel
 
     def _load_embedding_override(self):
         # token_embd dequantized to fp16 once (~1 GB) and served as an

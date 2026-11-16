@@ -2556,6 +2556,8 @@ def main() -> None:
     parser.add_argument("--kvwin", default=None, metavar="SINK:WINDOW",
                         help="fp16 sink + window ring of the quantized cache (EXL3_KVWIN, e.g. 4:128; an EXL3_KVWIN already set wins); written by tools/qualify as the kw6 choice")
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
+    parser.add_argument("--gguf-mtp", default="", help="GGUF body: directory with the MTP head tensors (mtp.* safetensors, tools/qwen/gguf_mtp_fetch.py); "
+                        "sets KYO_GGUF_MTP, use with --draft-policy mix|mtp")
     parser.add_argument("--draft-policy", choices=("mix", "mtp", "dflash", "off"), default="mix",
                         help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, dflash = DFlash2 block drafter "
                              "from --dflash-dir (lossless; see --dflash-adapt), off = plain decode")
@@ -2585,6 +2587,8 @@ def main() -> None:
                              "pages for its prompt + reply budget when it starts, so a request that does not fit waits. A reply longer than "
                              "its share of the context (-c / sessions) is requeued, not reserved up front")
     args = parser.parse_args()
+    if args.gguf_mtp:
+        os.environ["KYO_GGUF_MTP"] = os.path.abspath(os.path.expanduser(args.gguf_mtp))
     if args.ngram_ram:
         os.environ["EXL3_NGRAM_STREAM"] = "0"
     if args.draft_policy == "dflash" and not args.dflash_dir:
