@@ -127,6 +127,9 @@ def test_dequant():
     out = torch.empty((n, k), dtype=torch.half, device="cuda")
     ext.fq_dequant_iq(w, out, 10)
     torch.cuda.synchronize()
+    # + 0.0 maps -0.0 to +0.0: HIP builds may drop the sign of a zero product (negative scale x q == 0);
+    # every other value is still compared bit for bit
+    out, ref = out + 0.0, ref + 0.0
     bad = int((out.view(torch.int16) != ref.view(torch.int16)).sum())
     print(f"dequant q3_k: {bad} of {n * k} fp16 values differ from the torch gap reference")
     assert bad == 0, "q3_k: fq_dequant_iq differs from the reference"
