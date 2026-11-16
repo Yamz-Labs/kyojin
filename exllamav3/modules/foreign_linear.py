@@ -82,15 +82,17 @@ _MMVQ_FN = {"iq2_xxs": "fq_mmvq_iq2_xxs", "iq2_xs": "fq_mmvq_iq2_xs", "iq2_s": "
 # BOLT_FQ_MMVQ_KQ: Q4_K / Q6_K decode rows (1..15) also through the mmvq kernel (llama.cpp vec_dot_q4_K / q6_K_q8_1). Default on for
 # CUDA (RTX 3090, 8B Q4_K_M served: N8 +28 %, N4 +11 %, N1 +4 %), off on ROCm until measured there; 0 / 1 forces.
 if os.environ.get("BOLT_FQ_MMVQ_KQ", "1" if (torch.version.cuda and not torch.version.hip) else "0") == "1":
-    _MMVQ_FN.update({"q4_k": "fq_mmvq_q4_k", "q6_k": "fq_mmvq_q6_k"})
+    _MMVQ_FN.update({"q4_k": "fq_mmvq_q4_k", "q6_k": "fq_mmvq_q6_k", "q3_k": "fq_mmvq_q3_k"})
 # BOLT_FQ_MMQ_FEW: Q8_0 / Q4_K / Q5_K / Q6_K rows from a per-format minimum up to 24 through the few-row int8-MMA kernel (fq_mmq_few.cu,
 # llama.cpp PR #31533 port, thresholds tuned there on an RTX 5090). CUDA only (sm_80+), off on ROCm; 0 / 1 forces. RTX 3090 served, 8 sessions:
 # 8B Q4_K_M N4 +15 %, N8 +54 % (different prompts) / +77 % (same prompt), N1 and 8K prefill unchanged; 35B-A3B GGUF N8 +21 % / +26 %.
 _MMQ_FEW = os.environ.get("BOLT_FQ_MMQ_FEW", "1" if (torch.version.cuda and not torch.version.hip) else "0") == "1"
-_MMQ_FEW_FMT = {"q8_0": 0, "q4_k": 1, "q5_k": 2, "q6_k": 3}
-_MMQ_FEW_MINR = {"q5_k": 3, "q4_k": 4, "q6_k": 4, "q8_0": 5}
+_MMQ_FEW_FMT = {"q8_0": 0, "q4_k": 1, "q5_k": 2, "q6_k": 3, "q3_k": 4, "iq4_xs": 5}
+_MMQ_FEW_MINR = {"q5_k": 3, "q4_k": 4, "q6_k": 4, "q8_0": 5, "q3_k": 4, "iq4_xs": 4}
 _MMVQ_QK = {"iq4_nl": 32}
-_DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}   # fq_dequant_iq format ids (the others have native dequants already)
+_DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}
+if torch.version.cuda and not torch.version.hip:
+    _DEQ_IQ_ID["q3_k"] = 10   # native Q3_K dequant (prefill dequant + GEMM; the torch gap_dequant is ~2.5x slower at 8K)   # fq_dequant_iq format ids (the others have native dequants already)
 # rows served by the mmvq kernel (8 columns per launch, so R/8 passes over the weights): the old IQ path above 16 rows dequantized the whole weight in torch
 # on every call (1.7 s for the 8B at ANY prompt length). Past ~64 rows the dequant + GEMM path is the better one again.
 _MMVQ_MAXR = int(os.environ.get("BOLT_FQ_MMVQ_MAXR", "64"))
@@ -285,7 +287,7 @@ class ForeignLinear(Module):
                 out = None
         if out is not None:
             pass
-        elif (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format in ("q5_k", "q4_k", "q6_k") else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
+        elif (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format in ("q5_k", "q4_k", "q6_k", "q3_k") else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
                 and hasattr(ext, _MMVQ_FN[self.format])):
             N = self.out_features
             out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)

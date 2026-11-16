@@ -670,6 +670,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_mmvq_q6_k", &fq_mmvq_q6_k, "fq_mmvq_q6_k",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_q3_k", &fq_mmvq_q3_k, "fq_mmvq_q3_k",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
 #if !defined(USE_ROCM)
     m.def("fq_mmq_few", &fq_mmq_few, "fq_mmq_few",
           py::arg("x"), py::arg("scratch"), py::arg("packed"), py::arg("out"), py::arg("fmt"));

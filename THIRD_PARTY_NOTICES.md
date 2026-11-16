@@ -26,9 +26,9 @@ llama.cpp (https://github.com/ggml-org/llama.cpp, commit 7182ef7):
 - ggml_vecdotq_iq.cuh: the vec_dot_iq*_q8_1 functions and helpers from ggml/src/ggml-cuda/vecdotq.cuh (only ggml_cuda_dp4a renamed to __dp4a,
   CUDA-only helpers).
 - fq_mmvq.cu: kernel structure after ggml/src/ggml-cuda/mmvq.cu (mul_mat_vec_q, mul_mat_vec_q_moe).
-- ggml_vecdotq_k46.cuh: vec_dot_q4_K_q8_1 and vec_dot_q6_K_q8_1 (with their _impl helpers) and the block_q4_K / block_q6_K layouts,
-  from llama.cpp commit 61dbf49 (only ggml_cuda_dp4a renamed to ggml_dp4a).
-- fq_mmq_few.cu: the few-row MMQ (mul_mat_q_few, its Q8_0 / Q4_K / Q5_K / Q6_K decoders and quantize_mmq_few_q8_1) of llama.cpp PR #31533
+- ggml_vecdotq_k46.cuh: vec_dot_q4_K_q8_1, vec_dot_q6_K_q8_1 and vec_dot_q3_K_q8_1 (with their _impl helpers) and the block_q4_K / block_q6_K /
+  block_q3_K layouts, from llama.cpp commit 61dbf49 (only ggml_cuda_dp4a renamed to ggml_dp4a, __vsubss4 wrapped for HIP).
+- fq_mmq_few.cu: the few-row MMQ (mul_mat_q_few, its Q8_0 / Q4_K / Q5_K / Q6_K decoders and quantize_mmq_few_q8_1; the Q3_K and IQ4_XS decoders are new, in the style of the Q6_K one) of llama.cpp PR #31533
   (ggml/src/ggml-cuda/mmq-few.cu, quantize.cu; merge commit 0fb8f15770, release v1.0.0), with unpack_scales_q45_K (mmq-load-tiles.cuh) and
   the int8 mma / cp.async PTX of mma.cuh / cp-async.cuh inlined. Renamed: ggml_type -> local MF_* ids, tile<16, 8, int> -> mf_c_tile;
   one channel, half input, half or float output, no PDL / DGX Spark prefetch.

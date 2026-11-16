@@ -1,10 +1,10 @@
-// Few-row MMQ (2..24 activation rows) for the dense GGUF Q8_0 / Q4_K / Q5_K / Q6_K linears: int8 MMA (m16n8k32 / m16n8k16) on raw
+// Few-row MMQ (2..24 activation rows) for the dense GGUF Q8_0 / Q4_K / Q5_K / Q6_K / Q3_K / IQ4_XS linears: int8 MMA (m16n8k32 / m16n8k16) on raw
 // GGUF weight rows streamed through a per-warp cp.async ring, activations quantized to q8_1 in the MMA fragment layout.
 //
 // Ported from llama.cpp ggml/src/ggml-cuda/mmq-few.cu and quantize.cu (quantize_mmq_few_q8_1), PR #31533 "CUDA: few-row MMQ for
 // BS 2-24" (https://github.com/ggml-org/llama.cpp, merge commit 0fb8f15770, release v1.0.0).
 // MIT License, Copyright (c) 2023-2026 The ggml authors. See THIRD_PARTY_NOTICES.md at the repository root.
-// Changes: only the Q8_0 / Q4_K / Q5_K / Q6_K decoders; one channel and sample (no broadcast strides); half or float output; the
+// Changes: only the Q8_0 / Q4_K / Q5_K / Q6_K decoders (plus Q3_K and IQ4_XS decoders added here in the same style, not in llama.cpp); one channel and sample (no broadcast strides); half or float output; the
 // tile / mma / cp.async helpers of mma.cuh / cp-async.cuh inlined as PTX (Ampere+ only); no PDL, no DGX Spark L2 prefetch;
 // the src1 input is half (converted to float before the same quantization arithmetic). The decoder and kernel bodies are unchanged.
 // NVIDIA only (sm_80+): this file is not built on ROCm (foreign_quant is excluded there, see build_config.py).
@@ -21,7 +21,7 @@ namespace {
 
 using namespace ggml_iq;
 
-enum { MF_Q8_0 = 0, MF_Q4_K = 1, MF_Q5_K = 2, MF_Q6_K = 3 };
+enum { MF_Q8_0 = 0, MF_Q4_K = 1, MF_Q5_K = 2, MF_Q6_K = 3, MF_Q3_K = 4, MF_IQ4_XS = 5 };
 
 struct block_q8_0_mf { half d; int8_t qs[32]; };
 static_assert(sizeof(block_q8_0_mf) == 34, "ggml block layout");
@@ -36,7 +36,7 @@ constexpr int MF_QUANT_BLOCK    = 128;             // CUDA_QUANTIZE_BLOCK_SIZE_M
 
 // src0 bytes per 256 values
 constexpr __host__ __device__ int mmq_few_unit_size(const int type) {
-    return type == MF_Q8_0 ? 8*34 : type == MF_Q4_K ? 144 : type == MF_Q5_K ? 176 : type == MF_Q6_K ? 210 : 0;
+    return type == MF_Q8_0 ? 8*34 : type == MF_Q4_K ? 144 : type == MF_Q5_K ? 176 : type == MF_Q6_K ? 210 : type == MF_Q3_K ? 110 : type == MF_IQ4_XS ? 136 : 0;
 }
 
 // Q4_K and Q5_K also need the src1 sums for their mins (DS4 layout: half2 (d, sum)), the others take float d (D4).
@@ -356,6 +356,98 @@ __device__ __forceinline__ void mmq_few_vec_dot_q6_K(const char * const (&x)[2],
     mmq_few_add_scaled(sum, d, sum_d);
 }
 
+// Q3_K (new, written for this file on the Q6_K decoder; the bit layout is ggml dequantize_row_q3_K / vec_dot_q3_K_q8_1): 3-bit values
+// (low 2 bits of qs, inverted high bit of hmask: 0 -> subtract 4) with a 6-bit scale per 16 values -> one k=16 MMA per half of a sub-block.
+template <int ncg>
+__device__ __forceinline__ void mmq_few_vec_dot_q3_K(const char * const (&x)[2], const mmq_few_y_frag (&yf)[ncg], float (&sum)[ncg][4]) {
+    const int t = threadIdx.x % 4;
+
+    float d[2];
+    int   scw[2][3];
+    int   hm[2][2];
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const block_q3_K * bx = (const block_q3_K *) x[r];
+        d[r] = __half2float(bx->d);
+#pragma unroll
+        for (int w = 0; w < 3; ++w) {
+            scw[r][w] = get_int_b2(bx->scales, w);
+        }
+        hm[r][0] = ~get_int_b2(bx->hmask,      t);
+        hm[r][1] = ~get_int_b2(bx->hmask + 16, t);
+    }
+
+    float sum_d[ncg][4] = {{0.0f}};
+#pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        int qs[2][2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const block_q3_K * bx = (const block_q3_K *) x[r];
+            qs[r][0] = get_int_b2(bx->qs + 32*n,      t);
+            qs[r][1] = get_int_b2(bx->qs + 32*n + 16, t);
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int s = 4*n + j;
+            int lo[2];
+            int hi[2];
+            int sc_s[2];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                lo[r] = ggml_vsubss4((qs[r][0] >> (2*j)) & 0x03030303, ((hm[r][0] >> s) << 2) & 0x04040404);
+                hi[r] = ggml_vsubss4((qs[r][1] >> (2*j)) & 0x03030303, ((hm[r][1] >> s) << 2) & 0x04040404);
+                int sv[2];
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int is = 2*s + h;
+                    const int low  = (scw[r][(is % 8)/4] >> (8*(is % 4) + 4*(is/8))) & 0xF;
+                    const int high = ((scw[r][2] >> (8*(is % 4) + 2*(is/4))) & 3) << 4;
+                    sv[h] = (low | high) - 32;
+                }
+                sc_s[r] = (sv[0] & 0xFF) | ((sv[1] & 0xFF) << 8);
+            }
+            mmq_few_mma_k16_add<MF_Q3_K>(lo, hi, sc_s, yf, s, sum_d);
+        }
+    }
+    mmq_few_add_scaled(sum, d, sum_d);
+}
+
+// IQ4_XS: 4-bit non-linear values (kvalues_iq4nl) with a 6-bit scale per 32 values, low nibbles = values [0, 16), high nibbles = [16, 32).
+template <int ncg>
+__device__ __forceinline__ void mmq_few_vec_dot_iq4_xs(const char * const (&x)[2], const mmq_few_y_frag (&yf)[ncg], float (&sum)[ncg][4]) {
+    const int t = threadIdx.x % 4;
+
+    float d[2];
+    int   scl[2];
+    int   sch[2];
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const block_iq4_xs * bx = (const block_iq4_xs *) x[r];
+        d[r]   = __half2float(bx->d);
+        scl[r] = get_int_b2(bx->scales_l, 0);
+        sch[r] = bx->scales_h;
+    }
+
+    float sum_d[ncg][4] = {{0.0f}};
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+        int lo[2];
+        int hi[2];
+        int ls[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const block_iq4_xs * bx = (const block_iq4_xs *) x[r];
+            const int2 v = get_int_from_table_16(get_int_b2(bx->qs + 16*s, t), kvalues_iq4nl);
+            lo[r] = v.x;
+            hi[r] = v.y;
+            ls[r] = (((scl[r] >> (4*s)) & 0xF) | (((sch[r] >> (2*s)) & 3) << 4)) - 32;
+        }
+        mmq_few_mma_add<MF_IQ4_XS>(lo, hi, ls, yf, s, sum_d);
+    }
+    mmq_few_add_scaled(sum, d, sum_d);
+}
+
 template <int ncg>
 __device__ __forceinline__ void mmq_few_vec_dot_q8_0(const char * const (&x)[2], const mmq_few_y_frag (&yf)[ncg], float (&sum)[ncg][4]) {
     const int t = threadIdx.x % 4;
@@ -382,6 +474,10 @@ __device__ __forceinline__ void mmq_few_vec_dot(const char * const (&x)[2], cons
         mmq_few_vec_dot_q8_0<ncg>(x, yf, sum);
     } else if constexpr (type == MF_Q4_K || type == MF_Q5_K) {
         mmq_few_vec_dot_q45_K<type, ncg>(x, yf, sum);
+    } else if constexpr (type == MF_Q3_K) {
+        mmq_few_vec_dot_q3_K<ncg>(x, yf, sum);
+    } else if constexpr (type == MF_IQ4_XS) {
+        mmq_few_vec_dot_iq4_xs<ncg>(x, yf, sum);
     } else {
         mmq_few_vec_dot_q6_K<ncg>(x, yf, sum);
     }
@@ -649,14 +745,14 @@ void launch_switch_ncg(const uint8_t * x, const int4 * y, OUT * dst, int nunits,
 
 }  // namespace
 
-// out[R, N] = x[R, K] @ W^T for raw GGUF rows packed [N, K/256 * unit bytes] (fmt 0 Q8_0, 1 Q4_K, 2 Q5_K, 3 Q6_K), 1 <= R <= 24.
+// out[R, N] = x[R, K] @ W^T for raw GGUF rows packed [N, K/256 * unit bytes] (fmt 0 Q8_0, 1 Q4_K, 2 Q5_K, 3 Q6_K, 4 Q3_K, 5 IQ4_XS), 1 <= R <= 24.
 // scratch: uint8 CUDA tensor of at least ceil(R/8) * K * 9 bytes (fq_q8_scratch(dev, 8*ceil(R/8), K) has exactly that size).
 // Returns false (nothing launched) when the case is not served: GPU older than sm_80, K not a whole number of ring stages, short
 // rows (K < 2048: the warps idle), misaligned weights.
 bool fq_mmq_few(torch::Tensor x, torch::Tensor scratch, torch::Tensor packed, torch::Tensor out, int fmt)
 {
     TORCH_CHECK(x.is_cuda() && x.dtype() == torch::kHalf && x.is_contiguous() && x.dim() == 2, "x must be contiguous CUDA half [R, K]");
-    TORCH_CHECK(fmt >= 0 && fmt <= 3, "fmt must be 0..3");
+    TORCH_CHECK(fmt >= 0 && fmt <= 5, "fmt must be 0..5");
     const int R = (int) x.size(0), K = (int) x.size(1), N = (int) packed.size(0);
     TORCH_CHECK(R >= 1 && R <= MMQ_FEW_MAX_NCG*MMQ_FEW_NCOLS, "R must be 1..24");
     TORCH_CHECK(out.is_contiguous() && out.size(0) == R && out.size(1) == N, "out must be contiguous [R, N]");
@@ -694,6 +790,8 @@ bool fq_mmq_few(torch::Tensor x, torch::Tensor scratch, torch::Tensor packed, to
             case MF_Q8_0: launch_switch_ncg<MF_Q8_0, OUT>(w, y, dst, nunits, N, R, row_bytes, ncg, nmt, stream); break;
             case MF_Q4_K: launch_switch_ncg<MF_Q4_K, OUT>(w, y, dst, nunits, N, R, row_bytes, ncg, nmt, stream); break;
             case MF_Q5_K: launch_switch_ncg<MF_Q5_K, OUT>(w, y, dst, nunits, N, R, row_bytes, ncg, nmt, stream); break;
+            case MF_Q3_K: launch_switch_ncg<MF_Q3_K, OUT>(w, y, dst, nunits, N, R, row_bytes, ncg, nmt, stream); break;
+            case MF_IQ4_XS: launch_switch_ncg<MF_IQ4_XS, OUT>(w, y, dst, nunits, N, R, row_bytes, ncg, nmt, stream); break;
             default:      launch_switch_ncg<MF_Q6_K, OUT>(w, y, dst, nunits, N, R, row_bytes, ncg, nmt, stream); break;
         }
     };
