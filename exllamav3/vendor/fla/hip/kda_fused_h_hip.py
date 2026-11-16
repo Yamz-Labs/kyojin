@@ -11,8 +11,8 @@ from exllamav3.util.hip_lib import load_hip_runtime
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kda_fused_h.hip")
 _state = {}
 # The kernel source has a gfx12 (RDNA4) fragment path. Its bf16 x bf16 products round to
-# nearest even on gfx12 (gfx11.5 truncates), which makes o and the final state bitwise equal
-# to the Triton fused path on gfx1201; both arches are enabled at the gate.
+# nearest even on gfx11.5 and gfx12 (f2bf_mul), which makes o and the final state bitwise equal
+# to the Triton fused path on gfx1201 under Triton 3.9; both arches are enabled at the gate.
 _ARCHS = GFX115_ARCHS | frozenset(("gfx1200", "gfx1201"))
 
 

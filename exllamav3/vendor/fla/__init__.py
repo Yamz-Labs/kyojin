@@ -225,7 +225,10 @@ def chunk_kda(
     # The fused Triton output path is nondeterministic on gfx12, so an unavailable HIP kernel
     # must fall through to the deterministic fla chain there, not to fuse_o=True. gfx11.5 keeps
     # the Triton fused fallback. Explicit EXL3_KDA_FUSE=0/2 remain manual controls.
-    det_fallback = fuse == 3 and not _fused_output_stable(q.device)
+    # Off HIP (CUDA, unknown arch) the default keeps the previous rule: the deterministic chain only
+    # under a layer split (KYOJIN_SPLIT_ACTIVE), the Triton fused path otherwise.
+    det_fallback = (fuse == 3 and not _fused_output_stable(q.device)
+                    and (bool(torch.version.hip) or os.environ.get("KYOJIN_SPLIT_ACTIVE", "0") != "0"))
     # Whether the HIP fused kernel can run. Checked before the intra pass so a det_fallback arch
     # with no HIP kernel (gfx12) goes straight to the chain instead of computing Aqk/Akk twice.
     hip_may_run = (fuse == 3 and K == 128 and v.shape[-1] == 128
