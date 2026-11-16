@@ -59,19 +59,6 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
 
 
 _PF_HIP = {"ok": {}}
-_dump_n = {}
-def _qsa_dump(q, k, v, ind, bt, scale, layer):
-    """debug: QSA_DUMP=dir saves (q, indices) of chosen calls (QSA_DUMP_CALLS=comma list of call numbers) and k / v / bt at the last one"""
-    d = os.environ["QSA_DUMP"]; calls = [int(x) for x in os.environ.get("QSA_DUMP_CALLS", "0").split(",")]
-    tgt = _dump_n.setdefault("t", id(layer))
-    if id(layer) != tgt: return
-    n = _dump_n.get("n", 0); _dump_n["n"] = n + 1
-    if n in calls:
-        torch.save(dict(q = q.cpu(), idx = ind.cpu(), scale = scale, n = n), os.path.join(d, f"call{n}.pt"))
-        if n == calls[-1]:
-            torch.save(dict(k = k.cpu(), v = v.cpu(), bt = bt.cpu()), os.path.join(d, "kv.pt"))
-            os._exit(0)
-
 def _pf_hip_ready(device) -> bool:
     """EXL3_QSA_PF_HIP (default 1, 0 = Triton pair): per-device first use loads the
     proven HIP prefill kernel; a missing compiler or proof disables it only on that device."""
@@ -904,9 +891,9 @@ class QSAIndexer(Module):
         if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and qc is None and bsz == 1 and seq >= 64 and seq <= 4096 * 4
                 and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
                 and q_rows.dtype == torch.half and k_arg.dtype == torch.half and _pf_hip_ready(q.device)):
-            # one wave per (row, kv head) HIP kernel, bit-identical to the Triton pair (fp16 cache, prefill chunks only)
+            # one wave per (row, kv head) HIP kernel, bit-identical to the Triton pair (fp16 cache, prefill chunks only); on gfx1151 the
+            # 4-row union WMMA kernel by default (fp16 rounding-level difference, live switch EXL3_HIP_ATTN_WMMA)
             from .attention_fn.qsa_prefill_hip import qsa_prefill_hip, qsa_prefill_wmma, wmma_enabled
-            if os.environ.get("QSA_DUMP"): _qsa_dump(q_rows, k_arg, v_arg, indices, block_table[0].int().contiguous(), attn.sm_scale, layer)
             if wmma_enabled(q.device):
                 o = qsa_prefill_wmma(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
             else:
