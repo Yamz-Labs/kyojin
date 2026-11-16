@@ -88,9 +88,19 @@ def qsa_prefill_hip(q, k, v, indices, sm_scale, block_table, page_size, out = No
 # ---- 4-row union WMMA variant (qsa_prefill_wmma.hip), EXL3_HIP_ATTN_WMMA ----
 _WMMA_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qsa_prefill_wmma.hip")
 
+_WMMA_ARCH = {}
+
+
 def wmma_enabled(device = None) -> bool:
-    v = os.environ.get("EXL3_HIP_ATTN_WMMA", "0")
-    return v == "1"
+    # Live switch (read on every call, no reload): EXL3_HIP_ATTN_WMMA=0 / 1 forces it; unset = on for gfx1151 (the arch the
+    # kernel is compiled and measured for), off elsewhere
+    v = os.environ.get("EXL3_HIP_ATTN_WMMA", "")
+    if v in ("0", "1"):
+        return v == "1"
+    key = str(device)
+    if key not in _WMMA_ARCH:
+        _WMMA_ARCH[key] = bool(torch.version.hip) and device_arch(device).split(":")[0] == "gfx1151"
+    return _WMMA_ARCH[key]
 
 def _load_wmma(device = None, defs = ""):
     dev = select_device(device)
