@@ -307,19 +307,40 @@ class CudaGraphRunner:
         self.dev = dev
         return True
 
-    # -- GPU embedding table (EXL3_GPU_EMB: auto | 0 | 1) ----------------------------------------------------------------
-    # The table normally stays on the CPU (mmapped, gathered per step on the host: median 74 us, mean 345 us with ms-long page-fault
-    # outliers inside the server). With enough free VRAM after load it is copied to the device once and the gather runs inside the
-    # captured graph from a static id buffer; auto = only when free VRAM > table + EXL3_GPU_EMB_MARGIN_MB (default 2048), so the
-    # max-context configurations that need the memory keep the CPU table. The table only pays off for the lag-1 pipeline, so with
-    # EXL3_GPU_EMB unset it is built only when EXL3_LAG1=1: an unset switch leaves load-time VRAM exactly as in 1.8.2.
+    # -- GPU embedding table (EXL3_GPU_EMB: 0 | 1 | auto | host) -----------------------------------------------------------
+    # OFF by default (unset = 0: load-time VRAM and the host gather are exactly as on main). The table normally stays on the CPU
+    # (mmapped, gathered per step on the host). EXL3_GPU_EMB=1: it is copied to the device once and REPLACES the host weight (single
+    # copy; EXL3_GPU_EMB_DROP=0 keeps both), the gather runs inside the captured graph; costs the table in VRAM (+2425 MiB on the 27B).
+    # auto = same, only when free VRAM > table + EXL3_GPU_EMB_MARGIN_MB (default 2048).
+    # EXPERIMENTAL, EXL3_GPU_EMB=host (only picked implicitly when EXL3_LAG1=1 and EXL3_GPU_EMB is unset): no VRAM, no copy; the mmapped
+    # host table is registered (cudaHostRegister, mapped) and the in-graph gather reads the few needed rows over PCIe (fp16 only,
+    # falls back to the host gather if the driver refuses). Measured gain over the host gather: about 1 % (noise level).
     def _gemb_setup(self, emb, ids):
         self._gemb = False
-        mode = os.environ.get("EXL3_GPU_EMB", "auto" if os.environ.get("EXL3_LAG1", "0") == "1" else "0")
+        mode = os.environ.get("EXL3_GPU_EMB", "host" if os.environ.get("EXL3_LAG1", "0") == "1" else "0")
         if mode == "0" or emb.embedding is None or emb.normalize or emb.multiplier != 1.0:
             return
         w = emb.embedding.weight
-        if w.device.type != "cpu" or w.dtype not in (torch.half, torch.bfloat16):
+        if w.dtype not in (torch.half, torch.bfloat16):
+            return
+        if w.device.type == "cuda":
+            self._gemb = w.detach()      # already the device table (single copy, see below)
+            self._gemb_dtype = emb.forward(ids.detach().cpu().reshape(-1)[:4].reshape(1, -1).clone(), {}).dtype
+            return
+        if w.device.type != "cpu":
+            return
+        if mode == "host":
+            from .host_table import host_view
+            wg = host_view(w.detach(), self.dev)
+            if wg is None:
+                return
+            probe = ids.detach().cpu().reshape(-1)[:4].reshape(1, -1).clone()
+            ref = emb.forward(probe, {})
+            got = wg.index_select(0, probe.to(self.dev).reshape(-1)).view(1, -1, wg.shape[1]).to(ref.dtype)
+            if got.shape != ref.shape or not torch.equal(got.cpu(), ref):
+                return
+            self._gemb = wg
+            self._gemb_dtype = ref.dtype
             return
         need = w.numel() * w.element_size()
         free, _ = torch.cuda.mem_get_info(self.dev)
@@ -333,6 +354,10 @@ class CudaGraphRunner:
         if got.shape != ref.shape or not torch.equal(got.cpu(), ref):
             del wg
             return
+        # Single resident copy: the device table REPLACES the host (mmapped) one, Embedding.forward gathers on the device
+        if os.environ.get("EXL3_GPU_EMB_DROP", "1") == "1":
+            emb.embedding.weight = torch.nn.Parameter(wg, requires_grad = w.requires_grad)
+            w = None
         self._gemb = wg
         self._gemb_dtype = ref.dtype
 
