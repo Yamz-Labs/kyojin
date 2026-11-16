@@ -36,7 +36,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 import serve_compat  # noqa: E402  (the llama.cpp timings object, shared with the other servers)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
-from serve_metrics import Metrics, gpu_memory
+from serve_metrics import Metrics, cache_evictions, gpu_memory
 # serve_ping.py is a symlink to the shared tools/strix_halo/serve_ping.py: an SSE comment line every
 # KYOJIN_SSE_PING_S while a stream has nothing to send yet (off by default), so a long prefill does
 # not look like a hung server to a client that only watches its socket.
@@ -554,7 +554,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
         """The log id of the request being handled (None outside a logged route)."""
         return lifecycle.reqid()
 
-    def observe(st: dict[str, Any], prompt_tokens: int, queue_s: float = 0.0) -> None:
+    def observe(st: dict[str, Any], prompt_tokens: int, queue_s: float = 0.0, first_token_s: float = 0.0) -> None:
         accepted = int(st.get("accepted_draft_tokens", 0))
         rejected = int(st.get("rejected_draft_tokens", 0))
         proposed = accepted + rejected
@@ -566,7 +566,8 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             predicted=int(st.get("new_tokens", 0)),
             prefill_s=float(st.get("time_prefill") or 0.0), generate_s=float(st.get("time_generate") or 0.0),
             drafts=int(getattr(engine, "last_rounds", 0)) if proposed else 0,
-            draft_tokens=proposed, accepted=accepted, queue_s=queue_s)
+            draft_tokens=proposed, accepted=accepted, queue_s=queue_s, first_token_s=first_token_s,
+            reason=st.get("eos_reason"))
 
     async def models(_: web.Request) -> web.Response:
         return web.json_response({"object": "list", "data": [
@@ -597,11 +598,13 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             body["_job_at"] = time.perf_counter()
             if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
                 lifecycle.job_skipped(rid, wait)
+                app["metrics"].cancelled()
                 out.put_nowait(None)
                 queue.task_done()
                 continue
             store = getattr(engine, "slot_store", None)
             processing += 1  # admitted: counted from the dequeue, incl. lock and slot restore
+            run = None
             try:
                 async with lock:
                     if store is not None:
@@ -610,6 +613,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                                           images=len(body.get("_images") or ()),
                                           messages=len(body.get("messages") or ()), processing=processing)
                     first_token = False    # flipped once, so the log gets exactly one job_first_token line
+                    run = app["metrics"].begin()
                     async for delta in engine.generate(
                         body["_prompt"],
                         max_tokens=token_limit(body),
@@ -625,7 +629,10 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                         out.put_nowait(delta)
                     request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
-                        observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)), wait)
+                        observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)), wait,
+                                (body.get("_first_at") or body["_job_at"]) - body["_job_at"])
+                    elif cancel is not None and cancel.is_set():     # cancelled while it ran: no stats
+                        app["metrics"].cancelled()
                     lifecycle.job_done(rid, request_stats, started, prompt_tokens=body.get("_prompt_tokens"))
                     out.put_nowait(None)
             except Exception as exc:                             # noqa: BLE001
@@ -634,6 +641,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
                 out.put_nowait(exc)
             finally:
                 processing -= 1
+                app["metrics"].end(run)
                 if store is not None:
                     store.busy = False
                 queue.task_done()
@@ -972,7 +980,7 @@ def create_app(engine: Any, model_id: str, template: str) -> web.Application:
             cs, kv = {}, 0.0
         return web.Response(body=app["metrics"].render(
             processing=processing, deferred=queue.qsize(), kv_ratio=kv, cache=cs,
-            gpu=gpu_memory(getattr(engine, "torch", None))),
+            gpu=gpu_memory(getattr(engine, "torch", None)), evictions=cache_evictions(gen)),
             headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})
 
     if getattr(engine, "slot_store", None) is not None:

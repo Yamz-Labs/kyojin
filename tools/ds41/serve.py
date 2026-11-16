@@ -27,7 +27,7 @@ for _p in (str(HERE), str(HERE.parent)):
         sys.path.append(_p)
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
-from serve_metrics import Metrics, gpu_memory  # noqa: E402  (symlink to the shared tools/strix_halo/serve_metrics.py)
+from serve_metrics import Metrics, cache_evictions, gpu_memory  # noqa: E402  (symlink to the shared tools/strix_halo/serve_metrics.py)
 from serve_reqlog import Lifecycle, ReqLog, StreamWriter  # noqa: E402  (one line per request event; off by default)
 from serve_ping import ServePing  # noqa: E402  (SSE keep-alive comments; off by default)
 import ds41_chat  # noqa: E402
@@ -242,7 +242,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
         except ValueError as exc:
             raise web.HTTPBadRequest(reason=str(exc)) from exc
 
-    def observe(st: dict[str, Any], prompt_tokens: int, queue_s: float = 0.0) -> None:
+    def observe(st: dict[str, Any], prompt_tokens: int, queue_s: float = 0.0, first_token_s: float = 0.0) -> None:
         _memlog(prompt_tokens, int(st.get("new_tokens", 0)))
         num_draft = int(getattr(getattr(engine, "greedy_generator", None), "num_draft_tokens", 0) or 0)
         accepted = int(st.get("accepted_draft_tokens", 0))
@@ -253,7 +253,8 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
             predicted=int(st.get("new_tokens", 0)),
             prefill_s=float(st.get("time_prefill") or 0.0), generate_s=float(st.get("time_generate") or 0.0),
             drafts=int(st.get("draft_steps") or 0) or (proposed // num_draft if proposed and num_draft else 0),
-            draft_tokens=proposed, accepted=accepted, queue_s=queue_s)
+            draft_tokens=proposed, accepted=accepted, queue_s=queue_s, first_token_s=first_token_s,
+            reason=st.get("eos_reason"))
 
     async def health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "source": "kyojin", "model": model_id,
@@ -310,6 +311,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
             rid = body.get("_reqid")
             if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
                 lifecycle.job_skipped(rid, time.perf_counter() - (body.get("_queued_at") or time.perf_counter()))
+                app["metrics"].cancelled()
                 out.put_nowait(None)
                 queue.task_done()
                 continue
@@ -325,6 +327,7 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
                                           processing=processing, running=running)
                     if sessions == 1:
                         engine.last_stats = {}  # a cancelled or failed job must not re-count the previous one
+                    run = app["metrics"].begin()
                     try:
                         async for delta in engine.generate(
                             body["_prompt"],
@@ -343,11 +346,14 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
                             out.put_nowait(delta)
                     finally:
                         running -= 1
+                        app["metrics"].end(run)
                     if sessions == 1:
                         request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
                         observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)),
-                                started - (body.get("_queued_at") or started))
+                                started - (body.get("_queued_at") or started), (body.get("_first_at") or started) - started)
+                    elif cancel is not None and cancel.is_set():     # cancelled while it ran: no stats
+                        app["metrics"].cancelled()
                     lifecycle.job_done(rid, request_stats, started,
                                        prompt_tokens=int(request_stats.get("prompt_tokens") or body.get("_prompt_tokens") or 0))
                     out.put_nowait(None)
@@ -826,7 +832,8 @@ def create_app(engine: Any, model_id: str, defaults: Defaults | None = None) -> 
         except Exception:                                        # noqa: BLE001  (stub engines, page-table mutation mid-walk)
             cs, kv = {}, 0.0
         return web.Response(body=app["metrics"].render(processing=processing, deferred=queue.qsize(), kv_ratio=kv, cache=cs,
-                                                       gpu=gpu_memory(getattr(engine, "torch", None))),
+                                                       gpu=gpu_memory(getattr(engine, "torch", None)),
+                                                       evictions=cache_evictions(gen)),
                             headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})
 
     async def score(request: web.Request) -> web.Response:

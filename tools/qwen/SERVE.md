@@ -91,13 +91,14 @@ The pack is tied to one set of weights: download it from the same model repo.
 - Errors are JSON `{"error": {"message", "type", "code"}}`: 400 for bad requests (including prompt longer than the
   context), 500 for engine errors.
 - `GET /metrics`: Prometheus text with the llama.cpp `llamacpp:*` names, for scraping (the collector of the GLM and
-  MiMo servers). Counters accumulate when a request completes, on every generation route; a request cancelled
-  mid-stream is not counted. `requests_processing`, `requests_deferred` and `kv_cache_usage_ratio` are read live.
+  MiMo servers). Counters accumulate when a request completes, on every generation route; a cancelled request
+  counts only in `kyojin:requests_cancelled_total`. `requests_processing`, `requests_deferred` and `kv_cache_usage_ratio` are read live.
   `spec_decode_num_accepted_tokens_total` over `spec_decode_num_draft_tokens_total` is the draft acceptance.
   `spec_decode_num_drafts_total` is derived: a verification step yields one sampled token plus the draft tokens it
   accepts, so the rounds of a request are its new tokens minus its accepted draft tokens (a step that drafted
   nothing counts too; a request that drafted nothing adds none). The `kyojin:*` metrics (request count, failures,
-  queue time, version, server and model, sessions, context, cache token counts, device memory) are the same on
+  cancellations, finish reasons, queue time, time to first token, oldest request age, version, server and model,
+  sessions, context, cache token counts and evictions, device memory) are the same on
   every server: see `GET /metrics` in `tools/glm/SERVE.md`.
 - `GET /v1/models`, `GET /health` (status, speculation state, vision), `POST /apply-template` (renders the prompt,
   generates nothing), `GET /slots`, `POST /slots/0?action=save|restore|erase` (llama.cpp slot files),
