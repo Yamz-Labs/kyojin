@@ -891,9 +891,13 @@ class QSAIndexer(Module):
         if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and qc is None and bsz == 1 and seq >= 64 and seq <= 4096 * 4
                 and (attn.num_q_heads, attn.num_kv_heads, attn.head_dim, page_size, indices.shape[1]) == (24, 2, 256, 256, 2080)
                 and q_rows.dtype == torch.half and k_arg.dtype == torch.half and _pf_hip_ready(q.device)):
-            # one wave per (row, kv head) HIP kernel, bit-identical to the Triton pair (fp16 cache, prefill chunks only)
-            from .attention_fn.qsa_prefill_hip import qsa_prefill_hip
-            o = qsa_prefill_hip(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
+            # one wave per (row, kv head) HIP kernel, bit-identical to the Triton pair (fp16 cache, prefill chunks only); on gfx1151 the
+            # 4-row union WMMA kernel by default (fp16 rounding-level difference, live switch EXL3_HIP_ATTN_WMMA)
+            from .attention_fn.qsa_prefill_hip import qsa_prefill_hip, qsa_prefill_wmma, wmma_enabled
+            if wmma_enabled(q.device):
+                o = qsa_prefill_wmma(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
+            else:
+                o = qsa_prefill_hip(q_rows, k_arg, v_arg, indices, attn.sm_scale, block_table[0].int().contiguous(), page_size)
             return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
         if (os.environ.get("EXL3_QSA_PF_HIP", "1") == "1" and os.environ.get("EXL3_QSA_PF_DEQ", "1") == "1" and qc is not None
                 and tq is None and qc[2] == 8 and qc[3] == 8 and bsz == 1 and seq >= 64 and seq <= 4096 * 4
