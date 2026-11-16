@@ -709,8 +709,72 @@ Enable GPU/CPU handoff profiling, for debug purposes.
 
 ### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
 
-Use expandable segments for all Torch allocations. Opt out with a value of 1 or by explicitly
-setting `PYTORCH_CUDA_ALLOC_CONF`.
+Use expandable segments for all Torch allocations. Opt out with a value of `0` or by explicitly
+setting `PYTORCH_CUDA_ALLOC_CONF`. On a unified-memory box, disabling expandable segments can
+recover about **0.5 GiB** of allocator fragmentation around a large cache (a measured 512K
+GLM cache loads with it off but failed with the default); it does not add capacity.
+
+The serve and split entry points expose the same choice before the library import:
+`--expandable-segments auto|on|off` (env fallback `KYOJIN_EXPANDABLE_SEGMENTS`). `auto` leaves
+expandable segments on except for large-context unified loads where a documented estimate is
+within 8 GiB of the observed usable ceiling; set `KYOJIN_EXPANDABLE_SEGMENTS_AUTO_OFF=1` to
+force that decision on, or use `--expandable-segments on|off` to override it.
+
+### `KYOJIN_EXPANDABLE_SEGMENTS_AUTO_CTX` (default: `524288`)
+
+Context gate for the `--expandable-segments auto` heuristic. Below this token count, `auto`
+keeps expandable segments on. The estimate also requires a unified/GTT device and a model that
+is close to the usable ceiling (default `KYOJIN_OOM_GUARD_USABLE_CEILING_GIB=113.3` on a
+118 GiB Strix Halo iGPU).
+
+### `KYOJIN_OOM_GUARD` (default: `auto` for split, `warn` for single-device)
+
+Pre-flight per-device memory guard: `auto` refuses an impossible load before any weights,
+cache or reserve slab are allocated; `warn` only logs the table; `off` disables the check.
+The guard is read-only and never changes allocator settings or outputs. See
+`KYOJIN_OOM_GUARD_*` below and `doc/split.md` for the flags.
+
+### `KYOJIN_OOM_GUARD_RESERVE_GIB` (default: `4.5` unified, `0.8` dedicated)
+
+Per-device headroom kept out of the pre-flight capacity. Accepts the split's device-selector
+syntax, for example `gfx1151=4.5,gfx1201=0.8`; `cuda:N`, a UUID or a name substring also work.
+A bare number applies to every device. The part0 load slab (`--part0-reserve-gb`) is estimated
+separately and is not double-counted.
+
+### `KYOJIN_OOM_GUARD_WORKSPACE_GIB` (default: `2.0` bulk device, `1.5` other)
+
+Estimated prefill workspace per device. The device carrying the bulk of the layers gets 2.0
+GiB and the other 1.5 GiB unless a selector list overrides them, e.g.
+`cuda:0=4,cuda:1=3.5`. These defaults were calibrated on the measured box: 4.0 GiB refused
+the measured-good 8K MTP-on and 128K points, while 2.0 GiB brackets their measured peaks
+and still refuses 512K/640K at the usable ceiling. Raise them to be more conservative near
+the cliff.
+
+### `KYOJIN_OOM_GUARD_SAFETY_GIB` (default: `0`)
+
+Extra per-device capacity margin on top of the reserve and workspace.
+
+### `KYOJIN_OOM_GUARD_DEVICE_FLOOR` (default: `0`)
+
+Per-device free-memory floor used by the pre-flight guard and by the supervisor when a serve
+script passes it through. Same selector syntax as the reserve. `0` disables the floor.
+
+### `KYOJIN_OOM_GUARD_HOST_FLOOR_GIB` (default: `6`)
+
+Host `MemAvailable` floor used when a unified device is part of the load; the summed GTT
+footprint must fit in `MemAvailable - floor`. `exllamav3/guard.py` uses the same default for its
+external host floor.
+
+### `KYOJIN_OOM_GUARD_USABLE_CEILING_GIB` (default: `113.3`)
+
+Observed usable ceiling of a 118 GiB unified device. The guard caps a unified device's planned
+capacity at this value; the default reserve of 4.5 GiB is already the raw-minus-usable gap, so
+the reserve is not subtracted twice. Raise it only after measuring the actual ceiling.
+
+### `KYOJIN_OOM_GUARD_TOLERANCE_GIB` (default: `0.25`)
+
+Small band by which a byte estimate may exceed capacity before `auto` refuses (the estimator is
+byte accounting, not a measurement).
 
 ### `EXL3_LOAD_ARENA` (default: `1`)
 

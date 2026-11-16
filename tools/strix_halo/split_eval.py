@@ -30,12 +30,14 @@ correctness; per-segment capture is Phase 6).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
 import sys
 import time
-
+from pathlib import Path
+from types import SimpleNamespace
 
 # Kept in sync with exllamav3/serve_split.py:GRAPH_ENV_OFF; the consistency test
 # asserts the key sets match so a new graph flag cannot silently bypass this gate.
@@ -96,6 +98,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--endcaps", choices=("on", "off"), default="on")
     p.add_argument("--part0-reserve-gb", type=float, default=1.2)
     p.add_argument("--part1-reserve-gb", type=float, default=0.0)
+    p.add_argument("--expandable-segments", choices=("auto", "on", "off"), default=None,
+                   help="allocator mode, applied before exllamav3 import "
+                        "(default: KYOJIN_EXPANDABLE_SEGMENTS, else auto)")
+    p.add_argument("--oom-guard", choices=("auto", "warn", "off"), default=None,
+                   help="pre-flight per-device guard (default: KYOJIN_OOM_GUARD, else auto)")
+    p.add_argument("--oom-guard-reserve-gib", default=None,
+                   help="per-device reserve, e.g. gfx1151=4.5,gfx1201=0.8")
+    p.add_argument("--oom-guard-workspace-gib", default=None)
+    p.add_argument("--oom-guard-safety-gib", default=None)
+    p.add_argument("--oom-guard-device-floor", default=None)
     p.add_argument("-c", "--max-ctx", type=int, default=131072)
     p.add_argument("--num-draft", type=int, default=2)
     p.add_argument("--no-vision", action="store_true")
@@ -146,8 +158,31 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _allocator_env_module():
+    """Load the pure-stdlib shared allocator helper without importing exllamav3."""
+    path = Path(__file__).resolve().parents[2] / "exllamav3" / "serve_split.py"
+    spec = importlib.util.spec_from_file_location("_kyojin_allocator_env", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _apply_allocator_env(args: argparse.Namespace) -> str:
+    settings = SimpleNamespace(
+        expandable_segments=(args.expandable_segments
+                             or os.environ.get("KYOJIN_EXPANDABLE_SEGMENTS") or "auto"),
+        part0_reserve_gb=getattr(args, "part0_reserve_gb", 1.2),
+    )
+    return _allocator_env_module().apply_allocator_env(
+        settings, model_dir=args.model, ctx=args.max_ctx,
+        logger=lambda m: print(f"[harness] {m}", flush=True))
+
+
 def configure_env(args: argparse.Namespace) -> None:
     """Set everything exllamav3 reads at import time, before the first import."""
+    _apply_allocator_env(args)
     if args.no_graphs or not args.baseline:
         for k in GRAPH_ENV_OFF:
             os.environ[k] = "0"
@@ -176,6 +211,7 @@ def ids_of(text: str, tokenizer) -> torch.Tensor:
 
 def run_job(gen, job_cls, ids, n: int):
     import torch
+
     from exllamav3.generator.sampler import GreedySampler
     job = job_cls(input_ids = ids, max_new_tokens = n, sampler = GreedySampler(),
                   stop_conditions = gen.model.config.eos_token_id_list)
@@ -373,8 +409,18 @@ def main() -> None:
     configure_env(args)
 
     import torch
-    from exllamav3 import Cache, CacheLayer_quant, Config, Generator, Job, Model, Tokenizer
+
+    from exllamav3 import (
+        Cache,
+        CacheLayer_quant,
+        Config,
+        Generator,
+        Job,
+        Model,
+        Tokenizer,
+    )
     from exllamav3.generator import generator as GM
+    from exllamav3.memory_guard import DeviceBudget
 
     torch.set_grad_enabled(False)
 
@@ -383,7 +429,8 @@ def main() -> None:
     model = Model.from_config(config)
 
     qkw = dict(layer_type = CacheLayer_quant, k_bits = 6, v_bits = 6)
-    from exllamav3.cache.tq import CacheLayer_tq, supported as tq_supported
+    from exllamav3.cache.tq import CacheLayer_tq
+    from exllamav3.cache.tq import supported as tq_supported
     if tq_supported(512, 6):
         qkw = dict(layer_type = CacheLayer_tq, k_bits = 6, v_bits = 6)
     max_history = max(args.num_draft, 1)
@@ -395,10 +442,21 @@ def main() -> None:
     if not args.baseline:
         from exllamav3.device_map import SplitPlan, resolve_devices
         devices = resolve_devices(args.part0_device, args.part1_device)
+        budget = DeviceBudget.from_env(default_mode = "auto")
+        if args.oom_guard:
+            budget.mode = args.oom_guard
+        if args.oom_guard_reserve_gib is not None:
+            budget.reserve = args.oom_guard_reserve_gib
+        if args.oom_guard_workspace_gib is not None:
+            budget.workspace = args.oom_guard_workspace_gib
+        if args.oom_guard_safety_gib is not None:
+            budget.safety = args.oom_guard_safety_gib
+        if args.oom_guard_device_floor is not None:
+            budget.device_floor = args.oom_guard_device_floor
         plan = SplitPlan(
             devices, endcaps = args.endcaps == "on", part0_layers = args.part0_layers,
             part0_reserve_gb = 0.0 if args.no_budget else args.part0_reserve_gb,
-            part1_reserve_gb = args.part1_reserve_gb)
+            part1_reserve_gb = args.part1_reserve_gb, guard_budget = budget)
         plan.add("text", model, config = config, cache = cache, load_order = 0)
         plan.build()
         text_map = plan.map("text")

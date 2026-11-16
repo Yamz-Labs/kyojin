@@ -12,9 +12,13 @@ Usage (from the repo root, after `source tools/strix_halo/env.sh`):
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import resource
+import sys
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 
 def mem_available_gib() -> float:
@@ -25,6 +29,23 @@ def mem_available_gib() -> float:
     except OSError:
         pass
     return 0.0
+
+
+def _apply_allocator_env(args: argparse.Namespace) -> str:
+    """Load the shared allocator helper without importing exllamav3 first."""
+    path = Path(__file__).resolve().parents[2] / "exllamav3" / "serve_split.py"
+    spec = importlib.util.spec_from_file_location("_kyojin_allocator_env", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    settings = SimpleNamespace(
+        expandable_segments=(args.expandable_segments
+                             or os.environ.get("KYOJIN_EXPANDABLE_SEGMENTS") or "auto"),
+        part0_reserve_gb=args.part0_reserve_gb,
+    )
+    return module.apply_allocator_env(settings, model_dir=args.model, ctx=args.cache_size,
+                                      logger=lambda m: print(f"[split_load] {m}", flush=True))
 
 
 def main() -> None:
@@ -39,11 +60,21 @@ def main() -> None:
     p.add_argument("--num-draft", type=int, default=2)
     p.add_argument("--no-vision", action="store_true")
     p.add_argument("--baseline", action="store_true", help="load everything on cuda:0, for the host-RAM comparison")
+    p.add_argument("--expandable-segments", choices=("auto", "on", "off"), default=None)
+    p.add_argument("--oom-guard", choices=("auto", "warn", "off"), default=None)
+    p.add_argument("--oom-guard-reserve-gib", default=None)
+    p.add_argument("--oom-guard-workspace-gib", default=None)
+    p.add_argument("--oom-guard-safety-gib", default=None)
+    p.add_argument("--oom-guard-device-floor", default=None)
     args = p.parse_args()
 
+    _apply_allocator_env(args)
+
     import torch
+
     from exllamav3 import Cache, CacheLayer_quant, Config, Model
     from exllamav3.device_map import SplitPlan, resolve_devices
+    from exllamav3.memory_guard import DeviceBudget
 
     torch.set_grad_enabled(False)
     endcaps = args.endcaps == "on"
@@ -54,7 +85,8 @@ def main() -> None:
 
     # Same cache format as tools/glm/serve.py defaults: TurboQuant 6-bit latent.
     qkw = dict(layer_type=CacheLayer_quant, k_bits=6, v_bits=6)
-    from exllamav3.cache.tq import CacheLayer_tq, supported as tq_supported
+    from exllamav3.cache.tq import CacheLayer_tq
+    from exllamav3.cache.tq import supported as tq_supported
     if tq_supported(512, 6):
         qkw = dict(layer_type=CacheLayer_tq, k_bits=6, v_bits=6)
     max_history = max(args.num_draft, 1)
@@ -83,8 +115,19 @@ def main() -> None:
         return
 
     devices = resolve_devices(args.part0_device, args.part1_device)
+    budget = DeviceBudget.from_env(default_mode="auto")
+    if args.oom_guard:
+        budget.mode = args.oom_guard
+    if args.oom_guard_reserve_gib is not None:
+        budget.reserve = args.oom_guard_reserve_gib
+    if args.oom_guard_workspace_gib is not None:
+        budget.workspace = args.oom_guard_workspace_gib
+    if args.oom_guard_safety_gib is not None:
+        budget.safety = args.oom_guard_safety_gib
+    if args.oom_guard_device_floor is not None:
+        budget.device_floor = args.oom_guard_device_floor
     plan = SplitPlan(devices, endcaps=endcaps, part0_layers=args.part0_layers,
-                     part0_reserve_gb=args.part0_reserve_gb)
+                     part0_reserve_gb=args.part0_reserve_gb, guard_budget=budget)
     plan.add("text", model, config=config, cache=cache, load_order=0)
     plan.build()
     text_map = plan.map("text")

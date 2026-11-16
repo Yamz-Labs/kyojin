@@ -231,6 +231,26 @@ still launch 16 warps and index this buffer by warp id, so a 4-warp buffer gives
 and `eval/ppl.py` still reports the correct 4.2259 on that broken build. Only `bench_mtp.py`
 catches it.
 
+## Unified memory safety
+
+The 128 GB pool reports about 118 GiB to torch, but the practically usable ceiling is
+about **113.3 GiB**; the gap is driver/allocator overhead. Large loads should use the
+pre-flight guard and the external supervisor described in [split.md](split.md#memory-and-capacity):
+
+- `--oom-guard auto` (split default) estimates weights, cache, slab and workspace per
+  device and refuses a load that cannot fit before allocating anything. The workspace
+  default is 2.0 GiB on the bulk device and 1.5 GiB on the other (calibrated on this box). The workspace
+  default is 2.0 GiB on the bulk device and 1.5 GiB on the other (calibrated on this box).
+- `--expandable-segments off` (or `EXL3_EXPANDABLE_SEGMENTS=0`) recovers about 0.5 GiB of
+  allocator fragmentation around a large cache (the 512K GLM case), not capacity.
+- `python exllamav3/guard.py --floor-gib 6 --device-floor-gib 4 --fadvise-dir <model> -- ...`
+  SIGKILLs the child before the host or a device floor is breached and releases page cache.
+  The serve scripts wrap this with `MEMGUARD=auto|1|0`.
+
+Cutoffs observed on GLM: 128K split is the validated long-context point; 640K is refused
+by the pre-flight guard; 768K previously hard-locked the box. Do not probe above 128K with
+MTP on.
+
 ## Build
 
 ```bash

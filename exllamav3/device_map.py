@@ -43,6 +43,15 @@ from dataclasses import dataclass, field
 
 import torch
 
+from .memory_guard import (
+    DeviceBudget,
+    OOMGuard,
+    check_single_device,
+    device_free_bytes,
+    device_total_bytes,
+    host_available_bytes,
+    is_unified_device,
+)
 from .util.arch_list import device_arch
 
 GIB = 1024 ** 3
@@ -395,6 +404,25 @@ def _cache_bytes_by_layer(cache) -> dict[int, int]:
     return out
 
 
+def component_weight_bytes(model, config = None, cache = None) -> tuple[int, int]:
+    """Actual weight and cache bytes of one component (read-only, no allocation)."""
+    stc = getattr(config, "stc", None) if config is not None else None
+    weights = sum(_module_bytes(m, stc) for m in getattr(model, "modules", ())
+                  if not getattr(m, "caps", {}).get("prefer_cpu"))
+    layers = sum(1 for m in getattr(model, "modules", ())
+                 if getattr(m, "layer_idx", None) is not None)
+    return int(weights), int(_cache_bytes_for(cache, layers))
+
+
+def check_single_device_guard(model, config = None, cache = None, device = 0,
+                              budget: DeviceBudget | None = None,
+                              arch: str = "", logger = print):
+    """Pre-flight guard for a single-device load (default mode: warn)."""
+    weights, cache_bytes = component_weight_bytes(model, config, cache)
+    return check_single_device(weights, cache_bytes, device, budget = budget,
+                               arch = arch, logger = logger)
+
+
 # ---------------------------------------------------------------------------------------------------------
 # Component map
 # ---------------------------------------------------------------------------------------------------------
@@ -709,6 +737,7 @@ class SplitPlan:
         part1_reserve_gb: float = 0.0,
         preset: str = "auto",
         auto_cap: int | None = None,
+        guard_budget: DeviceBudget | None = None,
         logger = print,
     ):
         self.devices = devices
@@ -720,6 +749,10 @@ class SplitPlan:
         self.part1_reserve_gb = float(part1_reserve_gb)
         self.preset = (preset or "auto").strip().lower()
         self.auto_cap = None if auto_cap is None else max(0, int(auto_cap))
+        self.guard_budget = guard_budget or DeviceBudget.from_env()
+        self.guard_report = None
+        self._guard_key = None
+        self._module_byte_cache: dict[tuple[int, int], int] = {}
         self.logger = logger
         self.maps: dict[str, ComponentMap] = {}
         self._decls: dict[str, tuple] = {}
@@ -764,6 +797,10 @@ class SplitPlan:
         # A late component (vision/MTP after the target load) must not reset the
         # already-chosen auto-N plan.
         self._built = was_built
+        if was_built:
+            # Check only the components that have not loaded yet; the loaded
+            # target's bytes are already reflected in the device's free memory.
+            self.check_guard()
         return cmap
 
     def register_config(self, config) -> None:
@@ -797,6 +834,7 @@ class SplitPlan:
             )
         self._assign_owner()
         self.apply_policies()
+        self.check_guard()
         self._built = True
         return self
 
@@ -885,6 +923,186 @@ class SplitPlan:
                 out += _module_bytes(m, stc)
         return out
 
+    # -- pre-flight guard --------------------------------------------------
+
+    def _guard_context(self) -> int | None:
+        values = [int(m.cache.max_num_tokens) for m in self.maps.values()
+                  if m.cache is not None
+                  and getattr(m.cache, "max_num_tokens", None) is not None]
+        return max(values) if values else None
+
+    def _guard_infos(self) -> list[DeviceInfo]:
+        infos = list(self.devices.inventory)
+        known = {d.index for d in infos}
+        for index in self._guard_device_ids():
+            if index not in known:
+                arch = self.devices.part0_arch if self.devices.part0 is not None \
+                    and index == self.devices.part0.index else self.devices.part1_arch
+                infos.append(DeviceInfo(index = index, arch = arch or ""))
+        return infos
+
+    def _guard_device_ids(self) -> list[int]:
+        ids = {self.devices.part1.index}
+        if self.devices.part0 is not None:
+            ids.add(self.devices.part0.index)
+        for cmap in self.maps.values():
+            for module in cmap._module_refs:
+                device = cmap.device_for(module)
+                if device.type == "cuda" and device.index is not None:
+                    ids.add(int(device.index))
+        return sorted(ids)
+
+    def _guard_bytes(self, part0_layers: int | None = None,
+                     skip_components: set[str] | None = None) -> tuple[dict[int, int],
+                                                                       dict[int, int],
+                                                                       dict[int, int]]:
+        """Per-device weight, cache and reserve bytes for the current maps."""
+        weights: dict[int, int] = {}
+        cache_bytes: dict[int, int] = {}
+        reserve: dict[int, int] = {}
+        skip = skip_components or set()
+        text = next((m for m in self.maps.values() if m.policy_or_default.kind == "text"), None)
+        saved = None
+        if text is not None and part0_layers is not None:
+            saved = text.part0_layers
+            text.part0_layers = max(0, min(int(part0_layers), text.layer_count))
+        try:
+            for name, cmap in self.maps.items():
+                if name in skip:
+                    continue
+                stc = getattr(cmap.config, "stc", None)
+                for module in cmap._module_refs:
+                    device = cmap.device_for(module)
+                    if device.type == "cuda" and device.index is not None:
+                        key = (id(module), id(stc))
+                        size = self._module_byte_cache.get(key)
+                        if size is None:
+                            size = self._module_byte_cache[key] = _module_bytes(module, stc)
+                        weights[int(device.index)] = weights.get(int(device.index), 0) + size
+                for idx, size in cmap._cache_by_layer.items():
+                    device = self._expected_layer_device(cmap, idx)
+                    if device.type == "cuda" and device.index is not None:
+                        cache_bytes[int(device.index)] = cache_bytes.get(int(device.index), 0) + int(size)
+                for index, size in cmap.reserve_bytes.items():
+                    reserve[int(index)] = reserve.get(int(index), 0) + int(size)
+        finally:
+            if text is not None and saved is not None:
+                text.part0_layers = saved
+        return weights, cache_bytes, reserve
+
+    def _guard_footprints(self, guard: OOMGuard, *, part0_layers: int | None = None,
+                          probe: dict[int, tuple[int | None, int | None]] | None = None,
+                          skip_components: set[str] | None = None,
+                          infos: list[DeviceInfo] | None = None):
+        weights, cache_bytes, reserve = self._guard_bytes(
+            part0_layers = part0_layers, skip_components = skip_components)
+        infos = {d.index: d for d in (infos or self._guard_infos())}
+        out = []
+        for index in self._guard_device_ids():
+            total, free = (probe.get(index, (None, None))
+                           if probe is not None else (None, None))
+            info = infos.get(index)
+            out.append(guard.footprint(
+                index, arch = getattr(info, "arch", "") or "",
+                name = getattr(info, "name", "") or "",
+                total_bytes = total, free_bytes = free,
+                weights_bytes = weights.get(index, 0),
+                cache_bytes = cache_bytes.get(index, 0),
+                reserve_bytes = reserve.get(index, 0),
+            ))
+        return out
+
+    def _guard_probe(self) -> dict[int, tuple[int | None, int | None]]:
+        return {index: (device_total_bytes(index), device_free_bytes(index))
+                for index in self._guard_device_ids()}
+
+    def _largest_guard_n(self, guard: OOMGuard, probe, host_available, infos,
+                         skip_components: set[str]) -> int | None:
+        text = next((m for m in self.maps.values() if m.policy_or_default.kind == "text"), None)
+        if text is None or text.layer_count == 0 or "text" in skip_components:
+            return None
+        # More part0 layers move weight off the constrained unified device; search from
+        # the top so the answer is the largest feasible N, not merely a smaller one.
+        for n in range(text.layer_count, -1, -1):
+            if guard.evaluate(self._guard_footprints(
+                    guard, part0_layers = n, probe = probe,
+                    skip_components = skip_components, infos = infos),
+                    host_available = host_available).ok:
+                return n
+        return None
+
+    def _largest_guard_context(self, report, context: int | None) -> int | None:
+        if not context or context <= 0:
+            return None
+        limits = []
+        for result in report.device_results:
+            fp = result.footprint
+            if result.capacity_bytes is None or fp.cache_bytes <= 0:
+                continue
+            headroom = result.capacity_bytes - (fp.weights_bytes + fp.slab_bytes + fp.workspace_bytes)
+            if headroom < 0:
+                limits.append(0)
+                continue
+            limits.append(int(context * headroom / fp.cache_bytes))
+        host = report.host_result
+        if host is not None and host.capacity_bytes is not None:
+            cache_total = sum(r.footprint.cache_bytes for r in report.device_results
+                              if r.footprint.unified)
+            fixed_total = sum(r.footprint.weights_bytes + r.footprint.slab_bytes
+                              + r.footprint.workspace_bytes for r in report.device_results
+                              if r.footprint.unified)
+            if cache_total > 0:
+                headroom = host.capacity_bytes - fixed_total
+                limits.append(0 if headroom < 0 else
+                              int(context * headroom / cache_total))
+        if not limits:
+            return None
+        return max(0, (min(limits) // 256) * 256)
+
+    def check_guard(self) -> None:
+        """Refuse or warn before any allocation: read-only and idempotent."""
+        if self.guard_budget.mode == "off" or not self.maps:
+            return
+        try:
+            if not torch.cuda.is_available():
+                return
+        except Exception:                                    # noqa: BLE001 - CPU test environment
+            return
+        context = self._guard_context()
+        loaded = {r.component for r in self.records}
+        text = next((m for m in self.maps.values() if m.policy_or_default.kind == "text"), None)
+        chosen_n = text.part0_layers if text is not None else None
+        probe = self._guard_probe()
+        infos = self._guard_infos()
+        arch_of = {d.index: d.arch for d in infos}
+        unified = {index: is_unified_device(index, arch_of.get(index, ""), probe[index][0])
+                   for index in probe}
+        weights, _cache, _reserve = self._guard_bytes(skip_components = loaded)
+        bulk = max(weights, key = weights.get) if weights else self.devices.part1.index
+        guard = OOMGuard.from_budget(
+            self.guard_budget, infos,
+            lambda key: _select_device(key, "oom-guard", infos, "KYOJIN_OOM_GUARD_DEVICE"),
+            unified = unified, bulk_index = bulk, logger = self.logger)
+        key = (tuple(sorted((name, m.part0_layers) for name, m in self.maps.items())),
+               context, tuple(sorted(probe.items())), self.guard_budget.mode,
+               tuple(sorted(loaded)))
+        if key == self._guard_key:
+            return
+        host_available = host_available_bytes()
+        footprints = self._guard_footprints(guard, probe = probe,
+                                            skip_components = loaded, infos = infos)
+        report = guard.evaluate(footprints, host_available = host_available)
+        largest_n = None
+        if not report.ok and text is not None and self.guard_budget.mode != "warn":
+            largest_n = self._largest_guard_n(guard, probe, host_available, infos, loaded)
+            if largest_n is None:
+                largest_n = -1
+        largest_ctx = self._largest_guard_context(report, context) if not report.ok else None
+        self.guard_report = guard.check(
+            footprints, host_available = host_available, context = context,
+            chosen_n = chosen_n, largest_n = largest_n, largest_ctx = largest_ctx)
+        self._guard_key = key
+
     # -- runtime -----------------------------------------------------------
 
     def map(self, component: str) -> ComponentMap | None:
@@ -900,6 +1118,9 @@ class SplitPlan:
         # not allocate a second one.
         if self._budget_engaged_once:
             return
+        # Re-check after late component declarations (split harnesses add MTP/vision
+        # after build); still before the first slab allocation.
+        self.check_guard()
         if self._owner is not None and self._owner in self.maps:
             self.maps[self._owner].engage_budget()
         self._budget_engaged_once = True
