@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from ..util.device_copy import to_device
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
-from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS
+from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS, GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS
 
 
 def _pad_rows(y):
@@ -285,6 +285,12 @@ def _routing_nogroup_torch(cfg, y, params, scores):
 
 
 def routing_std(bsz, cfg, y, params):
+    if (GGUF_ROW_INV["on"] and 2 <= bsz <= GGUF_ROW_INV_MAX_ROWS and y.dim() == 2 and y.shape[0] == bsz
+            and not params.get("activate_all_experts")):
+        # row-invariant few-row mode (GGUF + MTP): the router GEMM of an R-row call picks another kernel than the one-row call, so its
+        # logits differ in the last bits and a near tie flips an expert. One one-row routing per row, the bits of the plain step.
+        outs = [routing_std(1, cfg, y[i:i + 1], params) for i in range(bsz)]
+        return torch.cat([o[0].clone() for o in outs]), torch.cat([o[1].clone() for o in outs])
     if _hip_router_call_supported(bsz, cfg, y, params):
         _prepare_hip_router_gate_t(cfg)
         scores, selected_experts, routing_weights = _hip_router_buffers(cfg, bsz)

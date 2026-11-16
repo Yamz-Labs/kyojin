@@ -3,6 +3,7 @@ import torch
 from torch import nn
 from ...ext import exllamav3_ext as ext
 import os as _os
+from ...util.row_inv import GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS
 _f32_via_f16 = _os.environ.get("EXL3_HIP_F32OUT_VIA_F16", "1") != "0" and bool(torch.version.hip)
 # 33, not 32: a 32-row multi-user verify step must stay on the exact row paths (a 32-row call widens an fp16 GEMM instead)
 _f32_via_f16_min_rows = int(_os.environ.get("EXL3_HIP_F32OUT_VIA_F16_MIN_ROWS", "33"))
@@ -97,6 +98,10 @@ class LinearFP16:
     ) -> torch.Tensor:
         out_shape = x.shape[:-1] + (self.out_features,)
         x = x.view(-1, x.shape[-1])
+        if GGUF_ROW_INV["on"] and 2 <= x.shape[0] <= GGUF_ROW_INV_MAX_ROWS:
+            # row-invariant few-row mode (GGUF + MTP): the dense GEMM of R rows picks another kernel than the one-row call;
+            # one one-row call per row gives every row the bits of the plain step (these projections are tiny: gates, GDN a / b)
+            return torch.cat([self.forward(x[i:i + 1], params, out_dtype) for i in range(x.shape[0])]).view(out_shape)
         dtype = out_dtype or self.out_dtype or torch.half
         y = torch.empty(
             (x.shape[0], self.out_features),
