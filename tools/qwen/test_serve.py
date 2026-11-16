@@ -951,6 +951,77 @@ class MiscTests(unittest.TestCase):
         self.assertEqual(serve._partial_tag("abc", ["</think>"]), 0)
 
 
+class MetricsTests(unittest.TestCase):
+    """GET /metrics: the shared llama.cpp-style collector, fed by the worker when a request completes."""
+    DRAFT_STATS = {"new_tokens": 7, "prompt_tokens": 11, "cached_tokens": 5, "eos_reason": "stop_token",
+                   "time_prefill": 0.5, "time_generate": 1.0, "token_ids": [1, 2, 3],
+                   "accepted_draft_tokens": 4, "rejected_draft_tokens": 2}
+    CHAT = ("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "one two three four"}]})
+
+    @staticmethod
+    def scrape(engine, posts=(), method="GET"):
+        async def fn(client):
+            statuses = [(await client.post(path, json=body)).status for path, body in posts]
+            resp = await client.request(method, "/metrics")
+            return statuses, resp.status, resp.headers["Content-Type"], await resp.text()
+        return with_client(engine, fn)
+
+    @staticmethod
+    def samples(text):
+        return {line.split()[0]: float(line.split()[1]) for line in text.splitlines() if line and not line.startswith("#")}
+
+    def test_endpoint_reports_a_finished_request(self):
+        import serve_metrics
+        statuses, status, ctype, text = self.scrape(FakeEngine("hello there", dict(self.DRAFT_STATS)), [self.CHAT])
+        self.assertEqual((statuses, status), ([200], 200))
+        self.assertEqual(ctype, "text/plain; version=0.0.4; charset=utf-8")
+        for name, mtype, _ in serve_metrics.METRICS:
+            self.assertIn(f"# HELP {name} ", text)
+            self.assertIn(f"# TYPE {name} {mtype}", text)
+        v = self.samples(text)
+        # 7 new tokens, 4 of them accepted drafts: 3 verification rounds; 4 accepted + 2 rejected = 6 proposed
+        serve_metrics.assert_reported(v, self, prompt_tokens=11, cached=5, predicted=7, prefill_s=0.5, generate_s=1.0,
+                                      drafts=3, draft_tokens=6, accepted=4)
+        self.assertEqual(v["llamacpp:requests_processing"], 0)
+        self.assertEqual(v["llamacpp:requests_deferred"], 0)
+        self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0)
+
+    def test_every_generation_route_is_counted(self):
+        posts = [self.CHAT, ("/completion", {"prompt": "hi"}), ("/v1/completions", {"model": "m", "prompt": "hi"})]
+        statuses, _, _, text = self.scrape(FakeEngine("hello there", dict(self.DRAFT_STATS)), posts)
+        self.assertEqual(statuses, [200, 200, 200])
+        v = self.samples(text)
+        self.assertEqual(v["llamacpp:tokens_predicted_total"], 21)
+        self.assertEqual(v["llamacpp:prompt_tokens_total"], 33)
+        self.assertEqual(v["llamacpp:prompt_tokens_cached_total"], 15)
+        self.assertEqual(v["llamacpp:spec_decode_num_drafts_total"], 9)
+        self.assertEqual(v["llamacpp:spec_decode_num_draft_tokens_total"], 18)
+        self.assertEqual(v["llamacpp:spec_decode_num_accepted_tokens_total"], 12)
+
+    def test_request_that_drafted_nothing_adds_no_rounds(self):
+        _, _, _, text = self.scrape(FakeEngine("hello there"), [self.CHAT])    # the default stats carry no draft counts
+        v = self.samples(text)
+        self.assertEqual(v["llamacpp:tokens_predicted_total"], 7)
+        self.assertEqual(v["llamacpp:spec_decode_num_drafts_total"], 0)
+        self.assertEqual(v["llamacpp:spec_decode_num_draft_tokens_total"], 0)
+
+    def test_idle_server_reports_zeros(self):
+        statuses, status, _, text = self.scrape(FakeEngine("x"))
+        self.assertEqual((statuses, status), ([], 200))
+        self.assertEqual(set(self.samples(text).values()), {0.0})
+
+    def test_kv_cache_usage_comes_from_the_generator(self):
+        engine = FakeEngine("x")
+        engine.generator = types.SimpleNamespace(get_cache_stats=lambda: {"used_tokens": 512, "max_tokens": 4096})
+        self.assertEqual(self.samples(self.scrape(engine)[3])["llamacpp:kv_cache_usage_ratio"], 0.125)
+
+    def test_wrong_method_answers_405_in_json(self):
+        _, status, ctype, text = self.scrape(FakeEngine("x"), method="POST")
+        self.assertEqual(status, 405)
+        self.assertTrue(ctype.startswith("application/json"))
+        self.assertEqual(json.loads(text)["error"]["code"], 405)
+
+
 class ServeEnvDefaultsTest(unittest.TestCase):
     def test_prefill_set_is_default_and_overridable(self):
         d = dict(serve.SERVE_ENV)
