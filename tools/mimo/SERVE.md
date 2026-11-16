@@ -59,7 +59,9 @@ top-level config does not carry `max_position_embeddings` — the GLM fix.
   `kv_cache_usage_ratio` are read live. `spec_decode_num_drafts_total` counts the engine's
   decode steps (one verification round each while speculating), an upper bound when
   `--spec-gate` falls back to plain. A request cancelled mid-stream is not counted in this
-  first version.
+  first version. The `kyojin:*` metrics (request count, failures, queue time, version, server and model, sessions,
+  context, cache token counts, device memory) are the same on every server: see `GET /metrics` in
+  `tools/glm/SERVE.md`.
 
 ## Diagnostics: the request log
 

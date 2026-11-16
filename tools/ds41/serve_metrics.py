@@ -4,8 +4,16 @@
 Counters accumulate when a request completes (the HTTP layer observes the engine's eos stats);
 the gauges requests_processing, requests_deferred and kv_cache_usage_ratio are read live at scrape.
 All mutation happens on the server's event loop, so no locking is needed.
+
+The kyojin:* metrics have no llama.cpp counterpart: the request count, failures and queue time, what the
+server is (version, server, model, sessions, context) and, read live at scrape, the cache's token counts
+and the device memory. A value a server does not pass is left out of the body.
 """
 from __future__ import annotations
+
+import re
+import time
+from pathlib import Path
 
 # (name, type, help) in the order the /metrics body renders them.
 METRICS = [
@@ -24,17 +32,73 @@ METRICS = [
     ("llamacpp:requests_deferred", "gauge", "Number of requests waiting for a session"),
     ("llamacpp:kv_cache_usage_ratio", "gauge",
      "In-flight prompt and generated tokens over sessions times context; excludes retained cache"),
+    ("kyojin:requests_total", "counter", "Finished requests"),
+    ("kyojin:requests_failed_total", "counter", "Requests that ended in an engine error"),
+    ("kyojin:queue_seconds_total", "counter", "Time the finished requests waited for a session"),
+    ("kyojin:start_time_seconds", "gauge", "Unix time the server began to serve, after the model loaded"),
 ]
+
+# Rendered only when the server passes the value: (name, type, help).
+OPTIONAL = [
+    ("kyojin:sessions", "gauge", "Requests the server runs at once"),
+    ("kyojin:context_tokens", "gauge", "Context length of one session in tokens"),
+    ("kyojin:kv_cache_max_tokens", "gauge", "Capacity of the paged KV cache in tokens"),
+    ("kyojin:kv_cache_used_tokens", "gauge", "Tokens in pages referenced by running requests"),
+    ("kyojin:kv_cache_free_tokens", "gauge", "Tokens in unreferenced pages that hold no reusable content"),
+    ("kyojin:prompt_cache_tokens", "gauge", "Tokens in pages a later request can reuse (the prompt cache)"),
+    ("kyojin:gpu_memory_allocated_bytes", "gauge", "Device memory held by tensors of this process"),
+    ("kyojin:gpu_memory_reserved_bytes", "gauge", "Device memory reserved by the allocator of this process"),
+    ("kyojin:gpu_memory_free_bytes", "gauge", "Free device memory, all processes"),
+    ("kyojin:gpu_memory_total_bytes", "gauge", "Total device memory"),
+]
+INFO = ("kyojin:info", "gauge", "Constant 1; the labels name the Kyojin version, the server and the model")
+# get_cache_stats() key and gpu_memory() key of each live OPTIONAL gauge
+CACHE_KEYS = {"kyojin:kv_cache_max_tokens": "max_tokens", "kyojin:kv_cache_used_tokens": "used_tokens",
+              "kyojin:kv_cache_free_tokens": "free_tokens", "kyojin:prompt_cache_tokens": "cached_tokens"}
+GPU_KEYS = {"kyojin:gpu_memory_allocated_bytes": "allocated", "kyojin:gpu_memory_reserved_bytes": "reserved",
+            "kyojin:gpu_memory_free_bytes": "free", "kyojin:gpu_memory_total_bytes": "total"}
 
 
 def fmt(v: float) -> str:
     return str(int(v)) if float(v).is_integer() else f"{v:.6f}"
 
 
+def kyojin_version() -> str:
+    """The version in exllamav3/version.py, read as text: importing the package would load the extension."""
+    try:
+        text = (Path(__file__).resolve().parents[2] / "exllamav3" / "version.py").read_text()
+        return re.search(r'__version__\s*=\s*"([^"]+)"', text).group(1)
+    except Exception:                                            # noqa: BLE001
+        return "unknown"
+
+
+def gpu_memory(torch) -> dict | None:
+    """Device memory for render(gpu=...): the allocator counters of this process and the device's free and total
+    bytes. None without torch or without a device (fake engines in tests)."""
+    try:
+        free, total = torch.cuda.mem_get_info()
+        return {"allocated": torch.cuda.memory_allocated(), "reserved": torch.cuda.memory_reserved(),
+                "free": free, "total": total}
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
+def label(value) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
 class Metrics:
     """Counters plus the last request's speeds, observed from the engine's eos event."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, server: str | None = None, model: str | None = None,
+                 sessions: int | None = None, context: int | None = None) -> None:
+        self.info = {"version": kyojin_version(), **({"server": server} if server else {}),
+                     **({"model": model} if model else {})}
+        self.sessions, self.context = sessions, context
+        self.start_time = time.time()
+        self.requests_total = 0.0
+        self.requests_failed_total = 0.0
+        self.queue_seconds_total = 0.0
         self.prompt_tokens_total = 0.0
         self.prompt_cached_total = 0.0
         self.prompt_seconds_total = 0.0
@@ -49,7 +113,9 @@ class Metrics:
 
     def observe(self, *, prompt_tokens: int, cached: int, predicted: int,
                 prefill_s: float, generate_s: float,
-                drafts: int = 0, draft_tokens: int = 0, accepted: int = 0) -> None:
+                drafts: int = 0, draft_tokens: int = 0, accepted: int = 0, queue_s: float = 0.0) -> None:
+        self.requests_total += 1
+        self.queue_seconds_total += queue_s
         self.prompt_tokens_total += prompt_tokens
         self.prompt_cached_total += cached
         self.prompt_seconds_total += prefill_s
@@ -64,7 +130,13 @@ class Metrics:
         if generate_s:
             self.predicted_tokens_seconds = predicted / generate_s
 
-    def render(self, *, processing: int, deferred: int, kv_ratio: float) -> bytes:
+    def failed(self) -> None:
+        """A request that ended in an engine error (it is not observed, so it is not in requests_total)."""
+        self.requests_failed_total += 1
+
+    def render(self, *, processing: int, deferred: int, kv_ratio: float,
+               cache: dict | None = None, gpu: dict | None = None) -> bytes:
+        """`cache` is the generator's get_cache_stats(), `gpu` is gpu_memory(): both read by the server at scrape."""
         values = {
             "llamacpp:prompt_tokens_total": self.prompt_tokens_total,
             "llamacpp:prompt_tokens_cached_total": self.prompt_cached_total,
@@ -80,10 +152,22 @@ class Metrics:
             "llamacpp:requests_processing": processing,
             "llamacpp:requests_deferred": deferred,
             "llamacpp:kv_cache_usage_ratio": kv_ratio,
+            "kyojin:requests_total": self.requests_total,
+            "kyojin:requests_failed_total": self.requests_failed_total,
+            "kyojin:queue_seconds_total": self.queue_seconds_total,
+            "kyojin:start_time_seconds": self.start_time,
+            "kyojin:sessions": self.sessions,
+            "kyojin:context_tokens": self.context,
+            **{name: (cache or {}).get(key) for name, key in CACHE_KEYS.items()},
+            **{name: (gpu or {}).get(key) for name, key in GPU_KEYS.items()},
         }
         out = []
-        for name, mtype, help_text in METRICS:
-            out.append(f"# HELP {name} {help_text}\n# TYPE {name} {mtype}\n{name} {fmt(values[name])}\n")
+        for name, mtype, help_text in METRICS + OPTIONAL:
+            if values[name] is not None:
+                out.append(f"# HELP {name} {help_text}\n# TYPE {name} {mtype}\n{name} {fmt(values[name])}\n")
+        name, mtype, help_text = INFO
+        labels = ",".join(f'{k}="{label(v)}"' for k, v in self.info.items())
+        out.append(f"# HELP {name} {help_text}\n# TYPE {name} {mtype}\n{name}{{{labels}}} 1\n")
         return "".join(out).encode()
 
 
