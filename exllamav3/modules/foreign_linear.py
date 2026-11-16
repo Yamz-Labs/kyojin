@@ -27,7 +27,7 @@ from ..foreign_quant.gap_formats import dequant as gap_dequant
 from ..foreign_quant import triton_iq
 from ..foreign_quant import triton_gap
 from ..foreign_quant import triton_rows
-from ..util.row_inv import GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS
+from ..util.row_inv import GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS, gguf_ri
 _ROWS_TRITON = os.environ.get("BOLT_FQ_ROWS_TRITON", "1") != "0"
 # Q8_0 rows 2..16 on CUDA: the Triton _rows_q8_0 kernel (tuned on Strix Halo) takes 172 us per launch on the 3090 (330 launches per step = 57 ms of an
 # 87 ms N8 step on the 35B-A3B UD-Q4_K_XL, 75 % of device time); the C++ q8_1 GEMV (fq_gemv_q8_0) takes 70-80 us. HIP keeps the Triton kernel.
@@ -280,7 +280,7 @@ class ForeignLinear(Module):
         if not flat.is_contiguous():
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
-        ri = GGUF_ROW_INV["on"] and 2 <= R <= GGUF_ROW_INV_MAX_ROWS   # row-invariant mode: every row gets the bits of the one-row launch
+        ri = gguf_ri("fl") and 2 <= R <= GGUF_ROW_INV_MAX_ROWS   # row-invariant mode: every row gets the bits of the one-row launch
         if (_MMQ_FEW and not ri and self.format in _MMQ_FEW_FMT and _MMQ_FEW_MINR[self.format] <= R <= 24 and flat.dtype == torch.half
                 and K % 256 == 0 and K >= 2048 and hasattr(ext, "fq_mmq_few")
                 and (self.format not in _MMQ_FEW_CAPTURE_ONLY or torch.cuda.is_current_stream_capturing())):

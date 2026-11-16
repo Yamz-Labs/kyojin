@@ -21,7 +21,7 @@ from ..util import profile_opt
 from ..util.knobs import knob_on
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .quant.exl3 import dec_workspace
-from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices, GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS
+from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices, GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS, gguf_ri
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
@@ -2526,7 +2526,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
-        if GGUF_ROW_INV["on"] and not params.get("autosplit_measure") and \
+        if gguf_ri("moe") and not params.get("autosplit_measure") and \
                 2 <= x.numel() // x.shape[-1] <= GGUF_ROW_INV_MAX_ROWS and self._gguf_experts():
             return self._forward_rows_single(x, params, out_dtype)
 

@@ -11,6 +11,7 @@ from .quant.exl3 import MAX_BSZN_GEMV_R, row_pad_pitch
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt, knobs
+from ..util.row_inv import gguf_ri
 import os
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
@@ -1467,7 +1468,7 @@ class Attention(Module):
                 tq_batch = bool(getattr(_lyr, "tq", False))
             if (
                 1 < seqlen <= MAX_BSZN_GEMV_R and non_causal_spans is None and not tq_batch and
-                knobs.knob_on("EXL3_VERIFY_ATTN_LOOP", "0")
+                (knobs.knob_on("EXL3_VERIFY_ATTN_LOOP", "0") or gguf_ri("attn"))
             ):
                 # Row-invariant verify: the R-row paged decode tiles the KV span from the batch's single
                 # cache_seqlens/q_len, a different float order than R batch-1 calls. Run the exact
@@ -1608,7 +1609,7 @@ class Attention(Module):
                 if max_kv_len is None and seqlen > 16 and not torch.version.hip:
                     max_kv_len = int(params["cache_seqlens"][sl].max())
                 # EXL3_VERIFY_ATTN_LOOP: the R-row paged decode as R one-row calls, as decode_flash_attn does
-                rows = range(seqlen) if 1 < seqlen <= MAX_BSZN_GEMV_R and knobs.knob_on("EXL3_VERIFY_ATTN_LOOP", "0") else None
+                rows = range(seqlen) if 1 < seqlen <= MAX_BSZN_GEMV_R and (knobs.knob_on("EXL3_VERIFY_ATTN_LOOP", "0") or gguf_ri("attn")) else None
                 def call(qq, kk, vv, cs):
                     return attn_dispatch(
                         q = qq, k = kk, v = vv,

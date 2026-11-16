@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from ..util.device_copy import to_device
 from ..ext import exllamav3_ext as ext
 from ..util.tensor import g_tensor_cache
-from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS, GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS
+from ..util.row_inv import ROW_INV, ROW_INV_MAX_ROWS, GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS, gguf_ri
 
 
 def _pad_rows(y):
@@ -285,7 +285,7 @@ def _routing_nogroup_torch(cfg, y, params, scores):
 
 
 def routing_std(bsz, cfg, y, params):
-    if (GGUF_ROW_INV["on"] and 2 <= bsz <= GGUF_ROW_INV_MAX_ROWS and y.dim() == 2 and y.shape[0] == bsz
+    if (gguf_ri("router") and 2 <= bsz <= GGUF_ROW_INV_MAX_ROWS and y.dim() == 2 and y.shape[0] == bsz
             and not params.get("activate_all_experts")):
         # row-invariant few-row mode (GGUF + MTP): the router GEMM of an R-row call picks another kernel than the one-row call, so its
         # logits differ in the last bits and a near tie flips an expert. One one-row routing per row, the bits of the plain step.

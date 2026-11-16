@@ -2590,6 +2590,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.gguf_mtp:
         os.environ["KYO_GGUF_MTP"] = os.path.abspath(os.path.expanduser(args.gguf_mtp))
+        os.environ.setdefault("EXL3_GDN_RS_REG_GDN", "0")   # GDN state of verify rows rounded to bf16 like the plain step
         os.environ.setdefault("EXL3_GGUF_ROW_INV", "1")   # greedy verify rows = the one-row step's bits (util/row_inv.py GGUF_ROW_INV)
     if args.ngram_ram:
         os.environ["EXL3_NGRAM_STREAM"] = "0"
