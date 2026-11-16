@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # check_all.sh: one command to validate a DS4.1 tree. ~6 min CPU stage (parallel), + GPU smoke when BOX=1.
-#   BOX=1   also run tools/ds41/smoke_pack.py on the synthetic pack through ~/ds41_work/bin/gpurun (one window)
+#   BOX=1   also run tools/ds41/smoke_pack.py on the synthetic pack through $DS41_WORK/bin/gpurun (one window)
 #   FAST=1  skip the files that take > 60 s (dspark_sampling, ds41_model, e2e, serving, spec, stream, dspark_official)
 #   JOBS=8  parallel pytest files      PACK=...  synthetic pack dir      OUT=dir  logs (default $ROOT/.check_logs)
 # Traps handled here:
@@ -10,7 +10,7 @@
 #  - gpurun's quiet.sh freezes (SIGSTOP) agent CPU jobs during any GPU window: wall times of the CPU stage inflate then.
 set -u
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-H=${H:-$HOME/ds41_work}
+H=${H:-${DS41_WORK:-./ds41_work}}
 EXT_SRC=${EXT_SRC:-$H/ds41box/mk}
 PACK=${PACK:-$H/ds41box/pack3}
 JOBS=${JOBS:-8}

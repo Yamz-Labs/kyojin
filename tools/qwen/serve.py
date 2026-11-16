@@ -662,6 +662,10 @@ SERVE_ENV = (("EXL3_HOST_LEAN", "1"), ("EXL3_HOST_CUTS", "1"),   # batched verif
 # "96000:0.45,0.2,4,0.8,0.6" (spec_policy.py) is the matching cap. EXL3_DRAFT_VOCAB=0 and QWSPEC_* set in the environment win.
 # SERVE_ENV entries tuned on gfx1151 for conversation resume and HIP kernels, not validated on NVIDIA (the 3090 numbers were
 # measured without them): CUDA starts without them, the environment still wins.
+# HIP (gfx1151) values for GGUF models that differ from SERVE_ENV: 8192-row prefill chunks (Strix served A/B, Qwen3.8-Flash-Next
+# UD-Q4_K_XL GGUF: 8K prefill 19.0 -> 15.0 and 17.5 -> 13.2 s vs 2048, N1 md5 identical). Not for EXL3 packs: the same model in EXL3
+# prefills slower at 8192 than at 4096 (6.67-6.79 s vs 7.99 s), so they keep SERVE_ENV's 4096.
+HIP_GGUF_SERVE_ENV_OVERRIDE = {"EXL3_PREFILL_CHUNK": "8192"}
 HIP_ONLY_SERVE_ENV = frozenset(("EXL3_BRANCH_CKPT", "EXL3_GDN_HF", "EXL3_MOE_WMMA_MIN_ROWS", "EXL3_NC2_ABLIT_F16", "EXL3_NC2_ASYNC_STASH",
                                 "EXL3_NC2_ATTN_F16", "EXL3_GEMV_R_WIDE8", "EXL3_REPLY_FIRST", "EXL3_TAIL_DENSE", "EXL3_TAIL_MAXGAP",
                                 "EXL3_TAIL_REPLY", "EXL3_TAIL_SUB", "EXL3_TOPK_PAR"))
@@ -780,17 +784,18 @@ class QwenEngine:
         # set before importing exllamav3. The caller's environment wins.
         import torch
         on_cuda = bool(torch.version.cuda and not torch.version.hip)
+        gguf = os.path.isdir(model_path) and any(f.endswith(".gguf") for f in os.listdir(model_path))
         for k, v in SERVE_ENV:
             if on_cuda and k in HIP_ONLY_SERVE_ENV:
                 continue
-            os.environ.setdefault(k, v)
+            os.environ.setdefault(k, HIP_GGUF_SERVE_ENV_OVERRIDE.get(k, v) if gguf and not on_cuda else v)
         check_latched_env()
         print("qserve:", configure_hc_sidecar(model_path), flush=True)
         print("qserve:", configure_draft2s(model_path), flush=True)
         if on_cuda:
             for k, v in CUDA_SERVE_ENV:
                 os.environ.setdefault(k, v)
-            if sessions > 1:   # one graph per (jobs, rows) shape of the batched step; the LRU holds the 4 x 8 shapes
+            if sessions > 1:   # one graph per (jobs, rows) shape of the batched step; the LRU holds the 8 x 4 shapes (jobs x rows)
                 os.environ.setdefault("EXL3_CUDA_GRAPH_MULTI", "1")
                 os.environ.setdefault("EXL3_CUDA_GRAPH_MAX", "32")
                 # several users: a big prompt prefills in 768-row steps beside the decoding users, which decode between two of its
@@ -799,6 +804,10 @@ class QwenEngine:
                 os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
                 os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
                 os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
+                # decode-priority chunk of 0.4 s of the leader's own s/row instead of 1.5 s (RTX 3090, 27B, 2 sessions, a short request
+                # beside a ~90K-token prompt): the short stream decodes at 56-64 tok/s instead of 21-25, the long prompt's first token is
+                # unchanged (94-95 s); 0.2 s gives the same as 0.4
+                os.environ.setdefault("EXL3_CIL_DPRIO_CHUNK_S", "0.4")
         if sessions > 1 and not on_cuda:   # speculative rounds of N requests verify N * (depth + 1) rows: cap the depth so they stay in one 8-row forward
             # (NVIDIA keeps the spec_policy default: a 16-row budget for a dense model, no cap for a MoE model)
             os.environ.setdefault("QWSPEC_LOAD_ROWS", os.environ.get("EXL3_ROW_INV_GROUP_ROWS") or "8")
@@ -812,6 +821,10 @@ class QwenEngine:
                 os.environ.setdefault("EXL3_SCHED_CHUNK_IL", "1")
                 os.environ.setdefault("EXL3_CIL_DECODE_PRIO", "1")
                 os.environ.setdefault("EXL3_CIL_SLICE_S", "0.35")
+                # decode-priority chunk of 0.4 s instead of 1.5 s, as on CUDA (gfx1151, Qwen3.8 Flash-Next EXL3, 8 sessions, a short
+                # request beside a ~90K-token prompt): the short stream decodes at 28-30 tok/s instead of 14-15, the long prompt's
+                # first token 81.3 / 84.1 s instead of 81.2 / 81.5 s
+                os.environ.setdefault("EXL3_CIL_DPRIO_CHUNK_S", "0.4")
         from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
         torch.set_grad_enabled(False)
         self.torch, self.Generator, self.Job = torch, Generator, Job
@@ -848,7 +861,14 @@ class QwenEngine:
             else:
                 print(f"qserve: kv-mode tq: k{k_bits}v{v_bits} at head_dim {hd} has no TurboQuant codebook, keeping the quant cache", flush=True)
         # one recurrent (GDN) slot per session; the Generator caps its batch at the slot count
-        self.cache = Cache(self.model, max_num_tokens=ctx, max_history=max(3, ndt), max_batch_size=sessions, **qkw)
+        # Recurrent (GDN) state history rows exist only for speculative verify rounds (draft_tokens is not None). Each row costs
+        # sessions x 32 x 128 x 128 x 4 B = 0.5 MiB per session and layer: ndt 7 on the 35B-A3B (30 GDN layers, 8 sessions) is 3.75 GiB
+        # of fp32 state, which is what made the UD-Q4_K_XL GGUF (20.3 GiB of weights on the GPU) miss a 24 GB card. Without a drafter
+        # and without the plain lookup nothing writes history: keep the committed-state row only.
+        hist = max(3, ndt) if (draft_policy != "off" or pl is not None) else 0
+        if os.environ.get("KYO_GDN_HISTORY"):   # A/B override
+            hist = int(os.environ["KYO_GDN_HISTORY"])
+        self.cache = Cache(self.model, max_num_tokens=ctx, max_history=hist, max_batch_size=sessions, **qkw)
         if qkw.get("layer_type") is not None and getattr(qkw["layer_type"], "tq", False):
             from exllamav3.cache.tq import cache_is_tq
             if not cache_is_tq(self.cache):

@@ -2,7 +2,7 @@
 
 Device time comes from a HIP graph of N back-to-back launches (so the ~30 us ctypes launch cost of the python wrapper is not in
 the number); the torch reference is timed the same way where it is capturable, else wall clock of an eager loop (flagged).
-    flock ~/ds41_work/gpu.lock python tools/ds41kern/bench_hipk.py          (<= 20 min window, see tools/ds41kern/gpu_window.sh)
+    flock $DS41_WORK/gpu.lock python tools/ds41kern/bench_hipk.py          (<= 20 min window, see tools/ds41kern/gpu_window.sh)
     DSV41_DEVICE=emu python tools/ds41kern/bench_hipk.py --smoke                  (CPU emulation, one launch each, no timing)
 """
 import argparse, os, sys, time

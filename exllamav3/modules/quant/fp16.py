@@ -23,6 +23,11 @@ def _skinny_rows_ok(rows: int, n: int) -> bool:
 from ...util.tensor import to2
 from ...util import first_not_none
 
+def _f16gemv_ok(R, K, N):
+    from ...foreign_quant import triton_f16gemv
+    return triton_f16gemv.supported(R, K, N)
+
+
 class LinearFP16:
 
     quant_type: str = "fp16"
@@ -108,7 +113,12 @@ class LinearFP16:
             from ...util.tensor import g_tensor_cache
             weight = g_tensor_cache.get_bucketed(x.device, pinned.numel(), pinned.dtype, "fp16_pin_stage").view(pinned.shape)
             weight.copy_(pinned, non_blocking = True)
-        if (_hip and x.dtype == torch.half and dtype == torch.half and x.shape[0] >= 256
+        if (_hip and x.dtype == torch.half and dtype == torch.half and pinned is None and weight.is_contiguous()
+                and _f16gemv_ok(x.shape[0], x.shape[1], self.out_features)):
+            # decode rows on ROCm: Triton GEMV instead of hipBLAS (small / medium N run far under the read roof there)
+            from ...foreign_quant import triton_f16gemv
+            triton_f16gemv.gemv(x.contiguous(), weight, y)
+        elif (_hip and x.dtype == torch.half and dtype == torch.half and x.shape[0] >= 256
                 and _os.environ.get("EXL3_DENSE_GEMM_TUNE", "1") != "0"
                 and weight.is_contiguous() and x.is_contiguous()):
             # prefill: ext.hgemm's tuned rocBLAS path (see hgemm.cu dtune); torch's hipBLASLt

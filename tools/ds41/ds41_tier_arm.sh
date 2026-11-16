@@ -2,7 +2,7 @@
 # usage: [DS41_BUDGET_GIB=.. (or DS41_BUDGET_MINUS=N: MemAvailable-N) DS41_WARM=.. DS41_CHUNK=.. EXL3_EXPERT_READERS=.. EXL3_EXPERT_RING=..] ds41_tier_arm.sh ARM [lens]
 # Re-executes itself under gpurun so MemAvailable (and the tier budget) is read after the GPU ticket is granted.
 set -u
-H=${H:-$HOME/ds41_work}
+H=${H:-${DS41_WORK:-./ds41_work}}
 if [ -z "${DS41_INTICKET:-}" ]; then
   DS41_INTICKET=1 exec "$H/bin/gpurun" --need "${DS41_NEED_GB:-20}" --who ${DS41_WHO:-ds41pfov} bash "${BASH_SOURCE[0]}" "$@"
 fi

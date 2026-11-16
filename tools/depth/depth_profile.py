@@ -16,7 +16,7 @@ scales for quantized pages), then for each depth D:
 Output JSON is rewritten after every depth, so a crash keeps what finished. Decode is content independent
 except top-k selection (random keys give the realistic score spread of a long document).
 The speculative drafter is NOT loaded: spec-off and verify are the target model's cost; MTP acceptance is content.
-Run inside:  flock ~/ds41_work/gpu.lock ~/ds41_work/cur1510/quiet.sh ...  (needs ~110 GiB free for GLM).
+Run inside:  flock $DS41_WORK/gpu.lock $DS41_WORK/cur1510/quiet.sh ...  (needs ~110 GiB free for GLM).
 """
 import argparse, ast, collections, hashlib, json, os, sys, time
 

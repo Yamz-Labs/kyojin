@@ -1,6 +1,7 @@
 #!/bin/bash
 # run_ab.sh: ONE server life, interleaved in-process A/B (ab_inproc.py). All settings come from the environment:
-#   AB_LOCK    3090 | igpu | none           (3090: rtx1/gpu3090.lock + wait for an empty card; igpu: strix-bench/gpu.lock then strixfix/kigpu.lock)
+#   AB_LOCK    3090 | igpu | none           (3090: flock AB_LOCK_3090, default /tmp/gpu3090.lock, + wait for an empty card;
+#                                            igpu: flock AB_LOCK_IGPU, default /tmp/igpu.lock)
 #   AB_TREE    checkout that has tools/ab and /admin/knobs (tools/harn commits)      AB_PY  python of that tree's venv
 #   AB_SERVER  server command after the python, e.g. "tools/qwen/serve.py --model M --port 8671 ..." (--admin-knobs is appended)
 #   AB_PORT    port of that server              AB_OUT  prefix for AB_OUT.srv.log / .ab.txt / .json
@@ -8,9 +9,9 @@
 # Extra environment (EXL3_*, PYTHONPATH...) passes through to the server. Kills only the server it started, by PID.
 : "${AB_LOCK:=none}" "${AB_TREE:?}" "${AB_PY:?}" "${AB_SERVER:?}" "${AB_PORT:?}" "${AB_OUT:?}" "${AB_ARGS:?}"
 case $AB_LOCK in
-  3090) exec 9>$HOME/hermes-work/rtx1/gpu3090.lock; flock -w 28800 9 || { echo "lockfail"; exit 1; }
+  3090) exec 9>"${AB_LOCK_3090:-/tmp/gpu3090.lock}"; flock -w 28800 9 || { echo "lockfail"; exit 1; }
         for w in $(seq 120); do [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)" -le 2000 ] && break; sleep 3; done ;;
-  igpu) exec 8>$HOME/strix-bench/gpu.lock; flock -w 28800 8 || exit 1; exec 7>$HOME/hermes-work/strixfix/kigpu.lock; flock -w 28800 7 || exit 1 ;;
+  igpu) exec 8>"${AB_LOCK_IGPU:-/tmp/igpu.lock}"; flock -w 28800 8 || exit 1 ;;
 esac
 cd "$AB_TREE" || exit 1
 export PYTHONPATH=$AB_TREE PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 TQDM_DISABLE=1

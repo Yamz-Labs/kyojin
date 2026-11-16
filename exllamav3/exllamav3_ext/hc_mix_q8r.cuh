@@ -39,6 +39,21 @@
 #ifndef GRR_FIN_UNROLL
 #define GRR_FIN_UNROLL 1
 #endif
+// Dots: preload a thread's weight words (H x GRR_PF_C columns x JT rows) before the math when D / 8 <=
+// GRR_PF_C * GR_THREADS_A and the register cost H * GRR_PF_C * JT int2 stays <= 32. Bit-identical.
+#ifndef GRR_DOTS_PF
+#define GRR_DOTS_PF 1
+#endif
+#ifndef GRR_PF_C
+#define GRR_PF_C 3
+#endif
+// Finalize: preload a lane's up words (GRR_FIN_PF_I rank steps x H) when LR <= 32 * GRR_FIN_PF_I. Bit-identical.
+#ifndef GRR_FIN_PF
+#define GRR_FIN_PF 1
+#endif
+#ifndef GRR_FIN_PF_I
+#define GRR_FIN_PF_I 10
+#endif
 template <int RT> struct GrrJ { static constexpr int v = RT == 1 ? GRR_J1 : RT == 2 ? GRR_J2 : RT == 3 ? GRR_J3 : GRR_J4; };
 
 template <int H, int RT, int JT>
@@ -64,6 +79,24 @@ void gr_dots_q8r_kernel
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
 
+    constexpr int PF_C = (GRR_DOTS_PF && H * GRR_PF_C * JT <= 32) ? GRR_PF_C : 1;
+    const bool pf = PF_C > 1 && !sq && !gs && D4 / 2 <= PF_C * GR_THREADS_A;
+    int2 pre[H][PF_C][JT];
+    if (pf)
+    {
+        #pragma unroll
+        for (int h = 0; h < H; ++h)
+            #pragma unroll
+            for (int k = 0; k < PF_C; ++k)
+                #pragma unroll
+                for (int u = 0; u < JT; ++u)
+                {
+                    const int c = threadIdx.x + k * GR_THREADS_A;
+                    const int2* f8 = (const int2*) (fn + ((size_t) min(j0 + u, M - 1) * H + h) * D);
+                    pre[h][k][u] = c < D4 / 2 ? f8[c] : make_int2(0, 0);
+                }
+    }
+
     #pragma unroll
     for (int h = 0; h < H; ++h)
     {
@@ -72,7 +105,40 @@ void gr_dots_q8r_kernel
         for (int u = 0; u < JT; ++u)
             #pragma unroll
             for (int q = 0; q < RT; ++q) a[u][q] = 0.0f;
-        if (!sq)
+        if (pf)
+        {
+            #pragma unroll
+            for (int k = 0; k < PF_C; ++k)
+            {
+                const int c = threadIdx.x + k * GR_THREADS_A;
+                if (c >= D4 / 2) break;
+                float wv[JT][8];
+                #pragma unroll
+                for (int u = 0; u < JT; ++u)
+                {
+                    unpack_s8x4((uint32_t) pre[h][k][u].x, wv[u][0], wv[u][1], wv[u][2], wv[u][3]);
+                    unpack_s8x4((uint32_t) pre[h][k][u].y, wv[u][4], wv[u][5], wv[u][6], wv[u][7]);
+                }
+                #pragma unroll
+                for (int q = 0; q < RT; ++q)
+                {
+                    const float4* s4 = (const float4*) (streams + (size_t) q * H * D);
+                    float4 s0 = s4[(size_t) h * D4 + 2 * c];
+                    float4 s1 = s4[(size_t) h * D4 + 2 * c + 1];
+                    #pragma unroll
+                    for (int u = 0; u < JT; ++u)
+                    {
+                        float x = a[u][q];
+                        x = fmaf(s0.x, wv[u][0], x); x = fmaf(s0.y, wv[u][1], x);
+                        x = fmaf(s0.z, wv[u][2], x); x = fmaf(s0.w, wv[u][3], x);
+                        x = fmaf(s1.x, wv[u][4], x); x = fmaf(s1.y, wv[u][5], x);
+                        x = fmaf(s1.z, wv[u][6], x); x = fmaf(s1.w, wv[u][7], x);
+                        a[u][q] = x;
+                    }
+                }
+            }
+        }
+        else if (!sq)
         {
             const int2* f8[JT];
             #pragma unroll
@@ -230,6 +296,44 @@ void gr_finalize_q8r_kernel
             #pragma unroll
             for (int h = 0; h < H; ++h) g[q][h] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 gsc[H];
+        constexpr int FI = GRR_FIN_PF ? GRR_FIN_PF_I : 1;
+        if (GRR_FIN_PF && RT <= 2 && !gs && LR <= 32 * FI)   // RT >= 3: the register cost loses (op bench R=3 +4 %, R=4 +15 %)
+        {
+            uint32_t ur[FI][H];
+            #pragma unroll
+            for (int k = 0; k < FI; ++k)
+                #pragma unroll
+                for (int h = 0; h < H; ++h)
+                {
+                    const int i = lane + 32 * k;
+                    ur[k][h] = i < LR ? *(const uint32_t*) (upt + ((((size_t) h * D4 + c) * LR + i) * 4)) : 0u;
+                }
+            #pragma unroll
+            for (int k = 0; k < FI; ++k)
+            {
+                const int i = lane + 32 * k;
+                if (i >= LR) break;
+                float ti[RT];
+                #pragma unroll
+                for (int q = 0; q < RT; ++q) ti[q] = t_s[q * LR + i];
+                #pragma unroll
+                for (int h = 0; h < H; ++h)
+                {
+                    float u0, u1, u2, u3;
+                    unpack_s8x4(ur[k][h], u0, u1, u2, u3);
+                    #pragma unroll
+                    for (int q = 0; q < RT; ++q)
+                    {
+                        g[q][h].x = fmaf(ti[q], u0, g[q][h].x);
+                        g[q][h].y = fmaf(ti[q], u1, g[q][h].y);
+                        g[q][h].z = fmaf(ti[q], u2, g[q][h].z);
+                        g[q][h].w = fmaf(ti[q], u3, g[q][h].w);
+                    }
+                }
+            }
+        }
+        else
+        {
         PORT_UNROLL(GRR_FIN_UNROLL)
         for (int i = lane; i < LR; i += 32)
         {
@@ -257,6 +361,7 @@ void gr_finalize_q8r_kernel
                     g[q][h].w = fmaf(ti[q], u3, g[q][h].w);
                 }
             }
+        }
         }
         #pragma unroll
         for (int q = 0; q < RT; ++q)

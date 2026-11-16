@@ -118,6 +118,8 @@
 #include "generator/dry.cuh"
 #include "ngram.cuh"
 #include "sam.h"
+#include "rocm/gmmq/gmmq.h"
+#include "rocm/routed_f16/routed_f16.h"
 
 #endif
 
@@ -191,6 +193,8 @@ static void bind_exl3_dec(py::module_& m)
     m.def("exl3_dec_rms_norm", &exl3_dec_rms_norm, "exl3_dec_rms_norm");
 }
 #endif
+
+#include "foreign_quant/fq_mmvq_api.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -474,6 +478,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 #if defined(USE_ROCM)
     m.def("mla_absorb_dec", &mla_absorb_dec, "mla_absorb_dec");
     m.def("mla_unfold_dec", &mla_unfold_dec, "mla_unfold_dec");
+    // routed (MoE) llama.cpp MMQ via Gufo (rocm/gmmq): out [T * n_used, M] fp32, row t * n_used + slot
+    m.def("fq_mmq_moe", &fq_mmq_moe, "fq_mmq_moe",
+          py::arg("x"), py::arg("ids"), py::arg("w_ptrs"), py::arg("fmt"), py::arg("M"), py::arg("out"),
+          py::arg("tile_cols") = 0, py::arg("max_expert_rows") = 0);
+    // routed F16-WMMA prefill MoE (Gufo kernels, rocm/routed_f16, gfx1151): gate + up + SwiGLU + down in one op
+    m.def("fq_routed_f16_moe", &fq_routed_f16_moe, "fq_routed_f16_moe",
+          py::arg("x"), py::arg("ids"), py::arg("counts"), py::arg("tiles"), py::arg("gate_ptrs"), py::arg("up_ptrs"),
+          py::arg("down_ptrs"), py::arg("gate_fmt"), py::arg("down_fmt"), py::arg("I"), py::arg("out"));
+    m.def("fq_routed_f16_combine", &fq_routed_f16_combine, "fq_routed_f16_combine", py::arg("rows"), py::arg("weights"), py::arg("out"));
+    m.def("fq_routed_f16_combine_shared", &fq_routed_f16_combine_shared, "fq_routed_f16_combine_shared", py::arg("rows"), py::arg("weights"), py::arg("shared"), py::arg("x"), py::arg("gate_w"), py::arg("out"));
 #endif
     m.def("kda_gb_norm", &kda_gb_norm, "kda_gb_norm");
     m.def("kda_inter_off", &kda_inter_off, "kda_inter_off");
@@ -611,6 +625,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("x"), py::arg("qb"));
     m.def("fq_gemv_iq2_xxs_q8", &fq_gemv_iq2_xxs_q8, "fq_gemv_iq2_xxs_q8",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_fp8", &fq_gemv_fp8, "fq_gemv_fp8",
+          py::arg("x"), py::arg("q"), py::arg("s"), py::arg("out"), py::arg("s_cols"), py::arg("bo"), py::arg("bi"), py::arg("grid"));
     m.def("fq_gemv_nvfp4_q8", &fq_gemv_nvfp4_q8, "fq_gemv_nvfp4_q8",
           py::arg("qb"), py::arg("packed"), py::arg("scales"), py::arg("global_scale"), py::arg("out"));
     m.def("fq_gemv_q8_0_q8", &fq_gemv_q8_0_q8, "fq_gemv_q8_0_q8",
@@ -623,6 +639,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_gemv_iq4_xs_q8", &fq_gemv_iq4_xs_q8, "fq_gemv_iq4_xs_q8",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_iq3_xxs_q8", &fq_gemv_iq3_xxs_q8, "fq_gemv_iq3_xxs_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_iq2_s_q8", &fq_gemv_iq2_s_q8, "fq_gemv_iq2_s_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_gemv_iq3_s_q8", &fq_gemv_iq3_s_q8, "fq_gemv_iq3_s_q8",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq2_xxs", &fq_mmvq_iq2_xxs, "fq_mmvq_iq2_xxs",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq2_xs", &fq_mmvq_iq2_xs, "fq_mmvq_iq2_xs",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq2_s", &fq_mmvq_iq2_s, "fq_mmvq_iq2_s",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq3_xxs", &fq_mmvq_iq3_xxs, "fq_mmvq_iq3_xxs",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq3_s", &fq_mmvq_iq3_s, "fq_mmvq_iq3_s",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq4_nl", &fq_mmvq_iq4_nl, "fq_mmvq_iq4_nl",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_iq4_xs", &fq_mmvq_iq4_xs, "fq_mmvq_iq4_xs",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_dequant_iq", &fq_dequant_iq, "fq_dequant_iq", py::arg("packed"), py::arg("out"), py::arg("fmt"));
+    m.def("fq_moe_mmvq_grouped", &fq_moe_mmvq_grouped, "fq_moe_mmvq_grouped",
+          py::arg("h"), py::arg("sel"), py::arg("wts"), py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"), py::arg("type_ug"), py::arg("type_down"),
+          py::arg("partial"), py::arg("out"));
+    m.def("fq_mmvq_q5_k", &fq_mmvq_q5_k, "fq_mmvq_q5_k",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_q4_k", &fq_mmvq_q4_k, "fq_mmvq_q4_k",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+    m.def("fq_mmvq_q6_k", &fq_mmvq_q6_k, "fq_mmvq_q6_k",
+          py::arg("qb"), py::arg("packed"), py::arg("out"));
+#if !defined(USE_ROCM)
+    m.def("fq_mmq_few", &fq_mmq_few, "fq_mmq_few",
+          py::arg("x"), py::arg("scratch"), py::arg("packed"), py::arg("out"), py::arg("fmt"));
+#endif
 // grouped KQ/IQ4_XS decode MoE (fq_moe_kq.cu): portable dp4a kernels, built on ROCm too
     m.def("fq_moe_q4k_grouped_q8", &fq_moe_q4k_grouped_q8, "fq_moe_q4k_grouped_q8",
           py::arg("h"), py::arg("sel"), py::arg("wts"),
@@ -650,5 +701,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
           py::arg("fmt_ug"), py::arg("fmt_down"),
           py::arg("partial"), py::arg("out"));
+    m.def("fq_moe_kq_grouped_mixed_sh_q8", &fq_moe_kq_grouped_mixed_sh_q8, "fq_moe_kq_grouped_mixed_sh_q8",
+          py::arg("h"), py::arg("sel"), py::arg("wts"),
+          py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
+          py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
+          py::arg("fmt_ug"), py::arg("fmt_down"),
+          py::arg("partial"), py::arg("out"),
+          py::arg("sh_gate"), py::arg("sh_up"), py::arg("sh_down"), py::arg("sh_wg"));
 #endif
 }

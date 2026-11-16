@@ -35,6 +35,39 @@ def _ple_gate_torch(gate, value, gate_scale):
     return torch.sigmoid(signed_sqrt).unsqueeze(-1) * value.float().unsqueeze(-2)
 
 
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _ple_tadd_kernel(g_ptr, y_ptr, T, C, y_sb, y_sc, BT: tl.constexpr, BC: tl.constexpr):
+        b = tl.program_id(2)
+        t = tl.program_id(0) * BT + tl.arange(0, BT)
+        c = tl.program_id(1) * BC + tl.arange(0, BC)
+        yv = tl.load(y_ptr + b.to(tl.int64) * y_sb + c[:, None] * y_sc + t[None, :], mask=(c[:, None] < C) & (t[None, :] < T), other=0.0)
+        yv = tl.trans(yv)
+        gp = g_ptr + b.to(tl.int64) * T * C + t[:, None] * C + c[None, :]
+        m = (t[:, None] < T) & (c[None, :] < C)
+        tl.store(gp, tl.load(gp, mask=m, other=0.0) + yv.to(tl.float32), mask=m)
+except Exception:          # no Triton: the transpose-copy fallback below
+    _ple_tadd_kernel = None
+
+
+def _ple_tadd(gated: torch.Tensor, conv_out: torch.Tensor) -> bool:
+    """gated (bsz, seq, H, D) fp32, contiguous, += conv_out (bsz, seq, ch = H * D) fp16, the transposed view of a (bsz, ch, seq) tensor: one Triton pass,
+    tiles transposed through shared memory. False when the layout / dtype / Triton is not the expected one (the caller adds the old way)."""
+    if _ple_tadd_kernel is None or not torch.version.hip or gated.dtype != torch.float or not gated.is_contiguous() \
+            or conv_out.dtype not in (torch.half, torch.bfloat16, torch.float) or conv_out.stride(1) != 1:
+        return False
+    bsz, seq, ch = conv_out.shape
+    if gated.numel() != bsz * seq * ch:
+        return False
+    BT = BC = 64
+    _ple_tadd_kernel[((seq + BT - 1) // BT, (ch + BC - 1) // BC, bsz)](gated, conv_out, seq, ch, conv_out.stride(0), conv_out.stride(2),
+                                                                     BT=BT, BC=BC, num_warps=4)
+    return True
+
+
 class PLELayerState:
     """
     Per-slot recurrent state for one PLE layer, following the ShortConvLayerState conventions:
@@ -347,7 +380,23 @@ class PLELayer(Module):
         if os.environ.get("EXL3_PFE_PLE", "1") != "0":
             # gated is a local temp that is dead after the conv: add in place, no 84 MB fresh allocation
             # (same fp32 elementwise sum, bit-identical)
-            delta = gated.add_(conv_out.view(bsz, seq, H, D))
+            co = conv_out.view(bsz, seq, H, D)
+            if os.environ.get("EXL3_PLE_CONTIG", "1" if torch.version.hip else "0") == "1" and not co.is_contiguous() and \
+                    (not torch.version.hip or "gfx1151" in torch.cuda.get_device_properties(gated.device).gcnArchName):
+                # EXL3_PLE_CONTIG=1 (default on with ROCm, gfx1151 only): conv_out is the transposed view of the (bsz, ch, seq) conv result, so
+                # the in-place add below reads it with a ch-sized stride (uncoalesced, a strided broadcast kernel: ~100 ms per 8K chunk). A
+                # tiled transposed add (Triton, ple_tadd) does it in one pass at bandwidth; where Triton or the layout does not fit, one
+                # transpose copy first. Same fp32 sum (fp16 widened, added), bit-identical. 0 = the strided broadcast add.
+                try:
+                    done = _ple_tadd(gated, conv_out) if conv_out.dim() == 3 else False
+                except Exception:
+                    done = False
+                if not done:
+                    delta = gated.add_(co.contiguous())
+                else:
+                    delta = gated
+            else:
+                delta = gated.add_(co)
         else:
             delta = gated + conv_out.view(bsz, seq, H, D)
         return delta, conv_stream

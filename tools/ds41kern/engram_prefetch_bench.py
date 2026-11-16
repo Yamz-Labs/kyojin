@@ -15,7 +15,7 @@ from exllamav3.modules.dsv41_fn.engram_io import NativeRowReader
 from exllamav3.modules.dsv41_fn.engram_prefetch import EngramPrefetcher, HostEngramHash
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-SCRATCH = os.path.expanduser("~/ds41_work/ds41eng-scratch")
+SCRATCH = os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "ds41eng-scratch")
 LAYERS, PAD, CVOC = [1, 14], 2, 99092
 
 
@@ -248,7 +248,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["io", "gpu"])
     ap.add_argument("--dir", default=os.path.expanduser("~/models/ds41-1017/engram_mxfp4"))
-    ap.add_argument("--tok", default=os.path.expanduser("~/ds41_work/ds41qual/.cache_tok/tokenizer.json"))
+    ap.add_argument("--tok", default=os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "ds41qual/.cache_tok/tokenizer.json"))
     ap.add_argument("--cache-gib", type=float, default=1.0)
     a = ap.parse_args()
     {"io": cmd_io, "gpu": cmd_gpu}[a.mode](a)

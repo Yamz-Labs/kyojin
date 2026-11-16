@@ -84,6 +84,81 @@ class Qwen4ExpConfig(Qwen3_5VLMoeBaseConfig):
         self.heads_per_ngram = self.read_cfg(int, pfx("heads_per_ngram"), no_default)
         self.ple_eos_token_id = self.read_cfg(int, pfx("eos_token_id"), no_default)
 
+        # Plain GGUF config dir: GGUF backing store (weights served as stored, see _init_gguf)
+        self.gguf = None
+        if os.path.exists(os.path.join(directory, "model.gguf")):
+            self._init_gguf(directory)
+
+    def _init_gguf(self, directory: str):
+        import json
+        import numpy as np
+        from ..loader.gguf_collection import GGUFCollection
+        from ..loader.gguf_config import name_map_qwen4exp
+        from .minicpm_v47 import _GGML_FMT, MiniCPMV47Config, _alog_override, _fp_override
+        from ..foreign_quant.q8_0 import dequant_q8_0
+        with open(os.path.join(directory, "config.json"), encoding = "utf8") as f:
+            cfg = json.load(f)
+        g = self.gguf = GGUFCollection(os.path.join(directory, "model.gguf"))
+        g.name_map = nm = name_map_qwen4exp(cfg)
+        self.stc = g
+        self.gguf_formats = {n: _GGML_FMT.get(ty, f"unk{ty}") for n, (ty, _, _) in g.infos.items()}
+        MiniCPMV47Config._load_embedding_override(self)      # token_embd -> fp16 once (sets g.new_tensors)
+        ov = g.new_tensors
+        raw = lambda gname: g.get_tensor(gname).float()       # F32 / BF16 in HF orientation [out, in]
+
+        def q8(gname):                                       # Q8_0 -> fp32, HF orientation [N, K]
+            ty, dims, _ = g.infos[gname]
+            assert ty == 8, (gname, ty)
+            r = g.get_tensor(gname).numpy()
+            K, N = dims[0], dims[1]
+            return torch.from_numpy(np.ascontiguousarray(dequant_q8_0(r.reshape(N * (K // 32), 34)).reshape(N, K).astype(np.float32)))
+
+        P = "model.language_model"
+        for ek, gname in nm.items():
+            if not isinstance(gname, str) or gname not in g.infos:
+                continue
+            if gname.endswith("norm.weight") and not gname.endswith("ssm_norm.weight"):
+                ov[ek] = raw(gname) - 1.0                     # GGUF stores 1 + w (zero-centered norms)
+            elif gname.endswith("conv1d.weight"):
+                ov[ek] = raw(gname).unsqueeze(1).contiguous() # (C, K) -> (C, 1, K)
+            elif gname.endswith("ffn_gate_inp_shexp.weight"):
+                ov[ek] = raw(gname).reshape(-1, 1).contiguous()   # Linear override: engine orientation [in, out]
+            elif (".hc_" in gname or gname.startswith("output_hc_")) and gname.endswith(("_down.weight", "_up.weight")):
+                ov[ek] = q8(gname)                            # hyper-connection mixers are read raw by the module
+        for i, lt in enumerate(self.layer_types):
+            L = f"{P}.layers.{i}"
+            if lt == "linear_attention":
+                _alog_override(self, f"{L}.linear_attn.A_log", f"blk.{i}.ssm_a")
+                _fp_override(self, f"{L}.linear_attn.in_proj_b.weight", f"blk.{i}.ssm_beta.weight")
+                _fp_override(self, f"{L}.linear_attn.in_proj_a.weight", f"blk.{i}.ssm_alpha.weight")
+            else:
+                qk = torch.cat([raw(f"blk.{i}.indexer.q_proj.weight"), raw(f"blk.{i}.indexer.k_proj.weight")], 0)
+                ov[f"{L}.self_attn.indexer.index_qk_proj.weight"] = qk.T.contiguous()   # engine fp orientation [in, out]
+
+
+def _gguf_moe(config, key, layer_idx, qbits_key):
+    from .minicpm_v47 import _fl
+    H, I, E, SI = config.hidden_size, config.moe_intermediate_size, config.num_experts, config.shared_expert_intermediate_size
+    G = f"blk.{layer_idx}"
+    gates = [_fl(config, f"{G}.ffn_gate_exps.e{e}", H, I) for e in range(E)]
+    ups = [_fl(config, f"{G}.ffn_up_exps.e{e}", H, I) for e in range(E)]
+    downs = [_fl(config, f"{G}.ffn_down_exps.e{e}", I, H, out_dtype = torch.float) for e in range(E)]
+    sh = GatedMLP(
+        config = config, key = f"{key}.mlp.shared_expert", hidden_size = H, intermediate_size = SI,
+        qmap = "block.mlp", interm_dtype = torch.half, out_dtype = torch.float, select_hq_bits = 2,
+        gates = [_fl(config, f"{G}.ffn_gate_shexp", H, SI)], ups = [_fl(config, f"{G}.ffn_up_shexp", H, SI)],
+        downs = [_fl(config, f"{G}.ffn_down_shexp", SI, H, out_dtype = torch.float)])
+    for m in sh.gates + sh.ups + sh.downs:
+        sh.register_submodule(m)
+    mlp = BlockSparseMLP(
+        config = config, key = f"{key}.mlp", hidden_size = H, intermediate_size = I, num_experts = E,
+        num_experts_per_tok = config.num_experts_per_tok, key_up = None, key_gate = None, key_down = None,
+        key_routing_gate = "gate", key_shared_gate = "shared_expert_gate", qmap = "block.mlp",
+        interm_dtype = torch.half, out_dtype = torch.float, gates = gates, ups = ups, downs = downs, shared_experts = sh)
+    for m in gates + ups + downs:
+        mlp.register_submodule(m)
+    return mlp
+
 
 def build_qwen4_block(
     config: Qwen4ExpConfig,
@@ -131,6 +206,7 @@ def build_qwen4_block(
                 key_a = "in_proj_a",
                 key_norm = "norm",
                 key_o = "out_proj",
+                blocked_gqa = getattr(config, "gguf", None) is not None,
                 norm = GatedRMSNorm(
                     config, f"{key}.linear_attn.norm",
                     config.rms_norm_eps, out_dtype = torch.half,
@@ -187,7 +263,7 @@ def build_qwen4_block(
                 ),
             )
         ),
-        mlp = BlockSparseMLP(
+        mlp = _gguf_moe(config, key, layer_idx, qbits_key) if getattr(config, "gguf", None) is not None else BlockSparseMLP(
             config = config,
             key = f"{key}.mlp",
             hidden_size = config.hidden_size,

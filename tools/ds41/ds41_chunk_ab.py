@@ -6,8 +6,8 @@ import numpy as np, torch
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 ap = argparse.ArgumentParser()
 ap.add_argument("pack"); ap.add_argument("--lens", default="32768"); ap.add_argument("--chunks", default="16384,32768")
-ap.add_argument("--engram-dir"); ap.add_argument("--data", default=os.path.expanduser("~/ds41_work/ds41ready_data"))
-ap.add_argument("--out", default=os.path.expanduser("~/ds41_work/ds41chunk_out")); ap.add_argument("--new", type=int, default=16)
+ap.add_argument("--engram-dir"); ap.add_argument("--data", default=os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "ds41ready_data"))
+ap.add_argument("--out", default=os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "ds41chunk_out")); ap.add_argument("--new", type=int, default=16)
 ap.add_argument("--blocking", default="1,0", help="1 = row blocking on, 0 = off (baseline); one arm per value")
 a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
 from ds41_serving import build_model

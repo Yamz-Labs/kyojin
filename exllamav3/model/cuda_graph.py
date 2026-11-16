@@ -65,7 +65,7 @@ CUDA_GRAPH_ENABLED = os.environ.get("EXL3_CUDA_GRAPH", "0") == "1"
 # EXL3_HIP_GRAPH=1 (experimental, default off): allow the whole-forward graph on ROCm (hipGraph through torch.cuda.CUDAGraph)
 HIP_GRAPH = os.environ.get("EXL3_HIP_GRAPH", "0") == "1"
 CUDA_GRAPH_WARMUPS = max(1, _env_int("EXL3_CUDA_GRAPH_WARMUPS", 2))
-# EXL3_CUDA_GRAPH_MULTI=1 (default off): several jobs per graph (B in 1..4, Q <= 16, B*Q <= 32), bigger LRU. Off =
+# EXL3_CUDA_GRAPH_MULTI=1 (default off): several jobs per graph (B in 1..8, Q <= 16, B*Q <= 32), bigger LRU. Off =
 # the B=1, Q <= 8 behaviour above, unchanged. set_multi() flips the globals for harness arms (then call purge()).
 CUDA_GRAPH_MULTI = False
 CUDA_GRAPH_MAX = 6
@@ -79,7 +79,9 @@ def set_multi(on: bool):
     CUDA_GRAPH_MULTI = bool(on)
     CUDA_GRAPH_MAX = max(1, _env_int("EXL3_CUDA_GRAPH_MAX", 16 if on else 6))
     CUDA_GRAPH_MAX_ROWS = 32 if on else 8
-    CUDA_GRAPH_MAX_B = 4 if on else 1
+    # 8 jobs: a server with 8 sessions decodes 8 one-row jobs per step; at 4 the N8 step fell back to eager (host-bound, 3090 GPU busy ~53 %).
+    # EXL3_CUDA_GRAPH_MAX_B overrides (4 = the previous cap).
+    CUDA_GRAPH_MAX_B = max(1, _env_int("EXL3_CUDA_GRAPH_MAX_B", 8)) if on else 1
     CUDA_GRAPH_MAX_Q = 16 if on else 8
 
 

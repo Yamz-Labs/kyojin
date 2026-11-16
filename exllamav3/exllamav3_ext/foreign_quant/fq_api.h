@@ -27,6 +27,8 @@ void fq_gemv_iq2_xxs_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor ou
 void fq_gemv_nvfp4_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor scales,
                       double global_scale, torch::Tensor out);
 void fq_gemv_q8_0_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
+// FP8 E4M3 decode GEMV (fq_gemv_fp8.cu): x half [M, K], q uint8 [N, K], s float32 [N] (per row) or [ceil(N/bo), s_cols] (grid), out float32 [M, N].
+void fq_gemv_fp8(torch::Tensor x, torch::Tensor q, torch::Tensor s, torch::Tensor out, int64_t s_cols, int64_t bo, int64_t bi, bool grid);
 // q8_1-activation grouped MoE (fq_moe_q8.cu), same args/contract as above.
 bool fq_use_q8moe();
 void fq_moe_iq2xxs_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
@@ -49,6 +51,9 @@ void fq_gemv_q4_k_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_gemv_q5_k_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_gemv_q6_k_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_gemv_iq4_xs_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
+void fq_gemv_iq3_xxs_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
+void fq_gemv_iq2_s_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
+void fq_gemv_iq3_s_q8(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 // q8_1-activation grouped MoE for KQ/IQ4_XS SwiGLU experts (fq_moe_kq.cu):
 // gate/up/down_ptrs = per-expert base addresses (E int64);
 // strides are per-row bytes; partial = [S, K] float scratch.
@@ -78,3 +83,11 @@ void fq_moe_kq_grouped_mixed_q8(torch::Tensor h, torch::Tensor sel, torch::Tenso
                                 int64_t gate_stride, int64_t up_stride, int64_t down_stride,
                                 int64_t fmt_ug, int64_t fmt_down,
                                 torch::Tensor partial, torch::Tensor out);
+void fq_moe_kq_grouped_mixed_sh_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
+                                   torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
+                                   torch::Tensor down_ptrs,
+                                   int64_t gate_stride, int64_t up_stride, int64_t down_stride,
+                                   int64_t fmt_ug, int64_t fmt_down,
+                                   torch::Tensor partial, torch::Tensor out,
+                                   torch::Tensor sh_gate, torch::Tensor sh_up, torch::Tensor sh_down,
+                                   torch::Tensor sh_wg);

@@ -7,7 +7,7 @@ their ROCMFP2S / MIX10 / FP23S rows.
 
 From `huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF`, download only `eval/` and `results/`:
 
-    DIR=~/ds41_work/luce_data   # DIR/eval/*, DIR/results/*
+    DIR=$DS41_WORK/luce_data   # DIR/eval/*, DIR/results/*
     for f in eval/heldout_8x1024.npy eval/teacher_8x1024.npz eval/teacher_kl.json results/*_kl.json; do ...; done
 
 File formats:
@@ -82,7 +82,7 @@ internal check against the original model on agentic text. This one is the publi
 
 ## Tests
 
-CPU only, 5 s: metric closed forms, the public teacher file when `LUCE_DATA` (default `~/ds41_work/luce_data`, layout
+CPU only, 5 s: metric closed forms, the public teacher file when `LUCE_DATA` (default `$DS41_WORK/luce_data`, layout
 `eval/` + `results/`) holds it, and an end-to-end run of two tiny random models against a synthetic teacher written in their
 format (same model as teacher gives KL 0 / top-1 100 %; a second model matches an independent numpy recomputation).
 

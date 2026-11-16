@@ -4,7 +4,7 @@ tool (~2K tok). Texts are real token rows (data/short.npy, long.npy), appended t
 import argparse, json, os, sys, time
 import numpy as np, torch
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
-H = os.path.expanduser("~/ds41_work")
+H = os.environ.get("DS41_WORK", "ds41_work")
 ap = argparse.ArgumentParser()
 ap.add_argument("pack"); ap.add_argument("--arm", required=True); ap.add_argument("--out", required=True)
 ap.add_argument("--chunk", type=int, default=16384); ap.add_argument("--new", type=int, default=96); ap.add_argument("--draft", default="4,0", help="comma list of draft depths, one engine each (0 = plain)")

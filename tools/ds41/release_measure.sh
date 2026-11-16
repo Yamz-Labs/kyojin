@@ -18,7 +18,7 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=${ROOT:-$(dirname "$(dirname "$HERE")")}
-GPURUN=${GPURUN:-$HOME/ds41_work/bin/gpurun}
+GPURUN=${GPURUN:-${DS41_WORK:-./ds41_work}/bin/gpurun}
 PY=${PY:-python3}
 OUT=${OUT:-$PWD/ds41_release_out}
 PORT=${PORT:-8398}

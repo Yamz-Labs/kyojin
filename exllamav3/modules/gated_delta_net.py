@@ -15,6 +15,7 @@ from ..cache import Cache
 from ..util.tensor import g_tensor_cache
 from .multilinear import SlicedMultiLinear
 import os
+_QZCAT = os.environ.get("EXL3_GDN_QZCAT", "1" if torch.version.hip else "0") != "0"   # GGUF Q8_0 qkv + z decode in one launch (project_qkvz_q8cat)
 
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
@@ -330,9 +331,17 @@ class GDNLayerState:
             dtype = torch.bfloat16,
             device = "meta"
         )
+        # EXL3_GDN_STATE_BF16 (default on with CUDA): store the recurrent state in bf16; the kernel loads it to fp32, updates in
+        # fp32 and stores round-to-nearest bf16, halving the state traffic. RTX 3090, Qwen3.8-27B EXL3, 8 x 16K decode (graphs on):
+        # 232.0 -> 249.9 tok/s; 512 forced tokens after 32K: natural text PPL -0.21 % (KL 0.0004), copy text -0.03 % (KL 0.00003).
+        # GDN 128x128 heads only; KDA / other head dims and ROCm keep fp32. 0 = fp32.
+        self.state_bf16 = (
+            os.environ.get("EXL3_GDN_STATE_BF16", "1" if (torch.version.cuda and not torch.version.hip) else "0") == "1"
+            and not module.kda and module.k_head_dim == 128 and module.v_head_dim == 128
+        )
         self.recurrent_state = torch.empty(
             (max_batch_size, max_history + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
-            dtype = torch.float,
+            dtype = torch.bfloat16 if self.state_bf16 else torch.float,
             device = "meta"
         )
         self.device = None
@@ -353,7 +362,7 @@ class GDNLayerState:
     def get_checkpoint_size(self):
         return (
             self.module.fdim_qkv * self.module.conv_kernel_size * 2 +
-            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * 4
+            self.module.num_v_heads * self.module.k_head_dim * self.module.v_head_dim * (2 if self.state_bf16 else 4)
         )
 
 
@@ -443,7 +452,8 @@ class GDNLayerState:
         return ext.StateRewindJob(
             self.recurrent_state[slot, last_history + 1 - num_tokens].data_ptr(),
             self.recurrent_state[slot, 0].data_ptr(),
-            self.recurrent_state[slot, 0].numel(),
+            # num_elements counts fp32 words (the rewind kernel copies float4)
+            self.recurrent_state[slot, 0].numel() * self.recurrent_state.element_size() // 4,
         )
 
 
@@ -1008,6 +1018,7 @@ class GatedDeltaNet(Module):
                 self.conv1d_v_weight = self.config.stc.get_tensor(self.key_conv1d_v_weight, self.device, optional = False, allow_bf16 = True, no_defer = True)
         self.norm.load(device, **kwargs)
         self.load_local(device, **kwargs)
+        self._q8cat_build()
 
 
     @override
@@ -1023,6 +1034,7 @@ class GatedDeltaNet(Module):
         self.ba_weight_filled = False
         self.multi_qkvz = None
         self.prealloc_qkvz_carrier = None
+        self._q8cat_w = None
         self.a_log = None
         self.dt_bias = None
         self.conv1d_weight = None
@@ -1133,6 +1145,44 @@ class GatedDeltaNet(Module):
         qkv, z = dec_proj_multi(lins, x, rows)
         return (qkv.view(bsz, seqlen, -1), z.view(bsz, seqlen, -1))
 
+
+    def _q8cat_build(self):
+        """GGUF Q8_0 qkv + z weights as one [nq + nz, row] tensor, both ForeignLinears re-pointed to views of it (same bytes, no
+        copy kept). Done at load, before any decode graph is captured. Nothing for other formats."""
+        self._q8cat_w = None
+        if not _QZCAT or self.qkv_proj is None or self.z_proj is None:
+            return
+        from .foreign_linear import ForeignLinear
+        fq, fz = self.qkv_proj, self.z_proj
+        if not (isinstance(fq, ForeignLinear) and isinstance(fz, ForeignLinear) and fq.format == "q8_0" and fz.format == "q8_0"
+                and fq.in_features == fz.in_features and fq.packed is not None and fz.packed is not None
+                and fq.packed.device == fz.packed.device and fq.packed.dtype == torch.uint8 and fz.packed.dtype == torch.uint8):
+            return
+        nq, nz = fq.out_features, fz.out_features
+        sq, sz = fq.packed.shape, fz.packed.shape
+        cat = torch.cat([fq.packed.reshape(nq, -1), fz.packed.reshape(nz, -1)], dim = 0)
+        fq.packed = cat[:nq].view(sq)
+        fz.packed = cat[nq:].view(sz)
+        self._q8cat_w = cat
+        if not getattr(GatedDeltaNet, "_q8cat_said", False):
+            GatedDeltaNet._q8cat_said = True
+            print(f" -- GDN qkv + z Q8_0 decode rows concatenated ({nq} + {nz})", flush = True)
+
+    def project_qkvz_q8cat(self, x: torch.Tensor, params: dict, qkv_dt, z_dt, bsz: int, seqlen: int):
+        """GGUF Q8_0 qkv + z of one decode row in ONE fq_gemv_q8_0 launch over the rows concatenated at load (_q8cat_build): one q8_1
+        quant and one launch instead of two, the same per-row dot: bit-exact. None = fall back to the two projections."""
+        cat = getattr(self, "_q8cat_w", None)
+        if cat is None or bsz * seqlen != 1 or not x.is_contiguous() or "capture" in params or "ovr" in params:
+            return None
+        fq, fz = self.qkv_proj, self.z_proj
+        flat = x.reshape(1, -1)
+        dq = qkv_dt or fq.out_dtype or torch.half
+        if dq != (z_dt or fz.out_dtype or torch.half) or not (fq.q8_fused_gemv_ok(flat) and fz.q8_fused_gemv_ok(flat)):
+            return None
+        nq, nz = fq.out_features, fz.out_features
+        out = torch.empty((1, nq + nz), dtype = dq, device = x.device)
+        ext.fq_gemv_q8_0(flat, cat.view(nq + nz, -1, 34), out)
+        return out[:, :nq].view(bsz, seqlen, nq), out[:, nq:].view(bsz, seqlen, nz)
 
     def _ab_cat(self, x: torch.Tensor, params: dict, bsz: int, seqlen: int):
         """decode b and a skinny projections in ONE launch (ext.skinny_cat_w, same per-column reduction order as the two
@@ -1273,6 +1323,9 @@ class GatedDeltaNet(Module):
         # buffer holds the same values and the consumer widens in-kernel: drops the widen copy, bit-exact
         if os.environ.get(env, "1") != "1" or "capture" in params or "quant_preserve" in params:
             return False
+        from .foreign_linear import pfe_f16_ok
+        if pfe_f16_ok(m, x):
+            return True
         from .quant import exl3 as _exl3
         rows = x.numel() // x.shape[-1]
         if not (_exl3._f32_via_f16 and rows >= _exl3._f32_via_f16_min_rows):
@@ -1791,8 +1844,12 @@ class GatedDeltaNet(Module):
             else:
                 qkv_dt = torch.half if self._pfe_f16_out(self.qkv_proj, x, params, "EXL3_PFE_QKVZ") else None
                 z_dt = torch.half if self._pfe_f16_out(self.z_proj, x, params, "EXL3_PFE_QKVZ") else None
-                qkv = self.qkv_proj.forward(x, params, qkv_dt)
-                z = self.z_proj.forward(x, params, z_dt)
+                qz8 = self.project_qkvz_q8cat(x, params, qkv_dt, z_dt, bsz, seqlen)
+                if qz8 is not None:
+                    qkv, z = qz8
+                else:
+                    qkv = self.qkv_proj.forward(x, params, qkv_dt)
+                    z = self.z_proj.forward(x, params, z_dt)
             z = z.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
             if not ab_first and qzab is None:
                 _c = getattr(self, "_qd3_ba", None)
@@ -1859,7 +1916,13 @@ class GatedDeltaNet(Module):
 
             # Delta rule
             _nk, _kd, _mq = self.num_k_heads, self.k_dim, mixed_qkv
-            if self.blocked_gqa and not self.kda:
+            # EXL3_GDN_BLOCKED_KERNEL (default 1 with ROCm): chunk prefill of blocked-GQA files without the q / k duplication copy
+            # (302 MB per GDN layer per 8K chunk on the 35B-A3B GGUF): the HIP HF kernel pairs v head h with q / k head h % H; any
+            # other chunk path duplicates inside vendor/fla (bit-equal)
+            _blk = (self.blocked_gqa and not self.kda and seqlen >= self.num_v_heads and not save_history
+                    and os.environ.get("EXL3_GDN_BLOCKED_KERNEL", "1" if torch.version.hip else "0") == "1"
+                    and os.environ.get("EXL3_GDN_PF", "1") == "1" and _mq.dim() == 3)
+            if self.blocked_gqa and not self.kda and not _blk:
                 # Blocked pairing for grouped-v files: duplicate q/k heads
                 # blocked ([q,q] not interleaved) AFTER the depthwise conv and
                 # run the rule plain (nk == nv, no repeat). Bitwise vs repeat
@@ -1868,7 +1931,8 @@ class GatedDeltaNet(Module):
                 _kd2 = 2 * self.k_dim
                 _q = _mq[..., :self.k_dim]
                 _k = _mq[..., self.k_dim:_kd2]
-                _mq = torch.cat([_q, _q, _k, _k, _mq[..., _kd2:]], dim=-1)
+                _r = self.num_v_heads // self.num_k_heads             # 2 on the 35B-A3B, 3 on the dense 27B (48 v / 16 k)
+                _mq = torch.cat([_q] * _r + [_k] * _r + [_mq[..., _kd2:]], dim=-1)
                 _nk, _kd = self.num_v_heads, self.v_dim
             core_attn_out = gated_delta_rule_fn(
                 mixed_qkv = _mq,
@@ -1888,6 +1952,7 @@ class GatedDeltaNet(Module):
                 params = params,
                 channelwise_g = self.kda,
                 g_cumsum = g_cumsum,
+                blocked_gqa = _blk,
             )
             if ck is not None:
                 params.pop("kda_ckpt")

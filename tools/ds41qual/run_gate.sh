@@ -4,7 +4,7 @@
 # PACK_DIR: serves it with tools/ds41/serve.py (loader ds41_serving) on PORT (default 8399) under the GPU lock, then stops it.
 # BASE_URL (http...): scores an already running server. REF_DIR defaults to data/gate_ref (copy of OUT/gate_ref written
 # by the conversion hook tools/ds41/evalref.py). env: PY, GPU_LOCK, PORT, CTX (default 16384), SERVE_ARGS, OUT.
-# GPU rule: DS4.1 GPU jobs run on the second machine only (iGPU lock ~/ds41_work/igpu.gpu.lock), never on the box GPU.
+# GPU rule: DS4.1 GPU jobs run on the second machine only (iGPU lock $DS41_WORK/igpu.gpu.lock), never on the box GPU.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$(dirname "$HERE")")
@@ -15,7 +15,7 @@ PY=${PY:-python3}; PORT=${PORT:-8399}; OUT=${OUT:-$PWD/gate_result.json}
 case "$TARGET" in
   http*) exec $PY "$HERE/gate.py" --base-url "$TARGET" --ref "$REF" --out "$OUT" "$@" ;;
 esac
-LOCK=${GPU_LOCK:-$HOME/ds41_work/igpu.gpu.lock}
+LOCK=${GPU_LOCK:-${DS41_WORK:-./ds41_work}/igpu.gpu.lock}
 LOG=${LOG:-$PWD/gate_serve.log}
 flock "$LOCK" bash -c '
   cd "$0/tools/ds41" || exit 1

@@ -112,6 +112,8 @@ class FusedMoEHalf:
             return "router bias / shared post norm"
         if len(mlp.gates) != mlp.num_experts or len(mlp.ups) != mlp.num_experts or len(mlp.downs) != mlp.num_experts:
             return "experts are not one linear each"
+        if any(getattr(getattr(m, "inner", None), "K", None) is None for m in (mlp.gates[0], mlp.ups[0], mlp.downs[0])):
+            return "experts are not EXL3 trellis linears (e.g. GGUF ForeignLinear experts)"
         return _k6s8_support_reason(mlp)
 
     def __init__(self, block):

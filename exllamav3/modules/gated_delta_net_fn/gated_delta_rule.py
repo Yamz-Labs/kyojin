@@ -104,7 +104,9 @@ def gated_delta_rule_fn(
     channelwise_g: bool = False,
     g_cumsum: bool = False,
     recurrent_base: torch.Tensor = None,
+    blocked_gqa: bool = False,
 ):
+    # blocked_gqa: q / k hold num_k_heads < num_v_heads heads paired blocked with v (chunk prefill path only, see vendor/fla)
     # g_cumsum: g already holds fla's chunk-local cumsum (EXL3_KDA_G_FUSED); only valid on the chunk path
     if params is None:
         params = {}
@@ -200,12 +202,17 @@ def gated_delta_rule_fn(
         core_attn_out = []
         for i, s in enumerate(recurrent_slots_cpu.tolist()):
             state = recurrent_state[s, 0].unsqueeze(0) if recurrent_state is not None else None
+            # bf16 state storage (EXL3_GDN_STATE_BF16): the chunk kernels run on an fp32 copy, rounded back on save
+            state_lp = state if state is not None and state.dtype != torch.float else None
+            if state_lp is not None:
+                state = state_lp.float()
             if pf:
                 core_attn, new_state = chunk_gated_delta_rule_pf(
                     q[i:i + 1], k[i:i + 1], v[i:i + 1], g = g[i:i + 1], beta = beta[i:i + 1],
                     initial_state = state, output_final_state = save_state,
-                    ckpt = params.get("kda_ckpt") if bsz == 1 else None)
+                    ckpt = params.get("kda_ckpt") if bsz == 1 else None, blocked = blocked_gqa)
             else:
+                assert not blocked_gqa, "blocked_gqa needs the EXL3_GDN_PF chunk path"
                 core_attn, new_state = chunk_gated_delta_rule(
                     q[i:i + 1], k[i:i + 1], v[i:i + 1],
                     g = g[i:i + 1],
@@ -215,7 +222,7 @@ def gated_delta_rule_fn(
                     use_qk_l2norm_in_kernel = True,
                 )
             if save_state and state is not None:
-                state.copy_(new_state)
+                (state_lp if state_lp is not None else state).copy_(new_state)
             core_attn_out.append(core_attn)
 
         core_attn_out = core_attn_out[0] if pf and len(core_attn_out) == 1 else torch.cat(core_attn_out, dim = 0)

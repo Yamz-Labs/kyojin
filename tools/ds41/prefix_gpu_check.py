@@ -6,7 +6,7 @@ HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 ap = argparse.ArgumentParser()
 ap.add_argument("pack"); ap.add_argument("--engram-dir"); ap.add_argument("--first", type=int, default=6144)
 ap.add_argument("--extra", type=int, default=50); ap.add_argument("--chunk", type=int, default=16384); ap.add_argument("--new", type=int, default=64)
-ap.add_argument("--data", default=os.path.expanduser("~/ds41_work/ds41ready_data")); ap.add_argument("--out")
+ap.add_argument("--data", default=os.path.join(os.environ.get("DS41_WORK", "ds41_work"), "ds41ready_data")); ap.add_argument("--out")
 a = ap.parse_args()
 from ds41_serving import build_model
 from ds41_engine import HFTokenizer

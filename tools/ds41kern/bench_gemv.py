@@ -1,7 +1,7 @@
 """GB/s of the dense EXL3 decode GEMV on every DS4.1 projection shape (random trellis bytes, batch 1 and 4 rows).
 Two kernels: exl3_dec_gemv (needs in_features % 512 == 0: wq_b 1280, shared w2 2304 and indexer wq_b 1280 do NOT qualify) and the
 generic WMMA exl3_gemv (the fallback those shapes take, quant/exl3.py:425-470). 190 GB/s is the practical line (k2kern: 177 on VALU).
-    flock ~/ds41_work/gpu.lock python tools/ds41kern/bench_gemv.py
+    flock $DS41_WORK/gpu.lock python tools/ds41kern/bench_gemv.py
 """
 import sys, torch
 import exllamav3.ext as extmod

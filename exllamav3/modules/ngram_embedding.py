@@ -204,8 +204,45 @@ class NGramEmbedding(Module):
             stc.release_file(f)
 
     @override
+    def _load_gguf(self, device) -> bool:
+        """GGUF store: IQ4_NL table rows gathered from the GGUF file (mode iq4nl_disk), aux arrays from the metadata."""
+        g = getattr(self.config, "gguf", None)
+        if g is None:
+            return False
+        gname = g.name_map.get(f"{self.key}.weight")
+        if gname is None or gname not in g.infos:
+            return False
+        ty, dims, off = g.infos[gname]
+        assert ty == 20 and dims[0] == ROW_DIM, f"{gname}: expected IQ4_NL rows of {ROW_DIM}, got type {ty} dims {dims}"
+        arch = g.meta["general.architecture"]
+        meta = lambda k: torch.tensor([int(v) for v in g.meta[f"{arch}.ple.{k}"]], dtype = torch.int64)
+        self.head_offsets = meta("head_offsets").contiguous()
+        self.head_vocab_sizes = meta("head_vocab_sizes").contiguous()
+        self.layer_multipliers = meta("layer_multipliers").contiguous()
+        assert self.head_offsets.shape[0] == self.num_heads, (self.head_offsets.shape, self.num_heads)
+        self.num_rows = dims[1]
+        self.rows_per_shard = self.num_rows
+        fi, o = off >> 48, off & ((1 << 48) - 1)
+        self.handles = [DiskTensorHandle(key = self.key, filename = g.paths[fi], abs_offset = g.bases[fi] + o,
+                                         shape = [self.num_rows, (ROW_DIM // 32) * 18], dtype = torch.uint8)]
+        self.tables = None
+        self.mode = "iq4nl_disk"
+        self._row_dtype = torch.uint8
+        print(f"[ngram] GGUF table {gname}: {self.num_rows} IQ4_NL rows of {ROW_DIM}, gathered from disk", flush = True)
+        return True
+
+    def _row_spec(self):
+        """(words per staged row, staged dtype) for the current mode."""
+        if self.mode.startswith("trellis"):
+            return words_per_row(self.K), torch.int16
+        if self.mode == "iq4nl_disk":
+            return (ROW_DIM // 32) * 18, torch.uint8
+        return ROW_DIM, self._row_dtype
+
     def load(self, device: torch.device, **kwargs):
         self.device = device
+        if self._load_gguf(device):
+            return
         stc = self.config.stc
         parent = self.key.rsplit(".", 1)[0]
 
@@ -398,7 +435,10 @@ class NGramEmbedding(Module):
         Reference form of the row pipeline (torch codec); forward() runs the fast path."""
         uids_cpu = uids.to("cpu", torch.int64)
         raw = self._fetch_packed(uids_cpu).to(self.device)
-        if self.mode.startswith("trellis"):
+        if self.mode == "iq4nl_disk":
+            from ..foreign_quant.gap_formats import dequant as _gap_dequant
+            rows = _gap_dequant("iq4_nl", raw).float()
+        elif self.mode.startswith("trellis"):
             heads = (torch.searchsorted(self.head_offsets.to(self.device),
                                         uids.to(self.device, torch.int64),
                                         right = True) - 1).clamp(0, self.num_heads - 1)
@@ -583,11 +623,8 @@ class NGramEmbedding(Module):
         history = history.to("cpu", torch.int64).contiguous().clone()
         if self._match(history) is not None:
             return
-        trellis = self.mode.startswith("trellis")
-        pin = self._acquire_pin(
-            bsz * out_len * self.num_heads,
-            words_per_row(self.K) if trellis else ROW_DIM,
-            torch.int16 if trellis else self._row_dtype)
+        rw, rdt = self._row_spec()
+        pin = self._acquire_pin(bsz * out_len * self.num_heads, rw, rdt)
         for h in self.handles or []:
             h._ensure_open()        # lazy open isn't thread-safe; do it here, not on the worker
         if self._executor is None:
@@ -605,8 +642,7 @@ class NGramEmbedding(Module):
         if pin is None:
             pin = self._warm_pin = _PinSet()
         n = (history.shape[1] - self.context_len) * self.num_heads
-        trellis = self.mode.startswith("trellis")
-        pin.grow(n, words_per_row(self.K) if trellis else ROW_DIM, torch.int16 if trellis else self._row_dtype)
+        pin.grow(n, *self._row_spec())
         self._stage(history, pin)
 
     def warm(self, history: torch.Tensor):
@@ -650,8 +686,7 @@ class NGramEmbedding(Module):
         H = self.num_heads
         n = bsz * out_len * H
         dev = self.device
-        row_words = words_per_row(self.K) if trellis else ROW_DIM
-        row_dtype = torch.int16 if trellis else self._row_dtype
+        row_words, row_dtype = self._row_spec()
 
         entry = self._match(ids)
         if entry is not None:
@@ -670,6 +705,9 @@ class NGramEmbedding(Module):
             heads_d = pin.heads[:U].to(dev, non_blocking = True)
             rows = torch.empty((U, ROW_DIM), dtype = torch.half, device = dev)
             ext.ngram_dequant(packed_d, self.K, heads_d, self.head_bias, rows)
+        elif self.mode == "iq4nl_disk":
+            from ..foreign_quant.gap_formats import dequant as _gap_dequant
+            rows = _gap_dequant("iq4_nl", packed_d).float()
         else:
             rows = packed_d.float()
         if rows.is_cuda:

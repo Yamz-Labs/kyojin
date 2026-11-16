@@ -3,7 +3,7 @@ DS4.1 HIP kernels (exllamav3/modules/dsv41_fn/dsv41_hip.hip) and the grouped-MoE
 reference (exllamav3/dsv41/{ops,quant,engram}.py).
 
 Opt-in (never collected by a plain pytest run): needs the box GPU, so run it under the GPU lock (<= 20 min window):
-    flock -w 14400 ~/ds41_work/gpu.lock bash -c 'source env... ; DSV41_DEVICE=cuda python -m pytest --noconftest -q \
+    flock -w 14400 $DS41_WORK/gpu.lock bash -c 'source env... ; DSV41_DEVICE=cuda python -m pytest --noconftest -q \
         tests/dsv41/test_dsv41_hipk.py'
 
 Exactness contract (what "within the repo tolerance" means here):

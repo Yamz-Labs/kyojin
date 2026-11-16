@@ -15,6 +15,7 @@ get_tensor_sizes. Anything else raises.
 from __future__ import annotations
 
 import os
+import re
 import struct
 
 import numpy as np
@@ -28,8 +29,8 @@ GGML_BBS = {
 }
 # (elements, bytes) per block of the formats served by gap_formats / fq_gemv_q8_0 (32- and 64-element blocks)
 GGML_BLK = {t: (256, bb) for t, bb in GGML_BBS.items()}
-GGML_BLK.update({2: (32, 18), 6: (32, 22), 8: (32, 34), 20: (32, 18), 18: (256, 98), 21: (256, 110),
-                 39: (32, 17), 40: (64, 36)})
+GGML_BLK.update({2: (32, 18), 6: (32, 22), 7: (32, 24), 8: (32, 34), 20: (32, 18), 18: (256, 98), 21: (256, 110),
+                 39: (32, 17), 40: (64, 36), 11: (256, 110), 17: (256, 74), 22: (256, 82), 10: (256, 84), 16: (256, 66)})
 GGML_QUANT = set(GGML_BLK.keys())
 
 _META_SZ = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
@@ -60,8 +61,35 @@ class GGUFCollection:
 
     def __init__(self, path: str):
         self.path = path
-        self.fd = os.open(path, os.O_RDONLY)
-        with open(path, "rb") as f:
+        # split packs: "<name>-00001-of-0000N.gguf" -> every file; tensor offsets carry the file index in bits 48+
+        real = os.path.realpath(path)
+        m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", real)
+        paths = [real] if m is None else [real[:m.start()] + f"-{i:05d}-of-{m.group(2)}.gguf" for i in range(1, int(m.group(2)) + 1)]
+        self.fds, self.bases, self.meta, self.infos = [], [], {}, {}
+        self.paths = paths
+        for i, p in enumerate(paths):
+            meta, infos, base = self._read_header(p)
+            for k, v in meta.items():
+                self.meta.setdefault(k, v)
+            for name, (ty, dims, off) in infos.items():
+                self.infos[name] = (ty, dims, off | (i << 48))
+            self.fds.append(os.open(p, os.O_RDONLY))
+            self.bases.append(base)
+        self.fd, self.base = self.fds[0], self.bases[0]
+        # SafetensorsCollection attrs poked by Config/model_init paths
+        self.directory = os.path.dirname(self.path)
+        self.tensor_file_map = {k: self.path for k in self.infos}
+        self.file_headers = {}
+        # Engine-key -> gguf-name translation (set by the arch config).
+        # Values are gguf names, or (gguf name, "T") when the engine wants
+        # the transpose of the stored orientation (e.g. the GDN conv).
+        self.name_map: dict[str, str | tuple] = {}
+        # In-memory overrides (e.g. dequantized embedding), served first.
+        self.new_tensors: dict[str, torch.Tensor] | None = None
+
+    @staticmethod
+    def _read_header(p: str):
+        with open(p, "rb") as f:
             assert f.read(4) == b"GGUF"
             f.read(4)
             nt = struct.unpack("<Q", f.read(8))[0]
@@ -87,29 +115,20 @@ class GGUFCollection:
                 raise ValueError(f"gguf metadata type {t}")
 
             # Metadata kept (config + tokenizer are derived from it, see loader/gguf_config.py)
-            self.meta = {}
+            meta = {}
             for _ in range(nm):
                 k = rs()
-                self.meta[k] = sv()
-            self.infos = {}
+                meta[k] = sv()
+            infos = {}
             for _ in range(nt):
                 name = rs()
                 nd = struct.unpack("<I", f.read(4))[0]
                 dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
                 ty = struct.unpack("<I", f.read(4))[0]
                 off = struct.unpack("<Q", f.read(8))[0]
-                self.infos[name] = (ty, tuple(dims), off)
-            self.base = (f.tell() + 31) // 32 * 32
-        # SafetensorsCollection attrs poked by Config/model_init paths
-        self.directory = os.path.dirname(path)
-        self.tensor_file_map = {k: path for k in self.infos}
-        self.file_headers = {}
-        # Engine-key -> gguf-name translation (set by the arch config).
-        # Values are gguf names, or (gguf name, "T") when the engine wants
-        # the transpose of the stored orientation (e.g. the GDN conv).
-        self.name_map: dict[str, str | tuple] = {}
-        # In-memory overrides (e.g. dequantized embedding), served first.
-        self.new_tensors: dict[str, torch.Tensor] | None = None
+                infos[name] = (ty, tuple(dims), off)
+            base = (f.tell() + 31) // 32 * 32
+        return meta, infos, base
 
     def _resolve(self, key: str) -> str:
         mapped = self.name_map.get(key, key)
@@ -136,10 +155,11 @@ class GGUFCollection:
         return None
 
     def close(self):
-        try:
-            os.close(self.fd)
-        except OSError:
-            pass
+        for fd in getattr(self, "fds", [self.fd]):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def has_tensor_group(self, key, subkeys) -> bool:
         if isinstance(key, list):
@@ -159,11 +179,13 @@ class GGUFCollection:
         return info[1]
 
     def _pread(self, off: int, n: int) -> np.ndarray:
+        fi, off = off >> 48, off & ((1 << 48) - 1)
+        fd, base = self.fds[fi], self.bases[fi]
         buf = bytearray(n)
         mv = memoryview(buf)
         got = 0
         while got < n:
-            r = os.pread(self.fd, n - got, self.base + off + got)
+            r = os.pread(fd, n - got, base + off + got)
             if not r:
                 raise IOError(f"short read at {off + got}")
             mv[got:got + len(r)] = r
@@ -226,12 +248,15 @@ class GGUFCollection:
             if transpose:
                 raise ValueError("transpose not supported for quant payloads")
             return t.to(dev)
-        if ty in (0, 1):  # F32 / F16
+        if ty in (0, 1, 30):  # F32 / F16 / BF16 (BF16 widened to float32: bit shift, exact)
             dt = np.float32 if ty == 0 else np.float16
             es = 4 if ty == 0 else 2
             n = int(np.prod(dims))
             raw = self._pread(off, n * es)
-            a = np.frombuffer(raw, dtype=dt)
+            if ty == 30:
+                a = (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+            else:
+                a = np.frombuffer(raw, dtype=dt)
             # GGUF dims are ggml order (ne[0] = row length, fastest): the TRUE
             # matrix orientation is [dims[1], dims[0}] (dims[1] rows of dims[0]).
             # (A scrambled (dims[0], dims[1]) view silently corrupts every 2-D
