@@ -2494,7 +2494,7 @@ def load_all(args: argparse.Namespace):
           f"defaults={ {k: v for k, v in defaults.items() if v is not None} }", flush=True)
     engine = QwenEngine(model_dir, args.ctx, ndt=args.ndt, draft_policy=args.draft_policy, vision=not args.no_vision,
                         cache_bits=args.cache_bits, sessions=args.sessions,
-                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()), kv_mode=args.kv_mode)
+                        k_bits=args.k_bits, v_bits=args.v_bits, dflash_dir=str(Path(args.dflash_dir).expanduser()), kv_mode=args.kv_mode, max_chunk_size=args.max_chunk)
     env = {k: v for k, v in sorted(os.environ.items()) if k.startswith(("EXL3_", "MPW"))}
     print(f"qserve: effective env {env}", flush=True)
     from exllamav3.generator.slot_store import SlotStore
@@ -2558,6 +2558,7 @@ def main() -> None:
     parser.add_argument("--ndt", type=int, default=7, help="max draft tokens per round (default 7; the rule drafts up to 3 for most rounds, deeper only on confident chains)")
     parser.add_argument("--gguf-mtp", default="", help="GGUF body: directory with the MTP head tensors (mtp.* safetensors, tools/qwen/gguf_mtp_fetch.py); "
                         "sets KYO_GGUF_MTP, use with --draft-policy mix|mtp")
+    parser.add_argument("--max-chunk", type=int, default=2048, help="prefill rows per forward (default 2048); a smaller chunk frees activation memory on a full card")
     parser.add_argument("--draft-policy", choices=("mix", "mtp", "dflash", "off"), default="mix",
                         help="mix = shipped rule (MTP + n-gram lookup, lossless), mtp = fixed MTP chain, dflash = DFlash2 block drafter "
                              "from --dflash-dir (lossless; see --dflash-adapt), off = plain decode")
