@@ -238,22 +238,21 @@ The 128 GB pool reports about 118 GiB to torch, but the practical usable point i
 guard and the external supervisor described in [split.md](split.md#memory-and-capacity):
 
 - `--oom-guard auto` (default) estimates weights, cache, part0 slab and workspace, caps each
-  device at its own `min(free, total)`, and caps the host at `MemAvailable - 7 GiB` (plus a
+  device at its own `min(free, total)`, and caps the host at `MemAvailable - 8 GiB` (plus a
   1 GiB planning margin). It refuses before allocating anything.
 - There is no GTT or VRAM reserve. A dedicated-VRAM OOM is a process-level error; the host
   floor is what prevents kernel starvation on the unified pool.
 - `EXL3_EXPANDABLE_SEGMENTS=0` recovers about 0.5 GiB of allocator fragmentation around a
   large cache (the 512K GLM case), not capacity.
 - `python exllamav3/guard.py --fadvise-dir <model> -- ...` SIGKILLs the child when host
-  `MemAvailable` falls below 7 GiB (`KYOJIN_OOM_GUARD_HOST_FREE_GIB`) and releases page
+  `MemAvailable` falls below 8 GiB (`MEMGUARD_FLOOR`) and releases page
   cache. The serve scripts wrap this with `MEMGUARD=auto|1|0` and log to
   `$TMPDIR/memguard.log`.
 
 Cutoffs observed on GLM: 128K split is the validated long-context point; 640K is refused by
-the pre-flight guard; 768K previously hard-locked the box. An 8K MTP-on N=6 probe was killed
-by the host floor at 7.0 GiB available before the kernel OOM zone (~4.3 GiB GTT free); N=7
-completed at 7.2 GiB host / 7.1 GiB GTT free. Do not hand-pick an N for MTP-on: use the
-guard's largest-N/context output and keep the supervisor armed.
+the pre-flight guard; 768K previously hard-locked the box. Do not hand-pick an N for MTP-on:
+use the guard's largest-N/context output and keep the supervisor armed. The host floor is
+tunable with `MEMGUARD_FLOOR` if the OS/background load differs from the default.
 
 ## Build
 

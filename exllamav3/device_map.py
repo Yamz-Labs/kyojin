@@ -415,10 +415,19 @@ def component_weight_bytes(model, config = None, cache = None) -> tuple[int, int
 
 def check_single_device_guard(model, config = None, cache = None, device = 0,
                               guard_mode: str | None = None,
-                              arch: str = "", logger = print):
-    """Pre-flight guard for a single-device load."""
+                              extra_components = (), arch: str = "", logger = print):
+    """Pre-flight guard for a single-device load.
+
+    ``extra_components`` is an iterable of ``(model, config, cache)`` tuples for the
+    drafter and vision tower that load on the same device after the target.
+    """
     weights, cache_bytes = component_weight_bytes(model, config, cache)
-    policy = GuardPolicy.from_env(default_mode = guard_mode or "auto")
+    for extra_model, extra_config, extra_cache in extra_components:
+        extra_weights, extra_cache_bytes = component_weight_bytes(
+            extra_model, extra_config, extra_cache)
+        weights += extra_weights
+        cache_bytes += extra_cache_bytes
+    policy = GuardPolicy.from_env(explicit_mode = guard_mode)
     return check_single_device(weights, cache_bytes, device, policy = policy,
                                arch = arch, logger = logger)
 
@@ -755,7 +764,7 @@ class SplitPlan:
         self._module_byte_cache: dict[tuple[int, int], int] = {}
         self.logger = logger
         self.guard = guard or OOMGuard(
-            GuardPolicy.from_env(default_mode = guard_mode or "auto"), logger = self.logger)
+            GuardPolicy.from_env(explicit_mode = guard_mode), logger = self.logger)
         self.maps: dict[str, ComponentMap] = {}
         self._decls: dict[str, tuple] = {}
         self.configs: list[object] = []

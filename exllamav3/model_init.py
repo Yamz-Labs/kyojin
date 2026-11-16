@@ -387,7 +387,9 @@ def init(
         # Single-device loads use the same automatic preflight; KYOJIN_OOM_GUARD=off
         # disables it.
         from .device_map import check_single_device_guard
+        extras = [(draft_model, draft_config or config, draft_cache)] if draft_model is not None else []
         check_single_device_guard(model, config, cache, single_device,
+                                  extra_components = extras,
                                   logger = lambda m: printp(not quiet, m))
 
     # Parallelism options

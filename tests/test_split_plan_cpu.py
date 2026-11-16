@@ -148,7 +148,8 @@ def _disable_default_oom_guard(split_modules, monkeypatch):
     """
     dm = split_modules[0]
     monkeypatch.setattr(dm.GuardPolicy, "from_env",
-                        classmethod(lambda cls, default_mode = "auto": cls(mode = "off")))
+                        classmethod(lambda cls, default_mode = "auto", explicit_mode = None:
+                                    cls(mode = explicit_mode or "off")))
 
 
 @pytest.fixture
@@ -787,3 +788,26 @@ def test_split_plan_guard_passes_or_refuses_before_allocation(split_modules, mon
 def test_guard_mode_is_normalized_from_env_style_values(split_modules):
     _dm, _bridge, split = split_modules
     assert split.SplitSettings(part0_layers = 1, oom_guard = "OFF").guard_mode == "off"
+
+
+def test_single_device_guard_includes_extra_components(split_modules, monkeypatch):
+    dm, _bridge, _split = split_modules
+    mg = __import__("exllamav3.memory_guard", fromlist = ["OOMGuardError"])
+    gib = dm.GIB
+    monkeypatch.setattr(dm.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(mg, "device_total_bytes", lambda _i: 118 * gib)
+    monkeypatch.setattr(mg, "device_free_bytes", lambda _i: 118 * gib)
+    monkeypatch.setattr(mg, "host_available_bytes", lambda: 120 * gib)
+    monkeypatch.setattr(mg, "is_unified_device", lambda *_a, **_k: True)
+
+    target = FakeModel([FakeModule("layer.0", layer_idx = 0)])
+    target_cfg = FakeConfig({"layer.0": 1 * gib})
+    extra = FakeModel([FakeModule("mtp.0")])
+    extra_cfg = FakeConfig({"mtp.0": 116 * gib})
+
+    dm.check_single_device_guard(target, target_cfg, None, 0, guard_mode = "auto",
+                                 logger = lambda *_a: None)
+    with pytest.raises(mg.OOMGuardError, match = "refused the load"):
+        dm.check_single_device_guard(target, target_cfg, None, 0, guard_mode = "auto",
+                                     extra_components = [(extra, extra_cfg, None)],
+                                     logger = lambda *_a: None)

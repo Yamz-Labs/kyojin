@@ -62,9 +62,8 @@
 #   EXL3_LOAD_DEVICE=cuda:0   single-device load, bypassing the autosplit budget
 #                         arithmetic (which reads MemFree, not MemAvailable).
 #                         Set to "" to restore stock autosplit.
-#   MEMGUARD=auto         auto | 1 | 0. `auto` enables exllamav3/guard.py on Linux for a
-#                         unified/GTT device or a large model.
-#   KYOJIN_OOM_GUARD_HOST_FREE_GIB=7  SIGKILL the server below this MemAvailable, in GiB
+#   MEMGUARD=auto         auto | 1 | 0. `auto` enables exllamav3/guard.py on Linux.
+#   MEMGUARD_FLOOR=8      SIGKILL below this MemAvailable, in GiB
 #   MIN_AVAIL_GIB=12      refuse to start below this MemAvailable, in GiB
 #   FOREGROUND=1          0 backgrounds it and writes $LOG
 #
@@ -245,21 +244,17 @@ export EXL3_LOAD_DEVICE="${EXL3_LOAD_DEVICE-cuda:0}"
 use_mg=0
 case "$MEMGUARD" in
     1) use_mg=1 ;;
+    0) ;;
     auto)
-        if compgen -G "/sys/class/drm/card*/device/mem_info_gtt_total" > /dev/null; then
-            use_mg=1
-        elif [ -r /proc/meminfo ]; then
-            model_bytes=$(du -sb --apparent-size "$MODEL_DIR"/*.safetensors 2> /dev/null | awk '{s+=$1} END {print s+0}')
-            [ "${model_bytes:-0}" -ge $((48 * 1024 * 1024 * 1024)) ] && use_mg=1
-        fi
+        if [ -r /proc/meminfo ]; then use_mg=1; fi
         ;;
 esac
 if [ "$use_mg" = "1" ] && [ -f "$REPO/exllamav3/guard.py" ]; then
     MG=(python "$REPO/exllamav3/guard.py"
         --fadvise-dir "$MODEL_DIR" --fadvise-every 5 --label tabbyapi
-        --sample-every 5 --log "${TMPDIR:-/tmp}/memguard.log")
+        --sample-every 5 --log "$TABBY_DIR/memguard.log")
     MG+=(--)
-    echo " -- MEMGUARD=on (host floor ${KYOJIN_OOM_GUARD_HOST_FREE_GIB:-7} GiB)"
+    echo " -- MEMGUARD=on (host floor MEMGUARD_FLOOR/default)"
 else
     MG=()
     [ "$use_mg" = "1" ] || echo " !! memguard disabled (MEMGUARD=$MEMGUARD)"

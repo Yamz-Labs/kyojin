@@ -7,7 +7,7 @@ export EXL3_ROOT="$LANE_ROOT" EXL3_REPO="$LANE_ROOT" PYTHONPATH="$LANE_ROOT" TMP
 mkdir -p "$TMPDIR"
 
 # External supervisor (exllamav3/guard.py): the reliable backstop for a unified pool.
-# auto = a unified/GTT device is visible, or the model is large enough to threaten it.
+# auto = arm on Linux when /proc/meminfo is readable (the previous memguard behavior).
 MEMGUARD="${MEMGUARD:-auto}"
 MODEL=""
 args=("$@")
@@ -20,15 +20,10 @@ done
 use_mg=0
 case "$MEMGUARD" in
     1) use_mg=1 ;;
-    auto)
-        if compgen -G "/sys/class/drm/card*/device/mem_info_gtt_total" > /dev/null; then
-            use_mg=1
-        elif [ -n "$MODEL" ] && [ -d "$MODEL" ]; then
-            model_bytes=$(du -sb --apparent-size "$MODEL"/*.safetensors 2> /dev/null | awk '{s+=$1} END {print s+0}' || true)
-            if [ "${model_bytes:-0}" -ge $((48 * 1024 * 1024 * 1024)) ]; then use_mg=1; fi
-        fi
-        ;;
     0) ;;
+    auto)
+        if [ -r /proc/meminfo ]; then use_mg=1; fi
+        ;;
 esac
 MG=()
 if [ "$use_mg" = "1" ] && [ -f "$LANE_ROOT/exllamav3/guard.py" ]; then
@@ -36,7 +31,7 @@ if [ "$use_mg" = "1" ] && [ -f "$LANE_ROOT/exllamav3/guard.py" ]; then
         --log "$TMPDIR/memguard.log" --sample-every 5 --fadvise-every 5)
     [ -n "$MODEL" ] && [ -d "$MODEL" ] && MG+=(--fadvise-dir "$MODEL")
     MG+=(--)
-    echo "serve_lane: MEMGUARD=on (host floor ${KYOJIN_OOM_GUARD_HOST_FREE_GIB:-7} GiB, log $TMPDIR/memguard.log)" >&2
+    echo "serve_lane: MEMGUARD=on (host floor MEMGUARD_FLOOR/default, log $TMPDIR/memguard.log)" >&2
 elif [ "$MEMGUARD" = "1" ]; then
     echo "serve_lane: MEMGUARD=1 requested but exllamav3/guard.py is missing" >&2
     exit 1

@@ -91,10 +91,10 @@ The measured 118 GiB Strix Halo iGPU has a practical usable point of about **113
 (the gap to the 118 GiB aperture is driver/allocator overhead). Recorded failure points on
 the measured GLM pack: 128K split runs complete (peak ~109.3 GiB on the iGPU); a 512K cache
 needs `expandable_segments:False` to load; 640K is refused by the pre-flight guard; 768K
-hard-locked the box. A 2026-11-16 8K MTP-on N=6 probe caused a kernel OOM at ~4.3 GiB GTT
-free under the old configuration. The host-only supervisor now catches that case: an N=6
-run allowed past preflight was SIGKILLed at 7.0 GiB host available / 5.3 GiB GTT free,
-with no kernel OOM.
+hard-locked the box. A host-only supervisor catches a run that reaches the configured host
+floor before the kernel OOM zone; the preflight uses the same floor plus a small planning
+margin. The measured case and its explicit floor override are recorded in
+`docs-notes/split-support-matrix.md`.
 
 ### Pre-flight guard
 
@@ -108,7 +108,7 @@ host_cap   = MemAvailable - (host_floor + preflight_margin)
 
 There is **no GTT or VRAM reserve**. A dedicated-VRAM allocation failure is a process-level
 error; the host floor is what prevents the unified-memory box from starving. The only
-tunables are `KYOJIN_OOM_GUARD_HOST_FREE_GIB` (default 7), the planning margin (default 1)
+tunables are `MEMGUARD_FLOOR` (default 8), the planning margin (default 1)
 and the prefill workspace (default 2.0 GiB). The host floor is shared with the supervisor;
 the margin keeps the planner above the supervisor's kill threshold.
 
@@ -116,10 +116,8 @@ the margin keeps the planner above the supervisor's kill threshold.
 table plus the chosen N/context and the largest N/context that fits. `off` disables it. The
 check is read-only.
 
-Measured budget on the GLM pack at idle: 128K N=5 needs ~111 GiB (passes); 640K N=5 needs
-~115.2 GiB and is refused by the host planning cap (~114.6 GiB); MTP-on N=6 needs ~110.4 GiB
-and is allowed to start, with the supervisor as the runtime backstop; MTP-on N=7 needs
-~107.7 GiB and completed at 7.2 GiB host / 7.1 GiB GTT free.
+The preflight's device caps are the devices' own free/full memory; the host cap follows
+the configured floor. A load that reaches the host floor is stopped by the supervisor.
 
 ### Allocator mode
 
@@ -142,10 +140,11 @@ Use `exllamav3/guard.py` (the compatibility path `util/memguard.py` execs it). I
 python exllamav3/guard.py --fadvise-dir /path/to/model -- python tools/glm/serve.py ...
 ```
 
-The host floor defaults to 7 GiB (or `KYOJIN_OOM_GUARD_HOST_FREE_GIB`) and is the same value
+The host floor defaults to 8 GiB (or `MEMGUARD_FLOOR`) and is the same value
 the preflight plans around. The supervisor logs a sample to `--log`; the serve lanes pass
 `$TMPDIR/memguard.log` so a future event leaves evidence. The serve scripts use a
-`MEMGUARD=auto|1|0` wrapper: `auto` enables it for a unified/GTT device or a large model.
+`MEMGUARD=auto|1|0` wrapper: `auto` arms `exllamav3/guard.py` on Linux when
+`/proc/meminfo` is readable; use `MEMGUARD=0` to disable it.
 Keep the supervisor external; an in-process watchdog cannot be relied on while the allocator
 or kernel is stalled. Do not run MTP-on probing with the retired `split_bench_ctx.py`; use
 `split_eval.py --bench-depth`.

@@ -21,8 +21,8 @@ Usage
 
 Options
 -------
-    --floor-gib F          kill when MemAvailable < F GiB       (default 7 or
-                           KYOJIN_OOM_GUARD_HOST_FREE_GIB)
+    --floor-gib F          kill when MemAvailable < F GiB       (default 8 or
+                           MEMGUARD_FLOOR)
     --interval S           poll period in seconds               (default 0.5)
     --warn-gib F           log a warning below this             (default floor + 8)
     --log PATH             also append the trace here
@@ -49,15 +49,13 @@ import subprocess
 import sys
 import time
 
+# Import the stdlib-only shared floor policy without importing the package/torch.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from guard_common import host_floor_from_env
+
 GIB = 1024.0 * 1024.0 * 1024.0
-DEFAULT_FLOOR_GIB = 7.0
-
-
-def _env_float(name: str, fallback: float) -> float:
-    try:
-        return float(os.environ.get(name, fallback))
-    except ValueError:
-        return float(fallback)
 
 
 def meminfo() -> dict[str, int]:
@@ -95,9 +93,22 @@ def proc_rss(pid: int) -> int:
     return 0
 
 
+def _open_log(path: str):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    return os.fdopen(fd, "a", buffering = 1)
+
+
 class Logger:
     def __init__(self, path: str | None):
-        self.fh = open(path, "a", buffering = 1) if path else None  # noqa: SIM115
+        self.fh = None
+        if path:
+            try:
+                self.fh = _open_log(path)
+            except OSError as exc:
+                print(f"[guard] cannot open log {path}: {exc}", file = sys.stderr, flush = True)
 
     def __call__(self, msg: str) -> None:
         line = f"[guard {time.strftime('%H:%M:%S')}] {msg}"
@@ -117,7 +128,7 @@ def kill_tree(pid: int, sig: int) -> None:
 
 
 def main() -> int:
-    default_floor = _env_float("KYOJIN_OOM_GUARD_HOST_FREE_GIB", DEFAULT_FLOOR_GIB)
+    default_floor = host_floor_from_env()
     ap = argparse.ArgumentParser(add_help = True)
     ap.add_argument("--floor-gib", type = float, default = default_floor)
     ap.add_argument("--warn-gib", type = float, default = None)

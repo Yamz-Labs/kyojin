@@ -19,10 +19,20 @@ import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
+try:
+    from .guard_common import (
+        DEFAULT_HOST_FLOOR_GIB,
+        host_floor_from_env,
+    )
+except ImportError:                                      # loaded as a standalone file in CPU tests
+    from guard_common import (
+        DEFAULT_HOST_FLOOR_GIB,
+        host_floor_from_env,
+    )
+
 GIB = 1024 ** 3
 
 MODES = ("auto", "off")
-DEFAULT_HOST_FLOOR_GIB = 7.0
 DEFAULT_PREFLIGHT_MARGIN_GIB = 1.0
 DEFAULT_WORKSPACE_GIB = 2.0
 
@@ -49,16 +59,19 @@ class GuardPolicy:
         self.workspace_gib = max(0.0, float(self.workspace_gib))
 
     @classmethod
-    def from_env(cls, default_mode: str = "auto") -> GuardPolicy:
+    def from_env(cls, default_mode: str = "auto",
+                 explicit_mode: str | None = None) -> GuardPolicy:
         def value(name: str, fallback: float) -> float:
             try:
                 return float(os.environ.get(name, fallback))
             except ValueError:
                 return float(fallback)
 
+        mode = explicit_mode if explicit_mode is not None else os.environ.get(
+            "KYOJIN_OOM_GUARD", default_mode)
         return cls(
-            mode=os.environ.get("KYOJIN_OOM_GUARD", default_mode),
-            host_floor_gib=value("KYOJIN_OOM_GUARD_HOST_FREE_GIB", DEFAULT_HOST_FLOOR_GIB),
+            mode=mode,
+            host_floor_gib=host_floor_from_env(),
             preflight_margin_gib=value("KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB",
                                        DEFAULT_PREFLIGHT_MARGIN_GIB),
             workspace_gib=value("KYOJIN_OOM_GUARD_WORKSPACE_GIB", DEFAULT_WORKSPACE_GIB),
@@ -343,7 +356,7 @@ class OOMGuard:
         raise OOMGuardError(
             "pre-flight OOM guard refused the load before allocating anything "
             f"(mode={self.policy.mode}):\n{message}\n"
-            "Lower -c/--max-ctx or --part0-layers, raise KYOJIN_OOM_GUARD_HOST_FREE_GIB/"
+            "Lower -c/--max-ctx or --part0-layers, raise MEMGUARD_FLOOR/"
             "KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB if they are wrong, or set "
             "KYOJIN_OOM_GUARD=off to disable the preflight.")
 

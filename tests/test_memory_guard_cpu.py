@@ -13,6 +13,8 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "exllamav3") not in sys.path:
+    sys.path.insert(0, str(ROOT / "exllamav3"))
 GIB = 1024 ** 3
 
 
@@ -55,9 +57,13 @@ def _guard(mg, mode="auto", host_floor=7.0, margin=1.0, workspace=2.0):
 
 
 def test_policy_env_defaults_and_overrides(mg, monkeypatch):
-    for key in ("KYOJIN_OOM_GUARD", "KYOJIN_OOM_GUARD_HOST_FREE_GIB",
+    for key in ("KYOJIN_OOM_GUARD", "MEMGUARD_FLOOR",
                 "KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB", "KYOJIN_OOM_GUARD_WORKSPACE_GIB"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("MEMGUARD_FLOOR", raising=False)
+    policy = mg.GuardPolicy.from_env()
+    assert policy.host_floor_gib == 8.0
+    monkeypatch.setenv("MEMGUARD_FLOOR", "7")
     policy = mg.GuardPolicy.from_env()
     assert policy.mode == "auto"
     assert policy.host_floor_gib == 7.0
@@ -65,7 +71,7 @@ def test_policy_env_defaults_and_overrides(mg, monkeypatch):
     assert policy.workspace_gib == 2.0
 
     monkeypatch.setenv("KYOJIN_OOM_GUARD", "OFF")
-    monkeypatch.setenv("KYOJIN_OOM_GUARD_HOST_FREE_GIB", "9.5")
+    monkeypatch.setenv("MEMGUARD_FLOOR", "9.5")
     monkeypatch.setenv("KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB", "0.5")
     monkeypatch.setenv("KYOJIN_OOM_GUARD_WORKSPACE_GIB", "3")
     policy = mg.GuardPolicy.from_env()
@@ -73,6 +79,11 @@ def test_policy_env_defaults_and_overrides(mg, monkeypatch):
     assert policy.host_floor_gib == 9.5
     assert policy.preflight_host_floor_gib == 10.0
     assert policy.workspace_gib == 3.0
+
+    # An explicit flag wins over the environment.
+    monkeypatch.setenv("KYOJIN_OOM_GUARD", "auto")
+    policy = mg.GuardPolicy.from_env(explicit_mode="off")
+    assert policy.mode == "off"
 
 
 def test_device_capacity_is_free_or_total_not_a_reserve(mg):
@@ -149,9 +160,7 @@ def test_unified_detection_does_not_flag_a_large_dedicated_gpu(mg, monkeypatch):
 
 
 def test_supervisor_host_floor_is_env_tunable(guard_mod, monkeypatch):
-    monkeypatch.delenv("KYOJIN_OOM_GUARD_HOST_FREE_GIB", raising=False)
-    assert guard_mod._env_float("KYOJIN_OOM_GUARD_HOST_FREE_GIB",
-                                guard_mod.DEFAULT_FLOOR_GIB) == 7.0
-    monkeypatch.setenv("KYOJIN_OOM_GUARD_HOST_FREE_GIB", "9.5")
-    assert guard_mod._env_float("KYOJIN_OOM_GUARD_HOST_FREE_GIB",
-                                guard_mod.DEFAULT_FLOOR_GIB) == 9.5
+    monkeypatch.delenv("MEMGUARD_FLOOR", raising=False)
+    assert guard_mod.host_floor_from_env() == 8.0
+    monkeypatch.setenv("MEMGUARD_FLOOR", "9.5")
+    assert guard_mod.host_floor_from_env() == 9.5

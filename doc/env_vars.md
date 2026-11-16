@@ -726,13 +726,13 @@ There is no per-device GTT or VRAM reserve. Each device's cap is its own reporte
 process-level error; the host floor is what protects the unified-memory box from kernel
 starvation.
 
-### `KYOJIN_OOM_GUARD_HOST_FREE_GIB` (default: `7`)
+### `MEMGUARD_FLOOR` (default: `8`)
 
 The host `MemAvailable` floor, used by both the pre-flight guard and `exllamav3/guard.py`.
 The preflight plans against `MemAvailable - (floor + margin)`; the supervisor SIGKILLs when
-`MemAvailable < floor`. Raise this for a hungrier OS or more background services; lower it
-only after measuring. Seven GiB is the measured boundary on this box: the 8K MTP-on N=7 run
-completed at 7.26 GiB host available, while the fatal N=6 run reached the kernel OOM zone.
+`MemAvailable < floor`. The name is the established memguard variable, so existing lanes
+keep working. Raise it for a hungrier OS or more background services; lower it only after
+measuring.
 
 ### `KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB` (default: `1`)
 
