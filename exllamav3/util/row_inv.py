@@ -16,6 +16,13 @@ ROW_INV = {"on": os.environ.get("EXL3_ROW_INV", "1") not in ("", "0")}
 ROW_INV_MAX_ROWS = max(1, int(os.environ.get("EXL3_ROW_INV_MAX_ROWS", "32" if torch.version.hip else "8")))
 
 
+# GGUF / foreign-quant body (modules/foreign_linear.py): rows 2..GGUF_ROW_INV_MAX_ROWS of one forward (verify rows, a few sessions) run the same
+# kernel arithmetic as the one-row step, so a greedy verify matches the plain step bit for bit. Off by default (the few-row int8 MMA kernel
+# and the 5..8 column mmvq launch are faster); serve.py --gguf-mtp turns it on. Mutable at run time for one-load A/B (purge the graphs).
+GGUF_ROW_INV = {"on": os.environ.get("EXL3_GGUF_ROW_INV", "0") not in ("", "0")}
+GGUF_ROW_INV_MAX_ROWS = ROW_INV_MAX_ROWS
+
+
 def job_slices(rows: int, w: int, cap: int) -> list:
     """Row ranges (lo, hi) that cut `rows` verify rows into calls of at most `cap` rows. `w` is the rows of one job (consecutive rows of
     one sequence share most of their experts, so whole jobs stay together when they fit, w > 1 and rows % w == 0). The slices are

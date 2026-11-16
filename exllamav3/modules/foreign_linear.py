@@ -27,6 +27,7 @@ from ..foreign_quant.gap_formats import dequant as gap_dequant
 from ..foreign_quant import triton_iq
 from ..foreign_quant import triton_gap
 from ..foreign_quant import triton_rows
+from ..util.row_inv import GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS
 _ROWS_TRITON = os.environ.get("BOLT_FQ_ROWS_TRITON", "1") != "0"
 # Q8_0 rows 2..16 on CUDA: the Triton _rows_q8_0 kernel (tuned on Strix Halo) takes 172 us per launch on the 3090 (330 launches per step = 57 ms of an
 # 87 ms N8 step on the 35B-A3B UD-Q4_K_XL, 75 % of device time); the C++ q8_1 GEMV (fq_gemv_q8_0) takes 70-80 us. HIP keeps the Triton kernel.
@@ -279,7 +280,8 @@ class ForeignLinear(Module):
         if not flat.is_contiguous():
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
-        if (_MMQ_FEW and self.format in _MMQ_FEW_FMT and _MMQ_FEW_MINR[self.format] <= R <= 24 and flat.dtype == torch.half
+        ri = GGUF_ROW_INV["on"] and 2 <= R <= GGUF_ROW_INV_MAX_ROWS   # row-invariant mode: every row gets the bits of the one-row launch
+        if (_MMQ_FEW and not ri and self.format in _MMQ_FEW_FMT and _MMQ_FEW_MINR[self.format] <= R <= 24 and flat.dtype == torch.half
                 and K % 256 == 0 and K >= 2048 and hasattr(ext, "fq_mmq_few")
                 and (self.format not in _MMQ_FEW_CAPTURE_ONLY or torch.cuda.is_current_stream_capturing())):
             N = self.out_features
@@ -299,7 +301,11 @@ class ForeignLinear(Module):
             dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
             qb = ext.fq_q8_scratch(dev_idx, R, K)
             ext.fq_quant_q8_1_rows(flat, qb)
-            getattr(ext, _MMVQ_FN[self.format])(qb, self.packed.reshape(N, -1), out)
+            if ri and R > 4:      # 5..8 columns launch 2 warps per row (other sum order than the one-row launch's 4): at most 4 columns per launch
+                for a in range(0, R, 4):
+                    getattr(ext, _MMVQ_FN[self.format])(qb[a:a + 4], self.packed.reshape(N, -1), out[a:a + 4])
+            else:
+                getattr(ext, _MMVQ_FN[self.format])(qb, self.packed.reshape(N, -1), out)
             if out.dtype != dtype:
                 out = out.to(dtype)
         elif (_ROWS_TRITON and flat.dtype == torch.half and (_ROWS_TRITON_Q8 or self.format != "q8_0")

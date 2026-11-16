@@ -38,12 +38,46 @@ def experts_fp8(t, block=128):
     return out
 
 
+GGML_TYPES = {"q4_k": (12, 144), "q5_k": (13, 176), "q6_k": (14, 210), "iq4_xs": (23, 136)}   # ggml type id, bytes per 256 weights
+
+
+def experts_gguf(t, fmt, lib):
+    """Fused bf16 MoE experts -> GGUF blocks (ggml_quantize_chunk of a llama.cpp libggml-base.so, no imatrix), one uint8 [N, K/256*bytes]
+    tensor per expert projection: the head then runs on the same grouped K-quant MoE kernels as a GGUF body (q4_k: 0.56 byte per weight)."""
+    import ctypes, torch
+    ty, bb = GGML_TYPES[fmt]
+    g = ctypes.CDLL(lib)
+    g.ggml_quantize_chunk.restype = ctypes.c_size_t
+    g.ggml_quantize_chunk.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+    g.ggml_quantize_init.argtypes = [ctypes.c_int]
+    g.ggml_quantize_init(ty)
+    def q(w):
+        N, K = w.shape
+        assert K % 256 == 0, K
+        src = w.float().contiguous()
+        dst = torch.empty((N, K // 256 * bb), dtype=torch.uint8)
+        n = g.ggml_quantize_chunk(ty, src.data_ptr(), dst.data_ptr(), 0, N, K, None)
+        assert n == dst.numel(), (n, dst.numel())
+        return dst
+    out = {k: v for k, v in t.items() if not k.endswith(("experts.gate_up_proj", "experts.down_proj"))}
+    for k, v in t.items():
+        if k.endswith("experts.gate_up_proj"):
+            base, I = k[:-len("gate_up_proj")], v.shape[1] // 2
+            dn = t[base + "down_proj"]
+            for e in range(v.shape[0]):
+                for name, w in (("gate_proj", v[e, :I]), ("up_proj", v[e, I:]), ("down_proj", dn[e])):
+                    out[f"{base}{e}.{name}.weight"] = q(w.contiguous())
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="Qwen/Qwen3.6-35B-A3B")
     ap.add_argument("--out", required=True)
     ap.add_argument("--size-only", action="store_true")
     ap.add_argument("--experts-fp8", action="store_true", help="store the routed experts as fp8 e4m3 + block scales (about half the size)")
+    ap.add_argument("--experts-gguf", default="", choices=("", *GGML_TYPES), help="store the routed experts as GGUF blocks of this type (q4_k = 0.56 byte per weight)")
+    ap.add_argument("--ggml-lib", default="", help="libggml-base.so of a llama.cpp build (for --experts-gguf)")
     ap.add_argument("--from-file", default="", help="convert an already fetched mtp safetensors instead of fetching")
     a = ap.parse_args()
     base = f"https://huggingface.co/{a.repo}/resolve/main/"
@@ -52,6 +86,9 @@ def main():
     if a.from_file:
         from safetensors.torch import load_file, save_file
         os.makedirs(a.out, exist_ok=True)
+        if a.experts_gguf:
+            save_file(experts_gguf(load_file(a.from_file), a.experts_gguf, a.ggml_lib), os.path.join(a.out, f"mtp_{a.experts_gguf}e.safetensors"), metadata={"format": "pt"})
+            return
         save_file(experts_fp8(load_file(a.from_file)), os.path.join(a.out, "mtp_fp8e.safetensors"), metadata={"format": "pt"})
         return
     hd, total = {}, 0

@@ -31,6 +31,32 @@ def exl3_block_subhead(inner, blocks):
                       mul1 = inner.mul1_tensor, out_dtype = inner.out_dtype)
 
 
+_GGUF_EXPERT_FMT = {144: "q4_k", 176: "q5_k", 210: "q6_k", 136: "iq4_xs"}   # bytes per 256 weights
+
+
+def _expert_kwargs(config, idx):
+    """BlockSparseMLP expert arguments of the MTP head. Default: the checkpoint's experts (bf16 / fp8 safetensors). GGUF body whose
+    sidecar holds the experts as GGUF blocks (uint8 [N, K/256*bytes], tools/qwen/gguf_mtp_fetch.py --experts-gguf): ForeignLinear experts
+    on the body's grouped K-quant MoE kernels."""
+    base = dict(key_up = "experts.{expert_idx}.up_proj", key_gate = "experts.{expert_idx}.gate_proj", key_down = "experts.{expert_idx}.down_proj",
+                key_gate_up_split = "experts.gate_up_proj", key_down_split = "experts.down_proj", transpose_fused_weights = False)
+    stc = getattr(config, "stc", None)
+    k0 = f"mtp.layers.{idx}.mlp.experts.0.gate_proj.weight"
+    if getattr(config, "gguf", None) is None or stc is None or not stc.has_tensor(k0):
+        return base
+    meta = stc.get_tensor_meta(k0)[k0]
+    if "uint8" not in meta["dtype"]:
+        return base
+    from ..modules.foreign_linear import ForeignLinear
+    H, I, E = config.hidden_size, config.moe_intermediate_size, config.num_experts
+    fmt = _GGUF_EXPERT_FMT[meta["n_bytes"] // I // (H // 256)]
+    L = f"mtp.layers.{idx}.mlp.experts"
+    gates = [ForeignLinear(config, f"{L}.{e}.gate_proj", H, I, fmt) for e in range(E)]
+    ups = [ForeignLinear(config, f"{L}.{e}.up_proj", H, I, fmt) for e in range(E)]
+    downs = [ForeignLinear(config, f"{L}.{e}.down_proj", I, H, fmt, out_dtype = torch.float) for e in range(E)]
+    return dict(key_up = None, key_gate = None, key_down = None, gates = gates, ups = ups, downs = downs)
+
+
 class Qwen3_5MTPModel(Model):
 
     def __init__(
@@ -121,14 +147,9 @@ class Qwen3_5MTPModel(Model):
                             intermediate_size = config.moe_intermediate_size,
                             num_experts = config.num_experts,
                             num_experts_per_tok = config.num_experts_per_tok,
-                            key_up = "experts.{expert_idx}.up_proj",
-                            key_gate = "experts.{expert_idx}.gate_proj",
-                            key_down = "experts.{expert_idx}.down_proj",
-                            key_gate_up_split = "experts.gate_up_proj",
-                            key_down_split = "experts.down_proj",
+                            **_expert_kwargs(config, idx),
                             key_routing_gate = "gate",
                             key_shared_gate = "shared_expert_gate",
-                            transpose_fused_weights = False,
                             qmap = "block.mlp",
                             interm_dtype = torch.half,
                             out_dtype = torch.float,
@@ -164,6 +185,12 @@ class Qwen3_5MTPModel(Model):
                     ),
                 )
             )
+
+        for blk in self.modules[self.first_block_idx:]:
+            m = getattr(blk, "mlp", None)
+            for l in (*getattr(m, "gates", ()), *getattr(m, "ups", ()), *getattr(m, "downs", ())):
+                if l.__class__.__name__ == "ForeignLinear":     # prebuilt experts bypass the builders, which are the register_submodule sites
+                    m.register_submodule(l)
 
         self.last_kv_module_idx = len(self.modules) - 1
 
