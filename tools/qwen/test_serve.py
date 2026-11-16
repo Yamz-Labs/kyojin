@@ -8,6 +8,7 @@ import io
 import json
 import os
 import sys
+import time
 import types
 import unittest
 import unittest.mock
@@ -985,6 +986,14 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(v["llamacpp:requests_processing"], 0)
         self.assertEqual(v["llamacpp:requests_deferred"], 0)
         self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0)
+        self.assertEqual((v["kyojin:requests_total"], v["kyojin:requests_failed_total"]), (1, 0))
+        self.assertGreaterEqual(v["kyojin:queue_seconds_total"], 0)
+        self.assertEqual((v["kyojin:sessions"], v["kyojin:context_tokens"]), (1, FakeEngine.ctx))
+        self.assertAlmostEqual(v["kyojin:start_time_seconds"], time.time(), delta=60)
+        self.assertIn(f'kyojin:info{{version="{serve_metrics.kyojin_version()}",server="qwen",model="m"}} 1\n', text)
+        for name, mtype, _ in serve_metrics.OPTIONAL:      # a fake engine has no cache stats and no device
+            if name not in ("kyojin:sessions", "kyojin:context_tokens"):
+                self.assertNotIn(name, text)
 
     def test_every_generation_route_is_counted(self):
         posts = [self.CHAT, ("/completion", {"prompt": "hi"}), ("/v1/completions", {"model": "m", "prompt": "hi"})]
@@ -997,6 +1006,7 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(v["llamacpp:spec_decode_num_drafts_total"], 9)
         self.assertEqual(v["llamacpp:spec_decode_num_draft_tokens_total"], 18)
         self.assertEqual(v["llamacpp:spec_decode_num_accepted_tokens_total"], 12)
+        self.assertEqual(v["kyojin:requests_total"], 3)
 
     def test_request_that_drafted_nothing_adds_no_rounds(self):
         _, _, _, text = self.scrape(FakeEngine("hello there"), [self.CHAT])    # the default stats carry no draft counts
@@ -1008,12 +1018,52 @@ class MetricsTests(unittest.TestCase):
     def test_idle_server_reports_zeros(self):
         statuses, status, _, text = self.scrape(FakeEngine("x"))
         self.assertEqual((statuses, status), ([], 200))
-        self.assertEqual(set(self.samples(text).values()), {0.0})
+        static = ("kyojin:start_time_seconds", "kyojin:sessions", "kyojin:context_tokens", "kyojin:info")
+        self.assertEqual({v for k, v in self.samples(text).items() if not k.startswith(static)}, {0.0})
 
-    def test_kv_cache_usage_comes_from_the_generator(self):
+    def test_kv_cache_usage_and_token_counts_come_from_the_generator(self):
         engine = FakeEngine("x")
-        engine.generator = types.SimpleNamespace(get_cache_stats=lambda: {"used_tokens": 512, "max_tokens": 4096})
-        self.assertEqual(self.samples(self.scrape(engine)[3])["llamacpp:kv_cache_usage_ratio"], 0.125)
+        engine.generator = types.SimpleNamespace(get_cache_stats=lambda: {
+            "used_tokens": 512, "max_tokens": 4096, "free_tokens": 1024, "cached_tokens": 2560})
+        v = self.samples(self.scrape(engine)[3])
+        self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0.125)
+        self.assertEqual([v[f"kyojin:{k}"] for k in ("kv_cache_max_tokens", "kv_cache_used_tokens", "kv_cache_free_tokens",
+                                                     "prompt_cache_tokens")], [4096, 512, 1024, 2560])
+
+    def test_device_memory_comes_from_the_engine_torch(self):
+        engine = FakeEngine("x")
+        engine.torch = types.SimpleNamespace(cuda=types.SimpleNamespace(
+            mem_get_info=lambda: (10, 100), memory_allocated=lambda: 7, memory_reserved=lambda: 9))
+        v = self.samples(self.scrape(engine)[3])
+        self.assertEqual([v[f"kyojin:gpu_memory_{k}_bytes"] for k in ("allocated", "reserved", "free", "total")], [7, 9, 10, 100])
+
+    def test_failed_request_is_counted_as_failed_only(self):
+        class Broken(FakeEngine):
+            async def generate(self, prompt, **kw):
+                raise RuntimeError("engine fault")
+                yield ""      # an async generator, as the real one
+
+        statuses, _, _, text = self.scrape(Broken("x"), [self.CHAT])
+        v = self.samples(text)
+        self.assertEqual(statuses, [500])
+        self.assertEqual((v["kyojin:requests_total"], v["kyojin:requests_failed_total"]), (0, 1))
+        self.assertEqual(v["llamacpp:tokens_predicted_total"], 0)
+
+    def test_queue_time_of_a_request_that_waited_is_counted(self):
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kw):
+                await asyncio.sleep(0.05)
+                async for piece in super().generate(prompt, **kw):
+                    yield piece
+
+        async def fn(client):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            rs = await asyncio.gather(*[client.post("/v1/chat/completions", json=body) for _ in range(2)])
+            return [r.status for r in rs], await (await client.get("/metrics")).text()
+        statuses, text = with_client(Slow("x"), fn)       # one session: the second request waits for the first
+        v = self.samples(text)
+        self.assertEqual((statuses, v["kyojin:requests_total"]), ([200, 200], 2))
+        self.assertGreater(v["kyojin:queue_seconds_total"], 0.04)
 
     def test_wrong_method_answers_405_in_json(self):
         _, status, ctype, text = self.scrape(FakeEngine("x"), method="POST")

@@ -514,6 +514,8 @@ class ServeTests(unittest.TestCase):
             accepted=st["accepted_draft_tokens"])
         self.assertEqual(v["llamacpp:requests_processing"], 0)
         self.assertEqual(v["llamacpp:requests_deferred"], 0)
+        self.assertEqual((v["kyojin:requests_total"], v["kyojin:requests_failed_total"]), (1, 0))
+        self.assertIn(f'kyojin:info{{version="{serve_metrics.kyojin_version()}",server="mimo",model="m"}} 1\n', text)
         self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0)  # fake engine: no get_cache_stats
 
     def test_two_queued_requests_are_both_counted(self):

@@ -53,7 +53,7 @@ from serve_ping import ServePing  # noqa: E402
 from serve_reqlog import Lifecycle, ReqLog, StreamWriter, refusal_text, sanitize  # noqa: E402
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py: the GET /metrics collector
 # (Prometheus text, llama.cpp names) of the GLM and MiMo servers.
-from serve_metrics import Metrics  # noqa: E402
+from serve_metrics import Metrics, gpu_memory  # noqa: E402
 
 
 def _load_mimo():
@@ -1693,7 +1693,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
     salt_state: dict[str, Any] = {"current": None}   # cache_salt namespace of the prompt cache (None = requests without a salt)
     admit_lock = asyncio.Lock()
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
-    app.update(engine=engine, model_id=model_id, template=template, defaults=defaults, metrics=Metrics())
+    app.update(engine=engine, model_id=model_id, template=template, defaults=defaults,
+               metrics=Metrics(server="qwen", model=model_id, sessions=sessions, context=getattr(engine, "ctx", None)))
     # SSE keep-alive: off unless KYOJIN_SSE_PING_S names an interval (see tools/strix_halo/serve_ping.py).
     # A request copies this pinger, so its timers are its own; the start-up line reports the setting.
     ping = ServePing.from_env()
@@ -1727,7 +1728,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             {"id": model_id, "object": "model", "created": 0, "owned_by": "yamz",
              "max_context": getattr(engine, "ctx", None)}]})
 
-    def observe(st: dict[str, Any], prompt_tokens: int) -> None:
+    def observe(st: dict[str, Any], prompt_tokens: int, queue_s: float = 0.0) -> None:
         """GET /metrics counters of one finished request. The draft depth changes from round to round on this server
         (spec_policy), so the round count cannot come from proposed / window as on the GLM server. A verification
         step yields the one token the target samples plus the draft tokens it accepts, so the rounds of a request
@@ -1738,7 +1739,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         app["metrics"].observe(
             prompt_tokens=prompt_tokens, cached=int(st.get("cached_tokens") or 0), predicted=predicted,
             prefill_s=float(st.get("time_prefill") or 0.0), generate_s=float(st.get("time_generate") or 0.0),
-            drafts=max(predicted - accepted, 0) if proposed else 0, draft_tokens=proposed, accepted=accepted)
+            drafts=max(predicted - accepted, 0) if proposed else 0, draft_tokens=proposed, accepted=accepted,
+            queue_s=queue_s)
 
     async def health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "source": "kyojin", "model": model_id, "vision": bool(engine.supports_vision), **startup_health.compiler_health(),
@@ -1831,13 +1833,14 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                         print(f"qserve: vram alloc={t.memory_allocated() >> 20} MiB peak={t.max_memory_allocated() >> 20} MiB reserved={t.memory_reserved() >> 20} MiB",
                               file=sys.stderr, flush=True)
                     if done:      # a request cancelled mid-stream leaves no stats: not counted
-                        observe(done, int(done.get("prompt_tokens") or job.get("prompt_tokens") or 0))
+                        observe(done, int(done.get("prompt_tokens") or job.get("prompt_tokens") or 0), wait)
                     lifecycle.job_done(rid, done, started, prompt_tokens=job.get("prompt_tokens"))
                     out.put_nowait(("done", done))
                     if getattr(engine, "prefix_disk", None) is not None:
                         await engine.disk_save(stats)    # the reply is out: the host copy of the new pages holds the lock, the write does not
             except Exception as exc:                                  # noqa: BLE001
                 lifecycle.job_error(rid, exc, started)
+                app["metrics"].failed()
                 out.put_nowait(exc)
             finally:
                 queue.task_done()
@@ -2438,8 +2441,9 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             cs = engine.generator.get_cache_stats()
             kv = cs["used_tokens"] / cs["max_tokens"] if cs.get("max_tokens") else 0.0
         except Exception:                                        # noqa: BLE001
-            kv = 0.0
-        return web.Response(body=app["metrics"].render(processing=running, deferred=queue.qsize(), kv_ratio=kv),
+            cs, kv = {}, 0.0
+        return web.Response(body=app["metrics"].render(processing=running, deferred=queue.qsize(), kv_ratio=kv, cache=cs,
+                                                       gpu=gpu_memory(getattr(engine, "torch", None))),
                             headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})
 
     if admin_knobs:

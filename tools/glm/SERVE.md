@@ -99,6 +99,16 @@ are read live. `spec_decode_num_drafts_total` is derived from the accepted+rejec
 token counts divided by `--num-draft` (exact except for a final MTP window truncated by
 `max_tokens`). A request cancelled mid-stream is not counted in this first version.
 
+The `kyojin:*` metrics have no llama.cpp counterpart and are the same on every Kyojin server:
+`kyojin:requests_total` (finished requests), `kyojin:requests_failed_total` (requests that ended in an
+engine error; they are not in `requests_total`), `kyojin:queue_seconds_total` (time the finished requests
+waited for a session), `kyojin:start_time_seconds`, `kyojin:sessions`, `kyojin:context_tokens` and
+`kyojin:info{version, server, model}` (constant 1). Read live at scrape: the cache's token counts
+(`kyojin:kv_cache_max_tokens`, `kyojin:kv_cache_used_tokens`, `kyojin:kv_cache_free_tokens`,
+`kyojin:prompt_cache_tokens`) and the device memory (`kyojin:gpu_memory_allocated_bytes`,
+`kyojin:gpu_memory_reserved_bytes` of this process, `kyojin:gpu_memory_free_bytes`,
+`kyojin:gpu_memory_total_bytes` of the device).
+
 ### `POST /v1/chat/completions`
 
 Honored:
