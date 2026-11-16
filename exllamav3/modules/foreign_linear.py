@@ -89,6 +89,10 @@ if os.environ.get("BOLT_FQ_MMVQ_KQ", "1" if (torch.version.cuda and not torch.ve
 _MMQ_FEW = os.environ.get("BOLT_FQ_MMQ_FEW", "1" if (torch.version.cuda and not torch.version.hip) else "0") == "1"
 _MMQ_FEW_FMT = {"q8_0": 0, "q4_k": 1, "q5_k": 2, "q6_k": 3, "q3_k": 4, "iq4_xs": 5}
 _MMQ_FEW_MINR = {"q5_k": 3, "q4_k": 4, "q6_k": 4, "q8_0": 5, "q3_k": 4, "iq4_xs": 4}
+# IQ4_XS few-row MMQ only inside CUDA-graph capture (the batched decode steps). Eager calls with 4..24 rows are prompt-chunk tails: there the
+# int8 activations would change the prompt KV (single-session output and decode path differ from the 1-row mmvq route) for no speed gain.
+# BOLT_FQ_MMQ_FEW_IQ4XS_ANY=1 serves every 4..24-row call. The other formats keep the unconditional gate.
+_MMQ_FEW_CAPTURE_ONLY = () if os.environ.get("BOLT_FQ_MMQ_FEW_IQ4XS_ANY", "0") == "1" else ("iq4_xs",)
 _MMVQ_QK = {"iq4_nl": 32}
 _DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}
 if torch.version.cuda and not torch.version.hip:
@@ -276,7 +280,8 @@ class ForeignLinear(Module):
             flat = flat.contiguous()
         out: Optional[torch.Tensor] = None
         if (_MMQ_FEW and self.format in _MMQ_FEW_FMT and _MMQ_FEW_MINR[self.format] <= R <= 24 and flat.dtype == torch.half
-                and K % 256 == 0 and K >= 2048 and hasattr(ext, "fq_mmq_few")):
+                and K % 256 == 0 and K >= 2048 and hasattr(ext, "fq_mmq_few")
+                and (self.format not in _MMQ_FEW_CAPTURE_ONLY or torch.cuda.is_current_stream_capturing())):
             N = self.out_features
             out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)
             dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
