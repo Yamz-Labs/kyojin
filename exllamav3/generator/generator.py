@@ -1699,15 +1699,24 @@ class Generator:
 
 
     # ---------------------------------------------------------------------------------------------------------------------
-    # Lag-1 decode pipeline (EXL3_LAG1=1). Plain decode (no draft, no recurrent cache) normally pays one host round trip
-    # per step: sample on the device -> read the token -> host bookkeeping -> build the next step's inputs -> launch. Here the
-    # next step is launched from the DEVICE token right after the sampler, before the host reads token k, so the GPU runs
-    # step k+1 while the host processes token k (one step of lag). The step in flight is adopted by the next call.
-    # A job that ends at token k leaves a wasted row in the step already in flight (its KV write lands in its own pages, in
-    # stream order ahead of any later reuse); that row is simply never sampled. Whatever the pipeline cannot do (filters,
-    # penalties, forced tokens, healing, banned strings, probs, drafts, recurrent caches, a job about to hit a token
-    # limit, waiting/prefilling jobs, a page boundary, no GPU embedding table) takes the regular loop.
-    # Needs the whole-forward CUDA graph with the GPU embedding table (cuda_graph.py, EXL3_GPU_EMB).
+    # Lag-1 decode pipeline (EXL3_LAG1=1). Plain decode (no draft) normally pays one host round trip per step: sample on the
+    # device -> read the token -> host bookkeeping -> build the next step's inputs -> launch. Here the next step is launched
+    # from the DEVICE token right after the sampler, before the host reads token k, so the GPU runs step k+1 while the host
+    # processes token k (one step of lag). The step in flight is adopted by the next call.
+    # Recurrent (GDN) caches: the step in flight advances every row's recurrent slot in place, in stream order behind the
+    # sampler of step k. A job that ends at token k leaves a wasted row in that step: its KV write lands in its own pages and its
+    # slot advances once more, both in stream order ahead of any later reuse (a new job clears / unstashes its slot on the same
+    # stream; no one reads the finished job's state: the reply-end checkpoint is the only reader and EXL3_TAIL_REPLY keeps the
+    # regular loop). Checkpoint / stash positions (page boundaries) are kept out of the window where a step is in flight
+    # (see `ahead` below); prompt-end (EXL3_TAIL_CKPT) and branch (EXL3_BRANCH_CKPT) checkpoints are taken during prefill, which
+    # always runs the regular loop. MRoPE models (the vision config) stage explicit positions. Row-invariant job groups
+    # (EXL3_ROW_INV_GROUPS) are cut exactly as iterate_gen cuts them (_lag1_forward).
+    # The wasted row is not free of numerics: the step carries one row more than the regular loop would, so on kernels that are
+    # not row-count invariant the other rows of that ONE step can differ in the last bits from the regular loop (identical to the
+    # regular loop run with that row kept alive for one more step). Jobs ending on a token limit never waste a row.
+    # Whatever the pipeline cannot do (filters, penalties, forced tokens, healing, banned strings, probs, drafts, EXL3_TAIL_REPLY,
+    # a job about to hit a token limit, waiting/prefilling jobs, a page boundary, no GPU embedding table) takes the regular loop.
+    # Needs the whole-forward CUDA graph with the GPU embedding table (cuda_graph.py, EXL3_GPU_EMB) or the eager table (lag_table).
     _lag = None
     _lag_par = 0
 
@@ -1720,16 +1729,25 @@ class Generator:
             return False
         return True
 
+    def _lag1_why(self, why: str) -> bool:
+        """Debug (EXL3_LAG1_DEBUG=1): count why a round took the regular loop; always False."""
+        if _LAG1_DEBUG:
+            w = self.__dict__.setdefault("_lag_why_n", {})
+            w[why] = w.get(why, 0) + 1
+            if sum(w.values()) % 200 == 1:
+                print(f"[lag1] regular-loop reasons {w}", flush = True)
+        return False
+
     def _lag1_ready(self) -> bool:
-        if self.draft_model or self.ngram_match_min or self.visualizer or _TAIL_REPLY_GEN or "mrope" in self.model.caps:
-            return False
-        if self.num_draft_tokens or ROW_GROUPS["on"] and ROW_INV["on"] and self.model.caps.get("row_inv_groups"):
-            return False
+        if self.draft_model or self.ngram_match_min or self.visualizer or _TAIL_REPLY_GEN:
+            return self._lag1_why("draft/ngram/vis/tail_reply_gen")
+        if self.num_draft_tokens:
+            return self._lag1_why("draft_tokens")
         if _cuda_graph.CUDA_GRAPH_ENABLED and not torch.version.hip:
             runner = self.model.__dict__.get("_cuda_graph_runner")
             g = getattr(runner, "_gemb", None) if runner is not None else None
-            return g is not None and g is not False
-        return self.model.lag_table() is not None
+            return g is not None and g is not False or self._lag1_why("no gpu emb table")
+        return self.model.lag_table() is not None or self._lag1_why("no lag table")
 
     def _lag1_params(self, jobs, rows_ids_shape, nxt: int):
         """Inputs of the step `nxt` positions after the current host state (0 = now, 1 = the step after the token in flight)."""
@@ -1745,6 +1763,13 @@ class Generator:
             bi = seq.block_index_tensor[:, :max_pages_batch]
             block_index[b:b + 1, :bi.shape[-1]].copy_(bi)
             cache_seqlens[b] = seq.kv_position + nxt
+        # MRoPE models (the vision config of the Qwen 3.5 family) pass explicit positions; a text-only decode is cache length + the
+        # job's rope offset, exactly what iterate_gen stages
+        positions = None
+        if "mrope" in self.model.caps:
+            positions = self._staging(f"positions_l{par}", n)
+            for b, job in enumerate(jobs):
+                positions[b] = job.sequences[0].kv_position + nxt + job.alt_rope_offset
         params = {
             "attn_mode": "flash_attn",
             "block_table": block_index,
@@ -1752,12 +1777,40 @@ class Generator:
             "cache_seqlens": cache_seqlens,
             "recurrent_states": [job.recurrent_state for job in jobs] if (self.ring_states or self.recurrent_cache is not None) else None,
             "indexed_embeddings": [],
-            "positions": None,
+            "positions": positions,
             "recurrent_history": False,
             "pinned_staging": True,
             "dflash_verify": plain_rows_verify(n, False),
         }
         return params
+
+    def _lag1_forward(self, jobs, ids, params: dict, dev: bool):
+        """One decode forward of the lag-1 pipeline. The row-invariant job groups (row_groups.py) are cut exactly as iterate_gen
+        cuts them: one forward per group, each with its own slice of the step (block table, lengths, positions, recurrent states).
+        dev: ids is a device tensor (forward_dev, None = the graph declined), else host ids (regular forward)."""
+        fwd = self.model.forward_dev if dev else (lambda i, p: self.model.forward(input_ids = i, params = p))
+        if not (len(jobs) > 1 and ROW_GROUPS["on"] and ROW_INV["on"] and self.model.caps.get("row_inv_groups")):
+            return fwd(ids, params)
+        groups = self._row_groups(jobs, 1)
+        logits = []
+        for j0, j1 in groups:
+            p = dict(params)
+            p["block_table"] = params["block_table"][j0:j1]
+            p["cache_seqlens"] = params["cache_seqlens"][j0:j1]
+            if params.get("positions") is not None:
+                p["positions"] = params["positions"][j0:j1]
+            if params.get("recurrent_states") is not None:
+                p["recurrent_states"] = params["recurrent_states"][j0:j1]
+            if j1 - j0 > 1:
+                p["dflash_verify"] = True
+                p["row_inv_per_seq"] = True
+            if len(groups) > 1:
+                p["pinned_staging"] = False
+            y = fwd(ids[j0:j1], p)
+            if y is None:
+                return None
+            logits.append(y)
+        return logits[0] if len(logits) == 1 else torch.cat(logits, dim = 0)
 
     def _gen_lag1(self, results: list) -> bool:
         """One pipelined decode round. Returns False (nothing done) when the regular loop must run this round."""
@@ -1766,8 +1819,10 @@ class Generator:
             if not self._lag1_ready():
                 return False
             jobs = [j for j in self.active_jobs if j.is_prefill_done()]
-            if not jobs or len(jobs) != len(self.active_jobs) or self.pending_jobs or not all(self._lag1_job_ok(j) for j in jobs):
-                return False
+            if not jobs or len(jobs) != len(self.active_jobs) or self.pending_jobs:
+                return self._lag1_why("no jobs / prefilling / pending")
+            if not all(self._lag1_job_ok(j) for j in jobs):
+                return self._lag1_why("job not ok")
             # step k from host ids (regular forward; the cuda graph runner takes the ids through its GPU table)
             _first = [j for j in jobs if j.time_first_token is None]
             if _first:
@@ -1780,7 +1835,7 @@ class Generator:
             if batch_ids.shape[-1] != 1:
                 return False
             params = self._lag1_params(jobs, batch_ids.shape, 0)
-            logits = self.model.forward(input_ids = batch_ids, params = params)
+            logits = self._lag1_forward(jobs, batch_ids, params, False)
         else:
             self._lag = None
             jobs, logits = st["jobs"], st["logits"]
@@ -1816,6 +1871,11 @@ class Generator:
             self._lag1_ready() and not self.pending_jobs and len(live_jobs) == len(self.active_jobs) and
             all(self._lag1_job_ok(j) for j in live_jobs)
         )
+        # a step in flight is one launch: with several row groups a group could be declined by the graph after an earlier one
+        # already advanced its recurrent states, so the pipeline only launches ahead when the step is a single group
+        if ahead and len(live_jobs) > 1 and ROW_GROUPS["on"] and ROW_INV["on"] and self.model.caps.get("row_inv_groups") and \
+                len(self._row_groups(live_jobs, 1)) > 1:
+            ahead = self._lag1_why("several row groups")
         if ahead:
             for job in live_jobs:
                 seq = job.sequences[0]
@@ -1832,7 +1892,7 @@ class Generator:
         if ahead:
             ids_dev = torch.cat(dev_tokens, dim = 0).to(torch.long)
             params = self._lag1_params(live_jobs, ids_dev.shape, 1)
-            nlogits = self.model.forward_dev(ids_dev, params)
+            nlogits = self._lag1_forward(live_jobs, ids_dev, params, True)
             if nlogits is not None:
                 nxt = {"jobs": live_jobs, "logits": nlogits}
         ev.synchronize()
