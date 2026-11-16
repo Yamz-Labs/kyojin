@@ -15,8 +15,7 @@ DeepSeek-V4.1-Flash adapters are staged; Flint and Mimo use the generic model pa
                     host-staged crossings
 
 `part0` and `part1` are positions in the layer order, not device indices. Either physical
-device can serve either part; MTP-on in the reverse orientation has a current JIT
-limitation, noted under Known limitations.
+device can serve either part.
 
 Every tensor that crosses the split goes through an asynchronous host-staged bridge:
 
@@ -93,7 +92,7 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
 
 | Model | Status | Notes |
 | --- | --- | --- |
-| GLM-5.3-Flash | measured | text, MTP and vision; on a 16 GiB `gfx12` `part0`, N=6 at ≤65K and N=5 for long context |
+| GLM-5.3-Flash | measured | text, MTP and vision; on a 16 GiB `gfx12` `part0`, N=6 fits short context (MTP off), N=4 is the 128K MTP setting, and N=5 fits 500K |
 | Qwen3.8-Flash-Next | staged, not load-tested | QSA/GDN/PLE components; separate dflash drafter config; QSA `gfx12` caveat below |
 | DeepSeek-V4.1-Flash | staged | uses the DSV4 engine, not `Model.load` |
 | Flint, Mimo | best effort | generic `Model` path; no dedicated adapter |
@@ -109,23 +108,53 @@ defect.
 - Split **on** is judged by run-to-run determinism with plain greedy decoding, KLD/task
   metrics and the needle probe. A mixed-architecture pair is not expected to be bitwise.
 - `tools/strix_halo/split_eval.py` runs the battery: `--baseline`, `--part0-layers`,
-  `--part1-device`/`--part0-device`, `--needle-depth`, `--bench-depth`, `--num-draft`,
-  `--perf-tokens`/`--perf-reps` and `--compare a.json b.json`. Its context-dependent part0
+  `--part1-device`/`--part0-device`, `--needle-depth`, `--bench-depth`,
+  `--bench-prompt passkey|summary`, `--bench-acceptance`, `--num-draft`,
+  `--perf-tokens`/`--perf-reps`, `--vision-image PATH` and `--compare a.json b.json`.
+  Its context-dependent part0
   default is harness tuning, not a split property; override it with `--part0-layers` or the
-  `--long-ctx-part0-layers`/`--short-ctx-part0-layers` flags.
+  `--long-ctx-part0-layers`/`--short-ctx-part0-layers` flags. `--bench-acceptance` uses
+  long-form summary prompts and reports the drafted-token sample plus a 95% interval;
+  the passkey prompt is too short for an acceptance comparison. `--vision-image` encodes
+  one image through the split vision tower; the harness sets `EXL3_CONV_GEMM=1` as the
+  safe gfx12 spatial-merge fallback.
+- `--kld-corpus PATH --kld-slices N --kld-len L --kld-out FILE` teacher-forces corpus
+  slices and `--kld-compare BASE SPLIT` reports KLD both ways, top-1 agreement and PPL.
+  The short battery also reports programmatic task checks. Use these for split-on quality:
+  a mixed-architecture pair is not bitwise.
+- `tools/strix_halo/split_sessions_smoke.py` sends N concurrent requests at a running
+  server and checks that every response succeeds and that the requests overlap.
+- `tools/strix_halo/split_startup_health.py` polls `/health` during load and checks the
+  stage trace; run it with and without `--no-vision` and with `--num-draft 0`.
 
 ## Known limitations
 
-- MTP on the split is not deterministic. `--num-draft 0` remains the deterministic mode.
-- Per-segment graphs are not implemented. Split runs eager and pays about 0.95x decode on
-  GLM with MTP.
-- Auto-N uses text bytes, cache and text endcaps, but does not yet subtract components
-  declared after the target load (MTP/vision). Leave headroom or set N explicitly.
+- Split-on is deterministic run-to-run, but it is **not bitwise** equal to a single
+  device on a mixed-architecture pair. Measured on GLM, N=4: 4/6 short greedy prompts
+  identical, task checks 5/6 vs 4/6, PPL 9.374 vs 9.401 and KLD 2.08e-2 with 94.52%
+  top-1 agreement over 1022 positions. The distributions and task accuracy are
+  unchanged; a few near-tie argmax positions flip. Use KLD/task metrics for split-on.
+- At 500K context the split fits the measured pair (`part0` 10.75 GiB, `part1` 100.2 GiB
+  load-time peak). A single 118 GiB device did not have headroom for the same context
+  there; size for capacity, not only speed.
+- Concurrent serving is smoke-tested at 4 sessions with MTP on (4/4 responses overlap,
+  no queue or slot error). A heavier mixed chat/image/tool workload is future work.
+- MTP on the split is deterministic at 8K/32K/128K with N=4 in the measured
+  configuration (two independent runs: 6/6 greedy prompts and identical long-prompt ids).
+  The earlier N=6 128K battery used short prompts; N=6 long prefill OOMs a 16 GB part0,
+  so N=4 is the 128K MTP configuration and the 500K capacity run used N=5. Use
+  `--num-draft 0` for configs outside this measured set.
+- Per-segment graphs are not implemented. Split runs eager; measured GLM decode is -3.4%
+  at 8K and +1.3% to +8.1% at 32K/128K versus single device with MTP on.
+- Auto-N subtracts the MTP drafter and vision tower when the adapter predeclares them
+  before load (the GLM server does). The default 2 GiB safety covers the measured 32K
+  MTP+vision warm-up (1 GiB still chose N=6 and OOMed; 1.5/2/3 GiB chose N=5), but it is
+  a fixed stopgap. Stage 5 sizes the forward workspace from the context and cache so
+  short context can use more part0 layers and long context reserves more;
+  `KYOJIN_AUTON_SAFETY_GB` remains the override.
 - Qwen QSA sparse attention has an illegal-access report in the `gfx12` top-k path on
   `gfx1201`; keep QSA cache pages off `part0` until that kernel is fixed.
-- Reverse orientation with MTP on currently fails on the eGPU + iGPU device order with a
-  Triton `no kernel image is available` error when the MTP block lands on the eGPU.
-  Forward split is unaffected. Treat either-device MTP-on placement as requiring this JIT
-  fix; MTP-off reverse placement is validated.
+- Reverse orientation with MTP on is validated at 32K (N=42, endcaps off, MTP on
+  `part1`) on the measured configuration.
 - Same-architecture and RDNA3/3.5 pairs are selection-tested only until such hardware is
   available.

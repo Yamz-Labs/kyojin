@@ -833,9 +833,10 @@ class SplitPlan:
         if self.devices.part0 is None:
             return 0
         total = int(torch.cuda.get_device_properties(self.devices.part0).total_memory)
-        # Allocator slack, not an architecture rule; Stage 5 replaces it with measured
-        # load/forward headroom.
-        safety = int(float(os.environ.get("KYOJIN_AUTON_SAFETY_GB", "0.25")) * GIB)
+        # Measured stopgap, not an architecture rule: 2 GiB covers the 32K MTP+vision
+        # warm-up on a 16 GiB part0 (1.0 GiB still chose N=6 and OOMed).  Stage 5 replaces
+        # it with a context-aware workspace/headroom budget.
+        safety = int(float(os.environ.get("KYOJIN_AUTON_SAFETY_GB", "2.0")) * GIB)
         return max(0, total - int(self.part0_reserve_gb * GIB) - safety)
 
     def _auto_n(self, text: str | None) -> int:
