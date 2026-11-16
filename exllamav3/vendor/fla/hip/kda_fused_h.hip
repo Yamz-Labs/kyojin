@@ -114,10 +114,16 @@ __device__ __forceinline__ uint32_t f2bf(float f)
 }
 __device__ __forceinline__ float bf2f(uint32_t b) { return __uint_as_float(b << 16); }
 __device__ __forceinline__ float rbf(float f) { return bf2f(f2bf(f)); }
-// Triton rounds explicit .to(bf16) casts and its bf16 x bf16 arithmetic (k * beta, v * beta)
-// to nearest even on both gfx11.5 and gfx12 under Triton 3.9 (oracle-checked on the box).
-// Keep the multiply site named so an arch-specific rounding can be reintroduced if needed.
-__device__ __forceinline__ uint32_t f2bf_mul(float f) { return f2bf(f); }
+// Triton rounds explicit .to(bf16) casts to nearest even. Its bf16 x bf16 arithmetic (k * beta, v * beta) is
+// truncated (RTZ) on gfx11.5 and nearest even on gfx12 (oracle-checked on the box), so the multiply site is arch-specific.
+__device__ __forceinline__ uint32_t f2bf_rtz(float f) { return __float_as_uint(f) >> 16; }
+__device__ __forceinline__ uint32_t f2bf_mul(float f) {
+#if KDA_GFX12
+    return f2bf(f);
+#else
+    return f2bf_rtz(f);
+#endif
+}
 __device__ __forceinline__ float ex2(float x) { return __builtin_amdgcn_exp2f(x); }
 
 __device__ __forceinline__ v8f wmma(frag_ab_t a, frag_ab_t b, v8f c)
