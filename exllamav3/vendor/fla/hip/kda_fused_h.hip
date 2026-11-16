@@ -1,21 +1,42 @@
-// KDA fused chunk recurrence (o fused), hand-written for gfx11.5 WMMA (Strix Halo, wave32).
+// KDA fused chunk recurrence (o fused), hand-written for gfx11.5 / gfx12 WMMA (wave32).
 // Same math and the same rounding points as chunk_kda_fwd_kernel_h_fused (FUSE_O) in kda_fused_h.py,
-// so o and the final state match it bitwise: bf16 x bf16 products truncated, casts RNE, raw v_exp_f32,
-// fp32 WMMA accumulation chained in the same k order, no fma contraction (build with -ffp-contract=off).
+// so o and the final state match it bitwise on gfx11.5 and gfx12: bf16 products round RNE, casts RNE,
+// raw v_exp_f32, fp32 WMMA accumulation chained in the same k order, no fma contraction (build with
+// -ffp-contract=off). The gfx12 fragment path uses 8 bf16 per lane and direct C->B packing.
 //
 // One workgroup (8 waves) per (batch, value head); K = V = 128, BT = 64. Wave i owns the state columns
 // h[:, 16i:16i+16] in registers (8 WMMA C tiles) and computes w[:, 16i:16i+16] and u[:, 16i:16i+16].
 // Per chunk: inputs -> LDS (kb^T, vb^T, Akk) -> w, u -> LDS (w, qg, kg^T, Aqk) -> o, v_new, state update.
 // All global loads of a chunk issue in one batch (Aqk overlaps the w / u products); 4 barriers per chunk.
-// Fragment layout (gfx1151, oracle-verified in exllamav3_ext/hip/hip_mma.cuh):
-//   A: lane l, elem r -> A[l & 15][r];  B: lane l, elem r -> B[r][l & 15];  C: lane l, reg r -> C[2r + (l >> 4)][l & 15]
+// Fragment layout (oracle-verified in exllamav3_ext/hip/hip_mma.cuh):
+//   gfx11.5: A/B carry all 16 k per lane; C: lane l, reg r -> C[2r + (l >> 4)][l & 15].
+//   gfx12:   A/B carry 8 k per lane (k split across the half-waves);
+//            A[l & 15][8(l >> 4) + r], B[8(l >> 4) + r][l & 15], C[8(l >> 4) + r][l & 15].
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
 #include <stdint.h>
 
 typedef short v16s __attribute__((ext_vector_type(16)));
 typedef float v8f __attribute__((ext_vector_type(8)));
 typedef uint32_t v8u __attribute__((ext_vector_type(8)));
+typedef uint32_t v4u __attribute__((ext_vector_type(4)));
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define KDA_GFX12 1
+typedef __bf16 v8b __attribute__((ext_vector_type(8)));
+typedef v8b frag_ab_t;
+#define KDA_WMMA(a, b, c) __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12((a), (b), (c))
+// C fragment row of register r, and the tril-mask key column within a diagonal tile.
+#define KDA_CROW(r) (8 * half + (r))
+#define KDA_TRIL_COL(m) (8 * half + 2 * (m))
+#else
+#define KDA_GFX12 0
+typedef v8u frag_ab_t;
+#define KDA_WMMA(a, b, c) __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(__builtin_bit_cast(v16s, (a)), __builtin_bit_cast(v16s, (b)), (c))
+#define KDA_CROW(r) (2 * (r) + half)
+#define KDA_TRIL_COL(m) (2 * (m))
+#endif
 
 #ifndef ABL
 #define ABL 0  // timing-only ablation bits (wrong results): 1 phase-1 loads, 2 w/u, 4 o/vn chain, 8 tril o + store, 16 state update
@@ -93,23 +114,36 @@ __device__ __forceinline__ uint32_t f2bf(float f)
 }
 __device__ __forceinline__ float bf2f(uint32_t b) { return __uint_as_float(b << 16); }
 __device__ __forceinline__ float rbf(float f) { return bf2f(f2bf(f)); }
-// Triton rounds explicit .to(bf16) casts to nearest even but truncates the result of bf16 x bf16 arithmetic
-// (k * beta, v * beta); oracle-checked against the Triton kernel on a captured GLM chunk.
+// Triton rounds explicit .to(bf16) casts to nearest even. Its bf16 x bf16 arithmetic (k * beta, v * beta) is
+// truncated (RTZ) on gfx11.5 and nearest even on gfx12 (oracle-checked on the box), so the multiply site is arch-specific.
 __device__ __forceinline__ uint32_t f2bf_rtz(float f) { return __float_as_uint(f) >> 16; }
+__device__ __forceinline__ uint32_t f2bf_mul(float f) {
+#if KDA_GFX12
+    return f2bf(f);
+#else
+    return f2bf_rtz(f);
+#endif
+}
 __device__ __forceinline__ float ex2(float x) { return __builtin_amdgcn_exp2f(x); }
 
-__device__ __forceinline__ v8f wmma(v8u a, v8u b, v8f c)
+__device__ __forceinline__ v8f wmma(frag_ab_t a, frag_ab_t b, v8f c)
 {
-    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(__builtin_bit_cast(v16s, a), __builtin_bit_cast(v16s, b), c);
+    return KDA_WMMA(a, b, c);
 }
 
-// 16 contiguous bf16 at base[row * ld + col] (32 B, 16 B aligned)
-__device__ __forceinline__ v8u ld16(const uint16_t* base, int row, int ld, int col)
+// WMMA A/B fragment at base[row * ld + col]: 16 bf16 (32 B) on gfx11.5, 8 bf16 (16 B) at
+// +8 * half on gfx12 (k split across the half-waves). 16 B aligned on both.
+__device__ __forceinline__ frag_ab_t ld16(const uint16_t* base, int row, int ld, int col)
 {
+#if KDA_GFX12
+    const uint4 x = *(const uint4*) (base + row * ld + col + 8 * ((threadIdx.x >> 4) & 1));
+    return __builtin_bit_cast(frag_ab_t, x);
+#else
     const uint4* p = (const uint4*) (base + row * ld + col);
     uint4 x = p[0], y = p[1];
     v8u r = {x.x, x.y, x.z, x.w, y.x, y.y, y.z, y.w};
     return r;
+#endif
 }
 
 // p must be a valid address (clamped row); zeroed after the load when !ok
@@ -121,9 +155,19 @@ __device__ __forceinline__ v8u ld16g(const uint16_t* p, bool ok)
     return r;
 }
 
-// C tile (fp32, rows 2r + half) -> B fragment of the same bf16-rounded matrix (k = row), via permlanex16.
-__device__ __forceinline__ v8u c_to_b(const v8f& c, int half)
+// C tile (fp32) -> B fragment of the same bf16-rounded matrix (k = row).
+// gfx12: C and B share the lane<->element map, so this is a direct pack; gfx11.5 needs
+// the half-wave exchange (C rows 2r + half vs B k 0..15).
+__device__ __forceinline__ frag_ab_t c_to_b(const v8f& c, int half)
 {
+#if KDA_GFX12
+    (void) half;
+    v4u p;
+    #pragma unroll
+    for (int m = 0; m < 4; ++m)
+        p[m] = f2bf(c[2 * m]) | (f2bf(c[2 * m + 1]) << 16);
+    return __builtin_bit_cast(frag_ab_t, p);
+#else
     uint32_t own[4], oth[4];
     #pragma unroll
     for (int m = 0; m < 4; ++m)
@@ -140,6 +184,30 @@ __device__ __forceinline__ v8u c_to_b(const v8f& c, int half)
         b[d] = half ? (t | (o << 16)) : (o | (t << 16));
     }
     return b;
+#endif
+}
+
+// Zero the strict upper triangle of a diagonal A tile: word m holds bf16 columns
+// KDA_TRIL_COL(m) (low) and KDA_TRIL_COL(m) + 1 (high); on gfx11.5 a word is 8 words of
+// 16 k, on gfx12 it is 4 words of 8 k (k split across the half-waves).
+__device__ __forceinline__ void tril_mask(frag_ab_t& A, int ll, int half)
+{
+#if KDA_GFX12
+    v4u& a = reinterpret_cast<v4u&>(A);
+    #pragma unroll
+    for (int m = 0; m < 4; ++m)
+    {
+        if (KDA_TRIL_COL(m) > ll) a[m] &= 0xffff0000u;
+        if (KDA_TRIL_COL(m) + 1 > ll) a[m] &= 0x0000ffffu;
+    }
+#else
+    #pragma unroll
+    for (int m = 0; m < 8; ++m)
+    {
+        if (KDA_TRIL_COL(m) > ll) A[m] &= 0xffff0000u;
+        if (KDA_TRIL_COL(m) + 1 > ll) A[m] &= 0x0000ffffu;
+    }
+#endif
 }
 
 #ifndef PROF
@@ -161,6 +229,15 @@ __device__ uint32_t kda_prof[4096 * 9];
 #endif
 #ifndef CK8
 #define CK8 0   // 1: eight side-write slots (dense prompt-tail checkpoints); implies the CK4 slots
+#endif
+
+// The gfx11 store/scheduling experiments encode the gfx11 C row / o-store layout and are not
+// ported; gfx12 uses the default build (CK4 / CK8 checkpoints are layout-independent and ported).
+#if KDA_GFX12 && (BRL || UNI || ADR || PF || PFW)
+#error "kda_fused_h.hip: BRL/UNI/ADR/PF/PFW are gfx11-only"
+#endif
+#if defined(STG) && KDA_GFX12
+#error "kda_fused_h.hip: STG is gfx11-only"
 #endif
 
 extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
@@ -241,7 +318,7 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
     for (int kt = 0; kt < 8; ++kt)
         #pragma unroll
         for (int r = 0; r < 8; ++r)
-            h[kt][r] = h0 ? h0[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] : 0.0f;
+            h[kt][r] = h0 ? h0[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] : 0.0f;
 
 #if PH1
     constexpr int NG = 16 / PH1;
@@ -307,10 +384,10 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
                     const float fb = bf2f(bb), eg0 = ex2(g.x), eg1 = ex2(g.y);
                     const float k0 = bf2f(kk & 0xffff), k1 = bf2f(kk >> 16);
                     const float q0 = bf2f(qq & 0xffff), q1 = bf2f(qq >> 16);
-                    kb[0][e] = f2bf(bf2f(f2bf_rtz(k0 * fb)) * eg0);
-                    kb[1][e] = f2bf(bf2f(f2bf_rtz(k1 * fb)) * eg1);
-                    vb[0][e] = f2bf_rtz(bf2f(vv & 0xffff) * fb);
-                    vb[1][e] = f2bf_rtz(bf2f(vv >> 16) * fb);
+                    kb[0][e] = f2bf(bf2f(f2bf_mul(k0 * fb)) * eg0);
+                    kb[1][e] = f2bf(bf2f(f2bf_mul(k1 * fb)) * eg1);
+                    vb[0][e] = f2bf_mul(bf2f(vv & 0xffff) * fb);
+                    vb[1][e] = f2bf_mul(bf2f(vv >> 16) * fb);
                     kg[0][e] = f2bf(k0 * (ok ? ex2(gn.x - g.x) : 0.0f));
                     kg[1][e] = f2bf(k1 * (ok ? ex2(gn.y - g.y) : 0.0f));
                     qgp[s] = f2bf(q0 * eg0) | (f2bf(q1 * eg1) << 16);
@@ -371,10 +448,10 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
                 const float fb = bf2f(bb), eg0 = ex2(g.x), eg1 = ex2(g.y);
                 const float k0 = bf2f(kk & 0xffff), k1 = bf2f(kk >> 16);
                 const float q0 = bf2f(qq & 0xffff), q1 = bf2f(qq >> 16);
-                kb[0][e] = f2bf(bf2f(f2bf_rtz(k0 * fb)) * eg0);
-                kb[1][e] = f2bf(bf2f(f2bf_rtz(k1 * fb)) * eg1);
-                vb[0][e] = f2bf_rtz(bf2f(vv & 0xffff) * fb);
-                vb[1][e] = f2bf_rtz(bf2f(vv >> 16) * fb);
+                kb[0][e] = f2bf(bf2f(f2bf_mul(k0 * fb)) * eg0);
+                kb[1][e] = f2bf(bf2f(f2bf_mul(k1 * fb)) * eg1);
+                vb[0][e] = f2bf_mul(bf2f(vv & 0xffff) * fb);
+                vb[1][e] = f2bf_mul(bf2f(vv >> 16) * fb);
                 kg[0][e] = f2bf(k0 * (ok ? ex2(gn.x - g.x) : 0.0f));
                 kg[1][e] = f2bf(k1 * (ok ? ex2(gn.y - g.y) : 0.0f));
                 qgp[2 * s2 + e] = f2bf(q0 * eg0) | (f2bf(q1 * eg1) << 16);
@@ -416,7 +493,7 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
         for (int a = 0; a < 4; ++a)
         {
             const int l_ = PIN(4, ll), c_ = PIN(4, col);
-            v8u A[4];
+            frag_ab_t A[4];
             #pragma unroll
             for (int j = 0; j < 4; ++j)
                 A[j] = ld16(sA, 16 * a + l_, LDT, 16 * j);
@@ -429,7 +506,7 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
             }
             #pragma unroll
             for (int r = 0; r < 8; ++r)
-                sW[(16 * a + 2 * r + half) * LDR + col] = (uint16_t) f2bf(w[r]);
+                sW[(16 * a + KDA_CROW(r)) * LDR + col] = (uint16_t) f2bf(w[r]);
             #pragma unroll
             for (int m = 0; m < 4; ++m)
                 up[a][m] = f2bf(u[2 * m]) | (f2bf(u[2 * m + 1]) << 16);
@@ -465,7 +542,7 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
         #pragma unroll
         for (int kt = 0; kt < 8; ++kt)
         {
-            const v8u hb = c_to_b(h[kt], half);
+            const frag_ab_t hb = c_to_b(h[kt], half);
             const int l_ = PIN(1, ll);
             #pragma unroll
             for (int a = 0; a < 4; ++a)
@@ -481,7 +558,7 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
 
         PT(6);
         // ---- v_new = u - w h; o = scale o + tril(Aqk) v_new
-        v8u vs[4];
+        frag_ab_t vs[4];
         #pragma unroll
         for (int a = 0; a < 4; ++a)
         {
@@ -500,19 +577,11 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
             #pragma unroll
             for (int j = 0; j < 4; ++j)
             {
-                v8u A = {0, 0, 0, 0, 0, 0, 0, 0};
+                frag_ab_t A = {0, 0, 0, 0, 0, 0, 0, 0};
                 if (j <= a)
                 {
                     A = ld16(sA, 16 * a + l_, LDT, 16 * j);
-                    if (j == a)
-                    {
-                        #pragma unroll
-                        for (int m = 0; m < 8; ++m)
-                        {
-                            if (2 * m > ll) A[m] &= 0xffff0000u;
-                            if (2 * m + 1 > ll) A[m] &= 0x0000ffffu;
-                        }
-                    }
+                    if (j == a) tril_mask(A, ll, half);
                 }
                 if (!(ABL & 8)) oa[a] = wmma(A, vs[j], oa[a]);
             }
@@ -554,7 +623,7 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
             #pragma unroll
             for (int r = 0; r < 8; ++r)
             {
-                const int t = t0 + 16 * a + 2 * r + half;
+                const int t = t0 + 16 * a + KDA_CROW(r);
                 if (t < T) o[((bos + t) * HV + i_hv) * VD + col] = (uint16_t) f2bf(oa[a][r]);
             }
             SBAR(8);
@@ -572,7 +641,7 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
             const int l_ = PIN(2, ll);
             #pragma unroll
             for (int r = 0; r < 8; ++r)
-                h[kt][r] *= sEgn[16 * kt + 2 * r + half];
+                h[kt][r] *= sEgn[16 * kt + KDA_CROW(r)];
             #pragma unroll
             for (int j = 0; j < 4; ++j)
                 if (!(ABL & 16)) h[kt] = wmma(ld16(sY, 16 * kt + l_, LDT, 16 * j), vs[j], h[kt]);
@@ -586,14 +655,14 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
             for (int kt = 0; kt < 8; ++kt)
                 #pragma unroll
                 for (int r = 0; r < 8; ++r)
-                    hc[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+                    hc[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] = h[kt][r];
         // second checkpoint (EXL3_PF_NO_TAIL: the prompt's last full page, stashed inside the chunk)
         if (hc2 && i_t + 1 == ckpt_chunk2)
             #pragma unroll
             for (int kt = 0; kt < 8; ++kt)
                 #pragma unroll
                 for (int r = 0; r < 8; ++r)
-                    hc2[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+                    hc2[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] = h[kt][r];
 #if CK4 || CK8
         // third and fourth checkpoints (EXL3_NC2_CKPT4: 8192-row chunks), same store as above
         if (hc3 && i_t + 1 == ckpt_chunk3)
@@ -601,13 +670,13 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
             for (int kt = 0; kt < 8; ++kt)
                 #pragma unroll
                 for (int r = 0; r < 8; ++r)
-                    hc3[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+                    hc3[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] = h[kt][r];
         if (hc4 && i_t + 1 == ckpt_chunk4)
             #pragma unroll
             for (int kt = 0; kt < 8; ++kt)
                 #pragma unroll
                 for (int r = 0; r < 8; ++r)
-                    hc4[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+                    hc4[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] = h[kt][r];
 #endif
 #if CK8
         // slots five to eight (dense prompt-tail checkpoints), same store
@@ -616,25 +685,25 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
             for (int kt = 0; kt < 8; ++kt)
                 #pragma unroll
                 for (int r = 0; r < 8; ++r)
-                    hc5[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+                    hc5[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] = h[kt][r];
         if (hc6 && i_t + 1 == ckpt_chunk6)
             #pragma unroll
             for (int kt = 0; kt < 8; ++kt)
                 #pragma unroll
                 for (int r = 0; r < 8; ++r)
-                    hc6[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+                    hc6[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] = h[kt][r];
         if (hc7 && i_t + 1 == ckpt_chunk7)
             #pragma unroll
             for (int kt = 0; kt < 8; ++kt)
                 #pragma unroll
                 for (int r = 0; r < 8; ++r)
-                    hc7[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+                    hc7[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] = h[kt][r];
         if (hc8 && i_t + 1 == ckpt_chunk8)
             #pragma unroll
             for (int kt = 0; kt < 8; ++kt)
                 #pragma unroll
                 for (int r = 0; r < 8; ++r)
-                    hc8[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+                    hc8[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] = h[kt][r];
 #endif
     }
 
@@ -647,5 +716,5 @@ extern "C" __global__ __launch_bounds__(PFW ? 288 : 256) void kda_fused_h_o(
         for (int kt = 0; kt < 8; ++kt)
             #pragma unroll
             for (int r = 0; r < 8; ++r)
-                ht[(int64_t) i_nh * KD * VD + (16 * kt + 2 * r + half) * VD + col] = h[kt][r];
+                ht[(int64_t) i_nh * KD * VD + (16 * kt + KDA_CROW(r)) * VD + col] = h[kt][r];
 }

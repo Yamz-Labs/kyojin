@@ -28,23 +28,6 @@ def _gcc_flag():
     return hip_compiler.gcc_flags()
 
 
-def _compile_tail(lines, n=12):
-    """Last n lines, plus any error lines clang printed before them (its warning preamble would
-    otherwise fill the window)."""
-    if len(lines) <= n:
-        return lines
-    start = len(lines) - n
-    hits = [i for i, l in enumerate(lines[:start]) if "error:" in l or "fatal error" in l][-n:]
-    keep = sorted(set(hits) | set(range(start, len(lines))))
-    out, prev = [], None
-    for i in keep:
-        if prev is not None and i > prev + 1:
-            out.append("...")
-        out.append(lines[i])
-        prev = i
-    return out
-
-
 def _load(device=None, blocked=False):
     dev = select_device(device)
     key = (dev, "blocked" if blocked else "")
@@ -65,7 +48,7 @@ def _load(device=None, blocked=False):
             except OSError:
                 pass
             err = (r.stderr or r.stdout or b"").decode(errors="replace").strip().splitlines()
-            raise RuntimeError(f"gdn_hf_hip: hipcc failed for {arch}:\n" + "\n".join(_compile_tail(err)))
+            raise RuntimeError(f"gdn_hf_hip: hipcc failed for {arch}:\n" + "\n".join(hip_compiler.compile_tail(err)))
         os.replace(tmp, cache)
     lib = load_hip_runtime()
     torch.cuda.init()

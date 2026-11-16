@@ -177,6 +177,7 @@ def test_warning_text(env, monkeypatch):
     ("exllamav3.modules.gr_fn.gr_mix_hip", lambda m: m.compile_hsaco()),
     ("exllamav3.vendor.fla.hip.gdn_fused_h_hip", lambda m: m._compile("", "gfx1151")),
     ("exllamav3.vendor.fla.hip.kda_fused_h_hip", lambda m: m._compile("", "gfx1151")),
+    ("exllamav3.vendor.fla.hip.kda_fused_h_hip", lambda m: m._compile("", "gfx1201")),  # compile-only gfx12 path
     ("exllamav3.modules.ple_fn.ple_hip", lambda m: m.compile_hsaco()),
 ])
 def test_cache_key_includes_compiler(env, monkeypatch, modname, call):

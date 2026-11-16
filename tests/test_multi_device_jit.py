@@ -4,8 +4,9 @@ The engine can run the same kernel on two GPUs from one process. A loader that a
 device 0's arch or keeps one handle per defines string runs the wrong code object on the
 other card. The CDC tests below fake the compiler and the HIP runtime, so the state-key
 and arch-selection invariant is checked without a GPU; the hardware tests load every
-loader on both devices. gdn_hf, gdn_fused, kda_fused and kda_hf are gfx11.5-only: on
-gfx1201 their supported() gate must refuse before any hipcc attempt.
+loader on both devices. gdn_hf, gdn_fused and kda_hf are gfx11.5-only at the gate: on
+gfx1201 their supported() gate must refuse before any hipcc attempt. kda_fused now has
+a bitwise gfx12 path and accepts gfx1200/gfx1201 as well.
 """
 import ctypes
 import importlib
@@ -53,6 +54,8 @@ finally:
         sys.modules.pop(_n, None)
 
 GFX115 = arch_list.GFX115_ARCHS
+GFX12 = frozenset(("gfx1200", "gfx1201"))
+KDA_FUSED_GATE = GFX115 | GFX12
 
 # name -> (module, load(device), arch gate)
 CASES = {
@@ -66,10 +69,11 @@ CASES = {
     "dsv41_moe": (dsv41_moe, lambda m, d: m._load(d), None),
     "gdn_hf": (gdn_hf, lambda m, d: m._load(d), GFX115),
     "gdn_fused_h_hip": (gdn_fused, lambda m, d: m._load("", d), GFX115),
-    "kda_fused_h_hip": (kda_fused, lambda m, d: m._load("", d), GFX115),
+    "kda_fused_h_hip": (kda_fused, lambda m, d: m._load("", d), KDA_FUSED_GATE),
     "kda_hf_hip": (kda_hf, lambda m, d: m._load("", d), GFX115),
 }
-SUPPORTED = {"gr_mix_hip", "ple_hip", "gdn_hf", "gdn_fused_h_hip", "kda_fused_h_hip", "kda_hf_hip"}
+# gfx11.5-only loaders whose gfx1201 supported() gate must refuse before compiling.
+SUPPORTED = {"gr_mix_hip", "ple_hip", "gdn_hf", "gdn_fused_h_hip", "kda_hf_hip"}
 
 
 class FakeCuda:
@@ -214,6 +218,11 @@ def test_gfx12_gate_refuses_before_compiling(fake_jit, name):
     assert module.supported(0) is True
     # No compile for the refused device: the state stays empty
     assert not any(isinstance(k, tuple) and k[0] == 1 for k in module._state)
+
+
+def test_kda_fused_gfx12_gate_accepts(fake_jit):
+    assert kda_fused.supported(0) is True
+    assert kda_fused.supported(1) is True
 
 
 @pytest.mark.skipif(not (torch.version.hip and torch.cuda.device_count() >= 2),

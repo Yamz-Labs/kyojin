@@ -10,13 +10,17 @@ from exllamav3.util.hip_lib import load_hip_runtime
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kda_fused_h.hip")
 _state = {}
+# The kernel source has a gfx12 (RDNA4) fragment path. Its bf16 x bf16 products round to
+# nearest even on gfx11.5 and gfx12 (f2bf_mul), which makes o and the final state bitwise equal
+# to the Triton fused path on gfx1201 under Triton 3.9; both arches are enabled at the gate.
+_ARCHS = GFX115_ARCHS | frozenset(("gfx1200", "gfx1201"))
 
 
 def supported(device=None):
-    """kda_fused_h.hip is a gfx11.5 WMMA kernel; refuse other archs before any hipcc attempt."""
+    """True for the gfx11.5 and gfx12 WMMA fragment paths of kda_fused_h.hip; refuse others before hipcc."""
     if not torch.version.hip:
         return False
-    return device_supported(device, GFX115_ARCHS)
+    return device_supported(device, _ARCHS)
 
 
 def _hipcc():
@@ -33,7 +37,14 @@ def _compile(defs, arch):
     if not os.path.isfile(cache):
         os.makedirs(os.path.dirname(cache), exist_ok=True)
         tmp = cache + f".{os.getpid()}.{threading.get_ident()}.tmp"
-        subprocess.run([_hipcc(), *flags, "-o", tmp, _SRC], check=True, capture_output=True)
+        r = subprocess.run([_hipcc(), *flags, "-o", tmp, _SRC], capture_output=True)
+        if r.returncode != 0:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            err = (r.stderr or r.stdout or b"").decode(errors="replace").strip().splitlines()
+            raise RuntimeError(f"kda_fused_h_hip: hipcc failed for {arch}:\n" + "\n".join(hip_compiler.compile_tail(err)))
         os.replace(tmp, cache)
     return cache
 
@@ -99,7 +110,9 @@ def chunk_kda_fwd_h_fused_hip(q, k, v, gk, beta, Akk, Aqk, scale, initial_state=
     assert q.dtype == k.dtype == v.dtype == beta.dtype == Akk.dtype == Aqk.dtype == torch.bfloat16 and gk.dtype == torch.float32
     for t in (q, k, v, gk, beta, Akk, Aqk):
         assert t.is_contiguous()
-    pf = os.environ.get("EXL3_KDA_PF_SPLIT", "0") if not defs else ""
+    # The EXL3_KDA_PF_SPLIT fast builds encode the gfx11 C row / o-store layout; gfx12 uses the
+    # default defs="" build (bitwise equal, but the port does not carry those experiments).
+    pf = os.environ.get("EXL3_KDA_PF_SPLIT", "0") if not defs and device_supported(q.device, GFX115_ARCHS) else ""
     if pf == "2":
         # spill-free build (0 VGPR spills vs 462): sched barriers (SB), opaque lane
         # indices (OPQ), pinned WMMA accumulators (OPV), uniform o-store base (ADR), no LSR,

@@ -29,7 +29,7 @@ from .kda_fused_h import chunk_kda_fwd_h_fused
 _HIP_FAIL = []  # first failure disables the HIP path for the process
 
 
-def _hip_ok(q, k, v, beta, Akk, Aqk, h0):
+def _hip_ok(q, k, v, beta, Akk=None, Aqk=None, h0=None):
     if _HIP_FAIL:
         return False
     try:
@@ -39,7 +39,7 @@ def _hip_ok(q, k, v, beta, Akk, Aqk, h0):
     except Exception:                                   # noqa: BLE001
         return False
     bf = torch.bfloat16
-    ts = (q, k, v, beta, Akk, Aqk)
+    ts = (q, k, v, beta) if Akk is None else (q, k, v, beta, Akk, Aqk)
     return (all(t.dtype == bf and t.is_contiguous() for t in ts)
             and (h0 is None or h0.is_contiguous()))
 
@@ -222,14 +222,17 @@ def chunk_kda(
     # or if hipcc/module load fails; default 3, step 12). Chunks under 512 tokens
     # keep the fla chain: the one-program-per-head fused loop is ~0.14 ms slower there (T=255 sweep).
     fuse = int(os.environ.get("EXL3_KDA_FUSE", "3")) if K <= 128 and chunk_size == 64 and T >= 512 else 0
-    if fuse and os.environ.get("KYOJIN_SPLIT_ACTIVE", "0") != "0" and not _fused_output_stable(q.device):
-        # A layer split can run KDA on a gfx12 front and a different main device in one
-        # process. The fused output path is not run-to-run deterministic on gfx12, and
-        # its gfx11.5 HIP kernel cannot be JIT-built there (kda_fused_h_hip.supported()
-        # declines, so _hip_ok already fell back to the Triton fuse path). Force the
-        # deterministic fla chain on that arch only; keep it here, split-side, until the
-        # gfx12 fused kernel lands.
-        fuse = 0
+    # The fused Triton output path is nondeterministic on gfx12, so an unavailable HIP kernel
+    # must fall through to the deterministic fla chain there, not to fuse_o=True. gfx11.5 keeps
+    # the Triton fused fallback. Explicit EXL3_KDA_FUSE=0/2 remain manual controls.
+    # Off HIP (CUDA, unknown arch) the default keeps the previous rule: the deterministic chain only
+    # under a layer split (KYOJIN_SPLIT_ACTIVE), the Triton fused path otherwise.
+    det_fallback = (fuse == 3 and not _fused_output_stable(q.device)
+                    and (bool(torch.version.hip) or os.environ.get("KYOJIN_SPLIT_ACTIVE", "0") != "0"))
+    # Whether the HIP fused kernel can run. Checked before the intra pass so a det_fallback arch
+    # with no HIP kernel (gfx12) goes straight to the chain instead of computing Aqk/Akk twice.
+    hip_may_run = (fuse == 3 and K == 128 and v.shape[-1] == 128
+                   and _hip_ok(q, k, v, beta, h0 = initial_state))
     if fuse:
         # EXL3_KDA_HF=1 (default off, read per call): 16-row-chunk WY kernel (hip/kda_hf.hip, derived from hipfire's GDN kernel,
         # diagonal blocks computed in the kernel); replaces the intra kernels + kda_fused_h_o, incl. the prefix-cache
@@ -241,40 +244,46 @@ def chunk_kda(
                 return o.to(q.dtype), final_state
             except Exception as e:
                 print(f" -- EXL3_KDA_HF failed, Triton/HIP chain for the rest of the process: {e!r}", flush = True)
-        # EXL3_KDA_INTRA (read per call): 2 = fla's two intra kernels with pinned gfx1151 configs (bitwise
-        # equal to 0), 1 = one-kernel intra (diagonal blocks computed in the inter/solve program, no
-        # token_parallel pass, no Akkd round trip; ties 2 on gfx1151, not bitwise), 0 = fla autotune. Default 2 (step 11)
-        intra = int(os.environ.get("EXL3_KDA_INTRA", "2"))
-        if intra == 2:
-            Aqk, Akk = chunk_kda_fwd_intra_pinned(q = q, k = k, gk = g, beta = beta, scale = scale, chunk_size = chunk_size)
-        elif intra == 1:
-            Aqk, Akk = chunk_kda_fwd_intra_fused(q = q, k = k, gk = g, beta = beta, scale = scale, chunk_size = chunk_size)
-        else:
-            _, _, _, _, Aqk, Akk = chunk_kda_fwd_intra(
-                q = q, k = k, v = v, gk = g, beta = beta, scale = scale, chunk_size = chunk_size, skip_wu = True,
-            )
-        o = None
-        if fuse == 3 and K == 128 and v.shape[-1] == 128 and _hip_ok(q, k, v, beta, Akk, Aqk, initial_state):
-            try:
-                from .hip.kda_fused_h_hip import chunk_kda_fwd_h_fused_hip
-                h, v_new, o, final_state = chunk_kda_fwd_h_fused_hip(
-                    q = q, k = k, v = v, gk = g, beta = beta, Akk = Akk, Aqk = Aqk, scale = scale,
-                    initial_state = initial_state, output_final_state = output_final_state, chunk_size = chunk_size,
-                    ckpt = ckpt,  # mid-chunk state side-write (HIP path only; sets ckpt["ok"])
+        # When the HIP kernel cannot run on a det_fallback arch (gfx12), skip the pinned intra pass
+        # and its Aqk/Akk buffers: the chain below computes its own.
+        if not det_fallback or hip_may_run:
+            # EXL3_KDA_INTRA (read per call): 2 = fla's two intra kernels with pinned gfx1151 configs (bitwise
+            # equal to 0), 1 = one-kernel intra (diagonal blocks computed in the inter/solve program, no
+            # token_parallel pass, no Akkd round trip; ties 2 on gfx1151, not bitwise), 0 = fla autotune. Default 2 (step 11)
+            intra = int(os.environ.get("EXL3_KDA_INTRA", "2"))
+            if intra == 2:
+                Aqk, Akk = chunk_kda_fwd_intra_pinned(q = q, k = k, gk = g, beta = beta, scale = scale, chunk_size = chunk_size)
+            elif intra == 1:
+                Aqk, Akk = chunk_kda_fwd_intra_fused(q = q, k = k, gk = g, beta = beta, scale = scale, chunk_size = chunk_size)
+            else:
+                _, _, _, _, Aqk, Akk = chunk_kda_fwd_intra(
+                    q = q, k = k, v = v, gk = g, beta = beta, scale = scale, chunk_size = chunk_size, skip_wu = True,
                 )
-            except Exception as e:  # hipcc missing, compile or module-load failure: fall back to Triton
-                _HIP_FAIL.append(repr(e))
-                print(f"chunk_kda: HIP fused_h disabled, Triton fallback: {e!r}", file = sys.stderr)
-                o = None
-        if o is None:
-            h, v_new, o, final_state = chunk_kda_fwd_h_fused(
-                q = q, k = k, v = v, gk = g, beta = beta, Akk = Akk, Aqk = Aqk, scale = scale,
-                initial_state = initial_state, output_final_state = output_final_state,
-                chunk_size = chunk_size, fuse_o = fuse >= 2,
-            )
-        if o is None:
-            o = chunk_gla_fwd_o_gk(q = q, v = v_new, g = g, A = Aqk, h = h, scale = scale, chunk_size = chunk_size)
-        return o.to(q.dtype), final_state
+            o = None
+            if hip_may_run and _hip_ok(q, k, v, beta, Akk, Aqk, initial_state):
+                try:
+                    from .hip.kda_fused_h_hip import chunk_kda_fwd_h_fused_hip
+                    h, v_new, o, final_state = chunk_kda_fwd_h_fused_hip(
+                        q = q, k = k, v = v, gk = g, beta = beta, Akk = Akk, Aqk = Aqk, scale = scale,
+                        initial_state = initial_state, output_final_state = output_final_state, chunk_size = chunk_size,
+                        ckpt = ckpt,  # mid-chunk state side-write (HIP path only; sets ckpt["ok"])
+                    )
+                except Exception as e:  # hipcc missing, compile or module-load failure
+                    _HIP_FAIL.append(repr(e))
+                    print(f"chunk_kda: HIP fused_h disabled: {e!r}", file = sys.stderr)
+                    o = None
+            if o is not None:
+                return o.to(q.dtype), final_state
+            if not det_fallback:
+                h, v_new, o, final_state = chunk_kda_fwd_h_fused(
+                    q = q, k = k, v = v, gk = g, beta = beta, Akk = Akk, Aqk = Aqk, scale = scale,
+                    initial_state = initial_state, output_final_state = output_final_state,
+                    chunk_size = chunk_size, fuse_o = fuse >= 2,
+                )
+                if o is None:
+                    o = chunk_gla_fwd_o_gk(q = q, v = v_new, g = g, A = Aqk, h = h, scale = scale, chunk_size = chunk_size)
+                return o.to(q.dtype), final_state
+        # gfx12 and the HIP kernel is unavailable: deterministic fla chain below.
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q = q, k = k, v = v, gk = g, beta = beta, scale = scale, chunk_size = chunk_size,
     )

@@ -129,6 +129,23 @@ def gcc_flags():
     return [f"--gcc-install-dir={d}"] if d else []
 
 
+def compile_tail(lines, n=12):
+    """Last n lines of a hipcc log, plus any error lines clang printed before them (its warning
+    preamble would otherwise fill the window). Shared by the JIT loaders' failure messages."""
+    if len(lines) <= n:
+        return lines
+    start = len(lines) - n
+    hits = [i for i, l in enumerate(lines[:start]) if "error:" in l or "fatal error" in l][-n:]
+    keep = sorted(set(hits) | set(range(start, len(lines))))
+    out, prev = [], None
+    for i in keep:
+        if prev is not None and i > prev + 1:
+            out.append("...")
+        out.append(lines[i])
+        prev = i
+    return out
+
+
 def describe():
     i = resolve()
     if not i["path"]:

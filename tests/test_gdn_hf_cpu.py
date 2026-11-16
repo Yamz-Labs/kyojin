@@ -1,4 +1,4 @@
-"""CPU tests of the gdn_hf_hip device gate and the hipcc error tail.
+"""CPU tests of the gdn_hf_hip device gate and the shared hipcc error tail.
 No GPU, no ROCm, no built extension (the package __init__ files are bypassed with empty namespace
 stubs while the module is imported, then removed)."""
 import importlib, sys, types
@@ -18,6 +18,7 @@ for _n in _PKGS:
 try:
     gdn_hf = importlib.import_module("exllamav3.vendor.fla.hip.gdn_hf_hip")
     arch_list = importlib.import_module("exllamav3.util.arch_list")
+    hip_compiler = importlib.import_module("exllamav3.util.hip_compiler")
 finally:
     for _n in _added:
         sys.modules.pop(_n, None)
@@ -78,12 +79,12 @@ def test_supported_probe_failure_is_false(monkeypatch):
 
 def test_compile_tail_short_output_is_unchanged():
     lines = [f"line {i}" for i in range(5)]
-    assert gdn_hf._compile_tail(lines) == lines
+    assert hip_compiler.compile_tail(lines) == lines
 
 
 def test_compile_tail_keeps_an_error_before_the_tail():
     lines = ["warning: noise"] * 30 + ["fatal error: 'cstdlib' file not found"] + ["note: context"] * 20
-    tail = gdn_hf._compile_tail(lines)
+    tail = hip_compiler.compile_tail(lines)
     assert "fatal error: 'cstdlib' file not found" in tail
     assert tail[-1] == lines[-1]
     assert "..." in tail
