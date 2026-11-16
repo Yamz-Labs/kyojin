@@ -77,7 +77,7 @@ def test_budget_defaults_follow_unified_and_bulk(mg):
     budget = mg.DeviceBudget(mode = "auto")
     resolved = budget.resolve(infos, lambda key: int(key.split(":")[1]),
                               unified = {0: False, 1: True}, bulk_index = 1)
-    assert resolved["reserve"] == {0: 0.8, 1: 4.5}
+    assert resolved["reserve"] == {0: 0.8, 1: 8.0}
     assert resolved["workspace"] == {0: 1.5, 1: 2.0}
     assert resolved["safety"] == {0: 0.0, 1: 0.0}
     assert resolved["device_floor"] == {0: 0.0, 1: 0.0}
@@ -122,6 +122,15 @@ def test_unified_capacity_uses_the_usable_ceiling_without_double_counting(mg):
     # Current free memory is a second cap; the reserve is subtracted from free only.
     fp3 = _footprint(mg, free_bytes = 100 * GIB, reserve_bytes = int(4.5 * GIB))
     assert fp3.capacity_bytes(113.3) == int(95.5 * GIB)
+
+
+def test_measured_unified_reserve_leaves_seven_gib_of_free_pool(mg):
+    # 118 GiB GTT total, 8 GiB pre-flight reserve -> 110 GiB planned, still under the
+    # 113.3 GiB hard ceiling; the supervisor's last-resort GTT floor is 7 GiB.
+    fp = _footprint(mg, reserve_bytes = int(8.0 * GIB), weights_bytes = int(107 * GIB),
+                    workspace_bytes = int(2 * GIB))
+    assert fp.capacity_bytes(113.3) == int(110 * GIB)
+    assert fp.need_bytes == int(109 * GIB)
 
 
 def test_dedicated_capacity_subtracts_reserve_and_floor(mg):
@@ -241,6 +250,18 @@ def test_unified_detection_does_not_flag_a_large_dedicated_gpu(mg, monkeypatch):
     monkeypatch.setattr(mg, "glob", SimpleNamespace(glob = lambda _p: []), raising = False)
     assert mg.is_unified_device(0, "gfx1201", 80 * GIB) is False
     assert mg.is_unified_device(0, "gfx1151", 80 * GIB) is True
+
+
+def test_auto_unified_floor_only_targets_the_apu(guard_mod, monkeypatch):
+    monkeypatch.setattr(guard_mod, "amd_device_memory", lambda: {
+        "card0": {"free": 118 * GIB, "total": 118 * GIB, "dedicated": False},
+        "card1": {"free": 16 * GIB, "total": 16 * GIB, "dedicated": True},
+    })
+    floors, active = guard_mod.auto_unified_floors({})
+    assert active and floors == {"card0": 7.0}
+    explicit = {"card0": 3.0}
+    floors, active = guard_mod.auto_unified_floors(explicit)
+    assert not active and floors == explicit
 
 
 def test_effective_floor_ignores_global_floor_on_multiple_devices(guard_mod):

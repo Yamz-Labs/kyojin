@@ -734,12 +734,17 @@ cache or reserve slab are allocated; `warn` only logs the table; `off` disables 
 The guard is read-only and never changes allocator settings or outputs. See
 `KYOJIN_OOM_GUARD_*` below and `doc/split.md` for the flags.
 
-### `KYOJIN_OOM_GUARD_RESERVE_GIB` (default: `4.5` unified, `0.8` dedicated)
+### `KYOJIN_OOM_GUARD_RESERVE_GIB` (default: `8.0` unified, `0.8` dedicated)
 
-Per-device headroom kept out of the pre-flight capacity. Accepts the split's device-selector
-syntax, for example `gfx1151=4.5,gfx1201=0.8`; `cuda:N`, a UUID or a name substring also work.
-A bare number applies to every device. The part0 load slab (`--part0-reserve-gb`) is estimated
-separately and is not double-counted.
+Per-device free-memory floor kept out of the pre-flight capacity. On a unified device this is
+one subtraction from the GTT pool, not a second reserve on top of the 113.3 GiB ceiling: the
+measured 128K N=5 load completed with **8.7 GiB** GTT free, while the fatal MTP-on event ran
+at about **4.3 GiB** free. Eight GiB is the measured boundary (0.7 GiB below the known-safe
+point, 3.7 GiB above the fatal one), so MTP-on that needs more space is refused and moved to
+a larger part0 N. Accepts the split's device-selector syntax, for example
+`gfx1151=8,gfx1201=0.8`; `cuda:N`, a UUID or a name substring also work. A bare number applies
+to every device. The part0 load slab (`--part0-reserve-gb`) is estimated separately and is not
+double-counted.
 
 ### `KYOJIN_OOM_GUARD_WORKSPACE_GIB` (default: `2.0` bulk device, `1.5` other)
 
@@ -759,17 +764,18 @@ Extra per-device capacity margin on top of the reserve and workspace.
 Per-device free-memory floor used by the pre-flight guard and by the supervisor when a serve
 script passes it through. Same selector syntax as the reserve. `0` disables the floor.
 
-### `KYOJIN_OOM_GUARD_HOST_FLOOR_GIB` (default: `6`)
+### `KYOJIN_OOM_GUARD_HOST_FLOOR_GIB` (default: `7`)
 
 Host `MemAvailable` floor used when a unified device is part of the load; the summed GTT
 footprint must fit in `MemAvailable - floor`. `exllamav3/guard.py` uses the same default for its
-external host floor.
+external host floor. Seven GiB is measured: the completed MTP-on N=7 8K run bottomed at
+7.26 GiB host available and 7.10 GiB GTT free; the fatal N=6 run was at ~4.3 GiB GTT free.
 
 ### `KYOJIN_OOM_GUARD_USABLE_CEILING_GIB` (default: `113.3`)
 
 Observed usable ceiling of a 118 GiB unified device. The guard caps a unified device's planned
-capacity at this value; the default reserve of 4.5 GiB is already the raw-minus-usable gap, so
-the reserve is not subtracted twice. Raise it only after measuring the actual ceiling.
+capacity at this value after the reserve is subtracted. The 8 GiB unified reserve is the
+measured free-memory floor; the ceiling remains a hard upper bound for larger reported pools. Raise it only after measuring the actual ceiling.
 
 ### `KYOJIN_OOM_GUARD_TOLERANCE_GIB` (default: `0.25`)
 

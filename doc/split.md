@@ -55,7 +55,7 @@ KYOJIN_PART1_DEVICE=gfx1151 \
 | `--split-graphs auto\|on\|off` | - | reserved for per-segment capture; split currently runs graphs off |
 | `--expandable-segments auto\|on\|off` | `KYOJIN_EXPANDABLE_SEGMENTS` | allocator mode, applied before `import exllamav3`; `auto` only turns it off for large-context unified loads |
 | `--oom-guard auto\|warn\|off` | `KYOJIN_OOM_GUARD` | pre-flight per-device guard (`auto` refuses, `warn` logs, `off` disables) |
-| `--oom-guard-reserve-gib` | `KYOJIN_OOM_GUARD_RESERVE_GIB` | per-device headroom, e.g. `gfx1151=4.5,gfx1201=0.8` (default 4.5 unified / 0.8 dedicated) |
+| `--oom-guard-reserve-gib` | `KYOJIN_OOM_GUARD_RESERVE_GIB` | per-device free floor, e.g. `gfx1151=8,gfx1201=0.8` (default 8.0 unified / 0.8 dedicated) |
 | `--oom-guard-workspace-gib` | `KYOJIN_OOM_GUARD_WORKSPACE_GIB` | per-device prefill workspace margin (default 2.0 bulk / 1.5 other) |
 | `--oom-guard-safety-gib` | `KYOJIN_OOM_GUARD_SAFETY_GIB` | extra per-device capacity margin |
 | `--oom-guard-device-floor` | `KYOJIN_OOM_GUARD_DEVICE_FLOOR` | per-device free-memory floor, shared with the supervisor |
@@ -96,23 +96,30 @@ The measured 118 GiB Strix Halo iGPU has a usable ceiling of about **113.3 GiB**
 ~4.5 GiB gap is driver/allocator overhead, not free capacity). Recorded failure points on
 the measured GLM pack: 128K split runs complete (peak ~110.7 GiB on the iGPU); a 512K
 cache needs `expandable_segments:False` to load; 640K is killed by the supervisor before
-a torch OOM; 768K hard-locked the box. Do not probe above 128K for MTP-on runs.
+a torch OOM; 768K hard-locked the box. A 2026-11-16 8K MTP-on N=6 probe still caused a
+kernel OOM at ~113.7 GiB GPU-active / ~4.3 GiB GTT free with the old 4.5 GiB reserve and
+6 GiB host floor. The measured fix is: pre-flight reserve 8 GiB (MTP-on N=6 is refused and
+N=7 is recommended), supervisor GTT floor 7 GiB (N=7 8K completed at 7.10 GiB free) and
+host floor 7 GiB (completed at 7.2 GiB available). With `--oom-guard warn`, the old N=6
+case is SIGKILLed by the supervisor at 6.8 GiB GTT free / 8.1 GiB host available instead
+of invoking the kernel OOM killer. Longer MTP-on contexts still need the guard's
+recommendation rather than a hand-picked N, and the supervisor must stay armed.
 
 ### Pre-flight guard
 
 The loader estimates each device's footprint from actual bytes: layer/endcap/component
 weights, KV/recurrent cache, the part0 reserve slab and a prefill workspace margin. It
 compares that with the device's usable/free memory and, for unified devices, with host
-`MemAvailable - 6 GiB`. `--oom-guard auto` (the split default) refuses before allocating
+`MemAvailable - 7 GiB`. `--oom-guard auto` (the split default) refuses before allocating
 weights, cache or slabs, and prints a per-device table plus the chosen N/context and the
 largest N/context that fits. `warn` only logs; `off` disables it. The check is read-only:
 it changes no allocator setting and no split-off path.
 
-Defaults are tuning values, not architecture rules: `4.5` GiB reserve on a unified/GTT
-device, `0.8` GiB on dedicated VRAM, `2.0`/`1.5` GiB prefill workspace on the bulk/other
-device (calibrated: 4.0 GiB refused measured-good 8K MTP-on/128K points and 2.0 brackets
-their peaks), and a `6` GiB host floor. All accept per-device selector lists, e.g.
-`--oom-guard-reserve-gib gfx1151=4.5,gfx1201=0.8`.
+Defaults are measured boundaries, not architecture rules: `8.0` GiB free on a unified/GTT
+device (128K N=5 completed with 8.7 GiB free; the fatal MTP-on run had ~4.3 GiB free),
+`0.8` GiB on dedicated VRAM, `2.0`/`1.5` GiB prefill workspace on the bulk/other device,
+and a `7` GiB host floor as the last resort. All accept per-device selector lists, e.g.
+`--oom-guard-reserve-gib gfx1151=8,gfx1201=0.8`.
 
 ### Allocator mode
 
@@ -137,8 +144,11 @@ python exllamav3/guard.py --floor-gib 6 --device-floor-gib 4 \
   --fadvise-dir /path/to/model -- python tools/glm/serve.py ...
 ```
 
-Per-device supervisor floors use `--device-floor card1=4.5,nvidia:0=2` (or
-`--device-floor-gib` for every watched device); the supervisor has no torch selector, so
+Per-device supervisor floors use `--device-floor card0=8,nvidia:0=2` (or
+`--device-floor-gib` for every watched device). On an APU the supervisor automatically keeps
+a **7 GiB GTT free floor** when no explicit device floor is given. This is the measured
+boundary: MTP-on N=7 8K completed at 7.10 GiB GTT free, 128K N=5 at 8.7 GiB, and the fatal
+MTP-on N=6 event was ~4.3 GiB free. the supervisor has no torch selector, so
 `cardN`, `nvidia:N`, `amd`, `nvidia` and `default` are accepted, and it degrades to the host
 floor when a per-device query is unavailable. On a host with several visible devices a
 global `--device-floor-gib` is ignored (with a warning): use explicit selectors so an

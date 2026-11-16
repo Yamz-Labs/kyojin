@@ -238,9 +238,11 @@ about **113.3 GiB**; the gap is driver/allocator overhead. Large loads should us
 pre-flight guard and the external supervisor described in [split.md](split.md#memory-and-capacity):
 
 - `--oom-guard auto` (split default) estimates weights, cache, slab and workspace per
-  device and refuses a load that cannot fit before allocating anything. The workspace
-  default is 2.0 GiB on the bulk device and 1.5 GiB on the other (calibrated on this box). The workspace
-  default is 2.0 GiB on the bulk device and 1.5 GiB on the other (calibrated on this box).
+  device and refuses a load that cannot fit before allocating anything. The unified free floor is 7.0 GiB (the MTP-on N=7 8K load completed at 7.1 GiB GTT free and
+  the 128K N=5 load at 8.7 GiB; the fatal MTP-on N=6 event had ~4.3 GiB). The workspace default is 2.0 GiB on the bulk device and
+  1.5 GiB on the other. The unified free floor is 7.0 GiB (the MTP-on N=7 8K load completed at 7.1 GiB GTT free and
+  the 128K N=5 load at 8.7 GiB; the fatal MTP-on N=6 event had ~4.3 GiB). The workspace default is 2.0 GiB on the bulk device and
+  1.5 GiB on the other.
 - `--expandable-segments off` (or `EXL3_EXPANDABLE_SEGMENTS=0`) recovers about 0.5 GiB of
   allocator fragmentation around a large cache (the 512K GLM case), not capacity.
 - `python exllamav3/guard.py --floor-gib 6 --device-floor-gib 4 --fadvise-dir <model> -- ...`
@@ -248,8 +250,10 @@ pre-flight guard and the external supervisor described in [split.md](split.md#me
   The serve scripts wrap this with `MEMGUARD=auto|1|0`.
 
 Cutoffs observed on GLM: 128K split is the validated long-context point; 640K is refused
-by the pre-flight guard; 768K previously hard-locked the box. Do not probe above 128K with
-MTP on.
+by the pre-flight guard; 768K previously hard-locked the box. An 8K MTP-on N=6 probe
+OOM-killed the kernel at ~4.3 GiB GTT free; the guard now refuses it and N=7 completes at
+7.10 GiB free. Do not hand-pick an N for MTP-on: use the guard's largest-N/context output
+and keep the supervisor armed (auto GTT floor 7 GiB).
 
 ## Build
 

@@ -9,7 +9,7 @@ mkdir -p "$TMPDIR"
 # External supervisor (exllamav3/guard.py): the reliable backstop for a unified pool.
 # auto = a unified/GTT device is visible, or the model is large enough to threaten it.
 MEMGUARD="${MEMGUARD:-auto}"
-MEMGUARD_FLOOR="${MEMGUARD_FLOOR:-6}"
+MEMGUARD_FLOOR="${MEMGUARD_FLOOR:-7}"
 MEMGUARD_DEVICE_FLOOR="${MEMGUARD_DEVICE_FLOOR:-0}"
 MODEL=""
 args=("$@")

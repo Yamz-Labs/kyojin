@@ -437,6 +437,21 @@ def main() -> None:
     cache = Cache(model, max_num_tokens = args.max_ctx + 4096, max_history = max_history,
                   max_batch_size = 1, **qkw)
 
+    # Declare every component before build so the pre-flight guard sees the MTP
+    # and vision footprints too; previously they were added after the text load.
+    draft = draft_cache = None
+    if args.num_draft > 0:
+        draft = Model.from_config(config, component = "mtp")
+        draft_cache = Cache(draft, max_num_tokens = args.max_ctx + 4096, max_history = max_history,
+                            max_batch_size = 1, **qkw)
+    vision = None
+    vision_error = None
+    if not args.no_vision:
+        try:
+            vision = Model.from_config(config, component = "vision")
+        except Exception as exc:                    # noqa: BLE001
+            vision_error = exc
+
     plan = None
     text_map = None
     if not args.baseline:
@@ -457,6 +472,10 @@ def main() -> None:
             devices, endcaps = args.endcaps == "on", part0_layers = args.part0_layers,
             part0_reserve_gb = 0.0 if args.no_budget else args.part0_reserve_gb,
             part1_reserve_gb = args.part1_reserve_gb, guard_budget = budget)
+        if draft is not None:
+            plan.add("mtp", draft, config = config, cache = draft_cache, load_order = 1)
+        if vision is not None:
+            plan.add("vision", vision, config = config, load_order = 2)
         plan.add("text", model, config = config, cache = cache, load_order = 0)
         plan.build()
         text_map = plan.map("text")
@@ -474,26 +493,20 @@ def main() -> None:
     if plan is not None:
         plan.record_load("text", load_s)
 
-    draft = draft_cache = None
-    if args.num_draft > 0:
-        draft = Model.from_config(config, component = "mtp")
-        draft_cache = Cache(draft, max_num_tokens = args.max_ctx + 4096, max_history = max_history,
-                            max_batch_size = 1, **qkw)
+    if draft is not None:
         t1 = time.perf_counter()
         if plan is not None:
-            plan.add("mtp", draft, config = config, cache = draft_cache, load_order = 1)
             draft.load(device_map = plan.map("mtp"), progressbar = True, max_chunk_size = 4096)
             plan.record_load("mtp", time.perf_counter() - t1)
         else:
             draft.load(device = "cuda:0", progressbar = True)
         print(f"[eval] drafter loaded in {time.perf_counter() - t1:.1f} s", flush = True)
 
-    vision = None
-    if not args.no_vision:
+    if vision_error is not None:
+        print(f"[eval] vision not loaded: {type(vision_error).__name__}: {vision_error}", flush = True)
+    elif vision is not None:
         try:
-            vision = Model.from_config(config, component = "vision")
             if plan is not None:
-                plan.add("vision", vision, config = config, load_order = 2)
                 t1 = time.perf_counter()
                 vision.load(device_map = plan.map("vision"), progressbar = True)
                 plan.record_load("vision", time.perf_counter() - t1)

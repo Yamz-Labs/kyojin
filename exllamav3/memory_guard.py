@@ -11,10 +11,10 @@ nothing.  It never allocates, changes an allocator setting or mutates the plan.
 The arithmetic is kept in one place so the split adapters cannot drift:
 
 * dedicated VRAM: ``capacity = min(total, free) - reserve - safety - floor``
-* unified/GTT: the observed usable ceiling (default 113.3 GiB of a reported 118 GiB,
-  i.e. the ~4.5 GiB reserve) is the hard cap; the current free memory is a second cap:
-  ``capacity = min(usable_ceiling, free - reserve) - safety - floor``.  The reserve is
-  not subtracted twice: the ceiling already accounts for the unified overhead.
+* unified/GTT: ``capacity = min(total, free) - reserve``, capped by the observed usable
+  ceiling (default 113.3 GiB).  The measured 8 GiB unified reserve is the free-memory
+  floor, not a second subtraction on top of the ceiling; the 128K N=5 load completed at
+  8.7 GiB GTT free and the fatal MTP-on event had ~4.3 GiB.
 * unified devices additionally consume the host pool, so the summed GTT footprint is
   compared with ``MemAvailable - host_floor``.
 
@@ -31,13 +31,13 @@ from dataclasses import dataclass, field
 GIB = 1024 ** 3
 
 # Calibrated, overridable tuning values from the measured Strix Halo + RX 9070 pair.
-DEFAULT_UNIFIED_RESERVE_GIB = 4.5
+DEFAULT_UNIFIED_RESERVE_GIB = 8.0
 DEFAULT_DEDICATED_RESERVE_GIB = 0.8
 DEFAULT_BULK_WORKSPACE_GIB = 2.0
 DEFAULT_OTHER_WORKSPACE_GIB = 1.5
 DEFAULT_SAFETY_GIB = 0.0
 DEFAULT_DEVICE_FLOOR_GIB = 0.0
-DEFAULT_HOST_FLOOR_GIB = 6.0
+DEFAULT_HOST_FLOOR_GIB = 7.0
 DEFAULT_UNIFIED_CEILING_GIB = 113.3
 
 # Do not refuse a load that misses the estimate by a hair: the estimator is byte
@@ -325,24 +325,20 @@ class DeviceFootprint:
     def capacity_bytes(self, unified_ceiling_gib: float) -> int | None:
         """Usable bytes for this device, or None when nothing can be probed."""
         reserve = int(self.reserve_bytes)
-        if self.unified:
-            hard = int(unified_ceiling_gib * GIB)
-            if self.total_bytes is not None:
-                hard = min(hard, int(self.total_bytes))
-            if self.free_bytes is not None:
-                hard = min(hard, int(self.free_bytes) - reserve)
-            else:
-                hard -= reserve
+        if self.total_bytes is None and self.free_bytes is None:
+            return None
+        if self.free_bytes is None:
+            base = int(self.total_bytes)
+        elif self.total_bytes is None:
+            base = int(self.free_bytes)
         else:
-            if self.total_bytes is None and self.free_bytes is None:
-                return None
-            if self.free_bytes is None:
-                base = int(self.total_bytes)
-            elif self.total_bytes is None:
-                base = int(self.free_bytes)
-            else:
-                base = min(int(self.total_bytes), int(self.free_bytes))
-            hard = base - reserve
+            base = min(int(self.total_bytes), int(self.free_bytes))
+        # The reserve is the free-memory floor we keep below the device's usable
+        # capacity.  For a unified device that floor covers both the GTT pool and the
+        # host kernel's own allocation needs, so it is one subtraction, not two.
+        hard = base - reserve
+        if self.unified:
+            hard = min(hard, int(unified_ceiling_gib * GIB))
         hard -= int(self.safety_bytes) + int(self.floor_bytes)
         return max(0, hard)
 

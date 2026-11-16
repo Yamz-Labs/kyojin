@@ -121,15 +121,9 @@ def _read_int(path: str) -> int | None:
         return None
 
 
-def amd_device_free() -> dict[str, int]:
-    """Free memory of every AMD DRM card, in bytes.
-
-    An APU's unified pool is the GTT aperture, whose total is close to host RAM.  A
-    discrete card also exposes ``mem_info_gtt_*`` (a host-RAM aperture), but its real
-    budget is VRAM, so choose by pool size rather than by file presence.
-    """
-    out: dict[str, int] = {}
-    host_total = meminfo().get("MemTotal", 0)
+def amd_device_memory() -> dict[str, dict[str, object]]:
+    """Free/total memory and APU-vs-dedicated classification for every AMD card."""
+    out: dict[str, dict[str, object]] = {}
     for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
         device = os.path.join(card, "device")
         name = os.path.basename(card)
@@ -138,15 +132,24 @@ def amd_device_free() -> dict[str, int]:
         vram_total = _read_int(os.path.join(device, "mem_info_vram_total"))
         vram_used = _read_int(os.path.join(device, "mem_info_vram_used"))
         total = used = None
-        if gtt_total is not None and host_total and gtt_total >= 0.9 * host_total:
-            total, used = gtt_total, gtt_used
-        elif vram_total is not None:
+        # A discrete card has a significant VRAM pool; an APU's VRAM is a small
+        # carve-out and its real budget is the GTT aperture.
+        dedicated = (vram_total is not None and vram_total >= 8 * 1024 ** 3
+                     and gtt_total is not None and vram_total >= 0.05 * gtt_total)
+        if dedicated:
             total, used = vram_total, vram_used
         elif gtt_total is not None:
             total, used = gtt_total, gtt_used
+        elif vram_total is not None:
+            total, used = vram_total, vram_used
         if total is not None and used is not None:
-            out[name] = max(0, total - used)
+            out[name] = {"free": max(0, total - used), "total": total,
+                         "dedicated": bool(dedicated)}
     return out
+
+
+def amd_device_free() -> dict[str, int]:
+    return {name: int(info["free"]) for name, info in amd_device_memory().items()}
 
 
 _NVIDIA_CACHE: dict[str, object] = {"t": -1e9, "data": {}, "unavailable": False,
@@ -231,6 +234,24 @@ def floor_for(name: str, floors: dict[str, float]) -> float:
     return floors.get("default", 0.0)
 
 
+AUTO_UNIFIED_DEVICE_FLOOR_GIB = 7.0
+
+
+def auto_unified_floors(floors: dict[str, float]) -> tuple[dict[str, float], bool]:
+    """Use the measured unified GTT free floor when the operator gave no device floor.
+
+    The 128K N=5 load completed with ~8.7 GiB GTT free and MTP-on N=7 8K completed at
+    ~7.1 GiB; the fatal MTP-on event had only ~4.3 GiB.  Seven GiB is the measured
+    boundary, not a generic cushion.
+    """
+    if floors:
+        return floors, False
+    devices = amd_device_memory()
+    auto = {name: AUTO_UNIFIED_DEVICE_FLOOR_GIB for name, info in devices.items()
+            if not bool(info["dedicated"])}
+    return auto, bool(auto)
+
+
 def effective_floor(name: str, floors: dict[str, float], multiple: bool) -> float:
     """A global floor is not safe on a multi-device host: use explicit selectors."""
     key = name.lower()
@@ -245,7 +266,7 @@ def effective_floor(name: str, floors: dict[str, float], multiple: bool) -> floa
 
 def main() -> int:
     ap = argparse.ArgumentParser(add_help = True)
-    ap.add_argument("--floor-gib", type = float, default = 6.0)
+    ap.add_argument("--floor-gib", type = float, default = 7.0)
     ap.add_argument("--warn-gib", type = float, default = None)
     ap.add_argument("--interval", type = float, default = 0.5)
     ap.add_argument("--log", type = str, default = None)
@@ -266,12 +287,15 @@ def main() -> int:
                "in-process hook could run. Doing it from the supervisor covers every loader.",
     )
     ap.add_argument("--fadvise-every", type = float, default = 5.0)
+    ap.add_argument("--sample-every", type = float, default = 5.0,
+                    help = "append a MemAvailable/MemFree/GTT sample to --log this often")
     ap.add_argument("--selftest", action = "store_true")
     ap.add_argument("cmd", nargs = argparse.REMAINDER)
     args = ap.parse_args()
 
     log = Logger(args.log)
     floors = parse_device_floors(args.device_floor, args.device_floor_gib)
+    floors, auto_floors = auto_unified_floors(floors)
 
     if args.selftest:
         mi = meminfo()
@@ -303,6 +327,9 @@ def main() -> int:
         f"MemAvailable {fmt_gib(mi.get('MemAvailable', 0))} GiB, Cached {fmt_gib(mi.get('Cached', 0))} GiB"
     )
     if floors:
+        if auto_floors:
+            log("auto unified/GTT floor: " + ", ".join(
+                f"{name}={value:.1f} GiB" for name, value in sorted(floors.items())))
         dev = device_free(floors)
         if dev:
             multiple = len(dev) > 1
@@ -335,6 +362,7 @@ def main() -> int:
     last_warn = 0.0
     last_beat = 0.0
     last_fadv = 0.0
+    last_sample = 0.0
     killed = False
     device_warned = False
 
@@ -379,6 +407,19 @@ def main() -> int:
             rss = proc_rss(child.pid)
             peak_rss = max(peak_rss, rss)
             now = time.time()
+            mono = time.monotonic()
+            dev = device_free(floors, now = mono) if (floors or args.sample_every > 0) else {}
+
+            if (args.sample_every > 0 and now - last_sample >= args.sample_every):
+                last_sample = now
+                device_text = " ".join(
+                    f"{name}_free={free / GIB:.2f}" for name, free in sorted(dev.items()))
+                log(f"sample t+{now - t0:.1f}s MemAvailable={avail / GIB:.2f} "
+                    f"MemFree={mi.get('MemFree', 0) / GIB:.2f} "
+                    f"Cached={mi.get('Cached', 0) / GIB:.2f} "
+                    f"Dirty={mi.get('Dirty', 0) / GIB:.2f} "
+                    f"Unevictable={mi.get('Unevictable', 0) / GIB:.2f} "
+                    f"{device_text}".rstrip())
 
             if avail < floor:
                 log(
@@ -404,7 +445,6 @@ def main() -> int:
                 break
 
             if floors:
-                dev = device_free(floors, now = now)
                 if not dev and not device_warned:
                     device_warned = True
                     log("device-floor query unavailable; falling back to the host floor")

@@ -301,7 +301,7 @@ def add_split_arguments(parser: argparse.ArgumentParser) -> None:
                                "KYOJIN_OOM_GUARD, else auto for split and warn for single-device)")
     parser.add_argument("--oom-guard-reserve-gib", type = str, default = None,
                         help = "per-device headroom, e.g. 4.5 or cuda:0=4.5,cuda:1=0.8 "
-                               "(default: KYOJIN_OOM_GUARD_RESERVE_GIB, else 4.5 unified / 0.8 dedicated)")
+                               "(default: KYOJIN_OOM_GUARD_RESERVE_GIB, else 8.0 unified / 0.8 dedicated)")
     parser.add_argument("--oom-guard-workspace-gib", type = str, default = None,
                         help = "per-device prefill workspace margin, e.g. cuda:0=4,cuda:1=3.5 "
                                "(default: KYOJIN_OOM_GUARD_WORKSPACE_GIB, else 4.0 bulk / 3.5 other)")

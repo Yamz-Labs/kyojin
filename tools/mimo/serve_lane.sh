@@ -8,7 +8,7 @@ mkdir -p "$TMPDIR"
 
 # External supervisor: unified-memory boxes do not reliably OOM-kill.
 MEMGUARD="${MEMGUARD:-auto}"
-MEMGUARD_FLOOR="${MEMGUARD_FLOOR:-6}"
+MEMGUARD_FLOOR="${MEMGUARD_FLOOR:-7}"
 MEMGUARD_DEVICE_FLOOR="${MEMGUARD_DEVICE_FLOOR:-0}"
 MODEL=""
 mg_args=("$@")
