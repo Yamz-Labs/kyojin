@@ -27,7 +27,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 # Shared split helper: pure stdlib at import, it loads exllamav3 lazily after SPEED_ENV.
 from kyojin_serve_split import (  # noqa: E402
-    SplitController, SplitSettings, add_split_arguments, apply_allocator_env, apply_split_env,
+    SplitController, SplitSettings, add_split_arguments, apply_split_env,
     parse_part0_layers, settings_from_namespace,
 )
 from loopguard import AnswerTap, loop_guard_default  # noqa: E402  (answer-phase loop guard shared with the Qwen server)
@@ -845,7 +845,7 @@ class ResidentEngine:
         else:
             from exllamav3.device_map import check_single_device_guard
             check_single_device_guard(self.model, self.config, self.cache, "cuda:0",
-                                      budget=split_settings.guard_budget(),
+                                      guard_mode=split_settings.guard_mode,
                                       logger=lambda m: print(f"serve: {m}", flush=True))
             self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         if num_draft > 0:
@@ -2303,8 +2303,6 @@ def main() -> None:
                         help="thinking effort when a request omits it (default: medium)")
     args = parser.parse_args()
     split_settings = settings_from_namespace(args)
-    apply_allocator_env(split_settings, model_dir=args.model, ctx=args.max_ctx,
-                        logger=lambda m: print(f"serve: {m}", flush=True))
     if split_settings.enabled:
         apply_split_env(split_settings, logger=lambda m: print(f"serve: {m}", flush=True))
     if args.kv_mode == "fp16":

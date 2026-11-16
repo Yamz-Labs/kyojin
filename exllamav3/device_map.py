@@ -44,13 +44,12 @@ from dataclasses import dataclass, field
 import torch
 
 from .memory_guard import (
-    DeviceBudget,
+    GuardPolicy,
     OOMGuard,
     check_single_device,
     device_free_bytes,
     device_total_bytes,
     host_available_bytes,
-    is_unified_device,
 )
 from .util.arch_list import device_arch
 
@@ -415,11 +414,12 @@ def component_weight_bytes(model, config = None, cache = None) -> tuple[int, int
 
 
 def check_single_device_guard(model, config = None, cache = None, device = 0,
-                              budget: DeviceBudget | None = None,
+                              guard_mode: str | None = None,
                               arch: str = "", logger = print):
-    """Pre-flight guard for a single-device load (default mode: warn)."""
+    """Pre-flight guard for a single-device load."""
     weights, cache_bytes = component_weight_bytes(model, config, cache)
-    return check_single_device(weights, cache_bytes, device, budget = budget,
+    policy = GuardPolicy.from_env(default_mode = guard_mode or "auto")
+    return check_single_device(weights, cache_bytes, device, policy = policy,
                                arch = arch, logger = logger)
 
 
@@ -737,7 +737,8 @@ class SplitPlan:
         part1_reserve_gb: float = 0.0,
         preset: str = "auto",
         auto_cap: int | None = None,
-        guard_budget: DeviceBudget | None = None,
+        guard_mode: str | None = None,
+        guard: OOMGuard | None = None,
         logger = print,
     ):
         self.devices = devices
@@ -749,11 +750,12 @@ class SplitPlan:
         self.part1_reserve_gb = float(part1_reserve_gb)
         self.preset = (preset or "auto").strip().lower()
         self.auto_cap = None if auto_cap is None else max(0, int(auto_cap))
-        self.guard_budget = guard_budget or DeviceBudget.from_env()
         self.guard_report = None
         self._guard_key = None
         self._module_byte_cache: dict[tuple[int, int], int] = {}
         self.logger = logger
+        self.guard = guard or OOMGuard(
+            GuardPolicy.from_env(default_mode = guard_mode or "auto"), logger = self.logger)
         self.maps: dict[str, ComponentMap] = {}
         self._decls: dict[str, tuple] = {}
         self.configs: list[object] = []
@@ -1060,8 +1062,8 @@ class SplitPlan:
         return max(0, (min(limits) // 256) * 256)
 
     def check_guard(self) -> None:
-        """Refuse or warn before any allocation: read-only and idempotent."""
-        if self.guard_budget.mode == "off" or not self.maps:
+        """Refuse before allocation: read-only and idempotent."""
+        if self.guard.policy.mode == "off" or not self.maps:
             return
         try:
             if not torch.cuda.is_available():
@@ -1074,31 +1076,22 @@ class SplitPlan:
         chosen_n = text.part0_layers if text is not None else None
         probe = self._guard_probe()
         infos = self._guard_infos()
-        arch_of = {d.index: d.arch for d in infos}
-        unified = {index: is_unified_device(index, arch_of.get(index, ""), probe[index][0])
-                   for index in probe}
-        weights, _cache, _reserve = self._guard_bytes(skip_components = loaded)
-        bulk = max(weights, key = weights.get) if weights else self.devices.part1.index
-        guard = OOMGuard.from_budget(
-            self.guard_budget, infos,
-            lambda key: _select_device(key, "oom-guard", infos, "KYOJIN_OOM_GUARD_DEVICE"),
-            unified = unified, bulk_index = bulk, logger = self.logger)
         key = (tuple(sorted((name, m.part0_layers) for name, m in self.maps.items())),
-               context, tuple(sorted(probe.items())), self.guard_budget.mode,
+               context, tuple(sorted(probe.items())), self.guard.policy.mode,
                tuple(sorted(loaded)))
         if key == self._guard_key:
             return
         host_available = host_available_bytes()
-        footprints = self._guard_footprints(guard, probe = probe,
+        footprints = self._guard_footprints(self.guard, probe = probe,
                                             skip_components = loaded, infos = infos)
-        report = guard.evaluate(footprints, host_available = host_available)
+        report = self.guard.evaluate(footprints, host_available = host_available)
         largest_n = None
-        if not report.ok and text is not None and self.guard_budget.mode != "warn":
-            largest_n = self._largest_guard_n(guard, probe, host_available, infos, loaded)
+        if not report.ok and text is not None:
+            largest_n = self._largest_guard_n(self.guard, probe, host_available, infos, loaded)
             if largest_n is None:
                 largest_n = -1
         largest_ctx = self._largest_guard_context(report, context) if not report.ok else None
-        self.guard_report = guard.check(
+        self.guard_report = self.guard.check(
             footprints, host_available = host_available, context = context,
             chosen_n = chosen_n, largest_n = largest_n, largest_ctx = largest_ctx)
         self._guard_key = key

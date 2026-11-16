@@ -710,77 +710,41 @@ Enable GPU/CPU handoff profiling, for debug purposes.
 ### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
 
 Use expandable segments for all Torch allocations. Opt out with a value of `0` or by explicitly
-setting `PYTORCH_CUDA_ALLOC_CONF`. On a unified-memory box, disabling expandable segments can
-recover about **0.5 GiB** of allocator fragmentation around a large cache (a measured 512K
-GLM cache loads with it off but failed with the default); it does not add capacity.
+setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`. On a unified-memory box,
+disabling expandable segments can recover about **0.5 GiB** of allocator fragmentation around a
+large cache (a measured 512K GLM cache loads with it off but failed with the default); it does
+not add capacity. Set it in the lane profile before `import exllamav3` for that case.
 
-The serve and split entry points expose the same choice before the library import:
-`--expandable-segments auto|on|off` (env fallback `KYOJIN_EXPANDABLE_SEGMENTS`). `auto` leaves
-expandable segments on except for large-context unified loads where a documented estimate is
-within 8 GiB of the observed usable ceiling; set `KYOJIN_EXPANDABLE_SEGMENTS_AUTO_OFF=1` to
-force that decision on, or use `--expandable-segments on|off` to override it.
+### `KYOJIN_OOM_GUARD` (default: `auto`)
 
-### `KYOJIN_EXPANDABLE_SEGMENTS_AUTO_CTX` (default: `524288`)
+Pre-flight memory guard: `auto` refuses a load whose measured weights, cache, part0 slab and
+prefill workspace do not fit before allocating anything; `off` disables the check. The guard is
+read-only and never changes allocator settings or outputs.
 
-Context gate for the `--expandable-segments auto` heuristic. Below this token count, `auto`
-keeps expandable segments on. The estimate also requires a unified/GTT device and a model that
-is close to the usable ceiling (default `KYOJIN_OOM_GUARD_USABLE_CEILING_GIB=113.3` on a
-118 GiB Strix Halo iGPU).
+There is no per-device GTT or VRAM reserve. Each device's cap is its own reported
+`min(mem_get_info().free, mem_get_info().total)`. A dedicated-VRAM allocation failure is a
+process-level error; the host floor is what protects the unified-memory box from kernel
+starvation.
 
-### `KYOJIN_OOM_GUARD` (default: `auto` for split, `warn` for single-device)
+### `KYOJIN_OOM_GUARD_HOST_FREE_GIB` (default: `7`)
 
-Pre-flight per-device memory guard: `auto` refuses an impossible load before any weights,
-cache or reserve slab are allocated; `warn` only logs the table; `off` disables the check.
-The guard is read-only and never changes allocator settings or outputs. See
-`KYOJIN_OOM_GUARD_*` below and `doc/split.md` for the flags.
+The host `MemAvailable` floor, used by both the pre-flight guard and `exllamav3/guard.py`.
+The preflight plans against `MemAvailable - (floor + margin)`; the supervisor SIGKILLs when
+`MemAvailable < floor`. Raise this for a hungrier OS or more background services; lower it
+only after measuring. Seven GiB is the measured boundary on this box: the 8K MTP-on N=7 run
+completed at 7.26 GiB host available, while the fatal N=6 run reached the kernel OOM zone.
 
-### `KYOJIN_OOM_GUARD_RESERVE_GIB` (default: `8.0` unified, `0.8` dedicated)
+### `KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB` (default: `1`)
 
-Per-device free-memory floor kept out of the pre-flight capacity. On a unified device this is
-one subtraction from the GTT pool, not a second reserve on top of the 113.3 GiB ceiling: the
-measured 128K N=5 load completed with **8.7 GiB** GTT free, while the fatal MTP-on event ran
-at about **4.3 GiB** free. Eight GiB is the measured boundary (0.7 GiB below the known-safe
-point, 3.7 GiB above the fatal one), so MTP-on that needs more space is refused and moved to
-a larger part0 N. Accepts the split's device-selector syntax, for example
-`gfx1151=8,gfx1201=0.8`; `cuda:N`, a UUID or a name substring also work. A bare number applies
-to every device. The part0 load slab (`--part0-reserve-gb`) is estimated separately and is not
-double-counted.
+Planning headroom above the supervisor floor. It keeps the preflight from deliberately
+planning at the kill threshold and covers ordinary estimator error. Set it to `0` to plan
+exactly at the floor.
 
-### `KYOJIN_OOM_GUARD_WORKSPACE_GIB` (default: `2.0` bulk device, `1.5` other)
+### `KYOJIN_OOM_GUARD_WORKSPACE_GIB` (default: `2.0`)
 
-Estimated prefill workspace per device. The device carrying the bulk of the layers gets 2.0
-GiB and the other 1.5 GiB unless a selector list overrides them, e.g.
-`cuda:0=4,cuda:1=3.5`. These defaults were calibrated on the measured box: 4.0 GiB refused
-the measured-good 8K MTP-on and 128K points, while 2.0 GiB brackets their measured peaks
-and still refuses 512K/640K at the usable ceiling. Raise them to be more conservative near
-the cliff.
-
-### `KYOJIN_OOM_GUARD_SAFETY_GIB` (default: `0`)
-
-Extra per-device capacity margin on top of the reserve and workspace.
-
-### `KYOJIN_OOM_GUARD_DEVICE_FLOOR` (default: `0`)
-
-Per-device free-memory floor used by the pre-flight guard and by the supervisor when a serve
-script passes it through. Same selector syntax as the reserve. `0` disables the floor.
-
-### `KYOJIN_OOM_GUARD_HOST_FLOOR_GIB` (default: `7`)
-
-Host `MemAvailable` floor used when a unified device is part of the load; the summed GTT
-footprint must fit in `MemAvailable - floor`. `exllamav3/guard.py` uses the same default for its
-external host floor. Seven GiB is measured: the completed MTP-on N=7 8K run bottomed at
-7.26 GiB host available and 7.10 GiB GTT free; the fatal N=6 run was at ~4.3 GiB GTT free.
-
-### `KYOJIN_OOM_GUARD_USABLE_CEILING_GIB` (default: `113.3`)
-
-Observed usable ceiling of a 118 GiB unified device. The guard caps a unified device's planned
-capacity at this value after the reserve is subtracted. The 8 GiB unified reserve is the
-measured free-memory floor; the ceiling remains a hard upper bound for larger reported pools. Raise it only after measuring the actual ceiling.
-
-### `KYOJIN_OOM_GUARD_TOLERANCE_GIB` (default: `0.25`)
-
-Small band by which a byte estimate may exceed capacity before `auto` refuses (the estimator is
-byte accounting, not a measurement).
+Estimated transient prefill workspace added to every device footprint. This is model/context
+dependent; raise it for a model with a larger prefill scratch area. It is not a reserve: the
+device cap remains its own reported free memory.
 
 ### `EXL3_LOAD_ARENA` (default: `1`)
 

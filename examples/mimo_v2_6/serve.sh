@@ -64,8 +64,7 @@
 #                         Set to "" to restore stock autosplit.
 #   MEMGUARD=auto         auto | 1 | 0. `auto` enables exllamav3/guard.py on Linux for a
 #                         unified/GTT device or a large model.
-#   MEMGUARD_FLOOR=8      SIGKILL the server below this MemAvailable, in GiB
-#   MEMGUARD_DEVICE_FLOOR=0  per-device free-memory floor, in GiB (0 = off)
+#   KYOJIN_OOM_GUARD_HOST_FREE_GIB=7  SIGKILL the server below this MemAvailable, in GiB
 #   MIN_AVAIL_GIB=12      refuse to start below this MemAvailable, in GiB
 #   FOREGROUND=1          0 backgrounds it and writes $LOG
 #
@@ -118,8 +117,6 @@ DYNAMIC_DRAFT="${DYNAMIC_DRAFT:-1}"
 DRAFT_CACHE_MODE="${DRAFT_CACHE_MODE:-FP16}"
 DRAFT_RING="${DRAFT_RING:-1}"
 MEMGUARD="${MEMGUARD:-auto}"
-MEMGUARD_FLOOR="${MEMGUARD_FLOOR:-7}"
-MEMGUARD_DEVICE_FLOOR="${MEMGUARD_DEVICE_FLOOR:-0}"
 MIN_AVAIL_GIB="${MIN_AVAIL_GIB:-12}"
 FOREGROUND="${FOREGROUND:-1}"
 CONFIG_OUT="${CONFIG_OUT:-$TABBY_DIR/mimo-tabby-config.yml}"
@@ -258,11 +255,11 @@ case "$MEMGUARD" in
         ;;
 esac
 if [ "$use_mg" = "1" ] && [ -f "$REPO/exllamav3/guard.py" ]; then
-    MG=(python "$REPO/exllamav3/guard.py" --floor-gib "$MEMGUARD_FLOOR"
-        --fadvise-dir "$MODEL_DIR" --fadvise-every 5 --label tabbyapi)
-    [ "$MEMGUARD_DEVICE_FLOOR" != "0" ] && MG+=(--device-floor-gib "$MEMGUARD_DEVICE_FLOOR")
+    MG=(python "$REPO/exllamav3/guard.py"
+        --fadvise-dir "$MODEL_DIR" --fadvise-every 5 --label tabbyapi
+        --sample-every 5 --log "${TMPDIR:-/tmp}/memguard.log")
     MG+=(--)
-    echo " -- MEMGUARD=on host floor ${MEMGUARD_FLOOR} GiB device floor ${MEMGUARD_DEVICE_FLOOR} GiB"
+    echo " -- MEMGUARD=on (host floor ${KYOJIN_OOM_GUARD_HOST_FREE_GIB:-7} GiB)"
 else
     MG=()
     [ "$use_mg" = "1" ] || echo " !! memguard disabled (MEMGUARD=$MEMGUARD)"

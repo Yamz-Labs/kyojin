@@ -384,8 +384,8 @@ def init(
         if split_plan.auto:
             printp(not quiet, f" -- layer split: auto chose {text_map.part0_layers} part0 layer(s)")
     elif single_device and not args.tensor_parallel:
-        # Single-device loads default to the guard's warn mode until the defaults are
-        # calibrated on the host; an explicit KYOJIN_OOM_GUARD=auto/warn/off wins.
+        # Single-device loads use the same automatic preflight; KYOJIN_OOM_GUARD=off
+        # disables it.
         from .device_map import check_single_device_guard
         check_single_device_guard(model, config, cache, single_device,
                                   logger = lambda m: printp(not quiet, m))

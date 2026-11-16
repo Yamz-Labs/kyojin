@@ -144,10 +144,10 @@ def _infos(dm, *pairs):
 def _disable_default_oom_guard(split_modules, monkeypatch):
     """The CPU placement tests are not guard tests: keep the pre-flight check off.
 
-    The guard integration test passes an explicit DeviceBudget, so it is unaffected.
+    The guard integration test passes an explicit guard, so it is unaffected.
     """
     dm = split_modules[0]
-    monkeypatch.setattr(dm.DeviceBudget, "from_env",
+    monkeypatch.setattr(dm.GuardPolicy, "from_env",
                         classmethod(lambda cls, default_mode = "auto": cls(mode = "off")))
 
 
@@ -736,14 +736,14 @@ def test_split_settings_off_is_a_noop(split_modules, monkeypatch):
     assert os.environ["EXL3_GR_PF_FUSE"] == "0"
 
 
-def _fake_guard_probe(dm, monkeypatch, *, part0_total=16 * 1024 ** 3,
+def _fake_guard_probe(dm, monkeypatch, *, mg, part0_total=16 * 1024 ** 3,
                       part1_total=118 * 1024 ** 3, host_available=120 * 1024 ** 3):
     monkeypatch.setattr(dm.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(dm, "device_total_bytes",
                         lambda i: part0_total if i == 1 else part1_total)
     monkeypatch.setattr(dm, "device_free_bytes",
                         lambda i: part0_total if i == 1 else part1_total)
-    monkeypatch.setattr(dm, "is_unified_device",
+    monkeypatch.setattr(mg, "is_unified_device",
                         lambda i, arch=None, total=None: i == 0)
     monkeypatch.setattr(dm, "host_available_bytes", lambda: host_available)
 
@@ -755,9 +755,10 @@ def test_split_plan_guard_passes_or_refuses_before_allocation(split_modules, mon
 
     small = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
     small_cfg = FakeConfig({f"layer.{i}": gib // 2 for i in range(4)})
-    _fake_guard_probe(dm, monkeypatch)
+    _fake_guard_probe(dm, monkeypatch, mg=mg)
     plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
-                        guard_budget = dm.DeviceBudget(mode = "auto"),
+                        guard = dm.OOMGuard(dm.GuardPolicy(mode = "auto"),
+                                            logger = lambda *_a: None),
                         logger = lambda *_a: None)
     plan.add("text", small, config = small_cfg)
     plan.build()
@@ -766,22 +767,17 @@ def test_split_plan_guard_passes_or_refuses_before_allocation(split_modules, mon
     huge = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
     huge_cfg = FakeConfig({f"layer.{i}": 40 * gib for i in range(4)})
     plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
-                        guard_budget = dm.DeviceBudget(mode = "auto"),
+                        guard = dm.OOMGuard(dm.GuardPolicy(mode = "auto"),
+                                            logger = lambda *_a: None),
                         logger = lambda *_a: None)
     plan.add("text", huge, config = huge_cfg)
     with pytest.raises(mg.OOMGuardError, match = "pre-flight OOM guard"):
         plan.build()
 
-    # warn downgrades the same refusal; off skips the check entirely.
-    warn = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
-                        guard_budget = dm.DeviceBudget(mode = "warn"),
-                        logger = lambda *_a: None)
-    warn.add("text", huge, config = huge_cfg)
-    warn.build()
-    assert warn.guard_report is not None and not warn.guard_report.ok
-
+    # off skips the check entirely.
     off = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
-                       guard_budget = dm.DeviceBudget(mode = "off"),
+                       guard = dm.OOMGuard(dm.GuardPolicy(mode = "off"),
+                                           logger = lambda *_a: None),
                        logger = lambda *_a: None)
     off.add("text", huge, config = huge_cfg)
     off.build()
@@ -790,5 +786,4 @@ def test_split_plan_guard_passes_or_refuses_before_allocation(split_modules, mon
 
 def test_guard_mode_is_normalized_from_env_style_values(split_modules):
     _dm, _bridge, split = split_modules
-    assert split.SplitSettings(part0_layers = 1, oom_guard = "OFF").guard_budget().mode == "off"
-    assert split.SplitSettings(part0_layers = 1, oom_guard = "Warn").guard_budget().mode == "warn"
+    assert split.SplitSettings(part0_layers = 1, oom_guard = "OFF").guard_mode == "off"

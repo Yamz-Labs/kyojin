@@ -9,8 +9,6 @@ mkdir -p "$TMPDIR"
 # External supervisor (exllamav3/guard.py): the reliable backstop for a unified pool.
 # auto = a unified/GTT device is visible, or the model is large enough to threaten it.
 MEMGUARD="${MEMGUARD:-auto}"
-MEMGUARD_FLOOR="${MEMGUARD_FLOOR:-7}"
-MEMGUARD_DEVICE_FLOOR="${MEMGUARD_DEVICE_FLOOR:-0}"
 MODEL=""
 args=("$@")
 for ((i = 0; i < ${#args[@]}; i++)); do
@@ -34,12 +32,11 @@ case "$MEMGUARD" in
 esac
 MG=()
 if [ "$use_mg" = "1" ] && [ -f "$LANE_ROOT/exllamav3/guard.py" ]; then
-    MG=(python "$LANE_ROOT/exllamav3/guard.py" --floor-gib "$MEMGUARD_FLOOR"
-        --label glm --fadvise-every 5)
+    MG=(python "$LANE_ROOT/exllamav3/guard.py" --label glm
+        --log "$TMPDIR/memguard.log" --sample-every 5 --fadvise-every 5)
     [ -n "$MODEL" ] && [ -d "$MODEL" ] && MG+=(--fadvise-dir "$MODEL")
-    [ "$MEMGUARD_DEVICE_FLOOR" != "0" ] && MG+=(--device-floor-gib "$MEMGUARD_DEVICE_FLOOR")
     MG+=(--)
-    echo "serve_lane: MEMGUARD=on host floor ${MEMGUARD_FLOOR} GiB device floor ${MEMGUARD_DEVICE_FLOOR} GiB" >&2
+    echo "serve_lane: MEMGUARD=on (host floor ${KYOJIN_OOM_GUARD_HOST_FREE_GIB:-7} GiB, log $TMPDIR/memguard.log)" >&2
 elif [ "$MEMGUARD" = "1" ]; then
     echo "serve_lane: MEMGUARD=1 requested but exllamav3/guard.py is missing" >&2
     exit 1

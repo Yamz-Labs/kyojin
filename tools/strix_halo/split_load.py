@@ -12,13 +12,8 @@ Usage (from the repo root, after `source tools/strix_halo/env.sh`):
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import os
 import resource
-import sys
 import time
-from pathlib import Path
-from types import SimpleNamespace
 
 
 def mem_available_gib() -> float:
@@ -29,23 +24,6 @@ def mem_available_gib() -> float:
     except OSError:
         pass
     return 0.0
-
-
-def _apply_allocator_env(args: argparse.Namespace) -> str:
-    """Load the shared allocator helper without importing exllamav3 first."""
-    path = Path(__file__).resolve().parents[2] / "exllamav3" / "serve_split.py"
-    spec = importlib.util.spec_from_file_location("_kyojin_allocator_env", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    settings = SimpleNamespace(
-        expandable_segments=(args.expandable_segments
-                             or os.environ.get("KYOJIN_EXPANDABLE_SEGMENTS") or "auto"),
-        part0_reserve_gb=args.part0_reserve_gb,
-    )
-    return module.apply_allocator_env(settings, model_dir=args.model, ctx=args.cache_size,
-                                      logger=lambda m: print(f"[split_load] {m}", flush=True))
 
 
 def main() -> None:
@@ -60,21 +38,13 @@ def main() -> None:
     p.add_argument("--num-draft", type=int, default=2)
     p.add_argument("--no-vision", action="store_true")
     p.add_argument("--baseline", action="store_true", help="load everything on cuda:0, for the host-RAM comparison")
-    p.add_argument("--expandable-segments", choices=("auto", "on", "off"), default=None)
-    p.add_argument("--oom-guard", choices=("auto", "warn", "off"), default=None)
-    p.add_argument("--oom-guard-reserve-gib", default=None)
-    p.add_argument("--oom-guard-workspace-gib", default=None)
-    p.add_argument("--oom-guard-safety-gib", default=None)
-    p.add_argument("--oom-guard-device-floor", default=None)
+    p.add_argument("--oom-guard", choices=("auto", "off"), default=None)
     args = p.parse_args()
-
-    _apply_allocator_env(args)
 
     import torch
 
     from exllamav3 import Cache, CacheLayer_quant, Config, Model
     from exllamav3.device_map import SplitPlan, resolve_devices
-    from exllamav3.memory_guard import DeviceBudget
 
     torch.set_grad_enabled(False)
     endcaps = args.endcaps == "on"
@@ -104,7 +74,7 @@ def main() -> None:
             try:
                 vision = Model.from_config(config, component="vision")
                 vision.load(device="cuda:0", progressbar=True)
-            except Exception as exc:                    # noqa: BLE001
+            except Exception as exc:
                 print(f"[baseline] vision not loaded: {type(exc).__name__}: {exc}", flush=True)
         print(f"[baseline] load {time.perf_counter() - t0:.1f} s; "
               f"cuda:0 allocated {torch.cuda.memory_allocated(torch.device('cuda:0')) / 2**30:.2f} GiB; "
@@ -115,17 +85,6 @@ def main() -> None:
         return
 
     devices = resolve_devices(args.part0_device, args.part1_device)
-    budget = DeviceBudget.from_env(default_mode="auto")
-    if args.oom_guard:
-        budget.mode = args.oom_guard
-    if args.oom_guard_reserve_gib is not None:
-        budget.reserve = args.oom_guard_reserve_gib
-    if args.oom_guard_workspace_gib is not None:
-        budget.workspace = args.oom_guard_workspace_gib
-    if args.oom_guard_safety_gib is not None:
-        budget.safety = args.oom_guard_safety_gib
-    if args.oom_guard_device_floor is not None:
-        budget.device_floor = args.oom_guard_device_floor
     # Declare MTP/vision before build so the pre-flight guard includes them.
     draft = draft_cache = None
     if args.num_draft > 0:
@@ -137,11 +96,11 @@ def main() -> None:
     if not args.no_vision:
         try:
             vision = Model.from_config(config, component="vision")
-        except Exception as exc:                        # noqa: BLE001
+        except Exception as exc:
             vision_error = exc
 
     plan = SplitPlan(devices, endcaps=endcaps, part0_layers=args.part0_layers,
-                     part0_reserve_gb=args.part0_reserve_gb, guard_budget=budget)
+                     part0_reserve_gb=args.part0_reserve_gb, guard_mode=args.oom_guard)
     if draft is not None:
         plan.add("mtp", draft, config=config, cache=draft_cache, load_order=1)
     if vision is not None:
@@ -174,7 +133,7 @@ def main() -> None:
             plan.record_load("vision", time.perf_counter() - t1)
             print(f"[split] vision loaded in {time.perf_counter() - t1:.1f} s "
                   f"on {plan.map('vision').placed_devices}", flush=True)
-        except Exception as exc:                        # noqa: BLE001
+        except Exception as exc:
             print(f"[split] vision not loaded: {type(exc).__name__}: {exc}", flush=True)
             vision = None
 

@@ -8,8 +8,6 @@ mkdir -p "$TMPDIR"
 
 # External supervisor: unified-memory boxes do not reliably OOM-kill.
 MEMGUARD="${MEMGUARD:-auto}"
-MEMGUARD_FLOOR="${MEMGUARD_FLOOR:-7}"
-MEMGUARD_DEVICE_FLOOR="${MEMGUARD_DEVICE_FLOOR:-0}"
 MODEL=""
 mg_args=("$@")
 for ((i = 0; i < ${#mg_args[@]}; i++)); do
@@ -21,16 +19,22 @@ done
 use_mg=0
 case "$MEMGUARD" in
     1) use_mg=1 ;;
-    auto) compgen -G "/sys/class/drm/card*/device/mem_info_gtt_total" > /dev/null && use_mg=1 ;;
+    auto)
+        if compgen -G "/sys/class/drm/card*/device/mem_info_gtt_total" > /dev/null; then
+            use_mg=1
+        elif [ -n "$MODEL" ] && [ -d "$MODEL" ]; then
+            model_bytes=$(du -sb --apparent-size "$MODEL"/*.safetensors 2> /dev/null | awk '{s+=$1} END {print s+0}' || true)
+            if [ "${model_bytes:-0}" -ge $((48 * 1024 * 1024 * 1024)) ]; then use_mg=1; fi
+        fi
+        ;;
 esac
 MG=()
 if [ "$use_mg" = "1" ] && [ -f "$LANE_ROOT/exllamav3/guard.py" ]; then
-    MG=(python "$LANE_ROOT/exllamav3/guard.py" --floor-gib "$MEMGUARD_FLOOR"
-        --label mimo --fadvise-every 5)
+    MG=(python "$LANE_ROOT/exllamav3/guard.py" --label mimo
+        --log "$TMPDIR/memguard.log" --sample-every 5 --fadvise-every 5)
     [ -n "$MODEL" ] && [ -d "$MODEL" ] && MG+=(--fadvise-dir "$MODEL")
-    [ "$MEMGUARD_DEVICE_FLOOR" != "0" ] && MG+=(--device-floor-gib "$MEMGUARD_DEVICE_FLOOR")
     MG+=(--)
-    echo "serve_lane: MEMGUARD=on host floor ${MEMGUARD_FLOOR} GiB device floor ${MEMGUARD_DEVICE_FLOOR} GiB" >&2
+    echo "serve_lane: MEMGUARD=on (host floor ${KYOJIN_OOM_GUARD_HOST_FREE_GIB:-7} GiB, log $TMPDIR/memguard.log)" >&2
 elif [ "$MEMGUARD" = "1" ]; then
     echo "serve_lane: MEMGUARD=1 requested but exllamav3/guard.py is missing" >&2
     exit 1

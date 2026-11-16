@@ -53,12 +53,7 @@ KYOJIN_PART1_DEVICE=gfx1151 \
 | `--part0-reserve-gb` | `KYOJIN_PART0_RESERVE_GB` | VRAM held as a load-time slab on `part0` for workspace (default 1.2) |
 | `--split-preset auto\|glm\|qwen\|ds41\|none` | `KYOJIN_SPLIT_PRESET` | per-model unsafe-environment preset; GLM needs none today |
 | `--split-graphs auto\|on\|off` | - | reserved for per-segment capture; split currently runs graphs off |
-| `--expandable-segments auto\|on\|off` | `KYOJIN_EXPANDABLE_SEGMENTS` | allocator mode, applied before `import exllamav3`; `auto` only turns it off for large-context unified loads |
-| `--oom-guard auto\|warn\|off` | `KYOJIN_OOM_GUARD` | pre-flight per-device guard (`auto` refuses, `warn` logs, `off` disables) |
-| `--oom-guard-reserve-gib` | `KYOJIN_OOM_GUARD_RESERVE_GIB` | per-device free floor, e.g. `gfx1151=8,gfx1201=0.8` (default 8.0 unified / 0.8 dedicated) |
-| `--oom-guard-workspace-gib` | `KYOJIN_OOM_GUARD_WORKSPACE_GIB` | per-device prefill workspace margin (default 2.0 bulk / 1.5 other) |
-| `--oom-guard-safety-gib` | `KYOJIN_OOM_GUARD_SAFETY_GIB` | extra per-device capacity margin |
-| `--oom-guard-device-floor` | `KYOJIN_OOM_GUARD_DEVICE_FLOOR` | per-device free-memory floor, shared with the supervisor |
+| `--oom-guard auto\|off` | `KYOJIN_OOM_GUARD` | pre-flight memory guard (`auto` refuses, `off` disables) |
 
 `cuda:N` is the torch device index **after** `HIP_VISIBLE_DEVICES`, not the `rocm-smi`
 index. Explicit selectors win in either position: `part0=cuda:1/part1=cuda:0` and
@@ -92,71 +87,68 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
 - Split mode runs eager. Whole-forward and per-block graphs are disabled; per-segment
   capture is not implemented yet.
 
-The measured 118 GiB Strix Halo iGPU has a usable ceiling of about **113.3 GiB** (the
-~4.5 GiB gap is driver/allocator overhead, not free capacity). Recorded failure points on
-the measured GLM pack: 128K split runs complete (peak ~110.7 GiB on the iGPU); a 512K
-cache needs `expandable_segments:False` to load; 640K is killed by the supervisor before
-a torch OOM; 768K hard-locked the box. A 2026-11-16 8K MTP-on N=6 probe still caused a
-kernel OOM at ~113.7 GiB GPU-active / ~4.3 GiB GTT free with the old 4.5 GiB reserve and
-6 GiB host floor. The measured fix is: pre-flight reserve 8 GiB (MTP-on N=6 is refused and
-N=7 is recommended), supervisor GTT floor 7 GiB (N=7 8K completed at 7.10 GiB free) and
-host floor 7 GiB (completed at 7.2 GiB available). With `--oom-guard warn`, the old N=6
-case is SIGKILLed by the supervisor at 6.8 GiB GTT free / 8.1 GiB host available instead
-of invoking the kernel OOM killer. Longer MTP-on contexts still need the guard's
-recommendation rather than a hand-picked N, and the supervisor must stay armed.
+The measured 118 GiB Strix Halo iGPU has a practical usable point of about **113 GiB**
+(the gap to the 118 GiB aperture is driver/allocator overhead). Recorded failure points on
+the measured GLM pack: 128K split runs complete (peak ~109.3 GiB on the iGPU); a 512K cache
+needs `expandable_segments:False` to load; 640K is refused by the pre-flight guard; 768K
+hard-locked the box. A 2026-11-16 8K MTP-on N=6 probe caused a kernel OOM at ~4.3 GiB GTT
+free under the old configuration. The host-only supervisor now catches that case: an N=6
+run allowed past preflight was SIGKILLed at 7.0 GiB host available / 5.3 GiB GTT free,
+with no kernel OOM.
 
 ### Pre-flight guard
 
-The loader estimates each device's footprint from actual bytes: layer/endcap/component
-weights, KV/recurrent cache, the part0 reserve slab and a prefill workspace margin. It
-compares that with the device's usable/free memory and, for unified devices, with host
-`MemAvailable - 7 GiB`. `--oom-guard auto` (the split default) refuses before allocating
-weights, cache or slabs, and prints a per-device table plus the chosen N/context and the
-largest N/context that fits. `warn` only logs; `off` disables it. The check is read-only:
-it changes no allocator setting and no split-off path.
+The guard estimates each device's footprint from actual bytes: weights, KV/recurrent cache,
+the part0 load slab and a prefill workspace. The device cap is the device itself:
 
-Defaults are measured boundaries, not architecture rules: `8.0` GiB free on a unified/GTT
-device (128K N=5 completed with 8.7 GiB free; the fatal MTP-on run had ~4.3 GiB free),
-`0.8` GiB on dedicated VRAM, `2.0`/`1.5` GiB prefill workspace on the bulk/other device,
-and a `7` GiB host floor as the last resort. All accept per-device selector lists, e.g.
-`--oom-guard-reserve-gib gfx1151=8,gfx1201=0.8`.
+```text
+device_cap = min(mem_get_info().free, mem_get_info().total)
+host_cap   = MemAvailable - (host_floor + preflight_margin)
+```
+
+There is **no GTT or VRAM reserve**. A dedicated-VRAM allocation failure is a process-level
+error; the host floor is what prevents the unified-memory box from starving. The only
+tunables are `KYOJIN_OOM_GUARD_HOST_FREE_GIB` (default 7), the planning margin (default 1)
+and the prefill workspace (default 2.0 GiB). The host floor is shared with the supervisor;
+the margin keeps the planner above the supervisor's kill threshold.
+
+`--oom-guard auto` refuses before allocating weights, cache or slabs, and prints a per-device
+table plus the chosen N/context and the largest N/context that fits. `off` disables it. The
+check is read-only.
+
+Measured budget on the GLM pack at idle: 128K N=5 needs ~111 GiB (passes); 640K N=5 needs
+~115.2 GiB and is refused by the host planning cap (~114.6 GiB); MTP-on N=6 needs ~110.4 GiB
+and is allowed to start, with the supervisor as the runtime backstop; MTP-on N=7 needs
+~107.7 GiB and completed at 7.2 GiB host / 7.1 GiB GTT free.
 
 ### Allocator mode
 
-`--expandable-segments off` (or `EXL3_EXPANDABLE_SEGMENTS=0`, or
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`) is applied before the library import.
-It recovers about **0.5 GiB** of fragmentation around a large cache and is the mode that
-loaded the 512K case; it does not add capacity. The pre-flight workspace estimate is
-conservative, so `auto` may still refuse a load-only 512K run that fits at 113.28 GiB
-measured: pass `--oom-guard warn` (or a lower `--oom-guard-workspace-gib`) for that
-measured point once the supervisor is armed. `auto` keeps expandable segments on
-except for unified loads at 512K context or above whose estimate is within 8 GiB of the
-usable ceiling. `on`/`off` are explicit overrides.
+The 512K case needs expandable segments off. Use the existing
+`EXL3_EXPANDABLE_SEGMENTS=0` (or `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`) in that
+lane profile before the library import. It recovers about **0.5 GiB** of fragmentation, not
+capacity. There is no automatic allocator heuristic.
+
+512K is also at the preflight planning boundary (the measured 512K load used 113.28 GiB).
+If the host cap refuses it on a particular boot, set
+`KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB=0` or `KYOJIN_OOM_GUARD=off` for that lane; the external
+supervisor floor is unchanged and still protects the box. Do not disable the supervisor.
 
 ### External supervisor
 
-Use `exllamav3/guard.py` (the compatibility path `util/memguard.py` execs it) when loading
-near the limit. It watches host `MemAvailable`, per-device free memory (`mem_info_gtt_*`/
-`mem_info_vram_*` on AMD, `nvidia-smi` on NVIDIA) and can release page cache:
+Use `exllamav3/guard.py` (the compatibility path `util/memguard.py` execs it). It watches host
+`MemAvailable` and page cache; it has no device floors and no torch import:
 
 ```sh
-python exllamav3/guard.py --floor-gib 6 --device-floor-gib 4 \
-  --fadvise-dir /path/to/model -- python tools/glm/serve.py ...
+python exllamav3/guard.py --fadvise-dir /path/to/model -- python tools/glm/serve.py ...
 ```
 
-Per-device supervisor floors use `--device-floor card0=8,nvidia:0=2` (or
-`--device-floor-gib` for every watched device). On an APU the supervisor automatically keeps
-a **7 GiB GTT free floor** when no explicit device floor is given. This is the measured
-boundary: MTP-on N=7 8K completed at 7.10 GiB GTT free, 128K N=5 at 8.7 GiB, and the fatal
-MTP-on N=6 event was ~4.3 GiB free. the supervisor has no torch selector, so
-`cardN`, `nvidia:N`, `amd`, `nvidia` and `default` are accepted, and it degrades to the host
-floor when a per-device query is unavailable. On a host with several visible devices a
-global `--device-floor-gib` is ignored (with a warning): use explicit selectors so an
-unrelated GPU cannot trigger a kill. The serve scripts use a
-`MEMGUARD=auto|1|0` wrapper: `auto` enables it for a unified/GTT device or a large model
-and logs the chosen floors. Keep the supervisor external; an
-in-process watchdog cannot be relied on while the allocator or kernel is stalled. Do not
-run MTP-on probing with the retired `split_bench_ctx.py`; use `split_eval.py --bench-depth`.
+The host floor defaults to 7 GiB (or `KYOJIN_OOM_GUARD_HOST_FREE_GIB`) and is the same value
+the preflight plans around. The supervisor logs a sample to `--log`; the serve lanes pass
+`$TMPDIR/memguard.log` so a future event leaves evidence. The serve scripts use a
+`MEMGUARD=auto|1|0` wrapper: `auto` enables it for a unified/GTT device or a large model.
+Keep the supervisor external; an in-process watchdog cannot be relied on while the allocator
+or kernel is stalled. Do not run MTP-on probing with the retired `split_bench_ctx.py`; use
+`split_eval.py --bench-depth`.
 
 ## Model support
 
