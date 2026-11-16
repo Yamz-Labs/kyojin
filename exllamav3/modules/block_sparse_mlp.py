@@ -21,7 +21,7 @@ from ..util import profile_opt
 from ..util.knobs import knob_on
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
 from .quant.exl3 import dec_workspace
-from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices
+from ..util.row_inv import ROW_INV_MAX_ROWS, job_slices, GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS
 from .block_sparse_mlp_routing import (
     RoutingCFG, ROUTING_ACT_SIGMOID, ROUTING_ACT_SQRTSP,
     routing_std, routing_std_bias, routing_ds3, routing_dots, routing_sqrtsp, routing_sqrtsp_hash,
@@ -2526,6 +2526,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
+        if GGUF_ROW_INV["on"] and not params.get("autosplit_measure") and \
+                2 <= x.numel() // x.shape[-1] <= GGUF_ROW_INV_MAX_ROWS and self._gguf_experts():
+            return self._forward_rows_single(x, params, out_dtype)
+
         if _ROW_CHUNK_MAX and self.coop_rows < x.numel() // x.shape[-1] <= \
                 (min(_ROW_CHUNK_MAX, _FUSED_3INST_MIN) if self.support_fused else _ROW_CHUNK_MAX) and self._row_chunk_ok() and \
                 not params.get("autosplit_measure"):
@@ -3504,6 +3508,29 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         out = torch.zeros_like(scores)
         out.scatter_(1, top.indices, wv)
         return out
+
+
+    def _gguf_experts(self) -> bool:
+        from .foreign_linear import ForeignLinear
+        for lst in (self.ups, self.downs):
+            if lst and isinstance(lst[0], ForeignLinear):
+                return True
+        return False
+
+
+    def _forward_rows_single(self, x: torch.Tensor, params: dict, out_dtype: torch.dtype | None) -> torch.Tensor:
+        # EXL3_GGUF_ROW_INV: the multi-row GGUF MoE paths (grouped prefill, per-expert token grouping + index_add) sum in another
+        # order and take other kernels than the one-row step; run every row through the one-row path so it gets its exact bits.
+        y = x.reshape(-1, x.shape[-1])
+        routed = params.pop("dec_routed", None)
+        outs = []
+        for a in range(y.shape[0]):
+            sub = {k: v for k, v in params.items() if k != "mlp_residual_out"}
+            if routed is not None:
+                sub["dec_routed"] = (routed[0][a:a + 1], routed[1][a:a + 1])
+            o = self.forward(y[a:a + 1].unsqueeze(0), sub, out_dtype)
+            outs.append(o.reshape(-1, o.shape[-1]).clone())
+        return torch.cat(outs).view(x.shape[:-1] + (outs[0].shape[-1],))
 
 
     def _row_chunk_ok(self) -> bool:
