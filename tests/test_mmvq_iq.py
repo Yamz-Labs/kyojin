@@ -15,9 +15,9 @@ FMTS = {  # name: (block bytes, elements per block, mmvq id)
     "iq3_s": (110, 256, 4), "iq4_nl": (18, 32, 5), "iq4_xs": (136, 256, 6), "q5_k": (176, 256, 7),
 }
 # dense-only K-quant entries (llama.cpp vec_dot_q4_K / q6_K_q8_1 in fq_mmvq.cu; no grouped MoE id)
-KQ_DENSE = {"q4_k": (144, 256, 8), "q6_k": (210, 256, 9)}
+KQ_DENSE = {"q4_k": (144, 256, 8), "q6_k": (210, 256, 9), "q3_k": (110, 256, 10)}
 # few-row MMQ formats (fq_mmq_few.cu, llama.cpp PR #31533 port): name -> (block bytes, elements per block, fq_mmq_few fmt id)
-MMQ_FEW = {"q8_0": (34, 32, 0), "q4_k": (144, 256, 1), "q5_k": (176, 256, 2), "q6_k": (210, 256, 3)}
+MMQ_FEW = {"q8_0": (34, 32, 0), "q4_k": (144, 256, 1), "q5_k": (176, 256, 2), "q6_k": (210, 256, 3), "q3_k": (110, 256, 4), "iq4_xs": (136, 256, 5)}
 
 
 def make_weights(fmt, n, k, seed, dscale=1.0):
@@ -25,8 +25,8 @@ def make_weights(fmt, n, k, seed, dscale=1.0):
     g = torch.Generator().manual_seed(seed)
     w = torch.randint(0, 256, (n, k // qk, bb), generator=g, dtype=torch.uint8)
     d = ((torch.rand(n, k // qk, generator=g) * 0.02 + 0.001) * dscale).half().view(torch.uint8).reshape(n, k // qk, 2)
-    if fmt == "q6_k":                     # d is the last field of block_q6_K
-        w[:, :, 208:210] = d
+    if fmt in ("q6_k", "q3_k"):           # d is the last field of block_q6_K / block_q3_K
+        w[:, :, bb - 2:bb] = d
     else:
         w[:, :, 0:2] = d
     if fmt in ("q5_k", "q4_k"):           # half2 (d, dmin)
@@ -48,7 +48,7 @@ def dequant(fmt, w, n, k):
         out = torch.empty((n, k), dtype=torch.half, device="cuda")
         getattr(ext, f"fq_dequant_{fmt}")(w, out)
         return out.float()
-    return gap_formats.dequant(fmt, w).float().reshape(n, k)
+    return gap_formats.dequant(fmt, w).float().reshape(n, k)   # q3_k: the torch gap reference
 
 
 def q8_dequant(qb, m, k):
@@ -91,6 +91,19 @@ def test_dense():
                         d = float((out - o).norm() / o.norm())
                         assert d < 2e-5, f"{fmt} [{n}x{k}] m={m}: differs from {old} by {d:.2e}"
                         worst_old[0] = max(worst_old[0], d)
+        if fmt == "q3_k":                 # vs the Triton gap kernel (fp16 activations, so the q8_1 quantization error shows: ~1e-2 relative)
+            from exllamav3.foreign_quant import triton_iq
+            n, k, m = 1024, 4096, 4
+            w = make_weights(fmt, n, k, 7)
+            x = (torch.randn(m, k, generator=torch.Generator().manual_seed(m)) * 0.5).half().cuda()
+            qb = ext.fq_q8_scratch(torch.cuda.current_device(), m, k)
+            ext.fq_quant_q8_1_rows(x, qb)
+            o = torch.empty((m, n), dtype=torch.float, device="cuda")
+            ext.fq_mmvq_q3_k(qb, w, o)
+            t = triton_iq.gemv("q3_k", x, w.reshape(n, -1)).float()
+            d = float((o - t).norm() / t.norm())
+            print(f"dense q3_k vs the Triton gap kernel: {d:.2e}")
+            assert d < 1e-2, f"q3_k differs from the Triton gap kernel by {d}"
         print(f"dense {fmt}: ok")
     print(f"dense worst fp32-out rel err vs dequant reference {worst:.2e}, vs previous q8 kernels {worst_old[0]:.2e}")
 
@@ -108,6 +121,15 @@ def test_dequant():
         bad = int((out.view(torch.int16) != ref.view(torch.int16)).sum())
         print(f"dequant {fmt}: {bad} of {n * k} fp16 values differ from the reference")
         assert bad == 0, f"{fmt}: fq_dequant_iq differs from the reference"
+    n, k = 96, 1024
+    w = make_weights("q3_k", n, k, 11)
+    ref = gap_formats.dequant("q3_k", w).half().reshape(n, k)
+    out = torch.empty((n, k), dtype=torch.half, device="cuda")
+    ext.fq_dequant_iq(w, out, 10)
+    torch.cuda.synchronize()
+    bad = int((out.view(torch.int16) != ref.view(torch.int16)).sum())
+    print(f"dequant q3_k: {bad} of {n * k} fp16 values differ from the torch gap reference")
+    assert bad == 0, "q3_k: fq_dequant_iq differs from the reference"
 
 
 def moe_case(fug, fd, K, I, E, R, topk, seed):
