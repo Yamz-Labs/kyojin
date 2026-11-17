@@ -58,6 +58,59 @@ def moe_gemv(x: torch.Tensor, wtab: torch.Tensor, btab: torch.Tensor | None, sel
     """x (rows, K) fp16 contiguous; sel (slots,) int32 expert ids; returns (slots, N) fp32."""
     slots = sel.numel()
     y = torch.empty((slots, N), dtype=torch.float32, device=x.device)
-    _mxfp4_moe[(triton.cdiv(N, BN), slots)](x, wtab, btab if btab is not None else wtab, sel, y, K, N, xdiv,
-                                            HAS_B=btab is not None, BN=BN, num_warps=NW)
+    bn, nw = (TUNED_BN, TUNED_NW) if tuned() else (BN, NW)
+    _mxfp4_moe[(triton.cdiv(N, bn), slots)](x, wtab, btab if btab is not None else wtab, sel, y, K, N, xdiv,
+                                            HAS_B=btab is not None, BN=bn, num_warps=nw)
     return y
+
+
+def tuned() -> bool:
+    """EXL3_MXFP4_MOE_TUNED=1 on CUDA (not HIP): fused gate+up launch + BN16/NW4 grids. Read at call time."""
+    return os.environ.get("EXL3_MXFP4_MOE_TUNED", "0") == "1" and not torch.version.hip
+
+
+TUNED_BN = 16
+TUNED_NW = 4
+
+
+@triton.jit
+def _gu_fused(x_ptr, gtab, gbtab, utab, ubtab, sel_ptr, a_ptr, K, N, LIM, BN: tl.constexpr):
+    pid = tl.program_id(0)
+    slot = tl.program_id(1)
+    e = tl.load(sel_ptr + slot).to(tl.int64)
+    gp = tl.load(gtab + e).to(tl.pointer_type(tl.uint8))
+    up = tl.load(utab + e).to(tl.pointer_type(tl.uint8))
+    Kb = K // 32
+    rn = pid * BN + tl.arange(0, BN)
+    mn = rn < N
+    j = tl.arange(0, 16)
+    row = rn.to(tl.int64) * (Kb * 17)
+    ag = tl.zeros((BN,), dtype=tl.float32)
+    au = tl.zeros((BN,), dtype=tl.float32)
+    for kb in range(0, Kb):
+        base = row + kb * 17
+        xl = tl.load(x_ptr + kb * 32 + j).to(tl.float32)
+        xh = tl.load(x_ptr + kb * 32 + 16 + j).to(tl.float32)
+        dg = tl.exp2(tl.load(gp + base, mask=mn, other=0).to(tl.float32) - 128.0)
+        du = tl.exp2(tl.load(up + base, mask=mn, other=0).to(tl.float32) - 128.0)
+        qg = tl.load(gp + base[:, None] + 1 + j[None, :], mask=mn[:, None], other=0).to(tl.int32)
+        qu = tl.load(up + base[:, None] + 1 + j[None, :], mask=mn[:, None], other=0).to(tl.int32)
+        ag += tl.sum(_fp4half(qg & 15) * xl[None, :] + _fp4half(qg >> 4) * xh[None, :], axis=1) * dg
+        au += tl.sum(_fp4half(qu & 15) * xl[None, :] + _fp4half(qu >> 4) * xh[None, :], axis=1) * du
+    bg = tl.load(gbtab + e).to(tl.pointer_type(tl.float16))
+    bu = tl.load(ubtab + e).to(tl.pointer_type(tl.float16))
+    ag += tl.load(bg + rn, mask=mn, other=0.0).to(tl.float32)
+    au += tl.load(bu + rn, mask=mn, other=0.0).to(tl.float32)
+    g = ag.to(tl.float16).to(tl.float32)        # the 3-launch path rounds g,u to fp16 before the activation
+    u = au.to(tl.float16).to(tl.float32)
+    g = tl.minimum(g, LIM)
+    u = tl.minimum(tl.maximum(u, -LIM), LIM)
+    a = (u + 1.0) * g * (1.0 / (1.0 + tl.exp(-1.702 * g)))     # swiglu_oai
+    tl.store(a_ptr + slot.to(tl.int64) * N + rn, a.to(tl.float16), mask=mn)
+
+
+def gu_fused(h, gw, gb, uw, ub, sel, I: int, K: int, lim: float) -> torch.Tensor:
+    """Fused gate+up+bias+swiglu_oai: h (rows=1.., K) fp16, returns (slots, I) fp16. Single-row input only (x row 0 for all slots)."""
+    a = torch.empty((sel.numel(), I), dtype=torch.float16, device=h.device)
+    _gu_fused[(triton.cdiv(I, TUNED_BN), sel.numel())](h, gw, gb, uw, ub, sel, a, K, I, lim, BN=TUNED_BN, num_warps=TUNED_NW)
+    return a
