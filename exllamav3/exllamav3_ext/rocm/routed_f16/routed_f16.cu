@@ -833,6 +833,10 @@ __global__ void RoutedCombineSharedKernel(const __half* __restrict__ rows, const
 }  // namespace
 #endif
 }  // namespace kyo_routed_f16
+
+// The host wrappers launch the kernels above, so they share their guard: a device pass for another
+// architecture has no kernels to launch (the Python side uses them on gfx1151 only).
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1151__)
 // out[slot, :K] (F16, slot = t * top_k + s) = down[ids[t, s]] @ (silu(gate[ids[t, s]] @ x[t]) * (up[ids[t, s]] @ x[t])),
 // F16 operands, F32 WMMA accumulation. x: half [T, K]; ids: int32 [T, top_k] (ids outside [0, E) are skipped); counts:
 // int32 [E] = rows per expert; tiles: int32 [n_tiles], one per 128-row tile of an expert's bucket, expert | (tile << 16);
@@ -939,4 +943,5 @@ void fq_routed_f16_combine_shared(torch::Tensor rows, torch::Tensor weights, tor
     TORCH_CHECK(hipGetLastError() == hipSuccess, "fq_routed_f16_combine_shared: launch failed");
 }
 
+#endif  // gfx1151 host wrappers
 #endif
