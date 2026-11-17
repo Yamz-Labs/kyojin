@@ -99,6 +99,13 @@ _MMQ_FEW_MINR = {"q5_k": 3, "q4_k": 4, "q6_k": 4, "q8_0": 5, "q3_k": 4, "iq4_xs"
 # BOLT_FQ_MMQ_FEW_IQ4XS_ANY=1 serves every 4..24-row call. The other formats keep the unconditional gate.
 _MMQ_FEW_CAPTURE_ONLY = () if os.environ.get("BOLT_FQ_MMQ_FEW_IQ4XS_ANY", "0") == "1" else ("iq4_xs",)
 _MMVQ_QK = {"iq4_nl": 32}
+# EXL3_FQ_MMVQ_LEGACY (default 0): Q4_0 / Q4_1 / Q5_0 / Q5_1 single decode row through the mmvq kernel (ggml vec_dot_q*_q8_1 port, q8_1 activations) instead
+# of the Triton triton_gap.gemv (~37 GB/s on gpt-oss-20b UD-Q4_K_XL attention q/k/v). Off = unchanged. 2+ rows stay on the Triton path.
+_LEGACY_FMTS = ("q4_0", "q4_1", "q5_0", "q5_1")
+_MMVQ_LEGACY = os.environ.get("EXL3_FQ_MMVQ_LEGACY", "0") == "1" and bool(torch.version.cuda) and not torch.version.hip
+if _MMVQ_LEGACY:
+    _MMVQ_FN.update({f: "fq_mmvq_" + f for f in _LEGACY_FMTS})
+    _MMVQ_QK.update({f: 32 for f in _LEGACY_FMTS})
 _DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}
 if os.environ.get("BOLT_FQ_DEQ_Q3K", "1") != "0":   # CUDA and HIP
     _DEQ_IQ_ID["q3_k"] = 10   # native Q3_K dequant (prefill dequant + GEMM; the torch gap_dequant is ~2.5x slower at 8K)   # fq_dequant_iq format ids (the others have native dequants already)
@@ -298,7 +305,7 @@ class ForeignLinear(Module):
                 out = None
         if out is not None:
             pass
-        elif (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format in ("q5_k", "q4_k", "q6_k", "q3_k") else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
+        elif (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and (R == 1 or self.format not in _LEGACY_FMTS) and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format in ("q5_k", "q4_k", "q6_k", "q3_k") else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
                 and hasattr(ext, _MMVQ_FN[self.format])):
             N = self.out_features
             out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)

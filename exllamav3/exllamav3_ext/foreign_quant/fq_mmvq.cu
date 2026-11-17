@@ -22,6 +22,7 @@
 #include "fq_api.h"
 #include "ggml_mmvq/ggml_vecdotq_iq.cuh"
 #include "ggml_mmvq/ggml_vecdotq_k46.cuh"
+#include "ggml_mmvq/ggml_vecdotq_legacy.cuh"
 
 #if defined(USE_ROCM)
 // HIP: maskless shuffles (RDNA runs these kernels as wave32, MQ_WARP = 32)
@@ -32,7 +33,7 @@ namespace {
 
 using namespace ggml_iq;
 
-enum { MQ_IQ2_XXS = 0, MQ_IQ2_XS = 1, MQ_IQ2_S = 2, MQ_IQ3_XXS = 3, MQ_IQ3_S = 4, MQ_IQ4_NL = 5, MQ_IQ4_XS = 6, MQ_Q5_K = 7, MQ_Q4_K = 8, MQ_Q6_K = 9, MQ_Q3_K = 10, MQ_NTYPES = 11 };
+enum { MQ_IQ2_XXS = 0, MQ_IQ2_XS = 1, MQ_IQ2_S = 2, MQ_IQ3_XXS = 3, MQ_IQ3_S = 4, MQ_IQ4_NL = 5, MQ_IQ4_XS = 6, MQ_Q5_K = 7, MQ_Q4_K = 8, MQ_Q6_K = 9, MQ_Q3_K = 10, MQ_Q4_0 = 11, MQ_Q4_1 = 12, MQ_Q5_0 = 13, MQ_Q5_1 = 14, MQ_NTYPES = 15 };
 
 // qk = weight elements per block, qi = ints per block (ggml QI*), vdr = ints per lane per call, bb = block bytes
 template <int T> struct MqTraits;
@@ -53,6 +54,11 @@ MQ_TRAITS(MQ_Q5_K, 256, 32, VDR_Q5_K_Q8_1_MMVQ, 176, vec_dot_q5_K_q8_1);
 MQ_TRAITS(MQ_Q4_K, 256, 32, VDR_Q4_K_Q8_1_MMVQ, 144, vec_dot_q4_K_q8_1);
 MQ_TRAITS(MQ_Q6_K, 256, 32, VDR_Q6_K_Q8_1_MMVQ, 210, vec_dot_q6_K_q8_1);
 MQ_TRAITS(MQ_Q3_K, 256, 16, VDR_Q3_K_Q8_1_MMVQ, 110, vec_dot_q3_K_q8_1);
+// legacy 32-element GGUF blocks (EXL3_FQ_MMVQ_LEGACY in foreign_linear.py): qi = QI4_0 = QI5_0 = 4 ints per block
+MQ_TRAITS(MQ_Q4_0, 32, 4, VDR_Q4_0_Q8_1_MMVQ, 18, vec_dot_q4_0_q8_1);
+MQ_TRAITS(MQ_Q4_1, 32, 4, VDR_Q4_1_Q8_1_MMVQ, 20, vec_dot_q4_1_q8_1);
+MQ_TRAITS(MQ_Q5_0, 32, 4, VDR_Q5_0_Q8_1_MMVQ, 22, vec_dot_q5_0_q8_1);
+MQ_TRAITS(MQ_Q5_1, 32, 4, VDR_Q5_1_Q8_1_MMVQ, 24, vec_dot_q5_1_q8_1);
 #undef MQ_TRAITS
 
 constexpr int MQ_WARP = 32;
@@ -192,6 +198,7 @@ void mq_run(torch::Tensor qb, torch::Tensor packed, torch::Tensor out)
     TORCH_CHECK(K % Tr::qk == 0, "K must be a multiple of the format block size");
     TORCH_CHECK(packed.size(1) == (int64_t)(K / Tr::qk) * Tr::bb, "packed width must match K");
     TORCH_CHECK((uintptr_t)packed.data_ptr() % 4 == 0 && ((int64_t)(K / Tr::qk) * Tr::bb) % 2 == 0, "weights must be 2-byte aligned (4 for IQ4_XS)");
+    TORCH_CHECK(Tr::bb % 4 == 2 || ((int64_t)(K / Tr::qk) * Tr::bb) % 4 == 0, "this format needs 4-byte aligned weight rows");
     TORCH_CHECK((uintptr_t)qb.data_ptr() % 4 == 0, "qb must be 4-byte aligned");
     at::cuda::CUDAGuard guard(qb.device());
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -510,6 +517,10 @@ void fq_mmvq_q5_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { m
 void fq_mmvq_q4_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q4_K>(qb, packed, out); }
 void fq_mmvq_q6_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q6_K>(qb, packed, out); }
 void fq_mmvq_q3_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q3_K>(qb, packed, out); }
+void fq_mmvq_q4_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q4_0>(qb, packed, out); }
+void fq_mmvq_q4_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q4_1>(qb, packed, out); }
+void fq_mmvq_q5_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q5_0>(qb, packed, out); }
+void fq_mmvq_q5_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q5_1>(qb, packed, out); }
 
 // Standalone grouped decode MoE for IQ experts (any of the 7 IQ formats for gate/up and for down; type ids = MQ_* order:
 // 0 iq2_xxs, 1 iq2_xs, 2 iq2_s, 3 iq3_xxs, 4 iq3_s, 5 iq4_nl, 6 iq4_xs). Same arguments and results as fq_moe_kq_grouped_mixed_q8:
