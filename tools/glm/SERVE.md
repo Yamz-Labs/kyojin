@@ -97,17 +97,23 @@ Prometheus text (llama.cpp `llamacpp:*` names) for scraping. Counters accumulate
 request completes; `requests_processing`, `requests_deferred` and `kv_cache_usage_ratio`
 are read live. `spec_decode_num_drafts_total` is derived from the accepted+rejected draft
 token counts divided by `--num-draft` (exact except for a final MTP window truncated by
-`max_tokens`). A request cancelled mid-stream is not counted in this first version.
+`max_tokens`). A cancelled request counts only in `kyojin:requests_cancelled_total`.
 
 The `kyojin:*` metrics have no llama.cpp counterpart and are the same on every Kyojin server:
 `kyojin:requests_total` (finished requests), `kyojin:requests_failed_total` (requests that ended in an
-engine error; they are not in `requests_total`), `kyojin:queue_seconds_total` (time the finished requests
-waited for a session), `kyojin:start_time_seconds`, `kyojin:sessions`, `kyojin:context_tokens` and
-`kyojin:info{version, server, model}` (constant 1). Read live at scrape: the cache's token counts
-(`kyojin:kv_cache_max_tokens`, `kyojin:kv_cache_used_tokens`, `kyojin:kv_cache_free_tokens`,
-`kyojin:prompt_cache_tokens`) and the device memory (`kyojin:gpu_memory_allocated_bytes`,
-`kyojin:gpu_memory_reserved_bytes` of this process, `kyojin:gpu_memory_free_bytes`,
-`kyojin:gpu_memory_total_bytes` of the device).
+engine error) and `kyojin:requests_cancelled_total` (requests the client cancelled, while queued or while
+running); the last two are not in `requests_total`. `kyojin:finish_reasons_total{reason}` splits the
+finished requests by the stop reason the engine reports (`stop_token`, `stop_string`, `max_new_tokens`
+and so on). `kyojin:queue_seconds_total` is the time the finished requests waited for a session and
+`kyojin:first_token_seconds_total` the time from their start to the first token; each one over
+`requests_total` is a mean. Then `kyojin:start_time_seconds`, `kyojin:sessions`, `kyojin:context_tokens`
+and `kyojin:info{version, server, model}` (constant 1). Read live at scrape:
+`kyojin:oldest_request_age_seconds` (run time of the oldest running request, 0 when none runs), the
+cache's token counts (`kyojin:kv_cache_max_tokens`, `kyojin:kv_cache_used_tokens`,
+`kyojin:kv_cache_free_tokens`, `kyojin:prompt_cache_tokens`), `kyojin:prompt_cache_evictions_total`
+(reusable prompt-cache pages the page table gave to new content; it starts again at 0 when the cache is
+dropped) and the device memory (`kyojin:gpu_memory_allocated_bytes`, `kyojin:gpu_memory_reserved_bytes`
+of this process, `kyojin:gpu_memory_free_bytes`, `kyojin:gpu_memory_total_bytes` of the device).
 
 ### `POST /v1/chat/completions`
 

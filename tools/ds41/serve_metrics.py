@@ -5,9 +5,10 @@ Counters accumulate when a request completes (the HTTP layer observes the engine
 the gauges requests_processing, requests_deferred and kv_cache_usage_ratio are read live at scrape.
 All mutation happens on the server's event loop, so no locking is needed.
 
-The kyojin:* metrics have no llama.cpp counterpart: the request count, failures and queue time, what the
-server is (version, server, model, sessions, context) and, read live at scrape, the cache's token counts
-and the device memory. A value a server does not pass is left out of the body.
+The kyojin:* metrics have no llama.cpp counterpart: the request count, failures, cancellations and finish
+reasons, the queue time and the time to the first token, what the server is (version, server, model, sessions,
+context) and, read live at scrape, the age of the oldest running request, the cache's token counts and
+evictions and the device memory. A value a server does not pass is left out of the body.
 """
 from __future__ import annotations
 
@@ -34,7 +35,10 @@ METRICS = [
      "In-flight prompt and generated tokens over sessions times context; excludes retained cache"),
     ("kyojin:requests_total", "counter", "Finished requests"),
     ("kyojin:requests_failed_total", "counter", "Requests that ended in an engine error"),
+    ("kyojin:requests_cancelled_total", "counter", "Requests the client cancelled, while queued or while running"),
     ("kyojin:queue_seconds_total", "counter", "Time the finished requests waited for a session"),
+    ("kyojin:first_token_seconds_total", "counter", "Time the finished requests took from their start to the first token"),
+    ("kyojin:oldest_request_age_seconds", "gauge", "Run time of the oldest running request, 0 when none runs"),
     ("kyojin:start_time_seconds", "gauge", "Unix time the server began to serve, after the model loaded"),
 ]
 
@@ -46,12 +50,16 @@ OPTIONAL = [
     ("kyojin:kv_cache_used_tokens", "gauge", "Tokens in pages referenced by running requests"),
     ("kyojin:kv_cache_free_tokens", "gauge", "Tokens in unreferenced pages that hold no reusable content"),
     ("kyojin:prompt_cache_tokens", "gauge", "Tokens in pages a later request can reuse (the prompt cache)"),
+    ("kyojin:prompt_cache_evictions_total", "counter",
+     "Reusable prompt-cache pages given to new content; starts again at 0 when the cache is dropped"),
     ("kyojin:gpu_memory_allocated_bytes", "gauge", "Device memory held by tensors of this process"),
     ("kyojin:gpu_memory_reserved_bytes", "gauge", "Device memory reserved by the allocator of this process"),
     ("kyojin:gpu_memory_free_bytes", "gauge", "Free device memory, all processes"),
     ("kyojin:gpu_memory_total_bytes", "gauge", "Total device memory"),
 ]
 INFO = ("kyojin:info", "gauge", "Constant 1; the labels name the Kyojin version, the server and the model")
+# One sample per stop reason seen so far (label reason); rendered once a request has finished.
+FINISH = ("kyojin:finish_reasons_total", "counter", "Finished requests by the stop reason the engine reports")
 # get_cache_stats() key and gpu_memory() key of each live OPTIONAL gauge
 CACHE_KEYS = {"kyojin:kv_cache_max_tokens": "max_tokens", "kyojin:kv_cache_used_tokens": "used_tokens",
               "kyojin:kv_cache_free_tokens": "free_tokens", "kyojin:prompt_cache_tokens": "cached_tokens"}
@@ -83,6 +91,15 @@ def gpu_memory(torch) -> dict | None:
         return None
 
 
+def cache_evictions(generator) -> int | None:
+    """Evicted prompt-cache pages for render(evictions=...): the complete pages the page table gave to new
+    content. None without a paged cache (fake engines in tests)."""
+    try:
+        return generator.pagetable.metrics["evictions_live"]
+    except Exception:                                            # noqa: BLE001
+        return None
+
+
 def label(value) -> str:
     return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
@@ -98,7 +115,12 @@ class Metrics:
         self.start_time = time.time()
         self.requests_total = 0.0
         self.requests_failed_total = 0.0
+        self.requests_cancelled_total = 0.0
         self.queue_seconds_total = 0.0
+        self.first_token_seconds_total = 0.0
+        self.finish_reasons: dict[str, int] = {}
+        self.running: dict[int, float] = {}     # begin() token -> start time of a request that runs now
+        self.serial = 0
         self.prompt_tokens_total = 0.0
         self.prompt_cached_total = 0.0
         self.prompt_seconds_total = 0.0
@@ -113,9 +135,13 @@ class Metrics:
 
     def observe(self, *, prompt_tokens: int, cached: int, predicted: int,
                 prefill_s: float, generate_s: float,
-                drafts: int = 0, draft_tokens: int = 0, accepted: int = 0, queue_s: float = 0.0) -> None:
+                drafts: int = 0, draft_tokens: int = 0, accepted: int = 0, queue_s: float = 0.0,
+                first_token_s: float = 0.0, reason: str | None = None) -> None:
         self.requests_total += 1
         self.queue_seconds_total += queue_s
+        self.first_token_seconds_total += first_token_s
+        if reason:
+            self.finish_reasons[str(reason)] = self.finish_reasons.get(str(reason), 0) + 1
         self.prompt_tokens_total += prompt_tokens
         self.prompt_cached_total += cached
         self.prompt_seconds_total += prefill_s
@@ -134,9 +160,23 @@ class Metrics:
         """A request that ended in an engine error (it is not observed, so it is not in requests_total)."""
         self.requests_failed_total += 1
 
+    def cancelled(self) -> None:
+        """A request the client cancelled, queued or running (it is not observed, so it is not in requests_total)."""
+        self.requests_cancelled_total += 1
+
+    def begin(self) -> int:
+        """A request starts to run: the token for end(). The oldest one that still runs sets oldest_request_age_seconds."""
+        self.serial += 1
+        self.running[self.serial] = time.perf_counter()
+        return self.serial
+
+    def end(self, token: int | None) -> None:
+        self.running.pop(token, None)
+
     def render(self, *, processing: int, deferred: int, kv_ratio: float,
-               cache: dict | None = None, gpu: dict | None = None) -> bytes:
-        """`cache` is the generator's get_cache_stats(), `gpu` is gpu_memory(): both read by the server at scrape."""
+               cache: dict | None = None, gpu: dict | None = None, evictions: int | None = None) -> bytes:
+        """`cache` is the generator's get_cache_stats(), `gpu` is gpu_memory(), `evictions` is cache_evictions():
+        all read by the server at scrape."""
         values = {
             "llamacpp:prompt_tokens_total": self.prompt_tokens_total,
             "llamacpp:prompt_tokens_cached_total": self.prompt_cached_total,
@@ -154,17 +194,26 @@ class Metrics:
             "llamacpp:kv_cache_usage_ratio": kv_ratio,
             "kyojin:requests_total": self.requests_total,
             "kyojin:requests_failed_total": self.requests_failed_total,
+            "kyojin:requests_cancelled_total": self.requests_cancelled_total,
             "kyojin:queue_seconds_total": self.queue_seconds_total,
+            "kyojin:first_token_seconds_total": self.first_token_seconds_total,
+            "kyojin:oldest_request_age_seconds":
+                time.perf_counter() - min(self.running.values()) if self.running else 0.0,
             "kyojin:start_time_seconds": self.start_time,
             "kyojin:sessions": self.sessions,
             "kyojin:context_tokens": self.context,
             **{name: (cache or {}).get(key) for name, key in CACHE_KEYS.items()},
             **{name: (gpu or {}).get(key) for name, key in GPU_KEYS.items()},
+            "kyojin:prompt_cache_evictions_total": evictions,
         }
         out = []
         for name, mtype, help_text in METRICS + OPTIONAL:
             if values[name] is not None:
                 out.append(f"# HELP {name} {help_text}\n# TYPE {name} {mtype}\n{name} {fmt(values[name])}\n")
+        if self.finish_reasons:
+            name, mtype, help_text = FINISH
+            out.append(f"# HELP {name} {help_text}\n# TYPE {name} {mtype}\n")
+            out.extend(f'{name}{{reason="{label(r)}"}} {n}\n' for r, n in sorted(self.finish_reasons.items()))
         name, mtype, help_text = INFO
         labels = ",".join(f'{k}="{label(v)}"' for k, v in self.info.items())
         out.append(f"# HELP {name} {help_text}\n# TYPE {name} {mtype}\n{name}{{{labels}}} 1\n")

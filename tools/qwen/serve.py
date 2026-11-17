@@ -53,7 +53,7 @@ from serve_ping import ServePing  # noqa: E402
 from serve_reqlog import Lifecycle, ReqLog, StreamWriter, refusal_text, sanitize  # noqa: E402
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py: the GET /metrics collector
 # (Prometheus text, llama.cpp names) of the GLM and MiMo servers.
-from serve_metrics import Metrics, gpu_memory  # noqa: E402
+from serve_metrics import Metrics, cache_evictions, gpu_memory  # noqa: E402
 
 
 def _load_mimo():
@@ -1728,7 +1728,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             {"id": model_id, "object": "model", "created": 0, "owned_by": "yamz",
              "max_context": getattr(engine, "ctx", None)}]})
 
-    def observe(st: dict[str, Any], prompt_tokens: int, queue_s: float = 0.0) -> None:
+    def observe(st: dict[str, Any], prompt_tokens: int, queue_s: float = 0.0, first_token_s: float = 0.0) -> None:
         """GET /metrics counters of one finished request. The draft depth changes from round to round on this server
         (spec_policy), so the round count cannot come from proposed / window as on the GLM server. A verification
         step yields the one token the target samples plus the draft tokens it accepts, so the rounds of a request
@@ -1740,7 +1740,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             prompt_tokens=prompt_tokens, cached=int(st.get("cached_tokens") or 0), predicted=predicted,
             prefill_s=float(st.get("time_prefill") or 0.0), generate_s=float(st.get("time_generate") or 0.0),
             drafts=max(predicted - accepted, 0) if proposed else 0, draft_tokens=proposed, accepted=accepted,
-            queue_s=queue_s)
+            queue_s=queue_s, first_token_s=first_token_s,
+            reason=st.get("eos_reason"))
 
     async def health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "source": "kyojin", "model": model_id, "vision": bool(engine.supports_vision), **startup_health.compiler_health(),
@@ -1790,6 +1791,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
             if job.get("cancel") is not None and job["cancel"].is_set():
                 # the client left while the job was queued: no prefill, no decode, one line
                 lifecycle.job_skipped(rid, wait)
+                app["metrics"].cancelled()
                 out.put_nowait(("done", {}))
                 queue.task_done()
                 continue
@@ -1803,6 +1805,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                                           images=len(job.get("images") or ()),
                                           messages=job.get("messages"), sessions=sessions, running=running)
                     first_token = False       # flipped once, so the log gets exactly one job_first_token line
+                    run = app["metrics"].begin()
                     try:
                         async for delta in engine.generate(
                                 job["prompt"], stats=stats, live=job.setdefault("_live", {}), max_tokens=job["max_tokens"], sampling=job["sampling"],
@@ -1820,6 +1823,7 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                             out.put_nowait(delta)
                     finally:
                         running -= 1
+                        app["metrics"].end(run)
                         if store is not None:
                             store.busy = running > 0
                     # a fake engine (tests) fills only last_stats
@@ -1832,8 +1836,11 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
                         t = engine.torch.cuda
                         print(f"qserve: vram alloc={t.memory_allocated() >> 20} MiB peak={t.max_memory_allocated() >> 20} MiB reserved={t.memory_reserved() >> 20} MiB",
                               file=sys.stderr, flush=True)
-                    if done:      # a request cancelled mid-stream leaves no stats: not counted
-                        observe(done, int(done.get("prompt_tokens") or job.get("prompt_tokens") or 0), wait)
+                    if done:
+                        observe(done, int(done.get("prompt_tokens") or job.get("prompt_tokens") or 0), wait,
+                                (job.get("_first_at") or job["_job_at"]) - job["_job_at"])
+                    elif job.get("cancel") is not None and job["cancel"].is_set():   # cancelled while it ran: no stats
+                        app["metrics"].cancelled()
                     lifecycle.job_done(rid, done, started, prompt_tokens=job.get("prompt_tokens"))
                     out.put_nowait(("done", done))
                     if getattr(engine, "prefix_disk", None) is not None:
@@ -2443,7 +2450,8 @@ def create_app(engine: Any, model_id: str, template: str, defaults: dict[str, An
         except Exception:                                        # noqa: BLE001
             cs, kv = {}, 0.0
         return web.Response(body=app["metrics"].render(processing=running, deferred=queue.qsize(), kv_ratio=kv, cache=cs,
-                                                       gpu=gpu_memory(getattr(engine, "torch", None))),
+                                                       gpu=gpu_memory(getattr(engine, "torch", None)),
+                                                       evictions=cache_evictions(getattr(engine, "generator", None))),
                             headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})
 
     if admin_knobs:

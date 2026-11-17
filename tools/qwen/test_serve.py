@@ -987,7 +987,11 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(v["llamacpp:requests_deferred"], 0)
         self.assertEqual(v["llamacpp:kv_cache_usage_ratio"], 0)
         self.assertEqual((v["kyojin:requests_total"], v["kyojin:requests_failed_total"]), (1, 0))
+        self.assertEqual((v["kyojin:requests_cancelled_total"], v["kyojin:oldest_request_age_seconds"]), (0, 0))
         self.assertGreaterEqual(v["kyojin:queue_seconds_total"], 0)
+        self.assertGreaterEqual(v["kyojin:first_token_seconds_total"], 0)
+        self.assertIn("# TYPE kyojin:finish_reasons_total counter\n", text)
+        self.assertEqual(v['kyojin:finish_reasons_total{reason="stop_token"}'], 1)
         self.assertEqual((v["kyojin:sessions"], v["kyojin:context_tokens"]), (1, FakeEngine.ctx))
         self.assertAlmostEqual(v["kyojin:start_time_seconds"], time.time(), delta=60)
         self.assertIn(f'kyojin:info{{version="{serve_metrics.kyojin_version()}",server="qwen",model="m"}} 1\n', text)
@@ -1007,6 +1011,7 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(v["llamacpp:spec_decode_num_draft_tokens_total"], 18)
         self.assertEqual(v["llamacpp:spec_decode_num_accepted_tokens_total"], 12)
         self.assertEqual(v["kyojin:requests_total"], 3)
+        self.assertEqual(v['kyojin:finish_reasons_total{reason="stop_token"}'], 3)
 
     def test_request_that_drafted_nothing_adds_no_rounds(self):
         _, _, _, text = self.scrape(FakeEngine("hello there"), [self.CHAT])    # the default stats carry no draft counts
@@ -1030,6 +1035,14 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual([v[f"kyojin:{k}"] for k in ("kv_cache_max_tokens", "kv_cache_used_tokens", "kv_cache_free_tokens",
                                                      "prompt_cache_tokens")], [4096, 512, 1024, 2560])
 
+    def test_evictions_come_from_the_page_table(self):
+        engine = FakeEngine("x")
+        engine.generator = types.SimpleNamespace(get_cache_stats=lambda: {"used_tokens": 0, "max_tokens": 4096},
+                                                 pagetable=types.SimpleNamespace(metrics={"evictions_live": 3}))
+        text = self.scrape(engine)[3]
+        self.assertIn("# TYPE kyojin:prompt_cache_evictions_total counter\n", text)
+        self.assertEqual(self.samples(text)["kyojin:prompt_cache_evictions_total"], 3)
+
     def test_device_memory_comes_from_the_engine_torch(self):
         engine = FakeEngine("x")
         engine.torch = types.SimpleNamespace(cuda=types.SimpleNamespace(
@@ -1048,6 +1061,52 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(statuses, [500])
         self.assertEqual((v["kyojin:requests_total"], v["kyojin:requests_failed_total"]), (0, 1))
         self.assertEqual(v["llamacpp:tokens_predicted_total"], 0)
+
+    def test_request_cancelled_while_it_runs_is_counted_as_cancelled_only(self):
+        class Endless(FakeEngine):
+            async def generate(self, prompt, cancel=None, **kw):
+                while not cancel.is_set():        # the real engine too returns without stats once the client left
+                    await asyncio.sleep(0.005)
+                    yield "word "
+
+        async def fn(client):
+            body = {"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            r = await client.post("/v1/chat/completions", json=body)
+            await r.content.readline()
+            r.close()
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                text = await (await client.get("/metrics")).text()
+                if self.samples(text)["kyojin:requests_cancelled_total"]:
+                    break
+            return text
+        text = with_client(Endless(""), fn)
+        v = self.samples(text)
+        self.assertEqual((v["kyojin:requests_total"], v["kyojin:requests_cancelled_total"]), (0, 1))
+        self.assertEqual((v["llamacpp:requests_processing"], v["kyojin:oldest_request_age_seconds"]), (0, 0))
+        self.assertEqual(v["llamacpp:tokens_predicted_total"], 0)
+        self.assertNotIn("kyojin:finish_reasons_total", text)
+
+    def test_first_token_time_and_the_age_of_a_running_request(self):
+        class Slow(FakeEngine):
+            async def generate(self, prompt, **kw):
+                await asyncio.sleep(0.3)
+                async for piece in super().generate(prompt, **kw):
+                    yield piece
+
+        async def fn(client):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+            req = asyncio.ensure_future(client.post("/v1/chat/completions", json=body))
+            await asyncio.sleep(0.15)
+            running = await (await client.get("/metrics")).text()
+            return (await req).status, running, await (await client.get("/metrics")).text()
+        status, running, done = with_client(Slow("x"), fn)
+        r, d = self.samples(running), self.samples(done)
+        self.assertEqual(status, 200)
+        self.assertGreater(r["kyojin:oldest_request_age_seconds"], 0.02)       # it runs: its age shows, nothing else yet
+        self.assertEqual((r["kyojin:first_token_seconds_total"], r["kyojin:requests_total"]), (0, 0))
+        self.assertEqual(d["kyojin:oldest_request_age_seconds"], 0)
+        self.assertGreater(d["kyojin:first_token_seconds_total"], 0.25)        # the engine's 0.3 s before its first piece
 
     def test_queue_time_of_a_request_that_waited_is_counted(self):
         class Slow(FakeEngine):
