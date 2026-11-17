@@ -89,3 +89,31 @@ def test_missing_slice_not_found(gguf):
         assert not c.has_tensor("y")
     finally:
         c.name_map = {}
+
+
+def _write_float_gguf(path, name, ty, es, dims):
+    def s(x):
+        b = x.encode()
+        return struct.pack("<Q", len(b)) + b
+    n = int(np.prod(dims))
+    data = np.zeros(n * es, dtype=np.uint8).tobytes()
+    blob = b"GGUF" + struct.pack("<IQQ", 3, 1, 0)
+    blob += s(name) + struct.pack("<I", len(dims)) + struct.pack("<" + "Q" * len(dims), *dims) + struct.pack("<I", ty) + struct.pack("<Q", 0)
+    blob += b"\0" * (-len(blob) % 32) + data
+    with open(path, "wb") as f:
+        f.write(blob)
+
+
+@pytest.mark.parametrize("ty,es,label", [(0, 4, "F32"), (1, 2, "F16"), (30, 2, "BF16")])
+def test_float_stacked_slice_refused(ty, es, label):
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "f.gguf")
+        _write_float_gguf(p, "blk.0.ffn_gate_exps.weight", ty, es, (K, N, E))
+        c = GGUFCollection(p)
+        with pytest.raises(ValueError, match=rf"{label} stacked tensor is not supported: blk\.0\.ffn_gate_exps\.weight \(expert 2\)"):
+            c.get_tensor("blk.0.ffn_gate_exps.e2.weight")
+        c.name_map = {"model.layers.0.mlp.experts.2.gate_proj.weight": "blk.0.ffn_gate_exps.e2.weight"}
+        with pytest.raises(ValueError, match=r"not supported"):
+            c.get_tensor("model.layers.0.mlp.experts.2.gate_proj.weight")
+        t = c.get_tensor("blk.0.ffn_gate_exps.weight")   # the whole stack still loads
+        assert t.numel() == K * N * E

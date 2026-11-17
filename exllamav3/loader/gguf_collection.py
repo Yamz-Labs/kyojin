@@ -280,6 +280,10 @@ class GGUFCollection:
                 raise ValueError("transpose not supported for quant payloads")
             return t.to(dev)
         if ty in (0, 1, 30):  # F32 / F16 / BF16 (BF16 widened to float32: bit shift, exact)
+            if exp_idx is not None:
+                # Not implemented for float payloads: refuse by name rather than return the whole stack.
+                raise ValueError(f"per-expert slice of a {({0: 'F32', 1: 'F16', 30: 'BF16'})[ty]} "
+                                 f"stacked tensor is not supported: {mapped} (expert {exp_idx})")
             dt = np.float32 if ty == 0 else np.float16
             es = 4 if ty == 0 else 2
             n = int(np.prod(dims))
