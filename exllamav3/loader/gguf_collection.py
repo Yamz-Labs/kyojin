@@ -314,3 +314,16 @@ class GGUFCollection:
                 t = t.bfloat16()
             return _pad_to(t.to(dev), pad_to)
         raise ValueError(f"unsupported gguf type {ty} for {key}")
+
+
+def gguf_fmt(fm: dict, gname: str | None):
+    """ggml format of a GGUF tensor name. A per-expert slice name 'blk.N.ffn_*_exps.eK.weight' is not in the
+    file's tensor table: it takes the format of its stacked tensor 'blk.N.ffn_*_exps.weight'."""
+    if not gname:
+        return None
+    fmt = fm.get(gname)
+    if fmt is None and "_exps.e" in gname:
+        base, e = (gname[:-7] if gname.endswith(".weight") else gname).rsplit(".e", 1)
+        if e.isdigit():
+            fmt = fm.get(base + ".weight")
+    return fmt

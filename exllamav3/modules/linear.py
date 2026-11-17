@@ -79,6 +79,7 @@ def apply_scale_grid(w: torch.Tensor, scale: torch.Tensor, block: tuple | None =
 
 
 
+
 class _ForeignInner:
     """Linear inner over a ForeignLinear payload (NVFP4 served as stored): the ForeignLinear kernels, Linear's interface."""
 
@@ -682,7 +683,8 @@ class Linear(Module):
             return False
         gname = g.name_map.get(key + ".weight")
         gname = gname[0] if isinstance(gname, tuple) else gname
-        fmt = fm.get(gname) if gname else None
+        from ..loader.gguf_collection import gguf_fmt as _gguf_fmt
+        fmt = _gguf_fmt(fm, gname)
         if fmt is None or fmt == "fp" or fmt.startswith("unk"):
             return False
         from .foreign_linear import ForeignLinear
