@@ -151,7 +151,14 @@ class GGUFCollection:
             return self.aux.has_tensor(key)
         if self.new_tensors and key in self.new_tensors:
             return True
-        return self._resolve(key) in self.infos
+        r = self._resolve(key)
+        if r in self.infos:
+            return True
+        if "_exps.e" in r:   # generic-loader expert slice name: "<gguf3d>.e<idx>[.weight]"
+            mb = r[:-7] if r.endswith(".weight") else r
+            bb_, es_ = mb.rsplit(".e", 1)
+            return es_.isdigit() and (bb_ + ".weight") in self.infos
+        return False
 
     # Deferred-load arena API (SafetensorsCollection): ForeignLinear and the
     # fp16 paths load eagerly, so these are no-ops. Present because
@@ -241,6 +248,12 @@ class GGUFCollection:
         want_T = False
         if isinstance(mapped, tuple):
             mapped, want_T = mapped[0], (mapped[1] == "T")
+        if exp_idx is None and mapped not in self.infos and "_exps.e" in mapped:
+            # engine key mapped by name_map to "<gguf3d>.e<idx>[.weight]" (generic loader): same slice protocol, after the map
+            mb = mapped[:-7] if mapped.endswith(".weight") else mapped
+            bb_, es_ = mb.rsplit(".e", 1)
+            if es_.isdigit() and (bb_ + ".weight") in self.infos:
+                mapped, exp_idx = bb_ + ".weight", int(es_)
         info = self.infos.get(mapped)
         if info is None:
             if not optional:
