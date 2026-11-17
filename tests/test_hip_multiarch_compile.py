@@ -1,11 +1,13 @@
 """Regression guard: the extension's ROCm TUs must compile for every architecture the repo supports.
 
 `rocm/routed_f16/routed_f16.cu` is the canary. Its kernels are gfx1151-only behind
-`#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1151__)`, and (until the fix in #<PR>) its host
-wrappers launched them from *outside* that guard: any other architecture's device pass had no kernels
-but still had to emit the launch stubs, so a build for gfx1201 (or any multi-arch string containing it)
-failed with "use of undeclared identifier 'RoutedPadBoundsKernel'". It went unnoticed because the box
-only built gfx1151 until a multi-arch build was needed (2026-11-16).
+`#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1151__)`, and before #232 its host wrappers
+launched them from *outside* that guard: any other architecture's device pass had no kernels but still
+had to emit the launch stubs, so a build for gfx1201 (or any multi-arch string containing it) failed
+with "use of undeclared identifier 'RoutedPadBoundsKernel'". It went unnoticed because the box only
+built gfx1151 until a multi-arch build was needed (2026-11-16). Any future TU that guards device code
+but not the host code launching it fails the same way, which is why this checks the build of the file
+rather than its text.
 
 A full multi-arch wheel build takes minutes; building the one translation unit through torch's own
 `cpp_extension` path (hipify + ninja, i.e. the exact pipeline `uv pip install .` uses) takes seconds and
@@ -23,7 +25,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import sys
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,19 @@ DEFAULT_ARCHS = ("gfx1151", "gfx1201")      # the guarded arch, and the arch who
 def _archs() -> list[str]:
     raw = os.environ.get("EXL3_TEST_ROCM_ARCHS", "").strip()
     return raw.replace(",", " ").split() if raw else list(DEFAULT_ARCHS)
+
+
+def _ninja_dir() -> str | None:
+    """Directory holding the ninja executable torch's cpp_extension runs: PATH first, then the pip
+    package ('ninja' ships its binary in BIN_DIR), which is what a venv install leaves unexported."""
+    exe = shutil.which("ninja")
+    if exe:
+        return os.path.dirname(exe)
+    try:
+        import ninja
+    except Exception:                                        # noqa: BLE001 - not installed
+        return None
+    return getattr(ninja, "BIN_DIR", None) or None
 
 
 def _skip_reason() -> str | None:
@@ -51,8 +65,8 @@ def _skip_reason() -> str | None:
     if cpp_extension.ROCM_HOME is None:
         return ("no ROCm SDK for torch's cpp_extension (set ROCM_HOME/EXL3_ROCM_SDK, "
                 "see tools/strix_halo/env.sh)")
-    if shutil.which("ninja") is None:
-        return "ninja not on PATH (torch.utils.cpp_extension uses it for the TU build)"
+    if _ninja_dir() is None:
+        return "ninja not found (torch.utils.cpp_extension uses it for the TU build)"
     if not TU.is_file():
         return f"missing {TU.relative_to(ROOT)}"
     return None
@@ -73,6 +87,9 @@ def test_tu_builds_for_arch(arch: str, tmp_path, monkeypatch):
 
     monkeypatch.setenv("PYTORCH_ROCM_ARCH", arch)
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", str(tmp_path / "ext"))
+    nd = _ninja_dir()
+    if nd:
+        monkeypatch.setenv("PATH", nd + os.pathsep + os.environ.get("PATH", ""))
     build_dir = tmp_path / "build"
     try:
         load(name="tu_smoke_" + arch.replace(":", "_"), sources=[str(TU)], is_python_module=False,
