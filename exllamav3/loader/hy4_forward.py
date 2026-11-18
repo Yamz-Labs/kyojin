@@ -28,6 +28,7 @@ from .engram_rows import F8Rows, Hy4Engram, load_dense, _dequant_q8_0, rms
 from .mla_hy4 import Hy4MLA
 from . import ref_fused as _rf
 from . import step_nosync as _ns
+from . import mla_bgemv as _BGM
 from . import head_bf16 as _HB
 from . import attn_eager as _AE
 
@@ -384,6 +385,9 @@ class Hy4Forward:
         L = SimpleNamespace()
         L.mla = Hy4MLA(g, i, q8_act=self.q8_act, lin=self._lin)
         _mv(L.mla, dev, self.wdtype)
+        if dev.type == "cuda":       # stored Q8_0 bytes of the two per-head MLA matrices (used when HY4_MLA_BG=1, T == 1)
+            L.mla.bg_kb = _BGM.load(g, b + "attn_k_b.weight", L.mla.H, dev)
+            L.mla.bg_vb = _BGM.load(g, b + "attn_v_b.weight", L.mla.H, dev)
         L.mla.tm = self.tm
         L.mla.kpos_arange = True        # layer(): kpos is torch.arange(N) (ref_fused window / causal block skip)
         if os.environ.get("HY4_ATTN_GROUPED", "0") == "1":          # flag off: nothing below runs, the old path is untouched

@@ -11,6 +11,7 @@ Generic by shape: P, base, R, H come from the caller / tensors."""
 from __future__ import annotations
 import os
 import torch
+from . import mla_bgemv as _BG
 
 _F = os.environ.get("HY4_ATTN_EAGER", "0")
 ENABLED = _F in ("1", "2")
@@ -90,7 +91,7 @@ def q(m, cur, pos):
         qr = rms(qa, m.eps) * m.q_a_norm
     qq = (m._q(qr, "wq_b") @ m.wq_b.T).view(T, H, m.hd)
     qn, qp = qq[..., :m.nope], rope(qq[..., m.nope:], pos, m.theta)
-    qlat = torch.einsum("hrk,thk->thr", m.wk_b, m._q(qn, "kb"))
+    qlat = m.bg_kb.mv(m._q(qn, "kb")) if (_BG.ENABLED and T == 1 and getattr(m, "bg_kb", None) is not None) else torch.einsum("hrk,thk->thr", m.wk_b, m._q(qn, "kb"))
     return m._h(qlat, "q"), m._h(qp, "q")
 
 
