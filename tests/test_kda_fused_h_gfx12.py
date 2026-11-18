@@ -6,8 +6,8 @@ state and the CK4/CK8 checkpoint side-writes. Skipped on every other device.
 
 STATUS: the gfx12 path compiles, loads, runs and is bitwise equal to the Triton fused
 path on gfx1201 for the shape/ragged/h0/ht matrix and CK4/CK8 checkpoints. The missing
-piece was the bf16 x bf16 product rounding: Triton truncates on gfx11.5 but rounds to
-nearest even on gfx12. `kda_fused_h.hip` selects that with `f2bf_mul`, and the runtime
+piece was the bf16 x bf16 product rounding: under Triton 3.9 it rounds to nearest even
+on both gfx11.5 and gfx12. `kda_fused_h.hip` does the same in `f2bf_mul`, and the runtime
 gate now includes gfx1200/gfx1201.
 """
 import pytest

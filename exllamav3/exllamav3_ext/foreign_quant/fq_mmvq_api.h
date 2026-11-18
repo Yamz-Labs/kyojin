@@ -13,15 +13,16 @@ void fq_mmvq_iq4_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_mmvq_q5_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_mmvq_q4_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_mmvq_q6_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
+void fq_mmvq_q3_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 // Grouped decode MoE for IQ experts: format ids 0 iq2_xxs, 1 iq2_xs, 2 iq2_s, 3 iq3_xxs, 4 iq3_s, 5 iq4_nl, 6 iq4_xs, 7 q5_k (gate/up and down independent).
 // Arguments and results as fq_moe_kq_grouped_mixed_q8 (fq_api.h).
 void fq_moe_mmvq_grouped(torch::Tensor h, torch::Tensor sel, torch::Tensor wts, torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
                          torch::Tensor down_ptrs, int64_t gate_stride, int64_t up_stride, int64_t down_stride, int64_t type_ug, int64_t type_down,
                          torch::Tensor partial, torch::Tensor out);
-// Dequantize IQ blocks to fp16 [N, K] (K % 256 == 0); fmt = MQ type id as above (0..6). Port of ggml convert.cu dequantize_block_iq*.
+// Dequantize IQ blocks to fp16 [N, K] (K % 256 == 0); fmt = MQ type id as above (0..6, 10 q3_k). Port of ggml convert.cu dequantize_block_iq*.
 void fq_dequant_iq(torch::Tensor packed, torch::Tensor out, int64_t fmt);
 #if !defined(USE_ROCM)
 // Few-row MMQ (fq_mmq_few.cu, CUDA sm_80+, port of llama.cpp PR #31533): out[R, N] = x[R, K] (half) @ W^T, R 1..24, raw GGUF rows
-// packed [N, K/256 * unit bytes], fmt 0 Q8_0, 1 Q4_K, 2 Q5_K, 3 Q6_K; scratch >= ceil(R/8)*K*9 bytes. False = not served (nothing launched).
+// packed [N, K/256 * unit bytes], fmt 0 Q8_0, 1 Q4_K, 2 Q5_K, 3 Q6_K, 4 Q3_K, 5 IQ4_XS; scratch >= ceil(R/8)*K*9 bytes. False = not served (nothing launched).
 bool fq_mmq_few(torch::Tensor x, torch::Tensor scratch, torch::Tensor packed, torch::Tensor out, int fmt);
 #endif

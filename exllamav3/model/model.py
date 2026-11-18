@@ -306,6 +306,20 @@ class Model(Model_TPMixin, Model_LSMixin):
             dev = self.fwd_modules[1][0].device
             if dev is None or torch.device(dev).type != "cuda":
                 return None
+            if os.environ.get("EXL3_GPU_EMB", "host") == "0":
+                return None
+            if w.device.type == "cpu" and os.environ.get("EXL3_GPU_EMB", "host") == "host":
+                from .host_table import host_view
+                wg = host_view(w.detach(), dev)
+                if wg is None:
+                    return None
+                probe = torch.arange(0, 8, dtype = torch.long).reshape(1, -1)
+                ref = emb.forward(probe, {"layer_instance": inst0})
+                got = wg.index_select(0, probe.to(wg.device).reshape(-1)).view(1, -1, wg.shape[1]).to(ref.dtype)
+                if got.shape != ref.shape or not torch.equal(got.cpu(), ref.cpu()):
+                    return None
+                self._lag_tbl = (wg, ref.dtype)
+                return self._lag_tbl
             need = w.numel() * w.element_size() if w.device.type == "cpu" else 0
             free, _ = torch.cuda.mem_get_info(dev)
             if free < need + (int(os.environ.get("EXL3_GPU_EMB_MARGIN_MB", "1536")) << 20):
@@ -316,6 +330,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             got = wg.index_select(0, probe.to(wg.device).reshape(-1)).view(1, -1, wg.shape[1]).to(ref.dtype)
             if got.shape != ref.shape or not torch.equal(got.cpu(), ref.cpu()):
                 return None
+            if w.device.type == "cpu" and os.environ.get("EXL3_GPU_EMB_DROP", "1") == "1":
+                emb.embedding.weight = torch.nn.Parameter(wg, requires_grad = w.requires_grad)   # single resident copy
             self._lag_tbl = (wg, ref.dtype)
         except Exception as ex:
             print(f"[lag1] no device embedding table: {ex}", flush = True)

@@ -92,6 +92,8 @@ def test_health_models_metrics():
             assert [x["id"] for x in m["data"]] == [MODEL]
             met = await c.get("/metrics")
             assert met.status == 200 and "text/plain" in met.headers["Content-Type"]
+            text = await met.text()
+            assert "kyojin:requests_total 0\n" in text and "kyojin:requests_cancelled_total 0\n" in text and f'server="ds41",model="{MODEL}"}} 1\n' in text
     run(go())
 
 

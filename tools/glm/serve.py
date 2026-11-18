@@ -34,7 +34,7 @@ from loopguard import AnswerTap, loop_guard_default  # noqa: E402  (answer-phase
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
 from l21_prompt_encode_cache import PromptEncodeCache  # noqa: E402  (incremental prompt encode)
 # serve_metrics.py is a symlink to the shared tools/strix_halo/serve_metrics.py
-from serve_metrics import Metrics
+from serve_metrics import Metrics, cache_evictions, gpu_memory
 # serve_reqlog.py is a symlink to the shared tools/strix_halo/serve_reqlog.py: one line per request
 # lifecycle event (numbers and event names only, never prompt or reply text) plus a heartbeat while a job
 # is queued or prefilling, so "the client went silent" can be lined up with what the server was doing.
@@ -1516,7 +1516,8 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
     processing = 0  # admitted requests; closure, app config is immutable after startup
     running = 0     # sessions > 1: requests inside generate()
     app = web.Application(client_max_size=64 * 1024**2, middlewares=[startup_health.json_errors_middleware()])
-    app.update(engine=engine, model_id=model_id, template=template, queue=queue, metrics=Metrics())
+    app.update(engine=engine, model_id=model_id, template=template, queue=queue,
+               metrics=Metrics(server="glm", model=model_id, sessions=sessions, context=getattr(engine, "ctx", None)))
 
     # Request log: off unless KYOJIN_REQLOG_DIR names a directory, in which case every generation request gets a line
     # per lifecycle event (numbers and event names only, never prompt or reply text) plus an 'alive' heartbeat
@@ -1557,7 +1558,7 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
             raise web.HTTPBadRequest(reason="cache_salt is not supported by this engine")
         return salt
 
-    def observe(st: dict[str, Any], prompt_tokens: int) -> None:
+    def observe(st: dict[str, Any], prompt_tokens: int, queue_s: float = 0.0, first_token_s: float = 0.0) -> None:
         # The MTP window is a fixed num_draft_tokens per round, so rounds = proposed / window
         # (exact except for a final window truncated by max_new_tokens). No generator -> no rounds.
         num_draft = int(getattr(getattr(engine, "greedy_generator", None), "num_draft_tokens", 0) or 0)
@@ -1569,7 +1570,8 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
             predicted=int(st.get("new_tokens", 0)),
             prefill_s=float(st.get("time_prefill") or 0.0), generate_s=float(st.get("time_generate") or 0.0),
             drafts=proposed // num_draft if proposed and num_draft else 0,
-            draft_tokens=proposed, accepted=accepted)
+            draft_tokens=proposed, accepted=accepted, queue_s=queue_s, first_token_s=first_token_s,
+            reason=st.get("eos_reason"))
 
     async def health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "source": "kyojin", "model": model_id,
@@ -1644,6 +1646,7 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
             rid = body.get("_reqid")
             if cancel is not None and cancel.is_set():   # the client left while the job was queued: no prefill, no decode
                 lifecycle.job_skipped(rid, time.perf_counter() - (body.get("_queued_at") or time.perf_counter()))
+                app["metrics"].cancelled()
                 out.put_nowait(None)
                 queue.task_done()
                 continue
@@ -1663,6 +1666,7 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
                         store.busy = True
                     if sessions == 1:
                         engine.last_stats = {}  # a cancelled or failed job must not re-count the previous one
+                    run = app["metrics"].begin()
                     try:
                         async for delta in engine.generate(
                             body["_prompt"],
@@ -1683,18 +1687,23 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
                             out.put_nowait(delta)
                     finally:
                         running -= 1
+                        app["metrics"].end(run)
                         if sessions > 1 and store is not None:
                             store.busy = running > 0
                     if sessions == 1:
                         request_stats.update(getattr(engine, "last_stats", None) or {})
                     if request_stats:
-                        observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)))
+                        observe(request_stats, body.get("_prompt_tokens") or int(request_stats.get("prompt_tokens", 0)),
+                                started - (body.get("_queued_at") or started), (body.get("_first_at") or started) - started)
+                    elif cancel is not None and cancel.is_set():     # cancelled while it ran: no stats
+                        app["metrics"].cancelled()
                     log_job_done(rid, body, request_stats, started)
                     out.put_nowait(None)
                     if getattr(engine, "prefix_disk", None) is not None:
                         await engine.disk_save()      # the reply is out: the host copy of the new pages holds the lock, the write does not
             except Exception as exc:
                 lifecycle.job_error(rid, exc, started)
+                app["metrics"].failed()
                 out.put_nowait(exc)
             finally:
                 processing -= 1
@@ -2216,9 +2225,10 @@ def create_app(engine: Any, model_id: str, template: str, admin_knobs: bool = Fa
             cs = gen.get_cache_stats()
             kv = cs["used_tokens"] / cs["max_tokens"] if cs.get("max_tokens") else 0.0
         except Exception:                                        # noqa: BLE001
-            kv = 0.0
+            cs, kv = {}, 0.0
         return web.Response(body=app["metrics"].render(
-            processing=processing, deferred=queue.qsize(), kv_ratio=kv),
+            processing=processing, deferred=queue.qsize(), kv_ratio=kv, cache=cs,
+            gpu=gpu_memory(getattr(engine, "torch", None)), evictions=cache_evictions(gen)),
             headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"})
 
     if getattr(engine, "slot_store", None) is not None:

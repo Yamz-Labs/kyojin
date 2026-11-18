@@ -86,6 +86,18 @@ class GGUFCollection:
         self.name_map: dict[str, str | tuple] = {}
         # In-memory overrides (e.g. dequantized embedding), served first.
         self.new_tensors: dict[str, torch.Tensor] | None = None
+        # Side collection (SafetensorsCollection) that serves the "mtp.*" keys (the Qwen3.5/3.6 MTP head kept beside a GGUF body)
+        self.aux = None
+
+    def __getattr__(self, name):
+        # only reached for attributes this class lacks: the MTP head's loaders use the safetensors-collection API
+        aux = self.__dict__.get("aux")
+        if aux is not None and not name.startswith("__"):
+            return getattr(aux, name)
+        raise AttributeError(name)
+
+    def _is_aux(self, key) -> bool:
+        return self.aux is not None and isinstance(key, str) and key.startswith("mtp.")
 
     @staticmethod
     def _read_header(p: str):
@@ -135,6 +147,8 @@ class GGUFCollection:
         return mapped[0] if isinstance(mapped, tuple) else mapped
 
     def has_tensor(self, key: str) -> bool:
+        if self._is_aux(key):
+            return self.aux.has_tensor(key)
         if self.new_tensors and key in self.new_tensors:
             return True
         return self._resolve(key) in self.infos
@@ -173,6 +187,8 @@ class GGUFCollection:
         return True
 
     def get_tensor_sizes(self, key: str):
+        if self._is_aux(key):
+            return self.aux.get_tensor_sizes(key)
         info = self.infos.get(self._resolve(key))
         if info is None:
             raise KeyError(key)
@@ -204,6 +220,8 @@ class GGUFCollection:
         pad_to: tuple | None = None,
         fidx=None,
     ) -> torch.Tensor | None:
+        if self._is_aux(key):
+            return self.aux.get_tensor(key, device, optional, allow_bf16, float2half, no_defer, transpose, pad_to, fidx)
         if self.new_tensors and key in self.new_tensors:
             t = self.new_tensors[key]
             t = t.to(device) if device is not None else t

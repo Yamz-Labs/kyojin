@@ -32,7 +32,7 @@ namespace {
 
 using namespace ggml_iq;
 
-enum { MQ_IQ2_XXS = 0, MQ_IQ2_XS = 1, MQ_IQ2_S = 2, MQ_IQ3_XXS = 3, MQ_IQ3_S = 4, MQ_IQ4_NL = 5, MQ_IQ4_XS = 6, MQ_Q5_K = 7, MQ_Q4_K = 8, MQ_Q6_K = 9, MQ_NTYPES = 10 };
+enum { MQ_IQ2_XXS = 0, MQ_IQ2_XS = 1, MQ_IQ2_S = 2, MQ_IQ3_XXS = 3, MQ_IQ3_S = 4, MQ_IQ4_NL = 5, MQ_IQ4_XS = 6, MQ_Q5_K = 7, MQ_Q4_K = 8, MQ_Q6_K = 9, MQ_Q3_K = 10, MQ_NTYPES = 11 };
 
 // qk = weight elements per block, qi = ints per block (ggml QI*), vdr = ints per lane per call, bb = block bytes
 template <int T> struct MqTraits;
@@ -52,6 +52,7 @@ MQ_TRAITS(MQ_IQ4_XS, 256, 32, VDR_IQ4_XS_Q8_1_MMVQ, 136, vec_dot_iq4_xs_q8_1);
 MQ_TRAITS(MQ_Q5_K, 256, 32, VDR_Q5_K_Q8_1_MMVQ, 176, vec_dot_q5_K_q8_1);
 MQ_TRAITS(MQ_Q4_K, 256, 32, VDR_Q4_K_Q8_1_MMVQ, 144, vec_dot_q4_K_q8_1);
 MQ_TRAITS(MQ_Q6_K, 256, 32, VDR_Q6_K_Q8_1_MMVQ, 210, vec_dot_q6_K_q8_1);
+MQ_TRAITS(MQ_Q3_K, 256, 16, VDR_Q3_K_Q8_1_MMVQ, 110, vec_dot_q3_K_q8_1);
 #undef MQ_TRAITS
 
 constexpr int MQ_WARP = 32;
@@ -448,6 +449,23 @@ template <int T> __global__ void fq_deq_iq_kernel(const uint8_t* __restrict__ pa
             y[j + 16] = __float2half_rn(d * kvalues_iq4nl[q4[j] >> 4]);
         }
     }
+    else if constexpr (T == MQ_Q3_K)
+    {
+        // ggml convert.cu dequantize_block_q3_K: thread = 8 values of one 16-value scale group
+        const block_q3_K* x = (const block_q3_K*)base + bi;
+        const int n = tid / 16, j = (tid / 4) % 4, half_ = (tid / 2) % 2, l8 = (tid % 2) * 8;
+        const int is = 8 * n + 2 * j + half_;
+        const int sc = (((x->scales[is % 8] >> (4 * (is / 8))) & 0xF) | (((x->scales[8 + is % 4] >> (2 * (is / 4))) & 3) << 4)) - 32;
+        const float dl = __half2float(x->d) * sc;
+        const int l = 16 * half_ + l8;
+        __half* y = y0 + 128 * n + 32 * j + l;
+        for (int e = 0; e < 8; ++e)
+        {
+            const int q = (x->qs[32 * n + l + e] >> (2 * j)) & 3;
+            const int hb = (x->hmask[l + e] >> (4 * n + j)) & 1;
+            y[e] = __float2half_rn(dl * (float)(q - (hb ? 0 : 4)));
+        }
+    }
     else  // MQ_IQ4_XS
     {
         const block_iq4_xs* x = (const block_iq4_xs*)base + bi;
@@ -491,6 +509,7 @@ void fq_mmvq_iq4_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) {
 void fq_mmvq_q5_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q5_K>(qb, packed, out); }
 void fq_mmvq_q4_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q4_K>(qb, packed, out); }
 void fq_mmvq_q6_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q6_K>(qb, packed, out); }
+void fq_mmvq_q3_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q3_K>(qb, packed, out); }
 
 // Standalone grouped decode MoE for IQ experts (any of the 7 IQ formats for gate/up and for down; type ids = MQ_* order:
 // 0 iq2_xxs, 1 iq2_xs, 2 iq2_s, 3 iq3_xxs, 4 iq3_s, 5 iq4_nl, 6 iq4_xs). Same arguments and results as fq_moe_kq_grouped_mixed_q8:
@@ -500,9 +519,9 @@ void fq_moe_mmvq_grouped(torch::Tensor h, torch::Tensor sel, torch::Tensor wts, 
                          torch::Tensor down_ptrs, int64_t gate_stride, int64_t up_stride, int64_t down_stride, int64_t type_ug, int64_t type_down,
                          torch::Tensor partial, torch::Tensor out)
 {
-    static const int kQk[MQ_NTYPES] = {256, 256, 256, 256, 256, 32, 256, 256};
-    static const int kBb[MQ_NTYPES] = {66, 74, 82, 98, 110, 18, 136, 176};
-    TORCH_CHECK(type_ug >= 0 && type_ug < MQ_NTYPES && type_down >= 0 && type_down < MQ_NTYPES, "fq_moe_mmvq_grouped: bad format id");
+    static const int kQk[8] = {256, 256, 256, 256, 256, 32, 256, 256};
+    static const int kBb[8] = {66, 74, 82, 98, 110, 18, 136, 176};
+    TORCH_CHECK(type_ug >= 0 && type_ug < 8 && type_down >= 0 && type_down < 8, "fq_moe_mmvq_grouped: bad format id");
     const int K = (int)h.size(1), R = (int)h.size(0), S = (int)sel.numel();
     TORCH_CHECK(S % R == 0 && R >= 1, "sel must be R x topk");
     TORCH_CHECK(h.dtype() == torch::kHalf && h.is_cuda() && h.is_contiguous(), "h must be contiguous half CUDA");
@@ -561,6 +580,7 @@ void fq_dequant_iq(torch::Tensor packed, torch::Tensor out, int64_t fmt)
         case MQ_IQ3_S: mq_dequant_t<MQ_IQ3_S>(packed, out); break;
         case MQ_IQ4_NL: mq_dequant_t<MQ_IQ4_NL>(packed, out); break;
         case MQ_IQ4_XS: mq_dequant_t<MQ_IQ4_XS>(packed, out); break;
+        case MQ_Q3_K: mq_dequant_t<MQ_Q3_K>(packed, out); break;
         default: TORCH_CHECK(false, "fq_dequant_iq: bad format id ", fmt);
     }
 }

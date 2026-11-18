@@ -1,4 +1,4 @@
-// Q4_K and Q6_K vec-dots (q8_1 activations, integer dp4a dots) ported from llama.cpp ggml/src/ggml-cuda/vecdotq.cuh
+// Q4_K, Q6_K and Q3_K vec-dots (q8_1 activations, integer dp4a dots) ported from llama.cpp ggml/src/ggml-cuda/vecdotq.cuh
 // (https://github.com/ggml-org/llama.cpp, commit 61dbf49) and block_q4_K / block_q6_K of ggml/src/ggml-common.h.
 // MIT License, Copyright (c) 2023-2026 The ggml authors. See THIRD_PARTY_NOTICES.md at the repository root.
 // Changes: ggml_cuda_dp4a -> ggml_dp4a, namespace ggml_iq, plain half2 / half block fields. The dot-product bodies are unchanged.
@@ -162,6 +162,95 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     }
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, __half2float(bq6_K->d), d8);
+}
+
+// ---- Q3_K (llama.cpp vecdotq.cuh vec_dot_q3_K_q8_1, same commit) ----
+#define QR3_K 4
+#define QI3_K (QK_K / (4*QR3_K))
+#define VDR_Q3_K_Q8_1_MMVQ 1
+
+struct block_q3_K {
+    uint8_t hmask[QK_K / 8];   // high bit, inverted (0 = subtract 4)
+    uint8_t qs[QK_K / 4];      // low 2 bits
+    uint8_t scales[12];        // 16 x 6-bit scales
+    half    d;
+};
+static_assert(sizeof(block_q3_K) == 110, "ggml block layout");
+
+// saturating per-byte signed subtract (CUDA __vsubss4; HIP has none, llama.cpp vendors/hip.h computes it per byte)
+static __device__ __forceinline__ int ggml_vsubss4(const int a, const int b) {
+#if !defined(USE_ROCM)
+    return __vsubss4(a, b);
+#else
+    const int8_t * a8 = reinterpret_cast<const int8_t *>(&a);
+    const int8_t * b8 = reinterpret_cast<const int8_t *>(&b);
+    int8_t r[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int v = (int) a8[i] - (int) b8[i];
+        r[i] = (int8_t) (v > 127 ? 127 : (v < -128 ? -128 : v));
+    }
+    return *reinterpret_cast<const int *>(r);
+#endif
+}
+
+static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
+    const int & vl, const int & vh, const int * __restrict__ u, const uint8_t * __restrict__ scales,
+    const int & scale_offset, const float & d3, const float * __restrict__ d8) {
+
+    float sumf = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        const int isc = scale_offset + 2*i;
+
+        const int isc_low = isc % (QK_K/32);
+        const int sc_shift_low = 4 * (isc / (QK_K/32));
+        const int sc_low  = (scales[isc_low] >> sc_shift_low) & 0xF;
+
+        const int isc_high = isc % (QK_K/64);
+        const int sc_shift_high = 2 * (isc / (QK_K/64));
+        const int sc_high = ((scales[(QK_K/32) + isc_high] >> sc_shift_high) & 3) << 4;
+
+        const int sc = (sc_low | sc_high) - 32;
+
+        const int vil = (vl >> (2*i)) & 0x03030303;
+
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+
+        const int vi = ggml_vsubss4(vil, vih);
+
+        sumf += d8[i] * (ggml_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+    }
+
+    return d3 * sumf;
+}
+
+static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_q3_K * bq3_K = (const block_q3_K *) vbq + kbx;
+
+    const int bq8_offset = QR3_K * (iqs / (QI3_K/2));
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
+
+    const float d = __half2float(bq3_K->d);
+
+    const int vl = get_int_b2(bq3_K->qs, iqs);
+
+    // invert the mask with ~ so that a 0/1 results in 4/0 being subtracted
+    const int vh = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
+
+    int    u[QR3_K];
+    float d8[QR3_K];
+
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        u[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+
+    return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
 }
 
 }  // namespace ggml_iq

@@ -108,7 +108,7 @@ class Embedding(Module):
         # Mixed embeddings when needed
         if indexed_emb and use_indexed_emb:
             bsz, seq_len = input_ids.shape
-            combined_emb = torch.empty((bsz, seq_len, self.hidden_size), device = self.device, dtype = out_dtype)
+            combined_emb = torch.empty((bsz, seq_len, self.hidden_size), device = self.embedding.weight.device, dtype = out_dtype)
 
             # Prepare deepstack embedding tensors
             if any(ie.deepstack_embeddings is not None for ie in indexed_emb) and indexed_act:
@@ -123,7 +123,7 @@ class Embedding(Module):
             if standard_mask.any():
                 for i in range(bsz):
                     standard_ids_row = input_ids[i][standard_mask[i]]
-                    standard_emb_row = self.embedding(standard_ids_row)
+                    standard_emb_row = self.embedding(standard_ids_row.to(self.embedding.weight.device))
                     combined_emb[i][standard_mask[i]] = standard_emb_row.to(out_dtype)
 
             # Only normalize standard embeddings
@@ -160,7 +160,7 @@ class Embedding(Module):
             dev = params.get("emb_next_device")
             if dev is not None and not explicit_dtype and self._narrow_upload_ok(x, params):
                 return self._upload_narrow(self._gather_narrow(x), x, out_dtype, dev)
-            x = self.embedding.forward(x)
+            x = self.embedding.forward(x.to(self.embedding.weight.device))
             if self.multiplier != 1.0:
                 x *= self.multiplier
             x = to2(x, out_dtype, self.out_dtype)
