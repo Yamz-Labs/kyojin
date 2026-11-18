@@ -32,6 +32,9 @@ GGML_FMT = {
 def hf_config(g: GGUFCollection) -> dict:
     m = g.meta
     arch = m["general.architecture"]
+    if arch not in GGUF_ARCHS and os.environ.get("EXL3_GGUF_GENERIC", "0") == "1":
+        from ..architecture.gguf_generic import hf_config_generic   # generic fallback: only when no specific mapping exists
+        return hf_config_generic(g)
     if arch not in GGUF_ARCHS:
         raise ValueError(f"GGUF architecture {arch!r} has no standard-class mapping (have: {sorted(GGUF_ARCHS)})")
     p = arch + "."
@@ -73,7 +76,8 @@ def _hf_config_qwen35moe(g: GGUFCollection, m: dict, arch: str = "qwen35moe") ->
         "num_attention_heads": m[p + "attention.head_count"],
         "num_key_value_heads": m[p + "attention.head_count_kv"],
         "head_dim": m[p + "attention.key_length"],
-        "num_hidden_layers": m[p + "block_count"],
+        "num_hidden_layers": m[p + "block_count"] - (
+            m.get(p + "nextn_predict_layers", 0) if os.environ.get("EXL3_GGUF_GENERIC", "0") == "1" else 0),
         "full_attention_interval": m[p + "full_attention_interval"],
         "linear_conv_kernel_dim": m[p + "ssm.conv_kernel"],
         "linear_num_key_heads": ssm_groups,

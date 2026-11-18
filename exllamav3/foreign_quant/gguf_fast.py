@@ -5,8 +5,9 @@ EXL3_GGUF_FAST=1 turns on, for every flag below that is not set explicitly:
 EXL3_MOE_FOLD_FUSED is NOT part of it (3.6 % < 4 %, stays opt-in). A flag that is set in the environment keeps its own value
 (EXL3_FQ_MMVQ_MXFP4=0 wins over EXL3_GGUF_FAST=1). Every reader calls flag() at call time.
 
-All six paths act on ForeignLinear / foreign MXFP4 expert weights, i.e. on weights kept in their stored GGUF format. This tree has no generic
-GGUF loader (exllamav3/architecture/gguf_generic.py is not in it), so there is no per-model attribute to key on: the switch is the env alone."""
+All six paths act on ForeignLinear / foreign MXFP4 expert weights, i.e. on weights kept in their stored GGUF format. The switch is the env alone:
+the readers are kernel-level (no model in hand) and the same switch must keep working for the hard-coded archs, so it is not keyed on
+the generic loader (EXL3_GGUF_GENERIC=1 loads a model; EXL3_GGUF_FAST=1 turns the paths on, for any GGUF-backed model)."""
 from __future__ import annotations
 
 import os
