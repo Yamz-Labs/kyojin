@@ -19,7 +19,8 @@ def _mla_layer(ctx, i):
     return {"n_head": nh[i], "q_lora_rank": ctx.key("attention.q_lora_rank"), "kv_lora_rank": ctx.key("attention.kv_lora_rank"),
             "qk_head_dim": ctx.key("attention.key_length_mla"), "v_head_dim": ctx.key("attention.value_length_mla"),
             "rope_dim": ctx.key("rope.dimension_count"), "k_b_dims": kb, "v_b_dims": ctx.dims(f"blk.{i}.attn_v_b.weight"),
-            "kv_a_dims": ctx.dims(f"blk.{i}.attn_kv_a_mqa.weight"), "kq_scale_dim": ctx.key("attention.key_length_mla")}
+            "kv_a_dims": ctx.dims(f"blk.{i}.attn_kv_a_mqa.weight"), "kq_scale_dim": ctx.key("attention.key_length_mla"),
+            "rope_theta": ctx.key("rope.freq_base_swa") if _swa(ctx, i) else ctx.key("rope.freq_base")}
 
 
 register(Block("mla", "attn", select=is_mla, config=_mla_layer, claims=_MLA, build=None, step="step 3", priority=1))
@@ -30,19 +31,32 @@ def _swa(ctx, i):
     return bool(pat[i]) if isinstance(pat, list) and i < len(pat) else False
 
 
+def _gguf(config):
+    return getattr(config, "gguf", config)      # the GGUFCollection, from a model config or passed directly
+
+
+def _build_hy4_attn(config, plan, i, key=None):
+    """Hy4 attention layer (CPU fp32 maths, loader/mla_hy4.py): MLA + sinks + window + sigmoid gate before o_proj + post norm.
+    Selected through the tensors attn_gate / attn_sinks (+ the window keys), never a model name; other MLA GGUFs keep build=None."""
+    from ..mla_hy4 import Hy4MLA
+    return Hy4MLA(_gguf(config), i)
+
+
 register(Block(
     "mla_window_sinks", "attn_mod", step="step 3",
     select=lambda ctx, i: is_mla(ctx, i) and (ctx.has(i, "attn_sinks.weight") or (_swa(ctx, i) and ctx.key("attention.sliding_window"))),
     config=lambda ctx, i: {"swa": _swa(ctx, i), "window": ctx.key("attention.sliding_window") if _swa(ctx, i) else 0,
                            "rope_theta": ctx.key("rope.freq_base_swa") if _swa(ctx, i) else ctx.key("rope.freq_base"),
                            "sinks": ctx.has(i, "attn_sinks.weight")},
-    claims=frozenset({"attn_sinks.weight"}), build=None))
+    claims=frozenset({"attn_sinks.weight"}),
+    build=lambda config, plan, i, key=None: _build_hy4_attn(config, plan, i, key) if plan is None or plan.ctx.has(i, "attn_gate.weight") else None))
 
 register(Block(
     "mla_output_gate", "attn_mod", step="step 3",
     select=lambda ctx, i: is_mla(ctx, i) and ctx.has(i, "attn_gate.weight"),
-    config=lambda ctx, i: {"gate": "sigmoid_full", "dims": ctx.dims(f"blk.{i}.attn_gate.weight")},
-    claims=frozenset({"attn_gate.weight"}), build=None))
+    config=lambda ctx, i: {"gate": "sigmoid_full", "order": "before_o_proj", "dims": ctx.dims(f"blk.{i}.attn_gate.weight"),
+                           "post_norm": ctx.has(i, "post_attention_norm.weight")},
+    claims=frozenset({"attn_gate.weight"}), build=_build_hy4_attn))
 
 
 def _indexer_layer(ctx, i):
