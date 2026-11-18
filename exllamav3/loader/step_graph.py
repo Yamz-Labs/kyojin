@@ -54,7 +54,8 @@ def indexer_static_init(ix, cap):
 @torch.no_grad()
 def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     """x [1, E], qr [1, R], pos [1] long (device), Nb rows -> allow [1, Nb] bool. Same maths and op order as FusedKPoolIndexer.forward for one
-    token; no host value is read: group slot and rope position come from `pos`, the visible groups from a mask (gend < pos)."""
+    token; no host value is read: group slot and rope position come from `pos`, the visible groups from a mask (gend < pos).
+    Returns None (all keys causal) while the bucket is small enough that no query can see more than n_top groups: only the pool state is updated."""
     k, d, H = ix.k, ix.d, ix.H
     ik = _rms(x @ ix.w["attn_k"].T, ix.w["k_norm"], ix.eps)
     vg_new = torch.cat([ik @ ix.w["value"].T, ik @ ix.w["gate"].T], -1)
@@ -65,6 +66,8 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     p = (torch.softmax(g + ix.w["ape"][None], dim=1) * v).sum(1)
     pooled = ix._rope(_rms(p, ix.w["pool_norm"], ix.eps), g0)
     ix.pool.index_copy_(0, pos // k, pooled)            # a group still open holds partial data here; it stays masked until it is complete
+    if Nb <= (ix.n_top + 1) * k:        # every position of this bucket sees <= n_top groups: the selection is all-causal (the eager path returns None)
+        return None
     iq = ix._rope((qr @ ix.w["q_b"].T).reshape(1, H, d), pos)
     wt = (x.float() @ ix.w["proj"].T) / math.sqrt(d * H)
     Pb = Nb // k
