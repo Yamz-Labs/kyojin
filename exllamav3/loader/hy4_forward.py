@@ -28,6 +28,7 @@ from .engram_rows import F8Rows, Hy4Engram, load_dense, _dequant_q8_0, rms
 from .mla_hy4 import Hy4MLA
 from . import ref_fused as _rf
 from . import step_nosync as _ns
+from . import q8_soa as _SOA
 from . import mla_bgemv as _BGM
 from . import head_bf16 as _HB
 from . import attn_eager as _AE
@@ -179,19 +180,27 @@ class QLinear:
     def __init__(self, packed, ty, spec, gemv, stats=None):
         self.packed, self.ty, self.spec, self.gemv, self.stats = packed, int(ty), spec, gemv, stats
         self.shape = (packed.shape[0], packed.shape[1] * spec[0])
+        self.soa = None
+        if _SOA.ENABLED and isinstance(packed, torch.Tensor) and packed.is_cuda and spec[2] == "fq_gemv_q8_0":    # HY4_Q8_SOA=1: repack, free the stored bytes
+            self.soa = _SOA.Q8Soa(packed)
+            self.packed = _SOA.Meta(packed.shape, packed.device)
 
     @property
     def T(self):
         return _QT(self)
 
     def dense(self):
-        return self.spec[3](self.packed)
+        return self.soa.dense() if self.soa is not None else self.spec[3](self.packed)
 
     def __call__(self, x):
         K, N = self.shape[1], self.shape[0]
         lead = x.shape[:-1]
         x2 = x.reshape(-1, K)
-        if x2.shape[0] <= DENSE_MAXR and self.gemv is not None:
+        if self.soa is not None and x2.shape[0] == 1:
+            out = self.soa.mv(x2.float().contiguous())
+            if self.stats is not None:
+                self.stats["dense_soa"] = self.stats.get("dense_soa", 0) + 1
+        elif x2.shape[0] <= DENSE_MAXR and self.gemv is not None and self.soa is None:
             xf = x2.float().contiguous()
             out = torch.empty(xf.shape[0], N, dtype=torch.float32, device=x.device)
             self.gemv(xf, self.packed, out)
