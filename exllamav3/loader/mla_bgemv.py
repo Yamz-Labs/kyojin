@@ -17,7 +17,7 @@ BK = int(os.environ.get("HY4_BG_BK", "128"))
 
 
 @triton.jit
-def _k_bg(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, BN: tl.constexpr, BK: tl.constexpr):
+def _k_bg(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, sxh, BN: tl.constexpr, BK: tl.constexpr):
     h = tl.program_id(0)
     rows = tl.program_id(1) * BN + tl.arange(0, BN)
     rm = rows < N
@@ -30,7 +30,7 @@ def _k_bg(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, BN: tl.constexpr, BK: tl.constex
         m2 = rm[:, None] & cm[None, :]
         q = tl.load(q_ptr + qrow + cols[None, :], mask=m2, other=0).to(tl.float32)
         d = tl.load(d_ptr + drow + (cols // 32)[None, :], mask=m2, other=0.0).to(tl.float32)
-        xv = tl.load(x_ptr + h * K + cols, mask=cm, other=0.0)
+        xv = tl.load(x_ptr + h * sxh + cols, mask=cm, other=0.0)
         acc += tl.sum(q * d * xv[None, :], axis=1)
     tl.store(o_ptr + h * N + rows, acc, mask=rm)
 
@@ -47,7 +47,11 @@ class Q8Batched:
     def mv(self, x):
         """x [1, H, K] fp32 -> [1, H, N] fp32"""
         out = torch.empty(self.H, self.N, dtype=torch.float32, device=x.device)
-        _k_bg[(self.H, triton.cdiv(self.N, BN))](self.q, self.d, x.reshape(self.H, self.K).contiguous(), out, self.N, self.K, self.K // 32, BN=BN, BK=BK, num_warps=4)
+        if x.dim() == 3 and x.shape[0] == 1 and x.stride(-1) == 1:       # [1, H, K] view with a head stride (e.g. the nope part of q): no copy
+            xv, sxh = x, x.stride(1)
+        else:
+            xv, sxh = x.reshape(self.H, self.K).contiguous(), self.K
+        _k_bg[(self.H, triton.cdiv(self.N, BN))](self.q, self.d, xv, out, self.N, self.K, self.K // 32, sxh, BN=BN, BK=BK, num_warps=4)
         return out.reshape(1, self.H, self.N)
 
 
