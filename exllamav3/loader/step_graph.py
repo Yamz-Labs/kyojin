@@ -34,22 +34,19 @@ def _rms(x, w, eps):
 
 
 def indexer_static_init(ix, cap):
-    """FusedKPoolIndexer -> fixed buffers: pool [cap // k, d], ring of the open group [k, 2d] (filled from the eager state), rope table to cap"""
+    """FusedKPoolIndexer -> fixed buffers: pool [cap // k, d], per-position (value | gate) rows vgb [cap, 2d] (open group filled from the eager state), rope table to cap"""
     k, d = ix.k, ix.d
     rows = cap // k
     if ix.pool.shape[0] < rows:
         big = torch.zeros(rows, d, device=ix.dev)
         big[:ix.P] = ix.pool[:ix.P]
         ix.pool = big
-    ring = getattr(ix, "vgr", None)
-    if ring is None:
-        ring = torch.zeros(k, 2 * d, device=ix.dev)
-    ring.zero_()                              # in place: a captured graph keeps the pointer
-    if ix.vg is not None:
+    vgb = getattr(ix, "vgb", None)             # per-position (value | gate) rows [cap, 2d]: a rejected / re-run position just overwrites its row
+    if vgb is None:
+        vgb = ix.vgb = torch.zeros(cap, 2 * d, device=ix.dev)
+    if ix.vg is not None:                      # open group of an eager prefill (< k rows)
         m = ix.vg.shape[0]
-        slots = (ix.n - m + torch.arange(m, device=ix.dev)) % k
-        ring[slots] = ix.vg
-    ix.vgr = ring
+        vgb[ix.n - m:ix.n] = ix.vg
     ix._max_pos = cap
     ix._table(cap)
 
@@ -61,10 +58,12 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     k, d, H = ix.k, ix.d, ix.H
     ik = _rms(x @ ix.w["attn_k"].T, ix.w["k_norm"], ix.eps)
     vg_new = torch.cat([ik @ ix.w["value"].T, ik @ ix.w["gate"].T], -1)
-    ix.vgr.index_copy_(0, pos % k, vg_new)
-    v, g = ix.vgr[:, :d].reshape(-1, k, d), ix.vgr[:, d:].reshape(-1, k, d)
+    ix.vgb.index_copy_(0, pos, vg_new)
+    g0 = (pos // k) * k
+    rows = ix.vgb[g0[:, None] + ar[:k][None, :]]                       # [1, k, 2d]: the (partial) group of this position
+    v, g = rows[..., :d].reshape(-1, k, d), rows[..., d:].reshape(-1, k, d)
     p = (torch.softmax(g + ix.w["ape"][None], dim=1) * v).sum(1)
-    pooled = ix._rope(_rms(p, ix.w["pool_norm"], ix.eps), (pos // k) * k)
+    pooled = ix._rope(_rms(p, ix.w["pool_norm"], ix.eps), g0)
     ix.pool.index_copy_(0, pos // k, pooled)            # a group still open holds partial data here; it stays masked until it is complete
     iq = ix._rope((qr @ ix.w["q_b"].T).reshape(1, H, d), pos)
     wt = (x.float() @ ix.w["proj"].T) / math.sqrt(d * H)
@@ -218,8 +217,8 @@ class GraphDecoder:
         for ix in getattr(fw, "ixf", {}).values():
             ix.n, ix.P, ix.vg = 0, 0, None
             ix.pool.zero_()
-            if getattr(ix, "vgr", None) is not None:
-                ix.vgr.zero_()
+            if getattr(ix, "vgb", None) is not None:
+                ix.vgb.zero_()
 
     # -- the step body (eager warm-up and capture run exactly this)
     def body(self):
@@ -228,13 +227,12 @@ class GraphDecoder:
         x = e[:, None, :].expand(-1, fw.hc, -1).contiguous()
         for i in range(fw.n_layers):
             x = fw.layer(i, x, gs.pos, None, 0)
-        self.x_out = x
         fw._ns_dev = True
         try:
             lg = fw._head(x, False)
         finally:
             fw._ns_dev = False
-        return lg, torch.argmax(lg)
+        return lg, torch.argmax(lg), x
 
     def _graph(self, Nb):
         g = self.graphs.get(Nb)
@@ -284,7 +282,7 @@ class GraphDecoder:
             self.prepare()
         start = fw.n
         assert start < self.cap, "context past the graph cap (HY4_NOSYNC_CAP)"
-        if self.expect_n != start:            # an eager prefill / reset ran since the last graph step: refill the indexer rings from its state
+        if self.expect_n != start:            # an eager prefill / reset ran since the last graph step: refill the indexer vg rows from its state
             for i in range(fw.n_layers):
                 if fw._layer(i).ix:
                     indexer_static_init(fw._indexer_fused(i), self.cap)
@@ -298,6 +296,7 @@ class GraphDecoder:
         self.stage(start)
         cg, _out = self._graph(Nb)
         lg = _out[0]
+        self.x_out = _out[2]
         cg.replay()
         self.ev.record()
         self.ev_set = True
