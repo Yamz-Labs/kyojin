@@ -87,15 +87,6 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
 - Split mode runs eager. Whole-forward and per-block graphs are disabled; per-segment
   capture is not implemented yet.
 
-The measured 118 GiB Strix Halo iGPU has a practical usable point of about **113 GiB**
-(the gap to the 118 GiB aperture is driver/allocator overhead). Recorded failure points on
-the measured GLM pack: 128K split runs complete (peak ~109.3 GiB on the iGPU); a 512K cache
-needs `expandable_segments:False` to load; 640K is refused by the pre-flight guard; 768K
-hard-locked the box. A host-only supervisor catches a run that reaches the configured host
-floor before the kernel OOM zone; the preflight uses the same floor plus a small planning
-margin. The measured case and its explicit floor override are recorded in
-`docs-notes/split-support-matrix.md`.
-
 ### Pre-flight guard
 
 The guard estimates each device's footprint from actual bytes: weights, KV/recurrent cache,
@@ -107,29 +98,28 @@ host_cap   = MemAvailable - (host_floor + preflight_margin)
 ```
 
 There is **no GTT or VRAM reserve**. A dedicated-VRAM allocation failure is a process-level
-error; the host floor is what prevents the unified-memory box from starving. The only
+error; the host floor is what prevents a unified-memory box from starving. The only
 tunables are `MEMGUARD_FLOOR` (default 8), the planning margin (default 1)
 and the prefill workspace (default 2.0 GiB). The host floor is shared with the supervisor;
 the margin keeps the planner above the supervisor's kill threshold.
 
 `--oom-guard auto` refuses before allocating weights, cache or slabs, and prints a per-device
 table plus the chosen N/context and the largest N/context that fits. `off` disables it. The
-check is read-only.
+check is read-only. For MTP-on, use the guard's recommendation instead of hand-picking N:
+the drafter and its cache change the memory budget.
 
 The preflight's device caps are the devices' own free/full memory; the host cap follows
 the configured floor. A load that reaches the host floor is stopped by the supervisor.
 
 ### Allocator mode
 
-The 512K case needs expandable segments off. Use the existing
-`EXL3_EXPANDABLE_SEGMENTS=0` (or `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`) in that
-lane profile before the library import. It recovers about **0.5 GiB** of fragmentation, not
-capacity. There is no automatic allocator heuristic.
+If a load needs expandable segments off: Use the existing `EXL3_EXPANDABLE_SEGMENTS=0`
+(or `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`) in that lane profile before the library import.
+It recovers about **0.5 GiB** of fragmentation, not capacity. There is no automatic allocator heuristic.
 
-512K is also at the preflight planning boundary (the measured 512K load used 113.28 GiB).
-If the host cap refuses it on a particular boot, set
-`KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB=0` or `KYOJIN_OOM_GUARD=off` for that lane; the external
-supervisor floor is unchanged and still protects the box. Do not disable the supervisor.
+If the host cap refuses on a particular boot:
+Set `KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB=0` or `KYOJIN_OOM_GUARD=off` for that lane;
+the external supervisor floor is unchanged and still protects the box. Do not disable the supervisor.
 
 ### External supervisor
 
@@ -146,8 +136,7 @@ the preflight plans around. The supervisor logs a sample to `--log`; the serve l
 `MEMGUARD=auto|1|0` wrapper: `auto` arms `exllamav3/guard.py` on Linux when
 `/proc/meminfo` is readable; use `MEMGUARD=0` to disable it.
 Keep the supervisor external; an in-process watchdog cannot be relied on while the allocator
-or kernel is stalled. Do not run MTP-on probing with the retired `split_bench_ctx.py`; use
-`split_eval.py --bench-depth`.
+or kernel is stalled.
 
 ## Model support
 
