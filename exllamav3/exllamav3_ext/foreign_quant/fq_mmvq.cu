@@ -765,12 +765,12 @@ void fq_moe_fold(torch::Tensor d, torch::Tensor rw, torch::Tensor out)
     {
         const __half* r = reinterpret_cast<const __half*>(rw.data_ptr<at::Half>());
         if (out.dtype() == torch::kHalf) fq_moe_fold_kernel<__half, __half><<<blocks, 128, 0, stream>>>(dp, r, reinterpret_cast<__half*>(out.data_ptr<at::Half>()), S, N, H);
-        else fq_moe_fold_kernel<__half, float><<<blocks, 128, 0, stream>>>(dp, r, out.data_ptr<float>(), S, N, H);
+        else { fq_moe_fold_kernel<__half, float><<<blocks, 128, 0, stream>>>(dp, r, out.data_ptr<float>(), S, N, H); }
     }
     else
     {
         const float* r = rw.data_ptr<float>();
         if (out.dtype() == torch::kHalf) fq_moe_fold_kernel<float, __half><<<blocks, 128, 0, stream>>>(dp, r, reinterpret_cast<__half*>(out.data_ptr<at::Half>()), S, N, H);
-        else fq_moe_fold_kernel<float, float><<<blocks, 128, 0, stream>>>(dp, r, out.data_ptr<float>(), S, N, H);
+        else { fq_moe_fold_kernel<float, float><<<blocks, 128, 0, stream>>>(dp, r, out.data_ptr<float>(), S, N, H); }
     }
 }
