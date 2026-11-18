@@ -108,6 +108,8 @@ def _fl(config, eng_key: str, i: int, o: int, out_dtype=None, bias=False, **kw):
     if fmt == "fp" or fmt.startswith("unk"):
         raise GenericUnsupported(f"{base}: ggml type {fmt!r} has no ForeignLinear format (add it to GGML_FMT)")
     if bias:
+    if fmt == "f8_e4m3":
+        raise GenericUnsupported(f"{base}: ggml F8_E4M3 (type 43) is a row-lookup-only type (loader/engram_rows.F8Rows), not a Linear")
         # Linear.load_gguf_ builds the ForeignLinear on the stored blocks and loads <key>.bias into _ForeignInner (inner.bias / inner.fl,
         # what the grouped MXFP4 MoE path and Attention read). pad_to=1: the GGUF payload is not padded to 128 (gpt-oss 2880).
         from ..modules.linear import Linear

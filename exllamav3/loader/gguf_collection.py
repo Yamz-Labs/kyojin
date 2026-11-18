@@ -326,6 +326,8 @@ class GGUFCollection:
             elif allow_bf16 and t.dtype == torch.float32:
                 t = t.bfloat16()
             return _pad_to(t.to(dev), pad_to)
+        if ty == 43:
+            raise ValueError(f"{key}: ggml F8_E4M3 (type 43) is row-lookup-only; read rows through loader/engram_rows.F8Rows, not get_tensor")
         raise ValueError(f"unsupported gguf type {ty} for {key}")
 
 
