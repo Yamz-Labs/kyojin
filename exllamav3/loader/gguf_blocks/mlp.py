@@ -181,6 +181,7 @@ def _latent_names(cfg, i, L, G):
 
 
 def _latent_build(config, plan, idx, L):
+    import math
     import torch
     from ...modules import GatedMLP, BlockSparseMLP
     from ...architecture.gguf_generic import _fl
@@ -197,8 +198,11 @@ def _latent_build(config, plan, idx, L):
         shared.register_submodule(m)
     kw = {}
     if c["clamp"]:
-        # the tree's clamp is post-activation; Hy4's is pre-activation (min(gate, c) then silu): they differ only for gate > c (<= 4.6e-4 at c = 10)
-        kw["act_limit"] = float(c["clamp"])
+        # Hy4 (llama.cpp swiglu_clamp_exp) is silu(min(g, c)) * clip(u, -c, c); the engine's single act_limit clamps after the
+        # activation. Exact split form (silu is increasing above -1.278, c > 0): min(silu(g), silu(c)) * clip(u, -c, c)
+        cl = float(c["clamp"])
+        kw["act_limit_gate"] = cl / (1.0 + math.exp(-cl))       # silu(c) = c * sigmoid(c)
+        kw["act_limit_up"] = cl
     mlp = BlockSparseMLP(config=config, key=f"{L}.mlp", hidden_size=H, intermediate_size=I, num_experts=E, shared_experts=shared,
                          num_experts_per_tok=c["top_k"], norm_topk=bool(c["weights_norm"]), key_up=None, key_gate=None, key_down=None,
                          key_routing_gate="gate", qmap="block.mlp", interm_dtype=torch.half, out_dtype=torch.float,

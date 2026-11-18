@@ -168,7 +168,9 @@ def test_build_kwargs():
     mod = M._latent_build(cfg, plan, 1, "L")
     k = mod.k
     assert k["latent_size"] == 1536 and k["router_type"] == "ds3" and k["n_group"] == k["topk_group"] == 1 and k["norm_topk"] is True
-    assert abs(k["routed_scaling_factor"] - 3.998) < 1e-6 and k["act_limit"] == 10.0 and k["num_experts_per_tok"] == 16
+    assert abs(k["routed_scaling_factor"] - 3.998) < 1e-6 and k["num_experts_per_tok"] == 16
+    import math
+    assert "act_limit" not in k and k["act_limit_up"] == 10.0 and abs(k["act_limit_gate"] - 10.0 / (1.0 + math.exp(-10.0))) < 1e-12   # exact split clamp: silu(c), c
     assert k["latent_in"] == ("L.mlp.fc1_latent_proj", 3072, 1536) and k["latent_out"] == ("L.mlp.fc2_latent_proj", 1536, 3072)
     assert k["gates"][0] == ("L.mlp.experts.0.gate_proj", 1536, 1536)
     sh = seen["n"][0]
@@ -194,3 +196,94 @@ if __name__ == "__main__":
     for p, c in CASES:
         for r in check(p, c):
             print(f"{r[0]} | {r[1]} | ffn_moe_out rel {r[2]:.2e} cos {r[3]:.6f} | ffn_out(l_out-derived) rel {r[4]:.2e} cos {r[5]:.6f} | {r[6]}", flush=True)
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# ---- split clamp (Hy4 swiglu_clamp_exp): silu(min(g, c)) * clip(u, -c, c) == min(silu(g), silu(c)) * clip(u, -c, c) ------------------------
+# These run in a clean interpreter: the module tests above replace exllamav3.modules with stubs in this process.
+_SPLIT_SCRIPT = r'''
+import json, math, torch, torch.nn.functional as F
+from exllamav3.ext_fallbacks import silu_mul, silu_mul_split
+from exllamav3.modules.block_sparse_mlp import BlockSparseMLP
+out = {}
+torch.manual_seed(0)
+def data(dt, c):
+    g = (torch.rand(2048, 64) * 40 - 20).to(dt); u = (torch.rand(2048, 64) * 40 - 20).to(dt)
+    g[:16] = (torch.rand(16, 64) * 8 + 10).to(dt)                      # rows with g > 10
+    return g, u
+mx, nbig, mxdef, mxdef_dtype = {}, 0, 0.0, []
+for dt in (torch.float32, torch.float16):
+    for c in (10.0, 2.0, 6.0, 7.5, 15.0, 0.75):
+        g, u = data(dt, c); nbig = int((g > 10).any(1).sum())
+        z = torch.empty(g.shape, dtype = torch.half)
+        silu_mul_split(g, u, z, c / (1.0 + math.exp(-c)), c)
+        ref = F.silu(torch.minimum(g, torch.tensor(c, dtype = dt))) * u.clamp(-c, c)
+        if dt == torch.float32: ref = ref.clamp(-65504.0, 65504.0)
+        mx[f"{str(dt)[6:]}_{c}"] = float((z.float() - ref.to(torch.half).float()).abs().max())
+        # (b) default path against the previous formula, bit for bit
+        for lim in (0.0, c):
+            z0 = torch.empty(g.shape, dtype = torch.half); silu_mul(g, u, z0, lim)
+            xa = F.silu(g)
+            if lim != 0.0: xa = xa.clamp(max = lim); uu = u.clamp(min = -lim, max = lim)
+            else: uu = u
+            r0 = xa * uu
+            if dt == torch.float32: r0 = r0.clamp(-65504.0, 65504.0)
+            mxdef = max(mxdef, float((z0.float() - r0.to(torch.half).float()).abs().max()))
+out["mx"], out["nbig"], out["mxdef"] = mx, nbig, mxdef
+# (c) decline, no GPU: stubbed device check
+m = BlockSparseMLP.__new__(BlockSparseMLP)
+m._split_lim, m.split_declined = True, []
+m.is_quantized, m.cpu_offload, m.cpu_split_first = True, False, None
+out["decline_true"] = m._split_decline("hip_grouped")
+try:
+    m.forward(torch.zeros(1, 4), {})
+    out["raised"] = None
+except NotImplementedError as e:
+    out["raised"] = str(e)
+out["declined"] = m.split_declined
+n = BlockSparseMLP.__new__(BlockSparseMLP); n._split_lim = False; n.split_declined = []
+out["decline_default"] = n._split_decline("hip_grouped")
+print("RESULT" + json.dumps(out))
+'''
+
+
+def _split_run():
+    import subprocess
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    p = subprocess.run([sys.executable, "-c", _SPLIT_SCRIPT], cwd=ROOT, env=env, capture_output=True, text=True, timeout=120)
+    if p.returncode != 0 and "libcudart" in p.stderr:
+        pytest.skip("exllamav3 extension not importable here")
+    assert p.returncode == 0, p.stderr[-800:]
+    return json.loads(p.stdout.split("RESULT", 1)[1])
+
+
+@pytest.fixture(scope="module")
+def split_res():
+    return _split_run()
+
+
+def test_split_clamp_exact_vs_reference(split_res):
+    """(a) torch split path == silu(min(g, c)) * clip(u, -c, c), fp32 and fp16 inputs, g and u in [-20, 20], rows with g > 10 present"""
+    assert split_res["nbig"] >= 16
+    assert max(split_res["mx"].values()) == 0.0, split_res["mx"]
+
+
+def test_split_clamp_default_path_bit_identical(split_res):
+    """(b) no split limits: ext_fallbacks.silu_mul (single act_limit) is bit-identical to the previous formula"""
+    assert split_res["mxdef"] == 0.0
+
+
+def test_split_clamp_declines_gpu_routes(split_res):
+    """(c) split limits record the decline on a GPU route and raise the clear error where no torch fallback exists; default never declines"""
+    assert split_res["decline_true"] is True and split_res["decline_default"] is False
+    assert split_res["raised"] == "split clamp limits need the two-limit kernel (Hy4 engine path)"
+    assert "exl3_or_cpu_host" in split_res["declined"]
+
+
+def test_split_clamp_every_kernel_route_guarded():
+    """every kernel `elif (` of the routed dispatch chain and every foreign grouped / prefill route checks the split flag"""
+    src = open(os.path.join(ROOT, "exllamav3/modules/block_sparse_mlp.py")).read()
+    a, b = src.index("# gfx11.5 batch-1 fused decode (exl3_dec_moe)"), src.index("# Torch/C++/fused path")
+    assert src[a:b].count("elif (\n            not self._split_lim and\n") == 7
+    assert src.count("not split_no_foreign") == 4

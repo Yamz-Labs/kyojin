@@ -10,6 +10,7 @@ from .multilinear import MultiLinear
 from .moe_mixedk import MixedKStore, MixedKUnsupported, expert_ks, layer_is_mixed, check_expert_bits, \
     PrunedLinear, pruned_experts, parse_expert_bits
 from ..ext import exllamav3_ext as ext
+from ..ext_fallbacks import silu_mul_split
 from dataclasses import dataclass
 from .mlp import MLP, GatedMLP
 from .rmsnorm import RMSNorm
@@ -389,6 +390,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         out_dtype: torch.dtype = None,
         activation_fn: str = "silu",
         act_limit: float = 0.0,
+        act_limit_gate: float | None = None,
+        act_limit_up: float | None = None,
         interm_dtype: torch.dtype = None,
         fused_fp16_interm: bool = True,
         interm_div: float = 1.0,
@@ -455,6 +458,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.expert_size = latent_size or hidden_size
         self.router_type = router_type
         self.act_limit = act_limit
+        # Split clamp (Hy4 latent MoE): min(act(g), act_limit_gate) * clip(u, +-act_limit_up); None = the single act_limit above
+        self.act_limit_gate = act_limit_gate
+        self.act_limit_up = act_limit_up
+        self._split_lim = act_limit_gate is not None or act_limit_up is not None
+        self.split_declined = []
+        if self._split_lim and (act_limit or activation_fn != "silu"):
+            raise ValueError("split clamp limits need activation_fn silu and act_limit 0")
         self.alt_residual_channel = alt_residual_channel
 
         self.routing_first = routing_first
@@ -686,6 +696,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     self.activation_fn_idx = 2
                 case _:
                     raise ValueError(f"Unknown activation function {activation_fn}")
+            if self._split_lim:
+                # torch-only activation: no CUDA / HIP kernel takes two limits
+                self.activation_fn_call = lambda g, u, a, _lim = 0.0: silu_mul_split(g, u, a, self.act_limit_gate, self.act_limit_up)
         else:
             # Gateless relu2 rides the gated fast paths via relu(u) * u = relu2(u): the act call
             # sites pass (u, u, a) and the fused MoE kernel's MOE_ACT_RELU2_NOGATE synthesizes
@@ -1495,7 +1508,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             return None
         if self.batch_recon is None:
             ok = (
-                self.tier is None and  # reads the per-expert scale tensors, which a tiered layer does not keep
+                not self._split_lim and self.tier is None and  # reads the per-expert scale tensors, which a tiered layer does not keep
                 BATCH_RECON and self.bc is not None and self.support_quant_paths and
                 hasattr(ext, "reconstruct_batch") and
                 self.interm_dtype in (torch.half, None, torch.float) and self.multi_up is not None and
@@ -1657,7 +1670,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         EXL3_DEC_SHARED_FOLD (default 1; 0 = separate shared launch)."""
         self.dec_shf = None
         se = self.shared_experts
-        if not (se is not None and isinstance(se, GatedMLP) and hasattr(ext, "exl3_dec_moe_shared")): return
+        if self._split_lim or not (se is not None and isinstance(se, GatedMLP) and hasattr(ext, "exl3_dec_moe_shared")): return
         if (self.shared_gate is not None or self.shared_experts_post_norm is not None or
             self.routed_post_norm is not None or self.latent_in is not None or self.latent_out is not None or
             self.alt_residual_channel or getattr(se, "tp_reduce", False) or se.num_slices != 1): return
@@ -2621,12 +2634,27 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
 
+    SPLIT_MSG = "split clamp limits need the two-limit kernel (Hy4 engine path)"
+
+    def _split_decline(self, route: str) -> bool:
+        """True (and recorded) when a GPU kernel route must not run: the kernels take one act_limit, split limits are torch-only."""
+        if not getattr(self, "_split_lim", False):
+            return False
+        if route not in self.split_declined:
+            self.split_declined.append(route)
+        return True
+
     def forward(
         self,
         x: torch.Tensor,
         params: dict,
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
+
+        # No fallback for these: EXL3 kernels (is_quantized) and the CPU expert host take one act_limit
+        if getattr(self, "_split_lim", False) and (self.is_quantized or self.cpu_offload or self.cpu_split_first is not None):
+            self._split_decline("exl3_or_cpu_host")
+            raise NotImplementedError(self.SPLIT_MSG)
 
         if gguf_ri("moe") and not params.get("autosplit_measure") and \
                 2 <= x.numel() // x.shape[-1] <= GGUF_ROW_INV_MAX_ROWS and self._gguf_experts():
@@ -2707,13 +2735,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # (see _forward_foreign_grouped_kq). Tried first (Bolt returns None
         # without latent projs anyway).
         # MXFP4 experts at prefill (EXL3_MXFP4_PREFILL_GROUPED=1, rows above FQ_GROUPED_MAX_ROWS): routed-expert Triton dequant + grouped GEMM.
-        if bsz >= 2 and not params.get("activate_all_experts") and not params.get("reconstruct") and \
+        split_no_foreign = self._split_decline("foreign_grouped")      # fp8 / mxfp4 / KQ / foreign kernels: single act_limit
+        if bsz >= 2 and not split_no_foreign and not params.get("activate_all_experts") and not params.get("reconstruct") and \
                 not params.get("autosplit_measure") and not params.get("dflash_verify"):
             pf = self._forward_mxfp4_prefill_grouped(x, y, selected_experts, routing_weights, params, out_dtype, eshape)
             if pf is not None:
                 return pf
 
-        if bsz <= FQ_GROUPED_MAX_ROWS and not params.get("activate_all_experts") and \
+        if bsz <= FQ_GROUPED_MAX_ROWS and not split_no_foreign and not params.get("activate_all_experts") and \
                 not params.get("reconstruct") and not params.get("autosplit_measure"):
             grouped = self._forward_fp8_grouped(
                 x, y, selected_experts, routing_weights, params, out_dtype, eshape)
@@ -2732,7 +2761,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if grouped is not None:
                 return grouped
 
-        if _MQ_MOE and FQ_GROUPED_MAX_ROWS < bsz <= _MQ_MOE_MAXR and not params.get("activate_all_experts") and                 not params.get("reconstruct") and not params.get("autosplit_measure") and not params.get("dflash_verify"):
+        if _MQ_MOE and not split_no_foreign and FQ_GROUPED_MAX_ROWS < bsz <= _MQ_MOE_MAXR and not params.get("activate_all_experts") and                 not params.get("reconstruct") and not params.get("autosplit_measure") and not params.get("dflash_verify"):
             grouped = self._forward_foreign_grouped_kq(
                 x, y, selected_experts, routing_weights, params, out_dtype, eshape, big=True)
             if grouped is not None:
@@ -2743,7 +2772,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # (see _forward_foreign_prefill). Strict eligibility inside; falls
         # through otherwise. Skipped for DFlash verify batches (bit-exact
         # union path owns those).
-        if bsz > 1 and not params.get("activate_all_experts") and \
+        if bsz > 1 and not split_no_foreign and not params.get("activate_all_experts") and \
                 not params.get("reconstruct") and not params.get("autosplit_measure") and \
                 not params.get("dflash_verify"):
             pf = self._forward_foreign_prefill_grouped(
@@ -2780,6 +2809,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # gfx11.5 batch-1 fused decode (exl3_dec_moe): two launches for the whole routed sum
         elif (
+            not self._split_lim and
             bsz == 1 and self.support_dec_moe and self.tp_mode is None and not (_MOE_VALU and self.support_hip_grouped) and
             y.dtype == torch.half and y.is_contiguous() and
             selected_experts.dtype == torch.long and routing_weights.dtype == torch.half and
@@ -2883,6 +2913,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # build dominates), only R=2..5; EXL3_DEC_MOE_UNION=1 to use it anyway (e.g. to get a
         # bit-exact verify path even before that's fixed).
         elif (
+            not self._split_lim and
             1 < bsz <= UNION_ROWS and self.support_dec_moe and self.tp_mode is None and
             not (_MOE_VALU and self.support_hip_grouped and bsz <= 8) and
             hasattr(ext, "exl3_dec_moe_union") and
@@ -2933,6 +2964,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # group partial sums added (moe_mixedk.MixedKStore.decode). Rows above the grouped cap and below the
         # WMMA threshold run the dense per-expert path, which is K-agnostic.
         elif (
+            not self._split_lim and
             self.mixed_k is not None and self.support_hip_grouped and self.tp_mode is None and
             _hip_grouped_rows_eligible(bsz, False) and
             tuple(y.shape) == (bsz, self.expert_size) and y.dtype == torch.half and
@@ -2955,6 +2987,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # gfx12 grouped decode/verification path: selected IDs and weights stay on-device,
         # and every row-major assignment slot remains distinct.
         elif (
+            not self._split_lim and
             self.mixed_k is None and
             _hip_grouped_rows_eligible(bsz, self.support_hip_prefill) and self.support_hip_grouped and
             self.tp_mode is None and
@@ -3001,6 +3034,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # so the fused kernel's per-expert count readback and tier planning are skipped for
         # eligible shapes.
         elif (
+            not self._split_lim and
             self.support_hip_prefill and self.tp_mode is None and
             (self.num_local_experts == self.num_experts or
              (self.cpu_split_first is not None and self.routing_first == 0 and
@@ -3061,6 +3095,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Per-expert K layer, prefill: picks grouped by K, one WMMA launch set per group (compacted picks,
         # the kernel has no masked picks), per-token sum in routing-slot order (moe_mixedk.MixedKStore.prefill)
         elif (
+            not self._split_lim and
             self.mixed_k is not None and self.support_hip_wmma and bsz >= _HIP_WMMA_MIN_ROWS and
             y.dtype == torch.half and (y.is_contiguous() or
                                        (y.dim() == 2 and y.stride(1) == 1 and y.stride(0) >= y.size(1) and y.stride(0) % 4 == 0)) and
@@ -3093,6 +3128,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # Grouped WMMA prefill (gfx11.5): one launch per projection over all experts, trellis
         # decoded inside the GEMM; replaces the per-expert reconstruct + hgemm loop at prefill
         elif (
+            not self._split_lim and
             self.mixed_k is None and self.support_hip_wmma and bsz >= _HIP_WMMA_MIN_ROWS and
             y.dtype == torch.half and (y.is_contiguous() or                 # or a row-padded producer view
                                        (y.dim() == 2 and y.stride(1) == 1 and y.stride(0) >= y.size(1) and y.stride(0) % 4 == 0)) and
@@ -3848,6 +3884,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 "n_group": self.n_group,
                 "topk_group": self.topk_group,
                 "act_limit": self.act_limit,
+                "act_limit_gate": self.act_limit_gate,
+                "act_limit_up": self.act_limit_up,
                 "alt_residual_channel": self.alt_residual_channel,
                 "key_tid2eid": self.tid2eid_key,
                 "key_e_score_bias_vl": self.e_score_bias_vl_key,
