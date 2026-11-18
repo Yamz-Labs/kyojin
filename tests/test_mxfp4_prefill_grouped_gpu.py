@@ -26,10 +26,11 @@ PKG = os.path.join(ROOT, "exllamav3")
 def _load_all():
     """Load gap_formats, triton_gap (if triton), fq_moe_prefill (if triton) and moe_mxfp4_prefill by path under empty parent packages,
     so that exllamav3/__init__ (which builds the C++ extension) never runs. Returns (modules dict, parent packages)."""
-    pk = {n: types.ModuleType(n) for n in ("exllamav3", "exllamav3.foreign_quant", "exllamav3.modules")}
+    pk = {n: types.ModuleType(n) for n in ("exllamav3", "exllamav3.foreign_quant", "exllamav3.modules", "exllamav3.util")}
     pk["exllamav3"].__path__ = [PKG]
     pk["exllamav3.foreign_quant"].__path__ = [os.path.join(PKG, "foreign_quant")]
     pk["exllamav3.modules"].__path__ = [os.path.join(PKG, "modules")]
+    pk["exllamav3.util"].__path__ = [os.path.join(PKG, "util")]
     for k, v in pk.items():
         sys.modules[k] = v
     try:
@@ -70,8 +71,9 @@ def mods():
     saved = {k: sys.modules.get(k) for k in list(sys.modules) if k == "exllamav3" or k.startswith("exllamav3.")}
     try:
         m = _load_all()
-        spec = importlib.util.spec_from_file_location("_exl3_fallbacks", os.path.join(PKG, "ext_fallbacks.py"))
+        spec = importlib.util.spec_from_file_location("exllamav3.ext_fallbacks", os.path.join(PKG, "ext_fallbacks.py"))
         fb = importlib.util.module_from_spec(spec)
+        sys.modules["exllamav3.ext_fallbacks"] = fb
         spec.loader.exec_module(fb)
         m["fallbacks"] = fb
         yield m
