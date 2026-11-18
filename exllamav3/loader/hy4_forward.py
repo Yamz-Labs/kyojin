@@ -28,6 +28,7 @@ from .engram_rows import F8Rows, Hy4Engram, load_dense, _dequant_q8_0, rms
 from .mla_hy4 import Hy4MLA
 from . import ref_fused as _rf
 from . import step_nosync as _ns
+from . import kv_fused as _KVF
 from . import mla_bgemv as _BGM
 from . import head_bf16 as _HB
 from . import attn_eager as _AE
@@ -566,9 +567,12 @@ class Hy4Forward:
                 pre, post = self._site(x, L.hca)
                 cur = rms((x * pre[:, :, None]).sum(1), self.eps) * L.attn_norm
         mla = L.mla
-        with tm.t("attn proj"):
-            kn = mla.kv(cur, pos)
-        kc = gs.append_kv(i, kn) if gs is not None else _ns.append_kv(self, i, kn, start) if _ns.active(self) else (torch.cat([self.kc[i], kn]) if self.kc[i] is not None else kn)
+        if gs is not None and _KVF.ENABLED and _AE.ENABLED:       # HY4_KV_FUSED: rms + rope + K-row write in ONE kernel
+            kc = gs.kv_row_fused(i, mla, cur, pos)
+        else:
+            with tm.t("attn proj"):
+                kn = mla.kv(cur, pos)
+            kc = gs.append_kv(i, kn) if gs is not None else _ns.append_kv(self, i, kn, start) if _ns.active(self) else (torch.cat([self.kc[i], kn]) if self.kc[i] is not None else kn)
         N = kc.shape[0]
         allow = None
         if L.ix:

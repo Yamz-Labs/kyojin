@@ -141,6 +141,15 @@ class _GS:
         b.index_copy_(0, self.pos, kn)
         return b[:self.Nb]
 
+    def kv_row_fused(self, i, mla, cur, pos):
+        """K row of this token written by ONE kernel (kv_fused): rms * w, rope from the attn_eager table, row `pos` of the layer's K buffer"""
+        from . import attn_eager as AE, kv_fused as KVF
+        b = _ns.state(self.fw).kv[i]
+        c = mla._q(cur, "wkv_a") @ mla.wkv_a.T
+        tab = AE.table(mla.rope_dim, mla.theta, self.fw.dev, pos)
+        KVF.write_row(c, mla.kv_a_norm, tab, pos, b, mla.R, mla.rope_dim, mla.eps)
+        return b[:self.Nb]
+
     def indexer(self, fw, i, cur, qr, N):
         return indexer_forward_static(fw._indexer_fused(i), cur, qr, self.pos, N, self.ar)
 
