@@ -8,6 +8,7 @@ import json
 import os
 
 from .gguf_collection import GGUFCollection
+from .gguf_registry import Block, register, class_block
 
 # gguf general.architecture -> (HF architectures entry, HF model_type)
 GGUF_ARCHS = {
@@ -30,18 +31,23 @@ GGML_FMT = {
 
 
 def hf_config(g: GGUFCollection) -> dict:
+    """GGUF header -> HF-style config, resolved through the block registry: a dedicated-class arch is one 'model' block
+    (class:<arch>), any other arch goes to the generic composer when EXL3_GGUF_GENERIC=1."""
     m = g.meta
     arch = m["general.architecture"]
-    if arch not in GGUF_ARCHS and os.environ.get("EXL3_GGUF_GENERIC", "0") == "1":
+    blk = class_block(arch)
+    if blk is None and os.environ.get("EXL3_GGUF_GENERIC", "0") == "1":
         from ..architecture.gguf_generic import hf_config_generic   # generic fallback: only when no specific mapping exists
         return hf_config_generic(g)
-    if arch not in GGUF_ARCHS:
+    if blk is None:
         raise ValueError(f"GGUF architecture {arch!r} has no standard-class mapping (have: {sorted(GGUF_ARCHS)})")
+    return blk.config(g, None)
+
+
+def _hf_config_dense(g: GGUFCollection) -> dict:
+    m = g.meta
+    arch = m["general.architecture"]
     p = arch + "."
-    if arch in ("qwen35moe", "qwen35"):
-        return _hf_config_qwen35moe(g, m, arch)
-    if arch == "qwen4exp":
-        return _hf_config_qwen4exp(g, m)
     ne = m[p + "embedding_length"]
     nq = m[p + "attention.head_count"]
     cfg = {
@@ -246,3 +252,23 @@ def write_config_dir(gguf_path: str, outdir: str) -> str:
         os.remove(link)
     os.symlink(os.path.abspath(gguf_path), link)
     return outdir
+
+
+def _name_map_qwen35(cfg: dict) -> dict:
+    """the MiniCPM-V-4.7 text class's GGUF name map (architecture/minicpm_v47.py: _map_layer + norm / head)"""
+    from ..architecture.minicpm_v47 import _map_layer
+    nm: dict = {}
+    for i in range(cfg["text_config"]["num_hidden_layers"]):
+        _map_layer(nm, i)
+    nm["model.language_model.norm.weight"] = "output_norm.weight"
+    nm["lm_head.weight"] = "output.weight"
+    return nm
+
+
+# Dedicated-class archs as registry 'model' blocks: config = their mapping function (unchanged), names = their name map.
+for _arch, _cfg, _nm in (("llama", lambda g, i: _hf_config_dense(g), name_map), ("qwen3", lambda g, i: _hf_config_dense(g), name_map),
+                         ("qwen35moe", lambda g, i: _hf_config_qwen35moe(g, g.meta, "qwen35moe"), _name_map_qwen35),
+                         ("qwen35", lambda g, i: _hf_config_qwen35moe(g, g.meta, "qwen35"), _name_map_qwen35),
+                         ("qwen4exp", lambda g, i: _hf_config_qwen4exp(g, g.meta), name_map_qwen4exp)):
+    register(Block("class:" + _arch, "model", select=lambda ctx, i, a=_arch: ctx.arch == a, config=_cfg, claims=frozenset(),
+                   build=GGUF_ARCHS[_arch][0], names=lambda cfg, i, L, G, f=_nm: f(cfg)))
