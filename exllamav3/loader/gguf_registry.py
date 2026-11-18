@@ -26,7 +26,7 @@ BASE_SLOTS = ("pre", "stream", "attn", "ffn")
 MOD_SLOTS = ("attn_mod", "ffn_mod", "layer_mod")
 GLOBAL_SLOTS = ("embed", "embed_mod", "head", "head_mod")
 CONFIG_ONLY = "config-only"      # build marker: the block feeds module configs, no module of its own
-BLOCK_MODULES = ("transformer", "attn", "mlp")
+BLOCK_MODULES = ("transformer", "attn", "mlp", "mla_attn", "hyperconnections", "engram", "mtp")
 
 # Per-arch features llama.cpp hard-codes with no GGUF key. Every entry names the llama.cpp source it mirrors
 # (M = the model patch published with the model, else the llama.cpp file).
@@ -46,6 +46,13 @@ ARCH_FEATS = {
     # src/models/gemma4.cpp (see GEMMA4_UNCHECKED.md): LLM_FFN_GELU (tanh) dense act; build_inp_embd(.., sqrtf(n_embd));
     # unweighted rms_norm on V of every layer (K=V layers: V = raw k_proj output); hparams.f_attention_scale = 1.0
     "gemma4": {"act": "gelu", "embed_scale": True, "v_norm": True, "sm_scale": 1.0},
+    "hy_v4_flash": {
+        "rope_gptj": True,                # M:4784 llama_model_rope_type: HY_V4_FLASH -> LLAMA_ROPE_TYPE_NORM (consecutive pairs), weights not permuted
+        "engram_eps": 1.1920929e-07,      # M:4852 HY_V4_FLASH_ENGRAM_EPS: Engram RMSNorms use FLT_EPSILON, not rms_norm_eps
+        "clamp_routed_only": True,        # M:4885 swiglu_clamp_exp applies to the routed experts only; shared and dense FFNs unclamped
+        "indexer_rope_tail": True,        # M:4936 the indexer head is a nope front + rope tail (rope on the last n_rot dims)
+        "hc_comb_identity": True,         # M:5431 HC post: comb is the identity, no cross-stream mix (no sinkhorn key in the GGUF)
+    },
 }
 
 

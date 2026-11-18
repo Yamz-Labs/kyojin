@@ -1,4 +1,5 @@
-"""Blocks around modules/mlp.py and block_sparse_mlp.py: dense gated MLP, standard top-k MoE (+shared, +biases)."""
+"""Blocks around modules/mlp.py and block_sparse_mlp.py: dense gated MLP, standard top-k MoE (+shared, +biases),
+and the predicates of the latent MoE / sigmoid-bias router (not built yet)."""
 from __future__ import annotations
 from ..gguf_registry import Block, register, req
 
@@ -142,3 +143,31 @@ register(Block(
     "moe_ffn", "ffn",
     select=lambda ctx, i: ctx.has(i, "ffn_gate_exps.weight") and not ctx.has(i, "ffn_routed_down.weight"),
     config=_moe_layer, claims=_MOE_CLAIMS, build=_moe_build, names=_moe_names))
+
+
+# ---- predicates only (Hy4 step 5): latent MoE (routed experts at expert_latent_length between ffn_routed_down/up),
+#      sigmoid router (gating_func 2) + exp_probs_b, weights_scale, per-layer swiglu_clamp_exp; engine module: block_sparse_mlp latent_in/out
+def _latent_layer(ctx, i):
+    gd = ctx.dims(f"blk.{i}.ffn_gate_exps.weight")
+    sh = ctx.dims(f"blk.{i}.ffn_gate_shexp.weight")
+    clamp = ctx.per_layer("swiglu_clamp_exp", 0.0)
+    return {"latent": ctx.key("expert_latent_length"), "latent_down": ctx.dims(f"blk.{i}.ffn_routed_down.weight"),
+            "expert_dims": gd, "num_experts": gd[2] if gd else None, "top_k": ctx.key("expert_used_count"),
+            "gating_func": ctx.key("expert_gating_func"), "weights_scale": ctx.key("expert_weights_scale"),
+            "weights_norm": ctx.key("expert_weights_norm"), "e_score_bias": ctx.has(i, "exp_probs_b.bias"),
+            "clamp": clamp[i] if i < len(clamp) else None, "clamp_routed_only": bool(ctx.feats.get("clamp_routed_only")),
+            "shared_dims": sh}
+
+
+register(Block(
+    "latent_moe", "ffn", step="step 5",
+    select=lambda ctx, i: ctx.has(i, "ffn_routed_down.weight") and ctx.has(i, "ffn_gate_exps.weight"),
+    config=_latent_layer, claims=_MOE_CLAIMS | {"ffn_routed_down.weight", "ffn_routed_up.weight", "exp_probs_b.bias"}, build=None))
+
+# sigmoid / sqrt-softplus router with a per-expert score bias on a plain MoE layer (glm5-next, deepseek41); predicate only
+register(Block(
+    "router_score_bias", "ffn_mod", step="step 5",
+    select=lambda ctx, i: ctx.has(i, "exp_probs_b.bias") and not ctx.has(i, "ffn_routed_down.weight"),
+    config=lambda ctx, i: {"gating_func": ctx.key("expert_gating_func"), "weights_scale": ctx.key("expert_weights_scale"),
+                           "vl_bias": ctx.has(i, "exp_probs_b_vl.bias")},
+    claims=frozenset({"exp_probs_b.bias", "exp_probs_b_vl.bias"}), build=None))
