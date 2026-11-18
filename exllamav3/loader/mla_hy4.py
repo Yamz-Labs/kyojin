@@ -6,6 +6,11 @@ from __future__ import annotations
 import importlib.util, os
 import torch
 from .engram_rows import load_dense, _dequant_q8_0, q8_0_roundtrip, rms
+from . import ref_fused as _rf
+
+PF_ATTN = os.environ.get("HY4_PREFILL_ATTN", "0") in ("1", "flash")
+PF_ATTN_FLASH = os.environ.get("HY4_PREFILL_ATTN", "0") == "flash"       # 1 = prefill rows (T > PF_ATTN_MIN): flash-style MLA kernel (prefill_attn.py)
+PF_ATTN_MIN = 16
 
 
 def _sinks_mod():
@@ -26,8 +31,8 @@ def _dense3(g, name, h):
 def rope_norm(x: torch.Tensor, pos: torch.Tensor, base: float) -> torch.Tensor:
     """ggml_rope_ext mode NORM (consecutive pairs), n_dims = x.shape[-1], no scaling / yarn: x [T, ..., P], pos [T]"""
     P = x.shape[-1]
-    th = pos.double()[:, None] * (base ** (-2.0 * torch.arange(P // 2, dtype=torch.float64) / P))[None, :]   # [T, P/2]
-    c, s = th.cos().float(), th.sin().float()
+    th = pos.double()[:, None] * (base ** (-2.0 * torch.arange(P // 2, dtype=torch.float64, device=pos.device) / P))[None, :]   # [T, P/2]
+    c, s = th.cos().float().to(x.device), th.sin().float().to(x.device)
     shp = (x.shape[0],) + (1,) * (x.dim() - 2) + (P // 2,)
     c, s = c.view(shp), s.view(shp)
     x0, x1 = x[..., 0::2], x[..., 1::2]
@@ -39,11 +44,12 @@ def rope_norm(x: torch.Tensor, pos: torch.Tensor, base: float) -> torch.Tensor:
 class Hy4MLA:
     """One attention layer: cur [T, n_embd] (normed collapsed stream) -> kqv / gated / out, with a K cache the caller keeps."""
 
-    def __init__(self, g, layer: int, q8_act: bool = False, f16_kv: bool = False):
+    def __init__(self, g, layer: int, q8_act: bool = False, f16_kv: bool = False, lin=None):
         m = g.meta
         p = m["general.architecture"] + "."
         b = f"blk.{layer}."
         self.layer, self.q8_act, self.f16_kv = layer, q8_act, f16_kv
+        lin = lin or (lambda n: load_dense(g, n))        # lin(name) -> fp32 [N, K] or a QLinear (stored bytes, hy4_forward.py)
         self.H = int(list(m[p + "attention.head_count"])[layer])
         self.hd, self.vd = m[p + "attention.key_length_mla"], m[p + "attention.value_length_mla"]
         self.rope_dim, self.R = m[p + "rope.dimension_count"], m[p + "attention.kv_lora_rank"]
@@ -54,17 +60,18 @@ class Hy4MLA:
         self.theta = float(m[p + ("rope.freq_base_swa" if self.swa else "rope.freq_base")])
         self.eps = float(m[p + "attention.layer_norm_rms_epsilon"])
         self.scale = 1.0 / float(self.hd) ** 0.5
-        self.wq_a, self.q_a_norm = load_dense(g, b + "attn_q_a.weight"), load_dense(g, b + "attn_q_a_norm.weight")
-        self.wq_b = load_dense(g, b + "attn_q_b.weight")
-        self.wkv_a, self.kv_a_norm = load_dense(g, b + "attn_kv_a_mqa.weight"), load_dense(g, b + "attn_kv_a_norm.weight")
+        self.wq_a, self.q_a_norm = lin(b + "attn_q_a.weight"), load_dense(g, b + "attn_q_a_norm.weight")
+        self.wq_b = lin(b + "attn_q_b.weight")
+        self.wkv_a, self.kv_a_norm = lin(b + "attn_kv_a_mqa.weight"), load_dense(g, b + "attn_kv_a_norm.weight")
         self.wk_b, self.wv_b = _dense3(g, b + "attn_k_b.weight", self.H), _dense3(g, b + "attn_v_b.weight", self.H)
-        self.wo, self.wgate = load_dense(g, b + "attn_output.weight"), load_dense(g, b + "attn_gate.weight")
+        self.wo, self.wgate = lin(b + "attn_output.weight"), lin(b + "attn_gate.weight")
         pn = b + POST_NORM
         self.post_norm = load_dense(g, pn) if pn in g.infos else None
         sk = b + "attn_sinks.weight"
         self.sinks = load_dense(g, sk) if sk in g.infos else None
         self.S = _sinks_mod()
 
+    tm = type("_NoTm", (), {"t": staticmethod(lambda n: __import__("contextlib").nullcontext())})()      # replaced by Hy4Forward._Tm
     q8_skip: tuple = ()          # matmul tags (wq_a wq_b wkv_a kb vb wgate wo) whose activation is NOT quantised (diagnostics)
     f16_parts: tuple = ("q", "k")
 
@@ -73,6 +80,16 @@ class Hy4MLA:
 
     def _h(self, x, part="k"):
         return x.half().float() if self.f16_kv and part in self.f16_parts else x
+
+    def _w16(self, name):
+        c = self.__dict__.setdefault("_w16c", {})
+        if name not in c:
+            c[name] = getattr(self, name).clamp(-65504.0, 65504.0).half().contiguous()
+        return c[name]
+
+    @staticmethod
+    def _f16(x):
+        return x.clamp(-65504.0, 65504.0).half()
 
     def kv(self, cur, pos):
         """cur [T, n_embd], pos [T] -> K cache rows [T, R + rope] = [rms(kv_a)*w | rope(k_pe)] (V is the first R columns)"""
@@ -87,16 +104,33 @@ class Hy4MLA:
         qr = rms(self._q(cur, "wq_a") @ self.wq_a.T, self.eps) * self.q_a_norm
         q = (self._q(qr, "wq_b") @ self.wq_b.T).view(T, H, self.hd)
         qn, qp = q[..., :self.nope], rope_norm(q[..., self.nope:].contiguous(), pos, self.theta)
-        qlat = torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
+        if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:       # prefill rows: fp16 batched GEMM over heads (fp32 einsum is ~3x slower)
+            qlat = torch.bmm(self._w16("wk_b"), self._f16(qn).permute(1, 2, 0)).permute(2, 0, 1).float()
+        else:
+            qlat = torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
         return self._h(qlat, "q"), self._h(qp, "q")
 
-    def attend(self, cur, pos, kcache, kpos):
+    def attend(self, cur, pos, kcache, kpos, allow=None):
         """cur [T, n_embd] at positions pos; kcache [N, R+rope] at kpos (includes the T new rows). -> (kqv, gated, out)"""
         T, H = cur.shape[0], self.H
-        qlat, qpe = self.q(cur, pos)
-        o = self.S.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window)
-        kqv = torch.einsum("hdr,thr->thd", self.wv_b, self._q(o, "vb")).reshape(T, H * self.vd)
-        gated, out = self.gate_out(cur, kqv)
+        tm = self.tm
+        with tm.t("attn proj"):
+            qlat, qpe = self.q(cur, pos)
+        with tm.t("MLA core + sinks"):
+            if PF_ATTN and T > PF_ATTN_MIN and qlat.is_cuda and getattr(self, "kpos_arange", False):
+                from . import prefill_attn as _pa     # prefill rows: flash-style kernel, keys visited only inside the window / causal range
+                o = (_pa.mla_flash if PF_ATTN_FLASH else _pa.mla_banded)(qlat, qpe, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow)
+            elif _rf.ENABLED:       # HY4_REF_FUSED=1: one online-softmax kernel (sinks / window / allow inside)
+                o = _rf.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window, allow,
+                                        kpos_is_arange=getattr(self, "kpos_arange", False))
+            else:
+                o = self.S.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window, allow)
+        with tm.t("attn proj"):
+            if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:
+                kqv = torch.bmm(self._w16("wv_b"), self._f16(o).permute(1, 2, 0)).permute(2, 0, 1).float().reshape(T, H * self.vd)
+            else:
+                kqv = torch.einsum("hdr,thr->thd", self.wv_b, self._q(o, "vb")).reshape(T, H * self.vd)
+            gated, out = self.gate_out(cur, kqv)
         return kqv, gated, out
 
     def gate_out(self, cur, kqv):
