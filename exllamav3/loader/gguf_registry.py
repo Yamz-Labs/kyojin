@@ -26,7 +26,7 @@ BASE_SLOTS = ("pre", "stream", "attn", "ffn")
 MOD_SLOTS = ("attn_mod", "ffn_mod", "layer_mod")
 GLOBAL_SLOTS = ("embed", "embed_mod", "head", "head_mod")
 CONFIG_ONLY = "config-only"      # build marker: the block feeds module configs, no module of its own
-BLOCK_MODULES = ("transformer", "attn", "mlp", "mla_attn", "hyperconnections", "engram", "mtp")
+BLOCK_MODULES = ("transformer", "attn", "mlp", "mla_attn", "indexer", "hyperconnections", "engram", "mtp")
 
 # Per-arch features llama.cpp hard-codes with no GGUF key. Every entry names the llama.cpp source it mirrors
 # (M = the model patch published with the model, else the llama.cpp file).
