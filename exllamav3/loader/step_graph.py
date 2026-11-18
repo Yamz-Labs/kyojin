@@ -208,6 +208,14 @@ class GraphDecoder:
                 indexer_static_init(fw._indexer_fused(i), self.cap)
         self.prepared = True
 
+    def clear(self):
+        """drop every captured graph (a flag changed) and start a fresh memory pool (a pool handle must not outlive its graphs)"""
+        self.graphs.clear()
+        self.pool = torch.cuda.graph_pool_handle()
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def reset(self):
         """new sequence: zero the static state (buffers keep their addresses so captured graphs stay valid)"""
         fw = self.fw
