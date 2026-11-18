@@ -127,6 +127,12 @@ def q8_share_end() -> None:
     _Q8S["key"] = None
 
 
+# EXL3_LEGACY_PREFILL_DQ (default 0, CUDA only, read at call time): Q4_0 / Q5_0 weights at rows > 1 dequantize with ONE Triton launch into a per-call fp16 tensor
+# (freed after the matmul, nothing resident) instead of the ~15 torch ops of gap_formats.dequant. Output bit-identical. Q5_1 already has its own Triton dequant.
+def _legacy_dq_on() -> bool:
+    return os.environ.get("EXL3_LEGACY_PREFILL_DQ", "0") == "1" and bool(torch.version.cuda) and not torch.version.hip
+
+
 _DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}
 if os.environ.get("BOLT_FQ_DEQ_Q3K", "1") != "0":   # CUDA and HIP
     _DEQ_IQ_ID["q3_k"] = 10   # native Q3_K dequant (prefill dequant + GEMM; the torch gap_dequant is ~2.5x slower at 8K)   # fq_dequant_iq format ids (the others have native dequants already)
@@ -253,6 +259,10 @@ class ForeignLinear(Module):
             out = torch.empty((count, self.in_features), dtype=torch.float16, device=dev)
             ext.fq_dequant_iq(self.packed[first:first + count].reshape(count, -1).contiguous(), out, _DEQ_IQ_ID[self.format])
             return out
+        if self.format in ("q4_0", "q5_0") and _legacy_dq_on() and self.packed.is_cuda:
+            from ..foreign_quant import legacy_dq
+            if legacy_dq.HAVE_TRITON:
+                return legacy_dq.dequant(self.format, self.packed[first:first + count])
         if self.format in _GAP_FORMATS:
             return gap_dequant(self.format, self.packed[first:first + count])
         if self.format in _KQ_FORMATS:
