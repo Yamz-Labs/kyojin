@@ -1070,3 +1070,52 @@ class HyperHead(Module):
         mixes = F.linear(flat, self.fn)
         pre = torch.sigmoid(mixes * self.scale + self.base) + self.hc_eps
         return (pre.unsqueeze(-1) * x).sum(dim = 2)
+
+
+class HyperConnectionPP(HyperConnection):
+    """Pre/post-only HC site (hy_v4_flash, llama.cpp build_hc_pre / build_hc_post): fn is (2H, H * hidden), scale 2 scalars,
+    base 2H. No comb block, no Sinkhorn: comb is the identity, so apply_ gives stream_i + post_i * y.
+        mixes = fn @ rms(flat streams, rms_norm_eps)            (rms is weightless)
+        pre   = sigmoid(mixes[:H]  * scale[0] + base[:H]) + hc_eps          collapsed = sum_i pre_i * stream_i
+        post  = magnitude * sigmoid(mixes[H:] * scale[1] + base[H:]) + hc_eps
+    Differs from the Sinkhorn mHC in: 2H rows instead of (2 + H) * H, post gets + hc_eps, magnitude is a parameter (2.0 there).
+    The fused ext.hc_mix kernels assume the (2 + H) * H layout, so every path here is torch (device agnostic)."""
+
+    def __init__(self, config, key: str, hc_mult: int, hidden_size: int, hc_eps: float, rms_norm_eps: float,
+                 magnitude: float = 2.0):
+        super().__init__(config = config, key = key, hc_mult = hc_mult, hidden_size = hidden_size,
+                         sinkhorn_iters = 0, hc_eps = hc_eps, rms_norm_eps = rms_norm_eps)
+        self.magnitude = magnitude
+
+    @override
+    def weights_numel(self):
+        h = self.hc_mult
+        return 2 * h * (h * self.hidden_size + 1) + 2
+
+    def gates(self, streams: torch.Tensor):
+        """streams (b, s, H, D) fp32 -> (pre (b,s,H), post (b,s,H))"""
+        H = self.hc_mult
+        flat = streams.flatten(2)
+        flat = flat * torch.rsqrt(flat.pow(2).mean(-1, keepdim = True) + self.rms_eps)
+        pre_w, post_w = F.linear(flat, self.fn).split([H, H], dim = -1)
+        pre_b, post_b = self.base.split([H, H])
+        pre_s, post_s = self.scale.unbind(0)
+        pre = torch.sigmoid(pre_w * pre_s + pre_b) + self.hc_eps
+        post = self.magnitude * torch.sigmoid(post_w * post_s + post_b) + self.hc_eps
+        return pre, post
+
+    @override
+    def mix(self, streams: torch.Tensor, params: dict, pending = None):
+        """streams (b, s, H, D) fp32 -> (post (b,s,H), comb = identity (b,s,H,H), collapsed (b,s,D) fp32)"""
+        if pending is not None:
+            HyperConnection.flush_pending(streams, pending)
+        b, s, H, D = streams.shape
+        pre, post = self.gates(streams)
+        comb = torch.eye(H, dtype = torch.float, device = streams.device).expand(b, s, H, H).contiguous()
+        return post, comb, (pre.unsqueeze(-1) * streams).sum(dim = 2)
+
+    @override
+    def mix_norm(self, streams: torch.Tensor, params: dict, norm, pending = None):
+        if pending is not None:
+            HyperConnection.flush_pending(streams, pending)
+        return None      # no fused mix_norm kernel for the 2H layout: the caller takes mix() + norm

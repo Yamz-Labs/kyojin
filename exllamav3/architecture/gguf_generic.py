@@ -77,6 +77,9 @@ def name_map_generic(cfg: dict, plan=None) -> dict:
     for slot in ("embed", "head"):
         b = REGISTRY[plan.glob[slot]]
         nm.update(b.names(cfg, None, None, None))
+    for bn in plan.glob["head_mod"]:
+        if REGISTRY[bn].names is not None:
+            nm.update(REGISTRY[bn].names(cfg, None, None, None))
     for i in range(cfg["num_hidden_layers"]):
         L, G = f"model.layers.{i}", f"blk.{i}"
         for bn in plan.blocks_at(i):
@@ -105,11 +108,11 @@ def _fl(config, eng_key: str, i: int, o: int, out_dtype=None, bias=False, **kw):
     gname = config.gguf.name_map[eng_key + ".weight"]
     base = re.sub(r"\.e\d+(\.weight)$", r"\1", gname) if "_exps.e" in gname else gname
     fmt = config.gguf_formats[base]
+    if fmt == "f8_e4m3":
+        raise GenericUnsupported(f"{base}: ggml F8_E4M3 (type 43) is a row-lookup-only type (loader/engram_rows.F8Rows), not a Linear")
     if fmt == "fp" or fmt.startswith("unk"):
         raise GenericUnsupported(f"{base}: ggml type {fmt!r} has no ForeignLinear format (add it to GGML_FMT)")
     if bias:
-    if fmt == "f8_e4m3":
-        raise GenericUnsupported(f"{base}: ggml F8_E4M3 (type 43) is a row-lookup-only type (loader/engram_rows.F8Rows), not a Linear")
         # Linear.load_gguf_ builds the ForeignLinear on the stored blocks and loads <key>.bias into _ForeignInner (inner.bias / inner.fl,
         # what the grouped MXFP4 MoE path and Attention read). pad_to=1: the GGUF payload is not padded to 128 (gpt-oss 2880).
         from ..modules.linear import Linear
@@ -238,6 +241,9 @@ class GGUFGenericModel(Model):
             mlp = _built(lp["ffn"]).build(config, plan, idx, L)
             self.modules += [_built(lp["stream"]).build(config, plan, idx, L, attn, mlp)]
         self.last_kv_module_idx = len(self.modules) - 1
+        for bn in plan.glob["head_mod"]:      # global head modifiers (the HC stream collapse) run before the final norm
+            if _built(bn).build is not CONFIG_ONLY:
+                self.modules += _built(bn).build(config, P)
         self.modules += _built(plan.glob["head"]).build(config, P)
         self.logit_layer_idx = len(self.modules) - 1
 
