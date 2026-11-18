@@ -22,6 +22,9 @@ def _sinks_mod():
 def _dense3(g, name, h):
     """GGUF 3-D Q8_0 tensor (ne0, ne1, h) -> [h, ne1, ne0] fp32 (ggml_mul_mat(w, x): out[h, j] = sum_k w[h, j, k] x[k])"""
     ty, dims, off = g.infos[name]
+    if ty == 30:      # BF16 (the MTP block): stored [ne2][ne1][ne0] row-major
+        raw = g._pread(off, dims[0] * dims[1] * dims[2] * 2)
+        return torch.from_numpy(raw.copy()).view(torch.bfloat16).float().reshape(h, dims[1], dims[0])
     assert ty == 8 and dims[2] == h, (name, ty, dims)
     return _dequant_q8_0(g._pread(off, dims[1] * dims[2] * (dims[0] // 32) * 34), dims[0], dims[1] * dims[2]).view(h, dims[1], dims[0])
 

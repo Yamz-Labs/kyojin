@@ -635,6 +635,7 @@ class Hy4Forward:
             col = (xl * pre[:, :, None]).sum(1)
             self._hk("hc_head", -1, col)
             h = rms(col, self.eps) * self.out_norm
+        self._h = h           # the trunk state the output head reads (MTP draft input)
         if self.head_cpu:
             h = h.cpu()
         out = head_gemm(h.float(), self.out_w)

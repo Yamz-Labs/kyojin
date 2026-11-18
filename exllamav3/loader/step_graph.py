@@ -252,7 +252,7 @@ class GraphDecoder:
             lg = fw._head(x, False)
         finally:
             fw._ns_dev = False
-        return lg, torch.argmax(lg), x
+        return lg, torch.argmax(lg), x, fw._h
 
     def _graph(self, Nb):
         g = self.graphs.get(Nb)
@@ -317,6 +317,7 @@ class GraphDecoder:
         cg, _out = self._graph(Nb)
         lg = _out[0]
         self.x_out = _out[2]
+        fw._h = _out[3]
         cg.replay()
         self.ev.record()
         self.ev_set = True
