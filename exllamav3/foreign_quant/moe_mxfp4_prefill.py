@@ -22,6 +22,8 @@ import os
 import numpy as np
 import torch
 
+from .gguf_fast import flag
+
 try:
     import triton
     import triton.language as tl
@@ -36,7 +38,7 @@ FIRES = 0                                                               # python
 
 def flag_on() -> bool:
     """EXL3_MXFP4_PREFILL_GROUPED=1 on CUDA (not HIP). Read at call time."""
-    return os.environ.get("EXL3_MXFP4_PREFILL_GROUPED", "0") == "1" and bool(torch.version.cuda) and not torch.version.hip
+    return flag("EXL3_MXFP4_PREFILL_GROUPED") and bool(torch.version.cuda) and not torch.version.hip
 
 
 def use_prefill(rows: int, decode_max_rows: int) -> bool:

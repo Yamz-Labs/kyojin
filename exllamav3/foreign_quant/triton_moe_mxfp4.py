@@ -12,6 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
+from .gguf_fast import flag
 from .triton_gap import _fp4half
 
 # Strix sweep 11/11: BN 16 101 -> BN 32 115 GB/s, served gpt-oss 24.4 -> 25.7 tok/s
@@ -51,7 +52,7 @@ MMVQ_FIRES = 0     # python-level count of EXL3_FQ_MMVQ_MXFP4 branch calls (eage
 
 def mmvq_mxfp4() -> bool:
     """EXL3_FQ_MMVQ_MXFP4=1 on CUDA (not HIP): llama.cpp-style MXFP4 mmvq decode MoE (fq_mxfp4_moe_gu / fq_mxfp4_moe_down). Read at call time."""
-    return os.environ.get("EXL3_FQ_MMVQ_MXFP4", "0") == "1" and bool(torch.version.cuda) and not torch.version.hip
+    return flag("EXL3_FQ_MMVQ_MXFP4") and bool(torch.version.cuda) and not torch.version.hip
 
 
 def moe_gemv(x: torch.Tensor, wtab: torch.Tensor, btab: torch.Tensor | None, sel: torch.Tensor, N: int, K: int, xdiv: int) -> torch.Tensor:
@@ -66,7 +67,7 @@ def moe_gemv(x: torch.Tensor, wtab: torch.Tensor, btab: torch.Tensor | None, sel
 
 def tuned() -> bool:
     """EXL3_MXFP4_MOE_TUNED=1 on CUDA (not HIP): fused gate+up launch + BN16/NW4 grids. Read at call time."""
-    return os.environ.get("EXL3_MXFP4_MOE_TUNED", "0") == "1" and not torch.version.hip
+    return flag("EXL3_MXFP4_MOE_TUNED") and not torch.version.hip
 
 
 TUNED_BN = 16

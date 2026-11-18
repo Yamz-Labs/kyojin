@@ -90,7 +90,7 @@ def test_dispatch(flag, monkeypatch):
         fq_mmvq_epi_abi=lambda: 1)
     ext.fq_mmvq_q5_0 = lambda qb, p, out, bias=None: (out.zero_(), log.append(("mmvq", bias is not None)))[1]
     monkeypatch.setattr(fl, "ext", ext)
-    monkeypatch.setattr(fl, "_MMVQ_LEGACY", True)
+    monkeypatch.setenv("EXL3_FQ_MMVQ_LEGACY", "1")      # read at call time
     monkeypatch.setitem(fl._MMVQ_FN, "q5_0", "fq_mmvq_q5_0")
     monkeypatch.setitem(fl._MMVQ_QK, "q5_0", 32)
     FB = _FakeCudaBias(8)
