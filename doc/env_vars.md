@@ -710,10 +710,9 @@ Enable GPU/CPU handoff profiling, for debug purposes.
 ### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
 
 Use expandable segments for all Torch allocations. Opt out with a value of `0` or by explicitly
-setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`. On a unified-memory box,
-disabling expandable segments can recover about **0.5 GiB** of allocator fragmentation around a
-large cache (a measured 512K GLM cache loads with it off but failed with the default); it does
-not add capacity. Set it in the lane profile before `import exllamav3` for that case.
+setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`. On a unified-memory box, disabling
+expandable segments can recover about **0.5 GiB** of allocator fragmentation around a large cache;
+it does not add capacity. Set it in the lane profile before `import exllamav3` for that case.
 
 ### `KYOJIN_OOM_GUARD` (default: `auto`)
 
