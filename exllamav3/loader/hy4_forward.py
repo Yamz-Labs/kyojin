@@ -28,7 +28,6 @@ from .engram_rows import F8Rows, Hy4Engram, load_dense, _dequant_q8_0, rms
 from .mla_hy4 import Hy4MLA
 from . import ref_fused as _rf
 from . import step_nosync as _ns
-from . import q8_soa as _SOA
 from . import mla_bgemv as _BGM
 from . import head_bf16 as _HB
 from . import attn_eager as _AE
@@ -180,27 +179,19 @@ class QLinear:
     def __init__(self, packed, ty, spec, gemv, stats=None):
         self.packed, self.ty, self.spec, self.gemv, self.stats = packed, int(ty), spec, gemv, stats
         self.shape = (packed.shape[0], packed.shape[1] * spec[0])
-        self.soa = None
-        if _SOA.ENABLED and isinstance(packed, torch.Tensor) and packed.is_cuda and spec[2] == "fq_gemv_q8_0":    # HY4_Q8_SOA=1: repack, free the stored bytes
-            self.soa = _SOA.Q8Soa(packed)
-            self.packed = _SOA.Meta(packed.shape, packed.device)
 
     @property
     def T(self):
         return _QT(self)
 
     def dense(self):
-        return self.soa.dense() if self.soa is not None else self.spec[3](self.packed)
+        return self.spec[3](self.packed)
 
     def __call__(self, x):
         K, N = self.shape[1], self.shape[0]
         lead = x.shape[:-1]
         x2 = x.reshape(-1, K)
-        if self.soa is not None and x2.shape[0] == 1:
-            out = self.soa.mv(x2.float().contiguous())
-            if self.stats is not None:
-                self.stats["dense_soa"] = self.stats.get("dense_soa", 0) + 1
-        elif x2.shape[0] <= DENSE_MAXR and self.gemv is not None and self.soa is None:
+        if x2.shape[0] <= DENSE_MAXR and self.gemv is not None:
             xf = x2.float().contiguous()
             out = torch.empty(xf.shape[0], N, dtype=torch.float32, device=x.device)
             self.gemv(xf, self.packed, out)
@@ -409,11 +400,21 @@ class Hy4Forward:
         L.attn_norm, L.ffn_norm, L.post_ffw = (load_dense(g, b + n).to(dev) for n in ("attn_norm.weight", "ffn_norm.weight", "post_ffw_norm.weight"))
         if i < self.n_dense:
             L.dense = [self._w(f"{b}ffn_{n}.weight") for n in ("gate", "up", "down")]
+            if os.environ.get("HY4_FFN_GROUPED", "0") == "1":
+                from .attn_grouped import group_linears
+                v = group_linears(L.dense[:2])
+                if v is not None:
+                    L.dense[:2] = v
         else:
             L.router = g.get_tensor(b + "ffn_gate_inp.weight").float().to(dev)
             L.rbias = g.get_tensor(b + "exp_probs_b.bias").float().to(dev)
             L.rdown, L.rup = self._w(b + "ffn_routed_down.weight"), self._w(b + "ffn_routed_up.weight")
             L.shexp = [self._w(f"{b}ffn_{n}_shexp.weight") for n in ("gate", "up", "down")]
+            if os.environ.get("HY4_FFN_GROUPED", "0") == "1":
+                from .attn_grouped import group_linears
+                v = group_linears([L.rdown, L.shexp[0], L.shexp[1]])
+                if v is not None:
+                    L.rdown, L.shexp[0], L.shexp[1] = v
             L.ety = g.infos[b + "ffn_gate_exps.weight"][0]
             L.ety_down = g.infos[b + "ffn_down_exps.weight"][0]
         L.ix = bool(self.use_indexer and self.idx_types[i] and not self.swa[i] and (b + "indexer.attn_k.weight") in g.infos)

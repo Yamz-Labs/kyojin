@@ -10,7 +10,6 @@ from __future__ import annotations
 import torch
 
 from .hy4_forward import QLinear, DENSE_MAXR
-from . import q8_soa as _SOA
 
 # attribute names of the MLA object that read the layer input `cur` (wq_a, wkv_a, wgate); keyed by role, not by model
 INPUT_SHARED = ("wq_a", "wkv_a", "wgate")
@@ -21,8 +20,7 @@ class _Group:
         self.sizes = [q.shape[0] for q in lins]
         self.offs = [sum(self.sizes[:i]) for i in range(len(lins))]
         self.K, self.gemv, self.stats = lins[0].shape[1], lins[0].gemv, lins[0].stats
-        self.soa = _SOA.Q8Soa.cat([q.soa for q in lins]) if all(getattr(q, "soa", None) is not None for q in lins) else None
-        self.packed = torch.cat([q.packed for q in lins], 0) if self.soa is None else _SOA.Meta((sum(self.sizes),) + tuple(lins[0].packed.shape[1:]), lins[0].packed.device)
+        self.packed = torch.cat([q.packed for q in lins], 0)
         self.ref = None                       # (x, x._version, outs)
 
     def run(self, x):
@@ -31,11 +29,8 @@ class _Group:
             return r[2]
         x2 = x.reshape(-1, self.K)
         xf = x2.float().contiguous()
-        if self.soa is not None:
-            out = self.soa.mv(xf) if xf.shape[0] == 1 else xf @ self.soa.dense().T
-        else:
-            out = torch.empty(xf.shape[0], sum(self.sizes), dtype=torch.float32, device=x.device)
-            self.gemv(xf, self.packed, out)
+        out = torch.empty(xf.shape[0], sum(self.sizes), dtype=torch.float32, device=x.device)
+        self.gemv(xf, self.packed, out)
         if self.stats is not None:
             self.stats["dense_gemv"] = self.stats.get("dense_gemv", 0) + 1
             self.stats["attn_grouped_calls"] = self.stats.get("attn_grouped_calls", 0) + 1
@@ -59,8 +54,6 @@ class GroupedView(QLinear):
     def __init__(self, lin, group, idx, packed_view):
         super().__init__(packed_view, lin.ty, lin.spec, lin.gemv, lin.stats)
         self.group, self.idx, self.orig_call = group, idx, QLinear.__call__
-        if group.soa is not None:
-            self.soa = group.soa.slice(group.offs[idx], group.sizes[idx])
 
     @property
     def T(self):
