@@ -725,3 +725,52 @@ void fq_dequant_iq(torch::Tensor packed, torch::Tensor out, int64_t fmt)
         default: TORCH_CHECK(false, "fq_dequant_iq: bad format id ", fmt);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------------
+// EXL3_MOE_FOLD_FUSED: out[n] = sum_s (d[s, n] * float(rw[s])) in ONE launch, replacing routing_weights.float(), the broadcast multiply,
+// .sum(1) and the final .to(out_dtype). Order = torch's CUDA reduce for a size-S non-fastest dim (Reduce.cuh thread_reduce_impl, no warp split:
+// ((0+v0)+v1)+v2)+v3, one rounded fp32 multiply then one rounded add, no FMA), so the fp32 result is bit-identical to the torch chain.
+// ---------------------------------------------------------------------------------------------------------------------------------
+template <typename RW> __device__ __forceinline__ float fold_to_f(RW v);
+template <> __device__ __forceinline__ float fold_to_f<float>(float v) { return v; }
+template <> __device__ __forceinline__ float fold_to_f<__half>(__half v) { return __half2float(v); }
+
+template <typename RW, typename OUT>
+__global__ void fq_moe_fold_kernel(const float* __restrict__ d, const RW* __restrict__ rw, OUT* __restrict__ out, int S, int64_t N, int H)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= H) return;
+    float acc = 0.0f;
+    for (int s = 0; s < S; ++s)
+        acc = __fadd_rn(acc, __fmul_rn(d[(int64_t)s * N + n], fold_to_f<RW>(rw[s])));
+    mq_store<OUT>(&out[n], acc);
+}
+
+void fq_moe_fold(torch::Tensor d, torch::Tensor rw, torch::Tensor out)
+{
+    TORCH_CHECK(d.is_cuda() && rw.is_cuda() && out.is_cuda(), "tensors must be CUDA");
+    TORCH_CHECK(d.is_contiguous() && rw.is_contiguous() && out.is_contiguous(), "tensors must be contiguous");
+    TORCH_CHECK(d.dtype() == torch::kFloat && d.dim() == 2, "d must be float [S, N]");
+    TORCH_CHECK(rw.dtype() == torch::kHalf || rw.dtype() == torch::kFloat, "rw must be half or float");
+    TORCH_CHECK(out.dtype() == torch::kHalf || out.dtype() == torch::kFloat, "out must be half or float");
+    const int S = (int)d.size(0);
+    const int64_t N = d.size(1);
+    const int H = (int)out.numel();
+    TORCH_CHECK(rw.numel() == S && H <= N, "shape mismatch");
+    at::cuda::CUDAGuard guard(d.device());
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    const int blocks = (H + 127) / 128;
+    const float* dp = d.data_ptr<float>();
+    if (rw.dtype() == torch::kHalf)
+    {
+        const __half* r = reinterpret_cast<const __half*>(rw.data_ptr<at::Half>());
+        if (out.dtype() == torch::kHalf) fq_moe_fold_kernel<__half, __half><<<blocks, 128, 0, stream>>>(dp, r, reinterpret_cast<__half*>(out.data_ptr<at::Half>()), S, N, H);
+        else fq_moe_fold_kernel<__half, float><<<blocks, 128, 0, stream>>>(dp, r, out.data_ptr<float>(), S, N, H);
+    }
+    else
+    {
+        const float* r = rw.data_ptr<float>();
+        if (out.dtype() == torch::kHalf) fq_moe_fold_kernel<float, __half><<<blocks, 128, 0, stream>>>(dp, r, reinterpret_cast<__half*>(out.data_ptr<at::Half>()), S, N, H);
+        else fq_moe_fold_kernel<float, float><<<blocks, 128, 0, stream>>>(dp, r, out.data_ptr<float>(), S, N, H);
+    }
+}

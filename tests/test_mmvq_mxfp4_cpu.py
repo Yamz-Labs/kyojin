@@ -78,7 +78,7 @@ def _mlp_methods():
     fns = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in want]
     assert len(fns) == 2
     mod = ast.Module(body=fns, type_ignores=[])
-    ns = {"torch": torch, "FQ_GROUPED_MAX_ROWS": 8, "ext": None, "__name__": "exllamav3.modules.block_sparse_mlp"}
+    ns = {"os": os, "torch": torch, "FQ_GROUPED_MAX_ROWS": 8, "ext": None, "__name__": "exllamav3.modules.block_sparse_mlp"}
     exec(compile(ast.fix_missing_locations(mod), "block_sparse_mlp.py", "exec"), ns)
     return ns
 

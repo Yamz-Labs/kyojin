@@ -1917,6 +1917,23 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         d = torch.empty((S, N), dtype=torch.float32, device=h.device)
         ext.fq_mxfp4_moe_down(qa, sel, dw, db if db is not None else dw[:0], d, N, I)
         MX.MMVQ_FIRES += 1
+        # EXL3_MOE_FOLD_FUSED=1 (CUDA, read at call time): routing_weights.float(), the multiply, .sum(1) and the final .to(out_dtype) in ONE kernel
+        # (fq_moe_fold: sequential fp32 sum over the S slots = torch's reduce order for a size-S non-fastest dim, bit-identical). With a shared expert
+        # the kernel writes fp32 and the rest is unchanged; out_dtype other than half / float falls back to the torch chain.
+        _rw = routing_weights.reshape(-1)
+        if (os.environ.get("EXL3_MOE_FOLD_FUSED", "0") == "1" and torch.version.cuda and not torch.version.hip and hasattr(ext, "fq_moe_fold")
+                and _rw.numel() == S and _rw.dtype in (torch.half, torch.float) and d.is_contiguous() and d.dtype == torch.float32 and H <= d.shape[1]
+                and out_dtype in (None, torch.half, torch.float) and x.numel() == H):
+            direct = self.shared_experts is None
+            routed = torch.empty((1, H), dtype=(out_dtype or torch.float32) if direct else torch.float32, device=d.device)
+            ext.fq_moe_fold(d, _rw.contiguous(), routed)
+            final_hidden_states = routed.view(x.shape)
+            if not direct:
+                se = self.shared_experts.forward(x, params)
+                final_hidden_states = final_hidden_states + se.to(torch.float).view(final_hidden_states.shape)
+                if out_dtype is not None:
+                    final_hidden_states = final_hidden_states.to(out_dtype)
+            return final_hidden_states
         routed = (d.view(1, S, -1)[..., :H] * routing_weights.reshape(1, S, 1).float()).sum(1)
         final_hidden_states = routed.view(x.shape)
         if self.shared_experts is not None:

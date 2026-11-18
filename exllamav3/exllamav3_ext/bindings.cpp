@@ -619,6 +619,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fq_mlp_shared_iq2xxs", &fq_mlp_shared_iq2xxs, "fq_mlp_shared_iq2xxs",
           py::arg("x"), py::arg("up_packed"), py::arg("h"));
 #endif
+    m.def("fq_moe_fold", &fq_moe_fold, "fq_moe_fold", py::arg("d"), py::arg("rw"), py::arg("out"));
     m.def("fq_mmvq_epi_abi", &fq_mmvq_epi_abi, "fq_mmvq_epi_abi");
     m.def("fq_q8_scratch", &fq_q8_scratch, "fq_q8_scratch",
           py::arg("dev"), py::arg("M"), py::arg("K"));

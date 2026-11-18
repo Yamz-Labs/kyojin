@@ -39,3 +39,6 @@ bool fq_mmq_few(torch::Tensor x, torch::Tensor scratch, torch::Tensor packed, to
 
 // ABI marker: the fq_mmvq_* functions above take an optional half bias applied in the store (EXL3_FQ_MMVQ_EPI).
 inline int fq_mmvq_epi_abi() { return 1; }
+
+// EXL3_MOE_FOLD_FUSED: out[H] (half or float) = sum over the S slots of d[s, :H] * float(rw[s]), torch's reduce order (fq_mmvq.cu).
+void fq_moe_fold(torch::Tensor d, torch::Tensor rw, torch::Tensor out);
