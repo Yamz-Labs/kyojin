@@ -23,6 +23,7 @@ from . import step_nosync as _ns
 from .engram_rows import QB, E4M3, E8M0
 
 BUCKET = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
+TM = int(os.environ.get("HY4_GRAPH_TM", "8"))          # max rows of one graph step (verify rows)
 MASK64 = (1 << 64) - 1
 _POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("HY4_GRAPH_IO", "16")))
 
@@ -119,25 +120,33 @@ def engram_row_ids(e, tokens, p):
 # ---------------------------------------------------------------------------------------------------- static context seen by Hy4Forward.layer
 class _GS:
     def __init__(self, fw, cap):
-        self.fw, self.cap, self.Nb = fw, cap, 0
+        self.fw, self.cap, self.Nb, self.T = fw, cap, 0, 1
         dev = fw.dev
-        self.inp = torch.zeros(2, dtype=torch.long, device=dev)         # [token, position]
-        self.tok, self.pos = self.inp[0:1], self.inp[1:2]
+        self.inp = torch.zeros(2, TM, dtype=torch.long, device=dev)     # row 0 tokens, row 1 positions (first T columns used)
         self.ar = torch.arange(cap, device=dev)
         self.eng_raw = self.eng_valid = None
+
+    @property
+    def tok(self):
+        return self.inp[0, :self.T]
+
+    @property
+    def pos(self):
+        return self.inp[1, :self.T]
 
     # -- Engram: rows are staged on the host before the replay, decoded + applied inside the graph
     def engram(self, fw, i, x):
         e = fw.eng[i]
-        u = self.eng_raw[e.e]
+        T = self.T
+        u = self.eng_raw[e.e, :T]                                       # [T, n_cols, row_bytes]
         tab = e.table
         t4, t8 = _tabs(fw.dev)
         if tab.layout == "plain":
             rows = t4[u.long()]
         else:
             w = tab.width
-            rows = (t4[u[:, :w].long()].reshape(u.shape[0], -1, QB) * t8[u[:, w:].long()][:, :, None]).reshape(u.shape[0], w)
-        return e.apply(x, rows[None], self.eng_valid[e.e][None])
+            rows = (t4[u[..., :w].long()].reshape(T, u.shape[1], -1, QB) * t8[u[..., w:].long()][..., None]).reshape(T, u.shape[1], w)
+        return e.apply(x, rows, self.eng_valid[e.e, :T])
 
     def append_kv(self, i, kn):
         b = _ns.state(self.fw).kv[i]
@@ -154,7 +163,12 @@ class _GS:
         return b[:self.Nb]
 
     def indexer(self, fw, i, cur, qr, N):
-        return indexer_forward_static(fw._indexer_fused(i), cur, qr, self.pos, N, self.ar)
+        ix = fw._indexer_fused(i)
+        if self.T == 1:
+            return indexer_forward_static(ix, cur, qr, self.pos, N, self.ar)
+        # verify rows: positions in order, each row writes its pool / vg state before the next row selects (same state as T eager steps)
+        outs = [indexer_forward_static(ix, cur[r:r + 1], qr[r:r + 1], self.pos[r:r + 1], N, self.ar) for r in range(self.T)]
+        return None if outs[0] is None else torch.cat(outs, 0)
 
 
 _T = {}
@@ -177,7 +191,7 @@ class GraphDecoder:
         self.graphs, self.pool = {}, torch.cuda.graph_pool_handle()
         self.prepared = False
         self.expect_n = None
-        self.hin = torch.zeros(2, dtype=torch.long).pin_memory()
+        self.hin = torch.zeros(2, TM, dtype=torch.long).pin_memory()
         self.stats = {"captures": 0, "replays": 0}
         self.ev = torch.cuda.Event()
         self.ev_set = False
@@ -210,10 +224,10 @@ class GraphDecoder:
                 fw.eng[i] = Hy4EngramGPU(fw.g, i, fw.dev, table=fw.table, lin=None if os.environ.get("HY4_ENGRAM_GPU") == "2" else fw._lin)
         e0 = fw.eng[min(fw.ple)]
         nE, nc, rb = len(fw.ple), e0.n_cols, e0.table.row_bytes
-        gs.eng_raw = torch.zeros(nE, nc, rb, dtype=torch.uint8, device=fw.dev)
-        gs.eng_valid = torch.zeros(nE, nc, dtype=torch.float32, device=fw.dev)
-        self.rpin = torch.zeros(nE, nc, rb, dtype=torch.uint8).pin_memory()
-        self.vpin = torch.zeros(nE, nc, dtype=torch.float32).pin_memory()
+        gs.eng_raw = torch.zeros(nE, TM, nc, rb, dtype=torch.uint8, device=fw.dev)
+        gs.eng_valid = torch.zeros(nE, TM, nc, dtype=torch.float32, device=fw.dev)
+        self.rpin = torch.zeros(nE, TM, nc, rb, dtype=torch.uint8).pin_memory()
+        self.vpin = torch.zeros(nE, TM, nc, dtype=torch.float32).pin_memory()
         self.rnp = self.rpin.numpy()
         for i in range(fw.n_layers):
             if fw._layer(i).ix:
@@ -249,17 +263,17 @@ class GraphDecoder:
             x = fw.layer(i, x, gs.pos, None, 0)
         fw._ns_dev = True
         try:
-            lg = fw._head(x, False)
+            lg = fw._head(x, gs.T > 1)              # T > 1: logits of every row [T, V]
         finally:
             fw._ns_dev = False
-        return lg, torch.argmax(lg), x, fw._h
+        return lg, torch.argmax(lg, -1), x, fw._h
 
-    def _graph(self, Nb):
-        g = self.graphs.get(Nb)
+    def _graph(self, Nb, T=1):
+        g = self.graphs.get((Nb, T))
         if g is not None:
             return g
         fw, gs = self.fw, self.gs
-        gs.Nb = Nb
+        gs.Nb, gs.T = Nb, T
         fw._gs = gs
         try:
             s = torch.cuda.Stream()
@@ -274,54 +288,69 @@ class GraphDecoder:
                 out = self.body()
         finally:
             fw._gs = None
-        g = self.graphs[Nb] = (cg, out)
+        g = self.graphs[(Nb, T)] = (cg, out)
         self.stats["captures"] += 1
         return g
 
-    def stage(self, start):
-        """host side of one token: Engram hash + threaded pread of this token's rows into pinned staging, one H2D each"""
+    def stage(self, start, T=1):
+        """host side of T tokens: Engram hash + threaded pread of their rows into pinned staging, one H2D each (fw.tokens holds them at start .. start + T - 1)"""
         fw = self.fw
         jobs = []
         toks = fw.tokens
         for i in sorted(fw.ple):
             e = fw.eng[i]
-            ids, valid = engram_row_ids(e, toks, start)
-            self.vpin[e.e] = torch.tensor(valid)
-            jobs += [(e, c, r) for c, r in enumerate(ids)]
+            for t in range(T):
+                ids, valid = engram_row_ids(e, toks, start + t)
+                self.vpin[e.e, t] = torch.tensor(valid)
+                jobs += [(e, t, c, r) for c, r in enumerate(ids)]
         def rd(j):
-            e, c, r = j
-            self.rnp[e.e, c] = e.table.raw_row(r)
+            e, t, c, r = j
+            self.rnp[e.e, t, c] = e.table.raw_row(r)
         list(_POOL.map(rd, jobs))
         self.gs.eng_raw.copy_(self.rpin, non_blocking=True)
         self.gs.eng_valid.copy_(self.vpin, non_blocking=True)
 
     def step(self, tok):
         """append host token id `tok` at position fw.n; returns the DEVICE logits [V] of this position (valid until the next step)"""
+        return self.step_rows([int(tok)])[0]
+
+    def step_rows(self, toks):
+        """append T host token ids at positions fw.n .. fw.n + T - 1 in ONE graph replay (T = 1: a plain decode step). Returns (logits, argmax, x, h) as DEVICE
+        tensors (T = 1: logits [V], argmax scalar; T > 1: [T, V], [T]). fw.n / fw.tokens advance by T: a verifier that rejects rows rewinds them (K rows and
+        indexer state are written by position, so the rejected rows are simply overwritten by the next step)."""
         fw = self.fw
+        T = len(toks)
+        assert 1 <= T <= TM
         if not self.prepared:
             self.prepare()
         start = fw.n
-        assert start < self.cap, "context past the graph cap (HY4_NOSYNC_CAP)"
+        assert start + T <= self.cap, "context past the graph cap (HY4_NOSYNC_CAP)"
         if self.expect_n != start:            # an eager prefill / reset ran since the last graph step: refill the indexer vg rows from its state
             for i in range(fw.n_layers):
                 if fw._layer(i).ix:
                     indexer_static_init(fw._indexer_fused(i), self.cap)
         if self.ev_set:
             self.ev.synchronize()           # the previous replay has read the pinned staging buffers: safe to overwrite them
-        fw.tokens.append(int(tok))
-        Nb = min(self.cap, (start // BUCKET + 1) * BUCKET)
+        fw.tokens.extend(int(t) for t in toks)
+        Nb = min(self.cap, ((start + T - 1) // BUCKET + 1) * BUCKET)
         self.gs.Nb = Nb
-        self.hin[0], self.hin[1] = int(tok), start
+        self.hin[0, :T] = torch.tensor([int(t) for t in toks])
+        self.hin[1, :T] = torch.arange(start, start + T)
         self.gs.inp.copy_(self.hin, non_blocking=True)
-        self.stage(start)
-        cg, _out = self._graph(Nb)
-        lg = _out[0]
+        self.stage(start, T)
+        cg, _out = self._graph(Nb, T)
         self.x_out = _out[2]
         fw._h = _out[3]
         cg.replay()
         self.ev.record()
         self.ev_set = True
-        fw.n += 1
+        fw.n += T
         self.expect_n = fw.n
         self.stats["replays"] += 1
-        return lg
+        return _out[0], _out[1], _out[2], _out[3]
+
+    def rewind(self, n):
+        """verifier rejected rows: the sequence continues from position n (<= fw.n); stale K / indexer rows past n are overwritten by position"""
+        fw = self.fw
+        del fw.tokens[n:]
+        fw.n = self.expect_n = n

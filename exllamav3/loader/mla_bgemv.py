@@ -14,6 +14,7 @@ import triton.language as tl
 ENABLED = os.environ.get("HY4_MLA_BG", "0") == "1"
 BN = int(os.environ.get("HY4_BG_BN", "16"))
 BK = int(os.environ.get("HY4_BG_BK", "128"))
+MAXT = 8                                   # rows served by the batched kernels (verify rows)
 
 
 @triton.jit
@@ -35,6 +36,27 @@ def _k_bg(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, sxh, BN: tl.constexpr, BK: tl.co
     tl.store(o_ptr + h * N + rows, acc, mask=rm)
 
 
+@triton.jit
+def _k_bgt(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, sxt, sxh, T, BT: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """T rows (verify): each weight tile is read ONCE and applied to all T rows. out[t, h, n] = sum_k (q * d)[h, n, k] * x[t, h, k]"""
+    h = tl.program_id(0)
+    rows = tl.program_id(1) * BN + tl.arange(0, BN)
+    rm = rows < N
+    tt = tl.arange(0, BT)
+    tm = tt < T
+    acc = tl.zeros([BT, BN], dtype=tl.float32)
+    qrow = (h * N + rows)[:, None] * K
+    drow = (h * N + rows)[:, None] * NB
+    for k0 in range(0, K, BK):
+        cols = k0 + tl.arange(0, BK)
+        cm = cols < K
+        m2 = rm[:, None] & cm[None, :]
+        w = tl.load(q_ptr + qrow + cols[None, :], mask=m2, other=0).to(tl.float32) * tl.load(d_ptr + drow + (cols // 32)[None, :], mask=m2, other=0.0).to(tl.float32)
+        xv = tl.load(x_ptr + tt[:, None] * sxt + h * sxh + cols[None, :], mask=tm[:, None] & cm[None, :], other=0.0)
+        acc += tl.sum(w[None, :, :] * xv[:, None, :], axis=2)
+    tl.store(o_ptr + (tt[:, None] * (tl.num_programs(0) * N)) + h * N + rows[None, :], acc, mask=tm[:, None] & rm[None, :])
+
+
 class Q8Batched:
     """[H, N, K] Q8_0 matrix as int8 + fp16 scales on a device"""
 
@@ -45,7 +67,13 @@ class Q8Batched:
         self.H, self.N, self.K = H, N, K
 
     def mv(self, x):
-        """x [1, H, K] fp32 -> [1, H, N] fp32"""
+        """x [T, H, K] fp32 -> [T, H, N] fp32 (T == 1: the single-row kernel; T > 1: one kernel, weights read once)"""
+        if x.dim() == 3 and x.shape[0] > 1 and x.stride(-1) == 1:
+            T = x.shape[0]
+            out = torch.empty(T, self.H, self.N, dtype=torch.float32, device=x.device)
+            _k_bgt[(self.H, triton.cdiv(self.N, BN))](self.q, self.d, x, out, self.N, self.K, self.K // 32, x.stride(0), x.stride(1), T,
+                                                      BT=triton.next_power_of_2(T), BN=BN, BK=min(BK, 64), num_warps=4)
+            return out
         out = torch.empty(self.H, self.N, dtype=torch.float32, device=x.device)
         if x.dim() == 3 and x.shape[0] == 1 and x.stride(-1) == 1:       # [1, H, K] view with a head stride (e.g. the nope part of q): no copy
             xv, sxh = x, x.stride(1)

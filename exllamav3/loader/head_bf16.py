@@ -26,14 +26,36 @@ def _k_head(w_ptr, h_ptr, o_ptr, V, D, BV: tl.constexpr, BD: tl.constexpr):
     tl.store(o_ptr + rows, acc, mask=rm)
 
 
+@triton.jit
+def _k_headt(w_ptr, h_ptr, o_ptr, V, D, T, BT: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr):
+    """T rows (verify): each weight tile is read once and applied to all rows; out [T, V]"""
+    rows = tl.program_id(0) * BV + tl.arange(0, BV)
+    rm = rows < V
+    tt = tl.arange(0, BT)
+    tm = tt < T
+    acc = tl.zeros([BT, BV], dtype=tl.float32)
+    for d0 in range(0, D, BD):
+        cols = d0 + tl.arange(0, BD)
+        cm = cols < D
+        w = tl.load(w_ptr + rows[:, None] * D + cols[None, :], mask=rm[:, None] & cm[None, :], other=0.0).to(tl.float32)
+        hv = tl.load(h_ptr + tt[:, None] * D + cols[None, :], mask=tm[:, None] & cm[None, :], other=0.0)
+        acc += tl.sum(w[None, :, :] * hv[:, None, :], axis=2)
+    tl.store(o_ptr + tt[:, None] * V + rows[None, :], acc, mask=tm[:, None] & rm[None, :])
+
+
 def usable(h, W):
-    return ENABLED and h.shape[0] == 1 and W.dim() == 2 and W.is_contiguous() and h.dtype == torch.float32 and W.dtype in (torch.bfloat16, torch.float16, torch.float32) \
+    return ENABLED and 1 <= h.shape[0] <= 16 and W.dim() == 2 and W.is_contiguous() and h.dtype == torch.float32 and W.dtype in (torch.bfloat16, torch.float16, torch.float32) \
         and (W.is_cuda or os.environ.get("TRITON_INTERPRET", "0") == "1")
 
 
 def gemv(h, W):
-    """h [1, D] fp32, W [V, D] -> logits [1, V] fp32"""
+    """h [T, D] fp32 (T <= 16), W [V, D] -> logits [T, V] fp32"""
     V, D = W.shape
+    T = h.shape[0]
+    if T > 1:
+        out = torch.empty(T, V, dtype=torch.float32, device=W.device)
+        _k_headt[(triton.cdiv(V, BV),)](W, h.contiguous(), out, V, D, T, BT=triton.next_power_of_2(T), BV=BV, BD=min(BD, 128), num_warps=4)
+        return out
     out = torch.empty(1, V, dtype=torch.float32, device=W.device)
     _k_head[(triton.cdiv(V, BV),)](W, h.contiguous(), out, V, D, BV=BV, BD=BD, num_warps=4)
     return out

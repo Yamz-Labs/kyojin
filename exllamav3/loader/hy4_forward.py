@@ -567,7 +567,7 @@ class Hy4Forward:
                 pre, post = self._site(x, L.hca)
                 cur = rms((x * pre[:, :, None]).sum(1), self.eps) * L.attn_norm
         mla = L.mla
-        if gs is not None and _KVF.ENABLED and _AE.ENABLED:       # HY4_KV_FUSED: rms + rope + K-row write in ONE kernel
+        if gs is not None and gs.T == 1 and _KVF.ENABLED and _AE.ENABLED:       # HY4_KV_FUSED: rms + rope + K-row write in ONE kernel
             kc = gs.kv_row_fused(i, mla, cur, pos)
         else:
             with tm.t("attn proj"):

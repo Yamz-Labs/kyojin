@@ -103,3 +103,65 @@ class Hy4MTP:
             outs.append(tok)
             h = y
         return outs
+
+
+class MTPGraph:
+    """the draft chain of k head steps as ONE HIP graph per context bucket: static inputs (token, trunk state, head position), greedy argmax feeds the next
+    step on the device, output = the k drafted tokens [k] (device). No host work between the steps."""
+
+    BUCKET = 512
+
+    def __init__(self, mt, k):
+        self.mt, self.k = mt, k
+        dev = mt.dev
+        D = mt.fw.D
+        self.tok0 = torch.zeros(1, dtype=torch.long, device=dev)
+        self.pos0 = torch.zeros(1, dtype=torch.long, device=dev)
+        self.h0 = torch.zeros(1, D, device=dev)
+        self.hin = torch.zeros(2, dtype=torch.long).pin_memory()
+        self.inp = torch.zeros(2, dtype=torch.long, device=dev)
+        self.graphs, self.pool = {}, torch.cuda.graph_pool_handle()
+        self.ev, self.ev_set = torch.cuda.Event(), False
+
+    def body(self, N):
+        mt = self.mt
+        outs, tok, h = [], self.inp[0:1], self.h0
+        pos = self.inp[1:2]
+        for i in range(self.k):
+            y, lg = mt.step(tok, h, pos + i if i else pos, N)
+            tok = torch.argmax(lg).reshape(1)
+            outs.append(tok)
+            h = y
+        return torch.cat(outs)
+
+    def _graph(self, N):
+        g = self.graphs.get(N)
+        if g is not None:
+            return g
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                self.body(N)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        cg = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cg, pool=self.pool):
+            out = self.body(N)
+        g = self.graphs[N] = (cg, out)
+        return g
+
+    def run(self, tok, h, j):
+        """tok: host int (the token of the pair, x_{j+1}), h: device [1, D] trunk state h_j, j: head position -> device tensor [k] of drafts"""
+        mt = self.mt
+        N = min(mt.cap, ((j + self.k) // self.BUCKET + 1) * self.BUCKET)
+        if self.ev_set:
+            self.ev.synchronize()
+        self.hin[0], self.hin[1] = int(tok), int(j)
+        self.inp.copy_(self.hin, non_blocking=True)
+        self.h0.copy_(h)
+        self.ev.record()
+        self.ev_set = True
+        cg, out = self._graph(N)
+        cg.replay()
+        return out

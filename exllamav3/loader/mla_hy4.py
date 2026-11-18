@@ -99,7 +99,7 @@ class Hy4MLA:
         qr = rms(self._q(cur, "wq_a") @ self.wq_a.T, self.eps) * self.q_a_norm
         q = (self._q(qr, "wq_b") @ self.wq_b.T).view(T, H, self.hd)
         qn, qp = q[..., :self.nope], rope_norm(q[..., self.nope:].contiguous(), pos, self.theta)
-        qlat = self.bg_kb.mv(self._q(qn, "kb")) if (_BG.ENABLED and T == 1 and getattr(self, "bg_kb", None) is not None) else torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
+        qlat = self.bg_kb.mv(self._q(qn, "kb")) if (_BG.ENABLED and T <= _BG.MAXT and getattr(self, "bg_kb", None) is not None) else torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
         return self._h(qlat, "q"), self._h(qp, "q")
 
     def attend(self, cur, pos, kcache, kpos, allow=None):
@@ -115,7 +115,7 @@ class Hy4MLA:
             else:
                 o = self.S.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window, allow)
         with tm.t("attn proj"):
-            kqv = (self.bg_vb.mv(self._q(o, "vb")) if (_BG.ENABLED and T == 1 and getattr(self, "bg_vb", None) is not None) else torch.einsum("hdr,thr->thd", self.wv_b, self._q(o, "vb"))).reshape(T, H * self.vd)
+            kqv = (self.bg_vb.mv(self._q(o, "vb")) if (_BG.ENABLED and T <= _BG.MAXT and getattr(self, "bg_vb", None) is not None) else torch.einsum("hdr,thr->thd", self.wv_b, self._q(o, "vb"))).reshape(T, H * self.vd)
             gated, out = self.gate_out(cur, kqv)
         return kqv, gated, out
 

@@ -96,7 +96,7 @@ def q(m, cur, pos):
         qp = _KVF.rope_q(qq, table(m.rope_dim, m.theta, qq.device, pos), pos, m.nope, m.rope_dim)
     else:
         qp = rope(qq[..., m.nope:], pos, m.theta)
-    qlat = m.bg_kb.mv(m._q(qn, "kb")) if (_BG.ENABLED and T == 1 and getattr(m, "bg_kb", None) is not None) else torch.einsum("hrk,thk->thr", m.wk_b, m._q(qn, "kb"))
+    qlat = m.bg_kb.mv(m._q(qn, "kb")) if (_BG.ENABLED and T <= _BG.MAXT and getattr(m, "bg_kb", None) is not None) else torch.einsum("hrk,thk->thr", m.wk_b, m._q(qn, "kb"))
     return m._h(qlat, "q"), m._h(qp, "q")
 
 
