@@ -874,6 +874,11 @@ __device__ float fq_dot_q8_0_q8(const uint8_t* __restrict__ wr,
 #define FQ_Q6_K_GROUP 256
 #define FQ_Q6_K_BYTES 210
 
+// Q3_K geometry (ggml block_q3_K): hmask[32] at +0 (inverted high bits), qs[64] at +32, 12 packed 6-bit scales at +96, d half at +108;
+// 110 B per 256-block (2-byte aligned only: every load below is a memcpy).
+#define FQ_Q3_K_GROUP 256
+#define FQ_Q3_K_BYTES 110
+
 // IQ4_XS geometry: d half at +0, scales_h u16 at +2, scales_l[4] at +4,
 // qs[128] at +8; 136 B per 256-block.
 #define FQ_IQ4_XS_GROUP 256
@@ -1217,6 +1222,54 @@ __device__ float fq_dot_q6_k_q8(const uint8_t* __restrict__ wr,
             int32_t u;
             memcpy(&u, aqb_blk + 4 + 4 * (iqs % 8), 4);
             sumf = __fadd_rn(sumf, __fmul_rn(d8, (float)(fq_dp4a((int32_t)vi, u, 0) * scc)));
+        }
+        acc = __fadd_rn(acc, __fmul_rn(d, sumf));
+    }
+    return acc;
+}
+
+// Q3_K q8_1 lane dot: per-thread partial over 16-elem sub-chunks (iqs = c & 15 within each 256-block b = c >> 4). Verbatim ggml
+// vec_dot_q3_K_q8_1 (ggml_mmvq/ggml_vecdotq_k46.cuh), same fadd/fmul order as fq_dot_q6_k_q8; vi = vil - vih has bytes in [-4, 3], so the wrapping
+// per-byte fq_vsub4 equals the saturating __vsubss4.
+__device__ float fq_dot_q3_k_q8(const uint8_t* __restrict__ wr,
+                               const uint8_t* __restrict__ aqb,
+                               int K, int tid, int nthreads)
+{
+    int nsub = K / 16;
+    float acc = 0.0f;
+    for (int c = tid; c < nsub; c += nthreads)
+    {
+        int b = c >> 4;
+        int iqs = c & 15;
+        const uint8_t* blk = wr + (size_t)b * FQ_Q3_K_BYTES;
+        int bq8_offset = 4 * (iqs / 8);
+        int scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
+        int32_t vl, vm;
+        memcpy(&vl, blk + 32 + 4 * iqs, 4);
+        memcpy(&vm, blk + 4 * (iqs % 8), 4);
+        int32_t vh = ~vm >> bq8_offset;
+        const uint8_t* scales = blk + 96;
+        __half dh;
+        memcpy(&dh, blk + 108, 2);
+        float d = __half2float(dh);
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            int isc = scale_offset + 2 * i;
+            int sc_low = (scales[isc % 8] >> (4 * (isc / 8))) & 0xF;
+            int sc_high = ((scales[8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
+            int sc = (sc_low | sc_high) - 32;
+            uint32_t vil = ((uint32_t)vl >> (2 * i)) & 0x03030303u;
+            uint32_t vih = (uint32_t)((vh >> i) << 2) & 0x04040404u;
+            uint32_t vi = fq_vsub4(vil, vih);
+            const uint8_t* aqb_blk = aqb + (size_t)(b * 8 + bq8_offset + i) * FQ_Q8_1_BYTES;
+            __half dah;
+            memcpy(&dah, aqb_blk, 2);
+            float d8 = __half2float(dah);
+            int32_t u;
+            memcpy(&u, aqb_blk + 4 + 4 * (iqs % 8), 4);
+            sumf = __fadd_rn(sumf, __fmul_rn(d8, (float)(fq_dp4a((int32_t)vi, u, 0) * sc)));
         }
         acc = __fadd_rn(acc, __fmul_rn(d, sumf));
     }

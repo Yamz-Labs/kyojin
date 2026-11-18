@@ -9,13 +9,15 @@ llama.cpp hy-v4-flash.cpp build_attention M:5787-5947). Pure torch, no package i
 import torch
 
 
-def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, window=0):
+def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, window=0, allow=None):
     """q_lat [T,H,R], q_pe [T,H,P], ckv [N,R], k_pe [N,P], qpos [T], kpos [N], sinks [H] or None -> o_lat [T,H,R]"""
     s = torch.einsum("thr,nr->htn", q_lat, ckv) + torch.einsum("thp,np->htn", q_pe, k_pe)
     s = s * scale
     vis = kpos[None, :] <= qpos[:, None]
     if window:
         vis = vis & ((qpos[:, None] - kpos[None, :]) < window)
+    if allow is not None:      # indexer selection: bool [T, N], a key outside the selected rows is masked (the sinks still apply)
+        vis = vis & allow
     s = s.masked_fill(~vis[None], float("-inf"))
     if sinks is not None:
         s = torch.cat([s, sinks.float()[:, None, None].expand(-1, s.shape[1], 1)], dim=-1)

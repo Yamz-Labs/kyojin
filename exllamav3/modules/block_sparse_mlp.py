@@ -223,6 +223,7 @@ _MOE_SH_FUSE = os.environ.get("EXL3_MOE_SH_FUSE", "1" if torch.version.hip else 
 _MOE_SH_SAID = [False]
 # MCPM_FQ_MOE_IQ (default 1): IQ3_XXS / IQ2_S experts take the grouped q8_1 decode MoE (fq_moe_kq.cu FMT 4 / 5)
 _FQ_MOE_IQ = os.environ.get("MCPM_FQ_MOE_IQ", "1") != "0"
+_FQ_MOE_Q3K = os.environ.get("MCPM_FQ_MOE_Q3K", "0") == "1"      # Q3_K in the grouped mixed kernel (fmt id 8): off until the GPU cell passes
 # HIP routed MMQ prefill MoE (rocm/gmmq, from Gufo / llama.cpp), default on with ROCm: Strix Halo Qwen3.8-Flash-Next UD-Q4_K_XL GGUF
 # served 8K prefill 13.5-15.8 -> 10.8 s, decode flat, N1 md5 identical, perplexity 3.1671 -> 3.1797. 0 = the grouped Triton path.
 _FQ_PF_GMMQ = os.environ.get("MCPM_FQ_PF_GMMQ", "1" if torch.version.hip else "0") == "1"
@@ -1827,6 +1828,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # gate/up share one format, down has its own (unsloth UD: gate/up Q4_K + down Q5_K)
         fmt = fmt_d = None
         _ug_ok = ("q4_k", "q5_k", "q6_k", "iq4_xs") + (("iq3_xxs", "iq2_s") if _FQ_MOE_IQ else ())
+        if _FQ_MOE_Q3K:
+            _ug_ok = _ug_ok + ("q3_k",)
         if _FQ_MOE_IQ and _MQ_MOE:
             _ug_ok = _ug_ok + ("iq2_xs", "iq3_s", "iq4_nl", "iq2_xxs")
         for m in self.gates + self.ups:
@@ -2126,7 +2129,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         h = y.reshape(R, -1)
         dev = h.device
         K = h.shape[1]
-        _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136, "iq3_xxs": 98, "iq2_s": 82, "q8_0": 34, "q5_1": 24,
+        _BB = {"q4_k": 144, "q5_k": 176, "q6_k": 210, "iq4_xs": 136, "iq3_xxs": 98, "iq2_s": 82, "q8_0": 34, "q5_1": 24, "q3_k": 110,
                "iq2_xs": 74, "iq3_s": 110, "iq4_nl": 18, "iq2_xxs": 66}
         _QK = lambda f: 32 if f in ("q8_0", "q5_1", "iq4_nl") else 256
         bb = _BB[fmt]
@@ -2169,7 +2172,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                     _MQ_ID[fmt], _MQ_ID[fmt_d], partial_v, routed_v)
         elif sh is not None:
             # shared expert in the same launches (extra slot per row); its gate row and the add are in the combine
-            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3, "iq3_xxs": 4, "iq2_s": 5, "q8_0": 6, "q5_1": 7}
+            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3, "iq3_xxs": 4, "iq2_s": 5, "q8_0": 6, "q5_1": 7, "q3_k": 8}
             ext.fq_moe_kq_grouped_mixed_sh_q8(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
                                               gate_stride, up_stride, down_stride, _FID[fmt], _FID[fmt_d],
                                               self._fq_kq_partial[:R * (S + 1)], routed_v, *sh)
@@ -2178,7 +2181,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                    gate_stride, up_stride, down_stride,
                                    partial_v, routed_v)
         else:
-            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3, "iq3_xxs": 4, "iq2_s": 5, "q8_0": 6, "q5_1": 7}
+            _FID = {"q4_k": 0, "q5_k": 1, "q6_k": 2, "iq4_xs": 3, "iq3_xxs": 4, "iq2_s": 5, "q8_0": 6, "q5_1": 7, "q3_k": 8}
             ext.fq_moe_kq_grouped_mixed_q8(h, sel, wts, gate_ptrs, up_ptrs, down_ptrs,
                                            gate_stride, up_stride, down_stride, _FID[fmt], _FID[fmt_d],
                                            partial_v, routed_v)

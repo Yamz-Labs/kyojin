@@ -86,6 +86,11 @@ __global__ void fq_moe_kq_upgate_kernel(const uint8_t* __restrict__ aqb,
             g = fq_dot_iq3_xxs_q8(gr, aq, K, lane, FQ_GEMV_LANES);
             u = fq_dot_iq3_xxs_q8(ur, aq, K, lane, FQ_GEMV_LANES);
         }
+        else if constexpr (FMT == 8)
+        {
+            g = fq_dot_q3_k_q8(gr, aq, K, lane, FQ_GEMV_LANES);
+            u = fq_dot_q3_k_q8(ur, aq, K, lane, FQ_GEMV_LANES);
+        }
         else
         {
             g = fq_dot_iq2_s_q8(gr, aq, K, lane, FQ_GEMV_LANES);
@@ -375,6 +380,8 @@ __global__ void fq_moe_kq_down_kernel(const uint8_t* __restrict__ aqb,
             p = fq_dot_iq4_xs_q8(dr, aq, I, lane, FQ_GEMV_LANES);
         else if constexpr (FMT == 4)
             p = fq_dot_iq3_xxs_q8(dr, aq, I, lane, FQ_GEMV_LANES);
+        else if constexpr (FMT == 8)
+            p = fq_dot_q3_k_q8(dr, aq, I, lane, FQ_GEMV_LANES);
         else if constexpr (FMT == 6)
             p = fq_dot_q8_0_q8(dr, aq, I, lane, FQ_GEMV_LANES);
         else if constexpr (FMT == 7)
@@ -470,7 +477,7 @@ static void fq_moe_kq_grouped_launch(torch::Tensor h, torch::Tensor sel, torch::
     int E = (int)up_ptrs.numel();
     // I from the down row stride (down rows are I-wide, like Bolt's
     // derivation from down_stride).
-    int I = (int)(down_stride / block_bytes) * ((FMT_D >= 6) ? 32 : FQ_Q4_K_GROUP);   // ids 6 / 7: 32-element blocks
+    int I = (int)(down_stride / block_bytes) * ((FMT_D == 6 || FMT_D == 7) ? 32 : FQ_Q4_K_GROUP);   // ids 6 / 7: 32-element blocks (8 = q3_k: 256)
     at::cuda::CUDAGuard guard(h.device());
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int Sg = S + (sh.gate != nullptr ? R : 0);   // routed slots + one shared-expert slot per row
@@ -578,8 +585,8 @@ void fq_moe_iq4xs_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor w
                                 FQ_IQ4_XS_BYTES, partial, out);
 }
 
-static const int64_t kFmtBytes[8] = {FQ_Q4_K_BYTES, FQ_Q5_K_BYTES, FQ_Q6_K_BYTES, FQ_IQ4_XS_BYTES, FQ_IQ3_XXS_BYTES, FQ_IQ2_S_BYTES,
-                                     FQ_Q8_0_BYTES, FQ_Q5_1_BYTES};
+static const int64_t kFmtBytes[9] = {FQ_Q4_K_BYTES, FQ_Q5_K_BYTES, FQ_Q6_K_BYTES, FQ_IQ4_XS_BYTES, FQ_IQ3_XXS_BYTES, FQ_IQ2_S_BYTES,
+                                     FQ_Q8_0_BYTES, FQ_Q5_1_BYTES, FQ_Q3_K_BYTES};
 
 template <int FU>
 static void fq_moe_kq_dispatch_d(int fd, torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
@@ -597,11 +604,12 @@ static void fq_moe_kq_dispatch_d(int fd, torch::Tensor h, torch::Tensor sel, tor
         case 5: fq_moe_kq_grouped_launch<FU, 5>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[5], partial, out, sh); break;
         case 6: fq_moe_kq_grouped_launch<FU, 6>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[6], partial, out, sh); break;
         case 7: fq_moe_kq_grouped_launch<FU, 7>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[7], partial, out, sh); break;
+        case 8: fq_moe_kq_grouped_launch<FU, 8>(h, sel, wts, gp, up, dp, gs, us, ds, kFmtBytes[8], partial, out, sh); break;
         default: TORCH_CHECK(false, "fq_moe_kq: bad down format ", fd);
     }
 }
 
-// Mixed per-projection formats (unsloth UD: gate/up Q4_K + down Q5_K). fmt ids: 0 q4_k, 1 q5_k, 2 q6_k, 3 iq4_xs, 4 iq3_xxs, 5 iq2_s.
+// Mixed per-projection formats (unsloth UD: gate/up Q4_K + down Q5_K). fmt ids: 0 q4_k, 1 q5_k, 2 q6_k, 3 iq4_xs, 4 iq3_xxs, 5 iq2_s, (down only 6 q8_0, 7 q5_1), 8 q3_k (gate/up and down).
 static void fq_moe_kq_grouped_mixed_impl(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
                                 torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
                                 torch::Tensor down_ptrs,
@@ -617,6 +625,7 @@ static void fq_moe_kq_grouped_mixed_impl(torch::Tensor h, torch::Tensor sel, tor
         case 3: fq_moe_kq_dispatch_d<3>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
         case 4: fq_moe_kq_dispatch_d<4>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
         case 5: fq_moe_kq_dispatch_d<5>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
+        case 8: fq_moe_kq_dispatch_d<8>((int)fmt_down, h, sel, wts, gate_ptrs, up_ptrs, down_ptrs, gate_stride, up_stride, down_stride, partial, out, sh); break;
         default: TORCH_CHECK(false, "fq_moe_kq: bad gate/up format ", fmt_ug);
     }
 }
