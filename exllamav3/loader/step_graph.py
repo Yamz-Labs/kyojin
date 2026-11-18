@@ -228,6 +228,7 @@ class GraphDecoder:
         x = e[:, None, :].expand(-1, fw.hc, -1).contiguous()
         for i in range(fw.n_layers):
             x = fw.layer(i, x, gs.pos, None, 0)
+        self.x_out = x
         fw._ns_dev = True
         try:
             lg = fw._head(x, False)
