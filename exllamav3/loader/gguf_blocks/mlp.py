@@ -145,24 +145,78 @@ register(Block(
     config=_moe_layer, claims=_MOE_CLAIMS, build=_moe_build, names=_moe_names))
 
 
-# ---- predicates only (Hy4 step 5): latent MoE (routed experts at expert_latent_length between ffn_routed_down/up),
-#      sigmoid router (gating_func 2) + exp_probs_b, weights_scale, per-layer swiglu_clamp_exp; engine module: block_sparse_mlp latent_in/out
+# ---- latent MoE (Hy4-flash, llama.cpp build_latent_moe M:5949): router on the full-width input (sigmoid + exp_probs_b for the pick,
+#      unbiased weights, renormalised, x weights_scale), routed experts at expert_latent_length between ffn_routed_down / _up,
+#      pre-activation swiglu clamp on the routed experts only, one full-width shared expert added after ffn_routed_up.
+#      The post_ffw_norm that follows is the stream block's (hyperconnections._stream_build), not this block's.
+#      engine module: block_sparse_mlp latent_in / latent_out + router_type "ds3" with one group
 def _latent_layer(ctx, i):
     gd = ctx.dims(f"blk.{i}.ffn_gate_exps.weight")
     sh = ctx.dims(f"blk.{i}.ffn_gate_shexp.weight")
+    rd = ctx.dims(f"blk.{i}.ffn_routed_down.weight")
     clamp = ctx.per_layer("swiglu_clamp_exp", 0.0)
-    return {"latent": ctx.key("expert_latent_length"), "latent_down": ctx.dims(f"blk.{i}.ffn_routed_down.weight"),
-            "expert_dims": gd, "num_experts": gd[2] if gd else None, "top_k": ctx.key("expert_used_count"),
+    lat = ctx.key("expert_latent_length")
+    if ctx.key("expert_gating_func") != 2:
+        ctx.gaps.append("latent MoE: expert_gating_func is not sigmoid (2)")
+    if gd and rd and not (gd[0] == lat == rd[1]):
+        ctx.gaps.append(f"latent MoE layer {i}: expert_latent_length {lat} disagrees with ffn_gate_exps {gd} / ffn_routed_down {rd}")
+    if not ctx.has(i, "exp_probs_b.bias") or not ctx.has(i, "ffn_routed_up.weight"):
+        ctx.gaps.append(f"latent MoE layer {i}: exp_probs_b.bias / ffn_routed_up.weight missing")
+    return {"latent": lat, "latent_down": rd, "expert_dims": gd, "num_experts": gd[2] if gd else None, "top_k": ctx.key("expert_used_count"),
             "gating_func": ctx.key("expert_gating_func"), "weights_scale": ctx.key("expert_weights_scale"),
             "weights_norm": ctx.key("expert_weights_norm"), "e_score_bias": ctx.has(i, "exp_probs_b.bias"),
             "clamp": clamp[i] if i < len(clamp) else None, "clamp_routed_only": bool(ctx.feats.get("clamp_routed_only")),
             "shared_dims": sh}
 
 
+def _latent_names(cfg, i, L, G):
+    nm = {f"{L}.mlp.gate.weight": f"{G}.ffn_gate_inp.weight", f"{L}.mlp.gate.e_score_correction_bias": f"{G}.exp_probs_b.bias",
+          f"{L}.mlp.fc1_latent_proj.weight": f"{G}.ffn_routed_down.weight", f"{L}.mlp.fc2_latent_proj.weight": f"{G}.ffn_routed_up.weight"}
+    for proj in ("gate", "up", "down"):
+        nm[f"{L}.mlp.shared_experts.{proj}_proj.weight"] = f"{G}.ffn_{proj}_shexp.weight"
+    for e in range(cfg["num_experts"]):
+        for proj, gp in (("gate_proj", "ffn_gate_exps"), ("up_proj", "ffn_up_exps"), ("down_proj", "ffn_down_exps")):
+            nm[f"{L}.mlp.experts.{e}.{proj}.weight"] = f"{G}.{gp}.e{e}.weight"
+    return nm
+
+
+def _latent_build(config, plan, idx, L):
+    import torch
+    from ...modules import GatedMLP, BlockSparseMLP
+    from ...architecture.gguf_generic import _fl
+    c = plan.configs[("latent_moe", idx)]
+    H, LAT, I, E = config.hidden_size, c["latent"], c["expert_dims"][1], c["num_experts"]
+    SI, SK = c["shared_dims"][1], f"{L}.mlp.shared_experts"
+    gates = [_fl(config, f"{L}.mlp.experts.{e}.gate_proj", LAT, I) for e in range(E)]
+    ups = [_fl(config, f"{L}.mlp.experts.{e}.up_proj", LAT, I) for e in range(E)]
+    downs = [_fl(config, f"{L}.mlp.experts.{e}.down_proj", I, LAT, out_dtype=torch.float) for e in range(E)]
+    shared = GatedMLP(config=config, key=SK, hidden_size=H, intermediate_size=SI, qmap="block.mlp", interm_dtype=torch.half, out_dtype=torch.float,
+                      gates=[_fl(config, f"{SK}.gate_proj", H, SI)], ups=[_fl(config, f"{SK}.up_proj", H, SI)],
+                      downs=[_fl(config, f"{SK}.down_proj", SI, H, out_dtype=torch.float)])
+    for m in shared.gates + shared.ups + shared.downs:
+        shared.register_submodule(m)
+    kw = {}
+    if c["clamp"]:
+        # the tree's clamp is post-activation; Hy4's is pre-activation (min(gate, c) then silu): they differ only for gate > c (<= 4.6e-4 at c = 10)
+        kw["act_limit"] = float(c["clamp"])
+    mlp = BlockSparseMLP(config=config, key=f"{L}.mlp", hidden_size=H, intermediate_size=I, num_experts=E, shared_experts=shared,
+                         num_experts_per_tok=c["top_k"], norm_topk=bool(c["weights_norm"]), key_up=None, key_gate=None, key_down=None,
+                         key_routing_gate="gate", qmap="block.mlp", interm_dtype=torch.half, out_dtype=torch.float,
+                         gates=gates, ups=ups, downs=downs, latent_size=LAT,
+                         key_latent_in="fc1_latent_proj", key_latent_out="fc2_latent_proj",
+                         latent_in=_fl(config, f"{L}.mlp.fc1_latent_proj", H, LAT),
+                         latent_out=_fl(config, f"{L}.mlp.fc2_latent_proj", LAT, H, out_dtype=torch.float),
+                         router_type="ds3", n_group=1, topk_group=1, routed_scaling_factor=float(c["weights_scale"]), **kw)
+    for m in gates + ups + downs:
+        mlp.register_submodule(m)
+    return mlp
+
+
 register(Block(
     "latent_moe", "ffn", step="step 5",
     select=lambda ctx, i: ctx.has(i, "ffn_routed_down.weight") and ctx.has(i, "ffn_gate_exps.weight"),
-    config=_latent_layer, claims=_MOE_CLAIMS | {"ffn_routed_down.weight", "ffn_routed_up.weight", "exp_probs_b.bias"}, build=None))
+    config=_latent_layer, claims=_MOE_CLAIMS | {"ffn_routed_down.weight", "ffn_routed_up.weight", "exp_probs_b.bias"},
+    build=_latent_build, names=_latent_names))
 
 # sigmoid / sqrt-softplus router with a per-expert score bias on a plain MoE layer (glm5-next, deepseek41); predicate only
 register(Block(
