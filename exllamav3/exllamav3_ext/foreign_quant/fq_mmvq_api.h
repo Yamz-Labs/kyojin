@@ -3,21 +3,21 @@
 #pragma once
 #include <torch/extension.h>
 
-void fq_mmvq_iq2_xxs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_iq2_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_iq2_s(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_iq3_xxs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_iq3_s(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_iq4_nl(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_iq4_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_q5_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_q4_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_q6_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_q3_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_q4_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_q4_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_q5_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
-void fq_mmvq_q5_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
+void fq_mmvq_iq2_xxs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_iq2_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_iq2_s(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_iq3_xxs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_iq3_s(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_iq4_nl(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_iq4_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_q5_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_q4_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_q6_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_q3_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_q4_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_q4_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_q5_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
+void fq_mmvq_q5_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias = c10::nullopt);
 // Grouped decode MoE for IQ experts: format ids 0 iq2_xxs, 1 iq2_xs, 2 iq2_s, 3 iq3_xxs, 4 iq3_s, 5 iq4_nl, 6 iq4_xs, 7 q5_k (gate/up and down independent).
 // Arguments and results as fq_moe_kq_grouped_mixed_q8 (fq_api.h).
 void fq_moe_mmvq_grouped(torch::Tensor h, torch::Tensor sel, torch::Tensor wts, torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
@@ -36,3 +36,6 @@ void fq_dequant_iq(torch::Tensor packed, torch::Tensor out, int64_t fmt);
 // packed [N, K/256 * unit bytes], fmt 0 Q8_0, 1 Q4_K, 2 Q5_K, 3 Q6_K, 4 Q3_K, 5 IQ4_XS; scratch >= ceil(R/8)*K*9 bytes. False = not served (nothing launched).
 bool fq_mmq_few(torch::Tensor x, torch::Tensor scratch, torch::Tensor packed, torch::Tensor out, int fmt);
 #endif
+
+// ABI marker: the fq_mmvq_* functions above take an optional half bias applied in the store (EXL3_FQ_MMVQ_EPI).
+inline int fq_mmvq_epi_abi() { return 1; }

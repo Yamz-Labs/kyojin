@@ -106,6 +106,27 @@ _MMVQ_LEGACY = os.environ.get("EXL3_FQ_MMVQ_LEGACY", "0") == "1" and bool(torch.
 if _MMVQ_LEGACY:
     _MMVQ_FN.update({f: "fq_mmvq_" + f for f in _LEGACY_FMTS})
     _MMVQ_QK.update({f: 32 for f in _LEGACY_FMTS})
+# EXL3_FQ_MMVQ_EPI (default 0, CUDA only, read at call time): (A1) a ForeignLinear bias (_ForeignInner) is added inside the mmvq store (half out: round the dot to
+# half, then half(float(h) + float(b)), torch's `y + bias` order; float out: v + float(b)) instead of a separate torch add; (A2) q, k and v of one attention
+# layer read the same normed x: it is quantized to q8_1 once (attn.project_qkv brackets the three calls with q8_share_begin / q8_share_end; the key is
+# x.data_ptr + x._version + R + K + device, valid only inside that bracket). Off = exactly the previous code.
+def _epi_on() -> bool:
+    return os.environ.get("EXL3_FQ_MMVQ_EPI", "0") == "1" and bool(torch.version.cuda) and not torch.version.hip
+
+
+_Q8S = {"on": False, "key": None}
+
+
+def q8_share_begin() -> None:
+    _Q8S["on"] = _epi_on()
+    _Q8S["key"] = None
+
+
+def q8_share_end() -> None:
+    _Q8S["on"] = False
+    _Q8S["key"] = None
+
+
 _DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}
 if os.environ.get("BOLT_FQ_DEQ_Q3K", "1") != "0":   # CUDA and HIP
     _DEQ_IQ_ID["q3_k"] = 10   # native Q3_K dequant (prefill dequant + GEMM; the torch gap_dequant is ~2.5x slower at 8K)   # fq_dequant_iq format ids (the others have native dequants already)
@@ -278,7 +299,10 @@ class ForeignLinear(Module):
         x: torch.Tensor,
         params: dict,
         out_dtype: torch.dtype | None = None,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # bias: only consumed by the mmvq epilogue under EXL3_FQ_MMVQ_EPI; self._bias_fused tells the caller whether it was added
+        self._bias_fused = False
         shape = x.shape
         K = self.in_features
         assert shape[-1] == K, f"{self.key}: width {shape[-1]} != {K}"
@@ -311,8 +335,24 @@ class ForeignLinear(Module):
             out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)
             dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
             qb = ext.fq_q8_scratch(dev_idx, R, K)
-            ext.fq_quant_q8_1_rows(flat, qb)
-            if ri and R > 4:      # 5..8 columns launch 2 warps per row (other sum order than the one-row launch's 4): at most 4 columns per launch
+            try:
+                _ver = flat._version
+            except RuntimeError:        # inference tensor: no version counter (nothing writes x between q, k and v)
+                _ver = -1
+            _sk = (flat.data_ptr(), _ver, R, K, dev_idx)
+            if _Q8S["on"] and _Q8S["key"] == _sk:
+                pass        # q8_1 of this exact x is already in the scratch (q / k / v of one layer)
+            else:
+                ext.fq_quant_q8_1_rows(flat, qb)
+                _Q8S["key"] = _sk if _Q8S["on"] else None
+            _bf = None
+            if (bias is not None and R == 1 and out.dtype == dtype and bias.dtype == torch.half and bias.is_cuda and bias.is_contiguous()
+                    and bias.numel() == N and self.post_scale == 1.0 and self.softcap == 0.0 and _epi_on() and hasattr(ext, "fq_mmvq_epi_abi")):
+                _bf = bias
+                self._bias_fused = True
+            if _bf is not None:
+                getattr(ext, _MMVQ_FN[self.format])(qb, self.packed.reshape(N, -1), out, _bf)
+            elif ri and R > 4:      # 5..8 columns launch 2 warps per row (other sum order than the one-row launch's 4): at most 4 columns per launch
                 for a in range(0, R, 4):
                     getattr(ext, _MMVQ_FN[self.format])(qb[a:a + 4], self.packed.reshape(N, -1), out[a:a + 4])
             else:
@@ -338,6 +378,7 @@ class ForeignLinear(Module):
             dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
             qb = ext.fq_q8_scratch(dev_idx, R, K)
             ext.fq_quant_q8_1_rows(flat, qb)
+            _Q8S["key"] = None
             getattr(ext, _IQ_Q8_FN[self.format])(qb, self.packed.reshape(N, -1), out)
             if out.dtype != dtype:
                 out = out.to(dtype)

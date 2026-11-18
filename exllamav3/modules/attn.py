@@ -908,6 +908,8 @@ class Attention(Module):
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
         qkv8 = self._qkv_q8cat(x, params, bsz, q_len)
+        from .foreign_linear import q8_share_begin, q8_share_end
+        q8_share_begin()        # EXL3_FQ_MMVQ_EPI: q / k / v ForeignLinear gemvs share one q8_1 quantization of x (no-op when the flag is off)
         if self.multi_qg is None or bsz * q_len > 32:
             q = qkv8[0] if qkv8 is not None else self.q_proj.forward(x, params)
             if self.interleaved_gate:
@@ -961,6 +963,7 @@ class Attention(Module):
         elif self.multi_kv is None or bsz * q_len > 32:
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
+            q8_share_end()
 
         else:
             if x.shape[-1] < self.k_proj.in_features:
@@ -992,6 +995,7 @@ class Attention(Module):
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
+        q8_share_end()
         return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
 

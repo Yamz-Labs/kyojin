@@ -82,11 +82,26 @@ template <typename OUT> __device__ __forceinline__ void mq_store(OUT* p, float v
 template <> __device__ __forceinline__ void mq_store<float>(float* p, float v) { *p = v; }
 template <> __device__ __forceinline__ void mq_store<__half>(__half* p, float v) { *p = __float2half_rn(v); }
 
+// EXL3_FQ_MMVQ_EPI: optional bias in the store. half out: round the dot to half FIRST, then half(float(h) + float(b)) (torch's `y + bias` on half);
+// float out: v + float(b). bias == nullptr is the plain store.
+template <typename OUT> __device__ __forceinline__ void mq_store_b(OUT* p, float v, const __half* __restrict__ bias, int64_t n);
+template <> __device__ __forceinline__ void mq_store_b<float>(float* p, float v, const __half* __restrict__ bias, int64_t n)
+{
+    *p = bias ? v + __half2float(bias[n]) : v;
+}
+template <> __device__ __forceinline__ void mq_store_b<__half>(__half* p, float v, const __half* __restrict__ bias, int64_t n)
+{
+    __half h = __float2half_rn(v);
+    if (bias) h = __float2half_rn(__half2float(h) + __half2float(bias[n]));
+    *p = h;
+}
+
 // One launch: out[j][row] = dot(weights row, activation column j), j < NC. Weight blocks of row r start at vx + r * row_bytes.
 template <int T, int NC, typename OUT>
 __global__ void __launch_bounds__(MQ_WARP * mq_nwarps(NC), 1)
 fq_mmvq_kernel(const uint8_t* __restrict__ vx, const block_q8_1* __restrict__ vy, OUT* __restrict__ dst,
-               int ncols_x, int nrows, int64_t row_blocks, int64_t y_col_blocks, int64_t dst_col_stride)
+               int ncols_x, int nrows, int64_t row_blocks, int64_t y_col_blocks, int64_t dst_col_stride,
+               const __half* __restrict__ bias)
 {
     using Tr = MqTraits<T>;
     constexpr int NW = mq_nwarps(NC);
@@ -151,40 +166,40 @@ fq_mmvq_kernel(const uint8_t* __restrict__ vx, const block_q8_1* __restrict__ vy
             }
             v = mq_warp_sum(v);
             if (threadIdx.x == 0 && row0 + i < nrows)
-                mq_store<OUT>(&dst[(int64_t)j * dst_col_stride + row0 + i], v);
+                mq_store_b<OUT>(&dst[(int64_t)j * dst_col_stride + row0 + i], v, bias, row0 + i);
         }
     }
 }
 
 template <int T, int NC, typename OUT>
-void mq_launch(const uint8_t* w, const uint8_t* qb, OUT* out, int K, int N, int64_t y_col_blocks, int64_t dst_col_stride, cudaStream_t stream)
+void mq_launch(const uint8_t* w, const uint8_t* qb, OUT* out, int K, int N, int64_t y_col_blocks, int64_t dst_col_stride, const __half* bias, cudaStream_t stream)
 {
     using Tr = MqTraits<T>;
     constexpr int NW = mq_nwarps(NC);
     constexpr int RPB = mq_rows(NC);
     dim3 grid((N + RPB - 1) / RPB, 1, 1), block(MQ_WARP, NW, 1);
     fq_mmvq_kernel<T, NC, OUT><<<grid, block, 0, stream>>>(w, reinterpret_cast<const block_q8_1*>(qb), out, K, N,
-                                                           (int64_t)(K / Tr::qk), y_col_blocks, dst_col_stride);
+                                                           (int64_t)(K / Tr::qk), y_col_blocks, dst_col_stride, bias);
 }
 
 template <int T, typename OUT>
-void mq_cols(int nc, const uint8_t* w, const uint8_t* qb, OUT* out, int K, int N, int64_t y_col_blocks, cudaStream_t stream)
+void mq_cols(int nc, const uint8_t* w, const uint8_t* qb, OUT* out, int K, int N, int64_t y_col_blocks, const __half* bias, cudaStream_t stream)
 {
     switch (nc)
     {
-        case 1: mq_launch<T, 1, OUT>(w, qb, out, K, N, y_col_blocks, N, stream); break;
-        case 2: mq_launch<T, 2, OUT>(w, qb, out, K, N, y_col_blocks, N, stream); break;
-        case 3: mq_launch<T, 3, OUT>(w, qb, out, K, N, y_col_blocks, N, stream); break;
-        case 4: mq_launch<T, 4, OUT>(w, qb, out, K, N, y_col_blocks, N, stream); break;
-        case 5: mq_launch<T, 5, OUT>(w, qb, out, K, N, y_col_blocks, N, stream); break;
-        case 6: mq_launch<T, 6, OUT>(w, qb, out, K, N, y_col_blocks, N, stream); break;
-        case 7: mq_launch<T, 7, OUT>(w, qb, out, K, N, y_col_blocks, N, stream); break;
-        default: mq_launch<T, 8, OUT>(w, qb, out, K, N, y_col_blocks, N, stream); break;
+        case 1: mq_launch<T, 1, OUT>(w, qb, out, K, N, y_col_blocks, N, bias, stream); break;
+        case 2: mq_launch<T, 2, OUT>(w, qb, out, K, N, y_col_blocks, N, bias, stream); break;
+        case 3: mq_launch<T, 3, OUT>(w, qb, out, K, N, y_col_blocks, N, bias, stream); break;
+        case 4: mq_launch<T, 4, OUT>(w, qb, out, K, N, y_col_blocks, N, bias, stream); break;
+        case 5: mq_launch<T, 5, OUT>(w, qb, out, K, N, y_col_blocks, N, bias, stream); break;
+        case 6: mq_launch<T, 6, OUT>(w, qb, out, K, N, y_col_blocks, N, bias, stream); break;
+        case 7: mq_launch<T, 7, OUT>(w, qb, out, K, N, y_col_blocks, N, bias, stream); break;
+        default: mq_launch<T, 8, OUT>(w, qb, out, K, N, y_col_blocks, N, bias, stream); break;
     }
 }
 
 template <int T>
-void mq_run(torch::Tensor qb, torch::Tensor packed, torch::Tensor out)
+void mq_run(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, const std::optional<torch::Tensor>& bias_opt)
 {
     using Tr = MqTraits<T>;
     TORCH_CHECK(qb.is_cuda() && packed.is_cuda() && out.is_cuda(), "tensors must be CUDA");
@@ -202,6 +217,13 @@ void mq_run(torch::Tensor qb, torch::Tensor packed, torch::Tensor out)
     TORCH_CHECK((uintptr_t)packed.data_ptr() % 4 == 0 && ((int64_t)(K / Tr::qk) * Tr::bb) % 2 == 0, "weights must be 2-byte aligned (4 for IQ4_XS)");
     TORCH_CHECK(Tr::bb % 4 == 2 || ((int64_t)(K / Tr::qk) * Tr::bb) % 4 == 0, "this format needs 4-byte aligned weight rows");
     TORCH_CHECK((uintptr_t)qb.data_ptr() % 4 == 0, "qb must be 4-byte aligned");
+    const __half* bias = nullptr;
+    if (bias_opt.has_value() && bias_opt->defined())
+    {
+        TORCH_CHECK(bias_opt->is_cuda() && bias_opt->is_contiguous() && bias_opt->dtype() == torch::kHalf, "bias must be a contiguous CUDA half tensor");
+        TORCH_CHECK(bias_opt->numel() == N, "bias must have N elements");
+        bias = reinterpret_cast<const __half*>(bias_opt->data_ptr<at::Half>());
+    }
     at::cuda::CUDAGuard guard(qb.device());
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const int64_t y_col_blocks = K / 32;
@@ -212,9 +234,9 @@ void mq_run(torch::Tensor qb, torch::Tensor packed, torch::Tensor out)
         const int nc = std::min(MQ_MAX_COLS, M - m0);
         const uint8_t* qm = q + (int64_t)m0 * y_col_blocks * 36;
         if (out.dtype() == torch::kHalf)
-            mq_cols<T, __half>(nc, w, qm, reinterpret_cast<__half*>(out.data_ptr<at::Half>()) + (int64_t)m0 * N, K, N, y_col_blocks, stream);
+            mq_cols<T, __half>(nc, w, qm, reinterpret_cast<__half*>(out.data_ptr<at::Half>()) + (int64_t)m0 * N, K, N, y_col_blocks, bias, stream);
         else
-            mq_cols<T, float>(nc, w, qm, out.data_ptr<float>() + (int64_t)m0 * N, K, N, y_col_blocks, stream);
+            mq_cols<T, float>(nc, w, qm, out.data_ptr<float>() + (int64_t)m0 * N, K, N, y_col_blocks, bias, stream);
     }
 }
 
@@ -579,21 +601,21 @@ template <int T> void mq_dequant_t(torch::Tensor packed, torch::Tensor out)
 
 }  // namespace
 
-void fq_mmvq_iq2_xxs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ2_XXS>(qb, packed, out); }
-void fq_mmvq_iq2_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ2_XS>(qb, packed, out); }
-void fq_mmvq_iq2_s(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ2_S>(qb, packed, out); }
-void fq_mmvq_iq3_xxs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ3_XXS>(qb, packed, out); }
-void fq_mmvq_iq3_s(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ3_S>(qb, packed, out); }
-void fq_mmvq_iq4_nl(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ4_NL>(qb, packed, out); }
-void fq_mmvq_iq4_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_IQ4_XS>(qb, packed, out); }
-void fq_mmvq_q5_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q5_K>(qb, packed, out); }
-void fq_mmvq_q4_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q4_K>(qb, packed, out); }
-void fq_mmvq_q6_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q6_K>(qb, packed, out); }
-void fq_mmvq_q3_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q3_K>(qb, packed, out); }
-void fq_mmvq_q4_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q4_0>(qb, packed, out); }
-void fq_mmvq_q4_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q4_1>(qb, packed, out); }
-void fq_mmvq_q5_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q5_0>(qb, packed, out); }
-void fq_mmvq_q5_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out) { mq_run<MQ_Q5_1>(qb, packed, out); }
+void fq_mmvq_iq2_xxs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_IQ2_XXS>(qb, packed, out, bias); }
+void fq_mmvq_iq2_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_IQ2_XS>(qb, packed, out, bias); }
+void fq_mmvq_iq2_s(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_IQ2_S>(qb, packed, out, bias); }
+void fq_mmvq_iq3_xxs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_IQ3_XXS>(qb, packed, out, bias); }
+void fq_mmvq_iq3_s(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_IQ3_S>(qb, packed, out, bias); }
+void fq_mmvq_iq4_nl(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_IQ4_NL>(qb, packed, out, bias); }
+void fq_mmvq_iq4_xs(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_IQ4_XS>(qb, packed, out, bias); }
+void fq_mmvq_q5_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_Q5_K>(qb, packed, out, bias); }
+void fq_mmvq_q4_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_Q4_K>(qb, packed, out, bias); }
+void fq_mmvq_q6_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_Q6_K>(qb, packed, out, bias); }
+void fq_mmvq_q3_k(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_Q3_K>(qb, packed, out, bias); }
+void fq_mmvq_q4_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_Q4_0>(qb, packed, out, bias); }
+void fq_mmvq_q4_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_Q4_1>(qb, packed, out, bias); }
+void fq_mmvq_q5_0(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_Q5_0>(qb, packed, out, bias); }
+void fq_mmvq_q5_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out, std::optional<torch::Tensor> bias) { mq_run<MQ_Q5_1>(qb, packed, out, bias); }
 
 // Standalone grouped decode MoE for IQ experts (any of the 7 IQ formats for gate/up and for down; type ids = MQ_* order:
 // 0 iq2_xxs, 1 iq2_xs, 2 iq2_s, 3 iq3_xxs, 4 iq3_s, 5 iq4_nl, 6 iq4_xs). Same arguments and results as fq_moe_kq_grouped_mixed_q8:

@@ -103,8 +103,11 @@ class _ForeignInner:
         return self.bias
 
     def forward(self, x, params, out_dtype = None):
-        y = self.fl.forward(x, params, out_dtype)
-        return y + self.bias if self.bias is not None else y
+        if self.bias is None:
+            return self.fl.forward(x, params, out_dtype)
+        self.fl._bias_fused = False
+        y = self.fl.forward(x, params, out_dtype, bias = self.bias)    # EXL3_FQ_MMVQ_EPI: the mmvq epilogue may add it (then _bias_fused)
+        return y if self.fl._bias_fused else y + self.bias
 
 
 class Linear(Module):
