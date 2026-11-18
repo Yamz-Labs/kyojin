@@ -415,9 +415,14 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         frange_dim: int = 0,
         gate_up_interleaved: bool = False,
         alt_residual_channel: bool = False,
-        qbits_key: str = "bits"
+        qbits_key: str = "bits",
+        norm_topk: bool = True
     ):
         super().__init__(config, key, None)
+        # False = router weights are the plain softmax probabilities of the picks (no top-k renormalisation); only the
+        # "std" router implements it (pure torch path, see _routing_std_nonorm)
+        assert norm_topk or router_type == "std", "norm_topk = False is only implemented for router_type 'std'"
+        self.norm_topk = norm_topk
 
         self.interm_dtype = interm_dtype
         # The fused prefill tier (exl3_moe) keeps its gate/up intermediates in fp16 no matter
@@ -1417,6 +1422,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             n_group = self.n_group,
             topk_group = self.topk_group,
             per_expert_scale = self.per_expert_scale,
+            norm_topk = self.norm_topk,
         )
         _prepare_hip_router_gate_t(self.routing_cfg)
 

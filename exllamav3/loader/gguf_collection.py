@@ -146,6 +146,18 @@ class GGUFCollection:
         mapped = self.name_map.get(key, key)
         return mapped[0] if isinstance(mapped, tuple) else mapped
 
+    def _exps_slice(self, name: str):
+        """"<gguf3d>.e<idx>[.weight|.bias]" -> (stacked tensor name, expert idx) when that stacked tensor exists, else None.
+        .bias: stacked F32 bias dims (row, E) (gpt-oss ffn_*_exps.bias), expert idx = one row."""
+        sfx = ".bias" if name.endswith(".bias") else ".weight"
+        mb = name[:-len(sfx)] if name.endswith(sfx) else name
+        if ".e" not in mb:
+            return None
+        bb_, es_ = mb.rsplit(".e", 1)
+        if es_.isdigit() and (bb_ + sfx) in self.infos:
+            return bb_ + sfx, int(es_)
+        return None
+
     def has_tensor(self, key: str) -> bool:
         if self._is_aux(key):
             return self.aux.has_tensor(key)
@@ -155,9 +167,7 @@ class GGUFCollection:
         if r in self.infos:
             return True
         if "_exps.e" in r:   # generic-loader expert slice name: "<gguf3d>.e<idx>[.weight]"
-            mb = r[:-7] if r.endswith(".weight") else r
-            bb_, es_ = mb.rsplit(".e", 1)
-            return es_.isdigit() and (bb_ + ".weight") in self.infos
+            return self._exps_slice(r) is not None
         return False
 
     # Deferred-load arena API (SafetensorsCollection): ForeignLinear and the
@@ -250,10 +260,9 @@ class GGUFCollection:
             mapped, want_T = mapped[0], (mapped[1] == "T")
         if exp_idx is None and mapped not in self.infos and "_exps.e" in mapped:
             # engine key mapped by name_map to "<gguf3d>.e<idx>[.weight]" (generic loader): same slice protocol, after the map
-            mb = mapped[:-7] if mapped.endswith(".weight") else mapped
-            bb_, es_ = mb.rsplit(".e", 1)
-            if es_.isdigit() and (bb_ + ".weight") in self.infos:
-                mapped, exp_idx = bb_ + ".weight", int(es_)
+            sl = self._exps_slice(mapped)
+            if sl is not None:
+                mapped, exp_idx = sl
         info = self.infos.get(mapped)
         if info is None:
             if not optional:
@@ -280,12 +289,16 @@ class GGUFCollection:
                 raise ValueError("transpose not supported for quant payloads")
             return t.to(dev)
         if ty in (0, 1, 30):  # F32 / F16 / BF16 (BF16 widened to float32: bit shift, exact)
-            if exp_idx is not None:
+            stacked_bias = exp_idx is not None and ty == 0 and mapped.endswith(".bias") and len(dims) == 2
+            if exp_idx is not None and not stacked_bias:
                 # Not implemented for float payloads: refuse by name rather than return the whole stack.
                 raise ValueError(f"per-expert slice of a {({0: 'F32', 1: 'F16', 30: 'BF16'})[ty]} "
                                  f"stacked tensor is not supported: {mapped} (expert {exp_idx})")
             dt = np.float32 if ty == 0 else np.float16
             es = 4 if ty == 0 else 2
+            if stacked_bias:   # stacked bias (row, E): one expert = one contiguous row of dims[0] values
+                assert 0 <= exp_idx < dims[1]
+                off, dims = off + exp_idx * dims[0] * es, (dims[0],)
             n = int(np.prod(dims))
             raw = self._pread(off, n * es)
             if ty == 30:

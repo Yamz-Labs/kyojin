@@ -684,6 +684,8 @@ class Linear(Module):
         g, fm = getattr(self.config, "gguf", None), getattr(self.config, "gguf_formats", None)
         if g is None or not fm or not isinstance(key, str) or self.is_sliced or self.weight_scale != 1.0:
             return False
+        if os.environ.get("EXL3_GGUF_GENERIC", "0") == "1" and g.new_tensors and (key + ".weight") in g.new_tensors:
+            return False  # in-memory fp override (e.g. dequantized GDN b/a projs) wins over the stored quant blocks
         gname = g.name_map.get(key + ".weight")
         gname = gname[0] if isinstance(gname, tuple) else gname
         from ..loader.gguf_collection import gguf_fmt as _gguf_fmt
