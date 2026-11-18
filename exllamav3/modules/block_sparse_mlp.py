@@ -1900,6 +1900,32 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 return False
         return True
 
+    def _mxfp4_mmvq_forward(self, x, h, sel, tbl, I, K, H, routing_weights, params, out_dtype):
+        """EXL3_FQ_MMVQ_MXFP4=1, one decode row: q8_1(x) once, gate+up+bias+swiglu_oai in one mmvq launch (fp16 [S, I]), q8_1(act), down + bias in one
+        mmvq launch (fp32 [S, N]), then the same torch fold as the Triton path. Weights = the stacked expert bytes via the Triton path's pointer tables."""
+        from ..foreign_quant import triton_moe_mxfp4 as MX
+        gw, gb, uw, ub, dw, db = tbl
+        S = self.num_experts_per_tok
+        ndev = h.device.index if h.device.index is not None else torch.cuda.current_device()
+        N = self.downs[0].inner.fl.out_features
+        qx = ext.fq_q8_scratch(ndev, 1, K)
+        ext.fq_quant_q8_1_rows(h, qx)
+        a = torch.empty((S, I), dtype=torch.float16, device=h.device)
+        ext.fq_mxfp4_moe_gu(qx, sel, gw, gb, uw, ub, a, I, K, float(self.act_limit))
+        qa = ext.fq_q8_scratch(ndev, S, I)
+        ext.fq_quant_q8_1_rows(a, qa)
+        d = torch.empty((S, N), dtype=torch.float32, device=h.device)
+        ext.fq_mxfp4_moe_down(qa, sel, dw, db if db is not None else dw[:0], d, N, I)
+        MX.MMVQ_FIRES += 1
+        routed = (d.view(1, S, -1)[..., :H] * routing_weights.reshape(1, S, 1).float()).sum(1)
+        final_hidden_states = routed.view(x.shape)
+        if self.shared_experts is not None:
+            se = self.shared_experts.forward(x, params)
+            final_hidden_states = final_hidden_states + se.to(torch.float).view(final_hidden_states.shape)
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states
+
     def _forward_mxfp4_grouped(self, x, y, selected_experts, routing_weights, params, out_dtype, eshape):
         """Grouped MXFP4 MoE decode: gate, up, down of every (row, expert) slot in one launch each (biases in-kernel),
         the layer's own activation (swiglu_oai clamp for gpt-oss), weighted fold per row."""
@@ -1927,6 +1953,10 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self._mx_ptrs = tbl
         _, _, gw, gb, uw, ub, dw, db = tbl
         sel = selected_experts.reshape(-1).to(torch.int32).contiguous()
+        if (MX.mmvq_mxfp4() and R == 1 and self.activation_fn == "swiglu_oai" and self.act_limit > 0 and
+                gb is not None and ub is not None):
+            # EXL3_FQ_MMVQ_MXFP4=1 (CUDA): llama.cpp-style mmvq decode, q8_1 activations (see _mxfp4_mmvq_forward)
+            return self._mxfp4_mmvq_forward(x, h, sel, (gw, gb, uw, ub, dw, db), I, K, H, routing_weights, params, out_dtype)
         g = MX.moe_gemv(h, gw, gb, sel, I, K, S).half()
         u = MX.moe_gemv(h, uw, ub, sel, I, K, S).half()
         a = torch.empty_like(g)

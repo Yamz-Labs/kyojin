@@ -46,6 +46,14 @@ def _mxfp4_moe(x_ptr, wtab, btab, sel_ptr, y_ptr, K, N, XDIV, HAS_B: tl.constexp
     tl.store(y_ptr + slot.to(tl.int64) * N + rn, acc, mask=mn)
 
 
+MMVQ_FIRES = 0     # python-level count of EXL3_FQ_MMVQ_MXFP4 branch calls (eager / capture; a graph replay does not run python)
+
+
+def mmvq_mxfp4() -> bool:
+    """EXL3_FQ_MMVQ_MXFP4=1 on CUDA (not HIP): llama.cpp-style MXFP4 mmvq decode MoE (fq_mxfp4_moe_gu / fq_mxfp4_moe_down). Read at call time."""
+    return os.environ.get("EXL3_FQ_MMVQ_MXFP4", "0") == "1" and bool(torch.version.cuda) and not torch.version.hip
+
+
 def moe_gemv(x: torch.Tensor, wtab: torch.Tensor, btab: torch.Tensor | None, sel: torch.Tensor, N: int, K: int, xdiv: int) -> torch.Tensor:
     """x (rows, K) fp16 contiguous; sel (slots,) int32 expert ids; returns (slots, N) fp32."""
     slots = sel.numel()

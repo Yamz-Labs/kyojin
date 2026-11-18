@@ -23,6 +23,12 @@ void fq_mmvq_q5_1(torch::Tensor qb, torch::Tensor packed, torch::Tensor out);
 void fq_moe_mmvq_grouped(torch::Tensor h, torch::Tensor sel, torch::Tensor wts, torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
                          torch::Tensor down_ptrs, int64_t gate_stride, int64_t up_stride, int64_t down_stride, int64_t type_ug, int64_t type_down,
                          torch::Tensor partial, torch::Tensor out);
+// EXL3_FQ_MMVQ_MXFP4 (CUDA, R == 1): llama.cpp-shaped MXFP4 MoE decode on the stacked experts through int64 pointer tables (fq_mmvq.cu).
+// gu: act [S, I] half = swiglu_oai(gate + bias, up + bias, lim); qb = ONE q8_1 row of the input. down: out [S, N] float = q8_1(act)[slot] . W^T + bias.
+void fq_mxfp4_moe_gu(torch::Tensor qb, torch::Tensor sel, torch::Tensor gate_ptrs, torch::Tensor gate_bias, torch::Tensor up_ptrs,
+                     torch::Tensor up_bias, torch::Tensor act, int64_t I, int64_t K, double lim);
+void fq_mxfp4_moe_down(torch::Tensor qb, torch::Tensor sel, torch::Tensor down_ptrs, torch::Tensor down_bias, torch::Tensor out, int64_t N,
+                       int64_t K);
 // Dequantize IQ blocks to fp16 [N, K] (K % 256 == 0); fmt = MQ type id as above (0..6, 10 q3_k). Port of ggml convert.cu dequantize_block_iq*.
 void fq_dequant_iq(torch::Tensor packed, torch::Tensor out, int64_t fmt);
 #if !defined(USE_ROCM)

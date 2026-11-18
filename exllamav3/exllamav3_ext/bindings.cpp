@@ -664,6 +664,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("h"), py::arg("sel"), py::arg("wts"), py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
           py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"), py::arg("type_ug"), py::arg("type_down"),
           py::arg("partial"), py::arg("out"));
+    m.def("fq_mxfp4_moe_gu", &fq_mxfp4_moe_gu, "fq_mxfp4_moe_gu",
+          py::arg("qb"), py::arg("sel"), py::arg("gate_ptrs"), py::arg("gate_bias"), py::arg("up_ptrs"), py::arg("up_bias"), py::arg("act"),
+          py::arg("I"), py::arg("K"), py::arg("lim"));
+    m.def("fq_mxfp4_moe_down", &fq_mxfp4_moe_down, "fq_mxfp4_moe_down",
+          py::arg("qb"), py::arg("sel"), py::arg("down_ptrs"), py::arg("down_bias"), py::arg("out"), py::arg("N"), py::arg("K"));
     m.def("fq_mmvq_q5_k", &fq_mmvq_q5_k, "fq_mmvq_q5_k",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_mmvq_q4_k", &fq_mmvq_q4_k, "fq_mmvq_q4_k",
