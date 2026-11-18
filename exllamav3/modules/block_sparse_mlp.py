@@ -1976,6 +1976,50 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = final_hidden_states.to(out_dtype)
         return final_hidden_states
 
+    def _forward_mxfp4_prefill_grouped(self, x, y, selected_experts, routing_weights, params, out_dtype, eshape):
+        """EXL3_MXFP4_PREFILL_GROUPED=1 (CUDA): MXFP4 experts at prefill. The experts routed in this chunk are dequantized to a per-chunk fp16
+        scratch with one launch per projection (moe_mxfp4_prefill.py), grouped fp16 GEMMs with bias, the layer's activation, down GEMM x routing
+        weight; nothing stays resident. Returns the block output or None (the caller keeps today's paths)."""
+        from ..foreign_quant import moe_mxfp4_prefill as MP
+        R = y.shape[0]
+        if not MP.use_prefill(R, FQ_GROUPED_MAX_ROWS):
+            return None
+        if not self._mxfp4_grouped_ok(y) or (self.num_local_experts or self.num_experts) != self.num_experts:
+            return None
+        S = self.num_experts_per_tok
+        if tuple(selected_experts.shape) != (R, S) or selected_experts.dtype != torch.long:
+            return None
+        fg, fd = self.gates[0].inner.fl, self.downs[0].inner.fl
+        K, I, N = fg.in_features, fg.out_features, fd.out_features
+        H = y.shape[1]
+        if fd.in_features != I or K < H or K % 32 or I % 32:
+            return None
+        if any(m.inner.bias is not None and (m.inner.bias.dtype != torch.half or not m.inner.bias.is_contiguous())
+               for m in self.gates + self.ups + self.downs):
+            return None
+        h = y.contiguous()
+        if K != H:
+            h = torch.nn.functional.pad(h, (0, K - H)).contiguous()
+        dev = h.device
+        tbl = getattr(self, "_mx_ptrs", None)
+        if tbl is None or tbl[0] != fg.packed.data_ptr() or tbl[1] != dev:
+            mk = lambda ms: torch.tensor([m.inner.fl.packed.data_ptr() for m in ms], dtype=torch.int64, device=dev)
+            mb = lambda ms: torch.tensor([m.inner.bias.data_ptr() for m in ms], dtype=torch.int64, device=dev) \
+                if all(m.inner.bias is not None for m in ms) else None
+            tbl = (fg.packed.data_ptr(), dev, mk(self.gates), mb(self.gates), mk(self.ups), mb(self.ups), mk(self.downs), mb(self.downs))
+            self._mx_ptrs = tbl
+        if (tbl[3] is None) != (tbl[5] is None):
+            return None
+        wts = routing_weights if routing_weights.dtype == torch.half else routing_weights.to(torch.half)
+        routed = MP.run(h, selected_experts.contiguous(), wts.contiguous(), tbl, self.num_experts, I, K, N, self.activation_fn_call, self.act_limit)
+        final_hidden_states = routed[:, :H].reshape(eshape)
+        if self.shared_experts is not None:
+            se = self.shared_experts.forward(x, params)
+            final_hidden_states = final_hidden_states + se.to(torch.float).view(final_hidden_states.shape)
+        if out_dtype is not None:
+            final_hidden_states = final_hidden_states.to(out_dtype)
+        return final_hidden_states
+
     def _forward_fp8_grouped(self, x, y, selected_experts, routing_weights, params, out_dtype, eshape):
         """Grouped FP8 MoE decode (R <= FQ_GROUPED_MAX_ROWS rows): gate and up of every (row, expert) slot in one launch each,
         SiLU * up in torch, down in one launch, weighted fold per row; then the shared expert as the KQ grouped path does."""
@@ -2639,6 +2683,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # KQ grouped decode (MiniCPM SwiGLU MoE): same idea via the KQ dots
         # (see _forward_foreign_grouped_kq). Tried first (Bolt returns None
         # without latent projs anyway).
+        # MXFP4 experts at prefill (EXL3_MXFP4_PREFILL_GROUPED=1, rows above FQ_GROUPED_MAX_ROWS): routed-expert Triton dequant + grouped GEMM.
+        if bsz >= 2 and not params.get("activate_all_experts") and not params.get("reconstruct") and \
+                not params.get("autosplit_measure") and not params.get("dflash_verify"):
+            pf = self._forward_mxfp4_prefill_grouped(x, y, selected_experts, routing_weights, params, out_dtype, eshape)
+            if pf is not None:
+                return pf
+
         if bsz <= FQ_GROUPED_MAX_ROWS and not params.get("activate_all_experts") and \
                 not params.get("reconstruct") and not params.get("autosplit_measure"):
             grouped = self._forward_fp8_grouped(
