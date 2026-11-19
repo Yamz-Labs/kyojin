@@ -264,7 +264,7 @@ def mla_banded(q_lat, q_pe, kc, qstart, scale, sinks=None, window=0, allow=None,
 # DSA layers: query t attends only the groups the indexer selected for it (gidx [T, GS] group ids, nsel [T] valid count, KP keys per group) plus its own open
 # group (tail keys lo_t..pos). One program = one query x a block of heads: the selected latent rows are gathered once and serve every head of the block.
 # Same maths as _mla_kernel with an allow mask (masked keys contribute exactly 0); the sink joins the denominator only.
-SPCFG = {"HB": 32, "BG": 16, "warps": 4, "stages": 1}
+SPCFG = {"HB": 16, "BG": 4, "warps": 4, "stages": 1}      # best of the 100-config sweep at N 33K: 288-299 ms per layer per 8192 rows
 
 
 @triton.jit
