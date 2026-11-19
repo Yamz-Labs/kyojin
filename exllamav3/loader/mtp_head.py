@@ -308,6 +308,10 @@ class MTPGraphCU(MTPGraph):
         return out
 
 
+import os
+_STAGE_OV = [False]
+
+
 def spec_generate(gd, mg, y, hcur, n_new, cu=False, timers=None):
     """Greedy speculative decode on the whole-step graph. gd = GraphDecoder (the trunk, context already in it), mg = MTPGraph / MTPGraphCU (k drafts per round),
     y = the trunk's greedy token after the context (host int, NOT yet fed), hcur = the trunk hidden [1, D] of the last context position, n_new = tokens wanted.
@@ -322,7 +326,10 @@ def spec_generate(gd, mg, y, hcur, n_new, cu=False, timers=None):
     while len(out) < n_new:
         j = fw.n - 1
         ta = pc()
-        d = (mg.run(cu_toks, cu_h, cu_p) if cu else mg.run(y, hcur, j)).tolist()
+        dd = mg.run(cu_toks, cu_h, cu_p) if cu else mg.run(y, hcur, j)
+        if _STAGE_OV[0]:
+            gd.prestage(y)
+        d = dd.tolist()
         tb = pc()
         toks = [y] + d
         _lg, amv, _x, hv = gd.step_rows(toks)
