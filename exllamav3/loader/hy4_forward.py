@@ -32,6 +32,7 @@ from . import kv_fused as _KVF
 from . import mla_bgemv as _BGM
 from . import head_bf16 as _HB
 from . import attn_eager as _AE
+from . import router_gemv as _RG
 
 _HCF = None
 if os.environ.get("HY4_HC_FUSED", "0") == "1":      # fused hyper-connection sites (loader/hc_fused.py)
@@ -472,10 +473,10 @@ class Hy4Forward:
         T, dev = x.shape[0], self.dev
         with tm.t("router"):
             if _rf.ENABLED:       # HY4_REF_FUSED=1: one router kernel; the host sync (tolist) only where the pread loop needs it
-                sel, w = _rf.router_select(x @ L.router.T, L.rbias, self.topk, self.w_scale)
+                sel, w = _rf.router_select(_RG.logits(x, L.router) if _RG.usable(x, L.router) else x @ L.router.T, L.rbias, self.topk, self.w_scale)
                 sel_l = [] if (self.res.get(i) is not None and T <= MMVQ_MAXR and dev.type == "cuda") else sorted(set(sel.flatten().tolist()))
             else:
-                p = torch.sigmoid(x @ L.router.T)
+                p = torch.sigmoid(_RG.logits(x, L.router) if _RG.usable(x, L.router) else x @ L.router.T)
                 sel = torch.sort(p + L.rbias, dim=-1, descending=True, stable=True).indices[:, :self.topk]      # stable: near-tied experts resolve to the lowest id every call
                 w = torch.gather(p, 1, sel)
                 w = w / w.sum(-1, keepdim=True).clamp(min=6.103515625e-5) * self.w_scale

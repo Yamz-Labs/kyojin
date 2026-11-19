@@ -11,6 +11,7 @@ so a rejected draft row is simply overwritten by the next round. Greedy chain on
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 
@@ -103,7 +104,9 @@ class Hy4MTP:
         fw = self.fw
         if self.fast:
             from . import ref_fused as _RF
-            sel, w = _RF.router_select(x @ self.router.T, self.rbias, fw.topk, fw.w_scale)        # one launch, lowest id on ties
+            from . import router_gemv as _RG
+            lg = _RG.logits(x, self.router) if _RG.usable(x, self.router) else x @ self.router.T
+            sel, w = _RF.router_select(lg, self.rbias, fw.topk, fw.w_scale)        # one launch, lowest id on ties
         else:
             p = torch.sigmoid(x @ self.router.T)
             sel = torch.topk(p + self.rbias, fw.topk, dim=-1).indices
@@ -303,3 +306,40 @@ class MTPGraphCU(MTPGraph):
         cg, out = self._graph(N, a)
         cg.replay()
         return out
+
+
+def spec_generate(gd, mg, y, hcur, n_new, cu=False, timers=None):
+    """Greedy speculative decode on the whole-step graph. gd = GraphDecoder (the trunk, context already in it), mg = MTPGraph / MTPGraphCU (k drafts per round),
+    y = the trunk's greedy token after the context (host int, NOT yet fed), hcur = the trunk hidden [1, D] of the last context position, n_new = tokens wanted.
+    Each round: the draft chain proposes k tokens, ONE T = k + 1 row verify replay checks them, the longest agreeing prefix plus the trunk's own next token is kept
+    (the output equals plain greedy decoding of the trunk), K / indexer rows of rejected positions are overwritten by the next round.
+    Returns (tokens [>= n_new, up to k more], accepted-length histogram, rounds). timers (list of 3 floats, optional) accumulates seconds in: draft chain launch +
+    wait, host stage + verify launch, verify wait."""
+    fw, k = gd.fw, mg.k
+    out, hist, rounds = [], [0] * (k + 1), 0
+    cu_toks, cu_h, cu_p = [y], hcur, fw.n - 1
+    pc = time.perf_counter
+    while len(out) < n_new:
+        j = fw.n - 1
+        ta = pc()
+        d = (mg.run(cu_toks, cu_h, cu_p) if cu else mg.run(y, hcur, j)).tolist()
+        tb = pc()
+        toks = [y] + d
+        _lg, amv, _x, hv = gd.step_rows(toks)
+        tc = pc()
+        amh = amv.tolist()
+        td = pc()
+        if timers is not None:
+            timers[0] += tb - ta
+            timers[1] += tc - tb
+            timers[2] += td - tc
+        acc = 0
+        while acc < k and d[acc] == amh[acc]:
+            acc += 1
+        out += toks[:acc + 1]
+        gd.rewind(j + 2 + acc)
+        y, hcur = amh[acc], hv[acc:acc + 1]
+        cu_toks, cu_h, cu_p = d[:acc] + [y], hv[:acc + 1], j + 1
+        hist[acc] += 1
+        rounds += 1
+    return out, hist, rounds

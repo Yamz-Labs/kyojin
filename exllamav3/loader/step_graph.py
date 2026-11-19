@@ -21,6 +21,7 @@ import torch
 
 from . import step_nosync as _ns
 from .engram_rows import QB, E4M3, E8M0
+from . import attn_eager as _ae
 
 BUCKET = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
 TM = int(os.environ.get("HY4_GRAPH_TM", "8"))          # max rows of one graph step (verify rows)
@@ -33,6 +34,8 @@ _POOL = ThreadPoolExecutor(max_workers=_IO_W)
 # ---------------------------------------------------------------------------------------------------- static indexer
 def _rms(x, w, eps):
     x = x.float()
+    if _ae.RMS and x.dim() == 2 and x.is_cuda:        # G2: one launch instead of five
+        return _ae.rmsw(x, w, eps)
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
 
 
