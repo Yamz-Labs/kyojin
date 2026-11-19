@@ -428,9 +428,32 @@ def pf_indexer(obj, tm=None):
 F16MAX = 65504.0
 
 
+@triton.jit
+def _sat_half_kernel(X, O, n, BLK: tl.constexpr):
+    i = tl.program_id(0).to(tl.int64) * BLK + tl.arange(0, BLK)
+    m = i < n
+    x = tl.load(X + i, mask=m, other=0.0)
+    tl.store(O + i, tl.minimum(tl.maximum(x, -65504.0), 65504.0).to(tl.float16), mask=m)
+
+
+_F16_MEMO = [None, None]      # (source tensor, converted) and its key: the fp32 stream of one layer feeds several GEMMs (wq_a, wkv_a, wgate / router, rdown, shared gate + up)
+
+
 def to_f16(x):
-    """saturating fp32 / fp16 -> fp16 (hidden streams keep the clamp)"""
-    return x.float().clamp(-F16MAX, F16MAX).half() if x.dtype != torch.float16 else x
+    """saturating fp32 / fp16 -> fp16 (hidden streams keep the clamp): one fused pass, and the conversion of the last fp32 input is reused while that tensor is
+    unchanged (same storage, same in-place version)"""
+    if x.dtype == torch.float16:
+        return x
+    if x.dtype != torch.float32 or not x.is_cuda or not x.is_contiguous() or x.numel() < (1 << 20):
+        return x.float().clamp(-F16MAX, F16MAX).half()
+    key = (x.data_ptr(), x.shape, x._version)
+    if _F16_MEMO[0] is not None and _F16_MEMO[1] == key and _F16_MEMO[0][0] is x:
+        return _F16_MEMO[0][1]
+    o = torch.empty(x.shape, dtype=torch.float16, device=x.device)
+    n = x.numel()
+    _sat_half_kernel[(triton.cdiv(n, 4096),)](x, o, n, BLK=4096, num_warps=4)
+    _F16_MEMO[0], _F16_MEMO[1] = (x, o), key
+    return o
 
 
 MOE_NF = None             # tests: force the grid order (None = env HY4_MOE_NFIRST)
