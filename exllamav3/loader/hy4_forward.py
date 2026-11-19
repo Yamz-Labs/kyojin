@@ -116,10 +116,13 @@ GG_GROUPED = {12: (0, 256, 144), 13: (1, 256, 176), 14: (2, 256, 210), 23: (3, 2
 GROUPED_UG = (0, 1, 2, 3, 4, 5, 8)
 EXPERT_PREAD = os.environ.get("HY4_EXPERT_PREAD", "0") == "1"                    # 1 = old path: experts pread from the GGUF every step ((1a) mmvq)
 RESIDENT_GB = float(os.environ.get("HY4_EXPERT_RESIDENT_GB", "72"))               # VRAM byte budget for resident routed experts (stored bytes)
-PF_MOE = os.environ.get("HY4_PREFILL_MOE", "0") in ("1", "ref")       # 1 = prefill rows (T > MMVQ_MAXR) of resident experts: sorted-token fused dequant GEMM (prefill_kernels.py)
+PF_MOE = os.environ.get("HY4_PREFILL_MOE", "0") in ("1", "i8", "ref")       # 1 = prefill rows (T > MMVQ_MAXR) of resident experts: sorted-token fused dequant GEMM (prefill_kernels.py)
+PF_MOE_I8 = os.environ.get("HY4_PREFILL_MOE", "0") == "i8"                 # i8 = Q8_K activations on int8 WMMA (llama.cpp mmq style)
 PF_MOE_REF = os.environ.get("HY4_PREFILL_MOE", "0") == "ref"         # ref = exact fp32 torch math on batched-dequantised resident experts (quality reference, same maths as the pread path)
 PF_DENSE = os.environ.get("HY4_PREFILL_DENSE", "0") in ("1", "i8")    # 1 = prefill rows of stored Q8_0 dense matrices: fused dequant fp16 GEMM; i8 = Q8 activations on int8 WMMA (prefill_kernels.py)
 PF_DENSE_I8 = os.environ.get("HY4_PREFILL_DENSE", "0") == "i8"
+PF_DIAG = os.environ.get("HY4_PREFILL_DIAG", "0") == "1"           # log fast-path vs exact error of every prefill dense matmul (debug)
+PF_ROUTER = os.environ.get("HY4_PREFILL_ROUTER", "0") == "1"       # 1 = router logits of prefill rows as an fp16 GEMM (fp32 accumulate): fp32 matmul runs at 2.7 TFLOPS here
 
 
 def _pk():
@@ -238,7 +241,15 @@ class QLinear:
             if self.stats is not None:
                 self.stats["dense_gemv"] = self.stats.get("dense_gemv", 0) + 1
         elif PF_DENSE and self.ty == 8 and x2.is_cuda:
-            out = _pk().qdense_i8(x2, self.packed) if PF_DENSE_I8 else _pk().qdense(x2, self.packed, _pk().FMT_Q8)
+            k_ = _pk()
+            out = k_.qdense_i8(x2, self.packed) if PF_DENSE_I8 else (k_.qdense_tm(x2, self.packed) if x2.shape[0] >= k_.DENSE_TM_MIN_M else k_.qdense(x2, self.packed, k_.FMT_Q8))
+            if PF_DIAG:
+                ex = x2.float() @ self.dense().T
+                df = out.float() - ex
+                rr = df.norm(dim=1) / ex.norm(dim=1).clamp_min(1e-30)
+                w_ = int(rr.argmax())
+                print(f"DIAG dense N={N} K={K} M={x2.shape[0]} rel={float(df.norm() / ex.norm()):.2e} worst_row={w_} {float(rr[w_]):.2e} row0={float(rr[0]):.2e} max|x|={float(x2.abs().max()):.3e} "
+                      f"clamped_in={int((x2.abs() > 65504).sum())} max|out|={float(ex.abs().max()):.3e} out_over={int((ex.abs() > 65504).sum())}", flush=True)
             if self.stats is not None:
                 self.stats["dense_pf"] = self.stats.get("dense_pf", 0) + 1
         else:
@@ -504,7 +515,12 @@ class Hy4Forward:
                 sel, w = _rf.router_select(x @ L.router.T, L.rbias, self.topk, self.w_scale)
                 sel_l = [] if (pf or (self.res.get(i) is not None and T <= MMVQ_MAXR and dev.type == "cuda")) else sorted(set(sel.flatten().tolist()))
             else:
-                p = torch.sigmoid(x @ L.router.T)
+                if PF_ROUTER and T > MMVQ_MAXR and dev.type == "cuda":
+                    if getattr(L, "router16", None) is None:
+                        L.router16 = L.router.half().contiguous()
+                    p = torch.sigmoid(_pk().mm_f32(_pk().to_f16(x), L.router16.T))
+                else:
+                    p = torch.sigmoid(x @ L.router.T)
                 sel = torch.topk(p + L.rbias, self.topk, dim=-1).indices
                 w = torch.gather(p, 1, sel)
                 w = w / w.sum(-1, keepdim=True).clamp(min=6.103515625e-5) * self.w_scale
@@ -521,7 +537,7 @@ class Hy4Forward:
         elif pf:
             with tm.t("routed experts"):
                 k_ = _pk()
-                lat = k_.moe_prefill(z, sel, w, (rsp.bufs["gate"], rsp.bufs["up"], rsp.bufs["down"]), (k_.FROM_GROUPED[rsp.fu], k_.FROM_GROUPED[rsp.fd]), lim,
+                lat = (k_.moe_prefill_i8 if PF_MOE_I8 else k_.moe_prefill)(z, sel, w, (rsp.bufs["gate"], rsp.bufs["up"], rsp.bufs["down"]), (k_.FROM_GROUPED[rsp.fu], k_.FROM_GROUPED[rsp.fd]), lim,
                                      rsp.nff, rsp.nout, (rsp.strides[0], rsp.strides[2]), rsp.ebytes, rsp.E)
             self.stats["prefill_moe_calls"] = self.stats.get("prefill_moe_calls", 0) + 1
             sel_l = []

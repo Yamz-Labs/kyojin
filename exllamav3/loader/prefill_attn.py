@@ -180,9 +180,14 @@ def _pv_kernel(Pm, V, O, M, NK, NKP, row0, klo, kbase, D: tl.constexpr, R: tl.co
 BCFG = {"BM": 128, "BN": 128, "BK": 32, "warps": 8, "PBN": 128, "PBK": 32, "pwarps": 8, "S_BYTES": 48 << 20}
 
 
+# measured (test_pf2, 2048 queries): sliding window H=64 best 7.9 TFLOPS at S=8 MiB; full + allow mask H=32 best 17.7 at S=16 MiB with a 64-wide key tile
+BCFG_SWA = dict(BCFG, S_BYTES=8 << 20)
+BCFG_FULL = dict(BCFG, S_BYTES=16 << 20, BN=64, PBK=64)
+
+
 def mla_banded(q_lat, q_pe, kc, qstart, scale, sinks=None, window=0, allow=None, cfg=None):
     """same contract as mla_flash: q_lat [T, H, R], q_pe [T, H, P], kc [N, R + P] (N = qstart + T) -> o_lat [T, H, R] fp32"""
-    c = cfg or BCFG
+    c = cfg or (BCFG_SWA if window else BCFG_FULL)
     T, H, R = q_lat.shape
     Pd = q_pe.shape[-1]
     D = R + Pd

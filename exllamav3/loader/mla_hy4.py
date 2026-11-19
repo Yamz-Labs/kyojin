@@ -93,21 +93,31 @@ class Hy4MLA:
 
     def kv(self, cur, pos):
         """cur [T, n_embd], pos [T] -> K cache rows [T, R + rope] = [rms(kv_a)*w | rope(k_pe)] (V is the first R columns)"""
-        c = self._q(cur, "wkv_a") @ self.wkv_a.T
-        lat = rms(c[:, :self.R], self.eps) * self.kv_a_norm
-        pe = rope_norm(c[:, self.R:], pos, self.theta)
-        return self._h(torch.cat([lat, pe], -1))
+        tm = self.tm
+        with tm.t("f kv: wkv_a mm"):
+            c = self._q(cur, "wkv_a") @ self.wkv_a.T
+        with tm.t("f kv: norm+rope"):
+            lat = rms(c[:, :self.R], self.eps) * self.kv_a_norm
+            pe = rope_norm(c[:, self.R:], pos, self.theta)
+            return self._h(torch.cat([lat, pe], -1))
 
     def q(self, cur, pos):
         """-> q_lat [T,H,R], q_pe [T,H,rope] (q_nope absorbed with k_b; rope on the pe part)"""
         T, H = cur.shape[0], self.H
-        qr = rms(self._q(cur, "wq_a") @ self.wq_a.T, self.eps) * self.q_a_norm
-        q = (self._q(qr, "wq_b") @ self.wq_b.T).view(T, H, self.hd)
-        qn, qp = q[..., :self.nope], rope_norm(q[..., self.nope:].contiguous(), pos, self.theta)
-        if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:       # prefill rows: fp16 batched GEMM over heads (fp32 einsum is ~3x slower)
-            qlat = torch.bmm(self._w16("wk_b"), self._f16(qn).permute(1, 2, 0)).permute(2, 0, 1).float()
-        else:
-            qlat = torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
+        tm = self.tm
+        with tm.t("f q: wq_a mm"):
+            qa = self._q(cur, "wq_a") @ self.wq_a.T
+        with tm.t("f q: norm"):
+            qr = rms(qa, self.eps) * self.q_a_norm
+        with tm.t("f q: wq_b mm"):
+            q = (self._q(qr, "wq_b") @ self.wq_b.T).view(T, H, self.hd)
+        with tm.t("f q: rope"):
+            qn, qp = q[..., :self.nope], rope_norm(q[..., self.nope:].contiguous(), pos, self.theta)
+        with tm.t("f q: wk_b bmm"):
+            if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:       # prefill rows: fp16 batched GEMM over heads (fp32 einsum is ~3x slower)
+                qlat = torch.bmm(self._w16("wk_b"), self._f16(qn).permute(1, 2, 0)).permute(2, 0, 1).float()
+            else:
+                qlat = torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
         return self._h(qlat, "q"), self._h(qp, "q")
 
     def attend(self, cur, pos, kcache, kpos, allow=None):
@@ -126,18 +136,23 @@ class Hy4MLA:
             else:
                 o = self.S.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window, allow)
         with tm.t("attn proj"):
-            if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:
-                kqv = torch.bmm(self._w16("wv_b"), self._f16(o).permute(1, 2, 0)).permute(2, 0, 1).float().reshape(T, H * self.vd)
-            else:
-                kqv = torch.einsum("hdr,thr->thd", self.wv_b, self._q(o, "vb")).reshape(T, H * self.vd)
+            with tm.t("f attend: wv_b bmm"):
+                if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:
+                    kqv = torch.bmm(self._w16("wv_b"), self._f16(o).permute(1, 2, 0)).permute(2, 0, 1).float().reshape(T, H * self.vd)
+                else:
+                    kqv = torch.einsum("hdr,thr->thd", self.wv_b, self._q(o, "vb")).reshape(T, H * self.vd)
             gated, out = self.gate_out(cur, kqv)
         return kqv, gated, out
 
     def gate_out(self, cur, kqv):
         """isolated tail (gate, then wo, then post norm): oracle attn_kqv + cur -> (gated, out)"""
-        gated = self.S.sigmoid_gate(kqv, self._q(cur, "wgate") @ self.wgate.T)
-        out = self._q(gated, "wo") @ self.wo.T
-        return gated, (rms(out, self.eps) * self.post_norm if self.post_norm is not None else out)
+        tm = self.tm
+        with tm.t("f gate: wgate mm + sigmoid"):
+            gated = self.S.sigmoid_gate(kqv, self._q(cur, "wgate") @ self.wgate.T)
+        with tm.t("f gate: wo mm"):
+            out = self._q(gated, "wo") @ self.wo.T
+        with tm.t("f gate: post norm"):
+            return gated, (rms(out, self.eps) * self.post_norm if self.post_norm is not None else out)
 
 
 POST_NORM = "post_attention_norm.weight"
