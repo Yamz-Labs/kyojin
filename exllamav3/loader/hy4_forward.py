@@ -211,6 +211,7 @@ def _dq_q8_0_t(packed):
 # rows <= DENSE_MAXR run the extension GEMV (activation quantised to q8_1 inside, like llama.cpp), more rows dequantise per call (no resident fp32 copy).
 GG_DENSE = {8: (32, 34, "fq_gemv_q8_0", _dq_q8_0_t)}
 DENSE_MAXR = 16
+NO_ALIAS_LAT = os.environ.get("HY4_LAT_CLONE", "0") == "1"     # 1 = copy the grouped MoE output before the rup matmul (old behaviour)
 DENSE_DQ = os.environ.get("HY4_DENSE_DQ", "0") == "1"       # 1 = old path: dense matrices dequantised once to fp32 and kept resident
 
 
@@ -557,7 +558,7 @@ class Hy4Forward:
                 sel_l = [] if (pf or _ns.skip_host_ids(self, i, T, MMVQ_MAXR)) else sorted(set(sel.flatten().tolist()))
         with tm.t("other"):
             z = self._mm(x, L.rdown)
-            lat = torch.zeros(T, z.shape[1], device=dev)
+            lat = None          # allocated (zeros) only by the paths that accumulate into it: the grouped / prefill paths overwrite it
         lim, N = float(self.clamp[i]), z.shape[1]
         b = f"blk.{i}."
         if pf and PF_MOE_REF:
@@ -582,9 +583,11 @@ class Hy4Forward:
                 ext.fq_moe_kq_set_swiglu_limit(lim)
                 ext.fq_moe_kq_grouped_mixed_q8(z.half().contiguous(), sel.contiguous(), w.half().contiguous(), *rs.ptrs, *rs.strides, rs.fu, rs.fd,
                                                self._gpart[:T * S], self._gout[:T])
-                lat = self._gout[:T].clone()
+                lat = self._gout[:T] if (self.hook is None and not NO_ALIAS_LAT) else self._gout[:T].clone()       # rup reads it before the next layer's grouped call overwrites _gout (one stream); hooks keep a copy
             self.stats["grouped_calls"] = self.stats.get("grouped_calls", 0) + 1
             sel_l = []          # the per-expert pread loop below runs zero times
+        if lat is None:
+            lat = torch.zeros(T, N, device=dev)
         kg, kd = (None, None) if (self.expert_dq or T > MMVQ_MAXR or dev.type != "cuda") else (mmvq_fn(L.ety, N), mmvq_fn(L.ety_down, N))
         use_k = kg is not None or kd is not None          # per tensor: a stored type without a kernel keeps the torch dequant for that tensor only
         with tm.t("routed experts"):

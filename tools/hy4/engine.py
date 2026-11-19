@@ -39,6 +39,7 @@ class Hy4Engine:
         self.ngram_adapt = os.environ.get("HY4_NGRAM_ADAPT", "0") == "1"
         self.ngram_gate = os.environ.get("HY4_NGRAM_GATE", "0") == "1"
         self.ngram_fill = os.environ.get("HY4_NGRAM_FILL", "0") == "1"
+        self.ngram_long = int(os.environ.get("HY4_NGRAM_LONG", "0"))      # >= 1: a match of at least this many tokens REPLACES the MTP draft chain (verify y + up to TM - 1 copied tokens; the draft cache is refilled from the trunk states); 0 = off
         self.ready = False
         self.meta = None
         self.last_stats: dict = {}
@@ -203,15 +204,23 @@ class Hy4Engine:
                 from ngram import NGram
                 ng = NGram(self.ngram_min, self.ngram_ext)
                 ng.reset(list(ids) + [y])
-            n_ext = n_hit = n_extacc = 0
+            n_ext = n_hit = n_extacc = n_long = 0
             rate, since = 0.7, 0          # recent acceptance of the extra rows; below 0.4 the proposer pauses (a probe every 8 rounds)
             while out_n < max_new and not stop and not cancel():
                 j = GR.fw.n - 1
                 ta = pc()
-                d = MG.run(y, hcur, j).tolist()
-                tb = pc()
-                ext = []
-                if ng is not None:
+                skip = False
+                if ng is not None and self.ngram_long > 0:
+                    cl, ml = ng.propose([], self.SG.TM - 1)
+                    skip = bool(cl) and ml >= self.ngram_long
+                if skip:
+                    d, ext = [], cl
+                    tb = pc()
+                else:
+                    d = MG.run(y, hcur, j).tolist()
+                    tb = pc()
+                    ext = []
+                if ng is not None and not skip:
                     lim = min(self.ngram_ext, self.SG.TM - 1 - k)
                     if self.ngram_gate:
                         since += 1
@@ -220,9 +229,12 @@ class Hy4Engine:
                     if self.ngram_adapt and ext:           # longer match, more rows: 2 rows at the minimum match, +2 per extra matched token
                         ext = ext[:max(1, (ml - self.ngram_min + 1) * 2)]
                 toks = [y] + d + ext
-                if ext:
+                if skip:
+                    n_long += 1
+                elif ext:
                     n_hit += 1
                     n_ext += len(ext)
+                hc0 = hcur.clone() if skip else None      # hcur views the static graph output: the replay below overwrites it
                 _lg, amv, _x, hv = GR.step_rows(toks)
                 tc = pc()
                 amh = amv.tolist()
@@ -234,13 +246,19 @@ class Hy4Engine:
                 nd = len(toks) - 1
                 while acc < nd and toks[acc + 1] == amh[acc]:
                     acc += 1
-                n_extacc += max(0, acc - k)
-                if ext:
+                if not skip:
+                    n_extacc += max(0, acc - k)
+                if ext and not skip:
                     since = 0
                     rate = 0.75 * rate + 0.25 * (max(0, acc - k) / len(ext))
                 new = toks[1:acc + 1] + [amh[acc]]        # toks[0] = y was already emitted; the verified drafts + the trunk's own next token
                 GR.rewind(j + 2 + acc)
-                if self.ngram_fill and acc >= k:          # head rows j + k .. j + acc were never written by the draft chain: true pairs (token p + 1, trunk state h_p)
+                if skip:                                  # the chain wrote no head rows: pairs (token m, state before it) for head positions j .. j + acc
+                    MT = self.MT
+                    N = ((j + acc + 1 + 3) // 4) * 4
+                    sts = torch.cat([hc0, hv[:acc]]) if acc > 0 else hc0
+                    MT.step(torch.tensor(toks[:acc + 1], dtype=torch.long, device=self.dev), sts, MT.ar[j:j + acc + 1], N)
+                elif self.ngram_fill and acc >= k:          # head rows j + k .. j + acc were never written by the draft chain: true pairs (token p + 1, trunk state h_p)
                     MT = self.MT
                     N = ((j + acc + 1 + 3) // 4) * 4
                     MT.step(torch.tensor(toks[k:acc + 1], dtype=torch.long, device=self.dev), hv[k - 1:acc], MT.ar[j + k:j + acc + 1], N)
@@ -255,7 +273,7 @@ class Hy4Engine:
                 out_n += len(new)
                 stop = on_tokens(new)
             st["round_ms"] = [x / max(rounds, 1) * 1000 for x in tm]
-            st["ngram"] = {"ext": self.ngram_ext, "min": self.ngram_min, "fill": self.ngram_fill, "hit_rounds": n_hit, "ext_rows": n_ext, "ext_accepted": n_extacc}
+            st["ngram"] = {"ext": self.ngram_ext, "min": self.ngram_min, "fill": self.ngram_fill, "hit_rounds": n_hit, "ext_rows": n_ext, "ext_accepted": n_extacc, "long": self.ngram_long, "long_rounds": n_long}
         else:
             while out_n < max_new and not stop and not cancel():
                 lg = GR.step(y)
