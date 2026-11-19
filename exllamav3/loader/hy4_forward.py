@@ -526,7 +526,7 @@ class Hy4Forward:
                 if v is not None:
                     L.dense[:2] = v
         else:
-            L.router = g.get_tensor(b + "ffn_gate_inp.weight").float().to(dev)
+            L.router = _RG.store(g.get_tensor(b + "ffn_gate_inp.weight").float().to(dev))      # HY4_RG_F16=1: fp16 resident
             L.rbias = g.get_tensor(b + "exp_probs_b.bias").float().to(dev)
             L.rdown, L.rup = self._w(b + "ffn_routed_down.weight"), self._w(b + "ffn_routed_up.weight")
             L.shexp = [self._w(f"{b}ffn_{n}_shexp.weight") for n in ("gate", "up", "down")]
@@ -597,7 +597,7 @@ class Hy4Forward:
         pf = bool(PF_MOE and T > MMVQ_MAXR and dev.type == "cuda" and rsp is not None and rsp.fu in _pk().FROM_GROUPED and rsp.fd in _pk().FROM_GROUPED)
         with tm.t("router"):
             if _rf.ENABLED:       # HY4_REF_FUSED=1: one router kernel; the host sync (tolist) only where the pread loop needs it
-                sel, w = _rf.router_select(_RG.logits(x, L.router) if _RG.usable(x, L.router) else x @ L.router.T, L.rbias, self.topk, self.w_scale)
+                sel, w = _rf.router_select(_RG.mm(x, L.router), L.rbias, self.topk, self.w_scale)
                 sel_l = [] if (pf or (self.res.get(i) is not None and T <= MMVQ_MAXR and dev.type == "cuda")) else sorted(set(sel.flatten().tolist()))
             else:
                 if PF_ROUTER and T > MMVQ_MAXR and dev.type == "cuda":
@@ -605,7 +605,7 @@ class Hy4Forward:
                         L.router16 = L.router.half().contiguous()
                     p = torch.sigmoid(_pk().mm_f32(_pk().to_f16(x), L.router16.T))
                 else:
-                    p = torch.sigmoid(_RG.logits(x, L.router) if _RG.usable(x, L.router) else x @ L.router.T)
+                    p = torch.sigmoid(_RG.mm(x, L.router))
                 sel = torch.sort(p + L.rbias, dim=-1, descending=True, stable=True).indices[:, :self.topk]      # stable: tied experts resolve to the lowest id every call (torch.topk tie order varies between calls on gfx1151)
                 w = torch.gather(p, 1, sel)
                 w = w / w.sum(-1, keepdim=True).clamp(min=6.103515625e-5) * self.w_scale
@@ -727,7 +727,7 @@ class Hy4Forward:
                 meta=torch.zeros(8 * S * 9, dtype=torch.int32, device=dev), nometa=torch.empty(0, dtype=torch.int32, device=dev), nores=torch.empty(0, dtype=torch.float32, device=dev))
         sel, w = st.sel[:T], st.w[:T]
         xc = x.contiguous()
-        gm.gm_route(xc, L.router, L.rbias, st.sc[:T], sel, w, 2, True, self.w_scale, 6.103515625e-5)
+        gm.gm_route(xc, L.router if L.router.dtype == torch.float32 else L.router.float(), L.rbias, st.sc[:T], sel, w, 2, True, self.w_scale, 6.103515625e-5)
         z3 = st.z3[:3 * T * N]
         gm.gm_qkv_decode(xc, w3[0], [3, 3, 3], z3.view(1, -1), st.qa)
         z, g, u = z3[:T * N].view(T, N), z3[T * N:2 * T * N].view(T, N), z3[2 * T * N:].view(T, N)

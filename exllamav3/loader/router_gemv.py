@@ -13,6 +13,7 @@ MAXT = 8
 BN = int(os.environ.get("HY4_RG_BN", "4"))
 BK = int(os.environ.get("HY4_RG_BK", "256"))
 NW = int(os.environ.get("HY4_RG_NW", "4"))
+F16 = os.environ.get("HY4_RG_F16", "0") == "1"      # router weights stored fp16 (GGUF F32 -> fp16: rel 5e-4 per weight, logits ~1e-5): half the bytes of the 41 gemvs; fp32 accumulate
 
 
 @triton.jit
@@ -25,15 +26,25 @@ def _k_rg(x_ptr, w_ptr, o_ptr, N, K, T, sxt, BT: tl.constexpr, BN: tl.constexpr,
     for k0 in range(0, K, BK):
         cols = k0 + tl.arange(0, BK)
         cm = cols < K
-        w = tl.load(w_ptr + rows[:, None] * K + cols[None, :], mask=rm[:, None] & cm[None, :], other=0.0)
+        w = tl.load(w_ptr + rows[:, None] * K + cols[None, :], mask=rm[:, None] & cm[None, :], other=0.0).to(tl.float32)
         xv = tl.load(x_ptr + tt[:, None] * sxt + cols[None, :], mask=tm[:, None] & cm[None, :], other=0.0)
         acc += tl.sum(w[None, :, :] * xv[:, None, :], axis=2)
     tl.store(o_ptr + tt[:, None] * N + rows[None, :], acc, mask=tm[:, None] & rm[None, :])
 
 
 def usable(x, w):
-    return (ENABLED and x.dtype == torch.float32 and w.dtype == torch.float32 and x.dim() == 2 and 1 <= x.shape[0] <= MAXT and w.is_contiguous()
+    return (ENABLED and x.dtype == torch.float32 and w.dtype in (torch.float32, torch.float16) and x.dim() == 2 and 1 <= x.shape[0] <= MAXT and w.is_contiguous()
             and x.stride(-1) == 1 and (x.is_cuda or os.environ.get("TRITON_INTERPRET", "0") == "1"))
+
+
+def store(w):
+    """router weight as kept resident: fp16 when HY4_RG_F16=1 (and the gemv is on), else unchanged fp32"""
+    return w.half().contiguous() if (ENABLED and F16) else w
+
+
+def mm(x, w):
+    """x [T, K] fp32 @ w[N, K].T -> [T, N] fp32: the Triton mat-vec when usable, else the matmul (fp16 weights upcast)"""
+    return logits(x, w) if usable(x, w) else x @ w.float().T
 
 
 def logits(x, w, bn=None, bk=None, nw=None):
