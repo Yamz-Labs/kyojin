@@ -18,7 +18,7 @@ import types
 from typing import Callable
 
 CHUNK_DEFAULT = 8192
-PRIME_ROWS = 2048           # rows per batched MTP draft-cache fill call
+PRIME_ROWS = int(os.environ.get("HY4_PRIME_ROWS", "2048"))           # rows per batched MTP draft-cache fill call
 
 
 def _stub_package(tree: str):
@@ -235,7 +235,7 @@ class Hy4Engine:
         try:
             while s < n - 1:
                 e = min(n - 1, s + PRIME_ROWS)
-                MT.step(tok[s + 1:e + 1], H[s:e], ar[s:e], ((e + 3) // 4) * 4)
+                MT.prime(tok[s + 1:e + 1], H[s:e], ar[s:e], ((e + 3) // 4) * 4)
                 s = e
             self.last_stats["prime_mode"] = "batched" if lo == 0 else f"batched tail {n - 1 - lo}"
         except Exception as ex:           # noqa: BLE001 - the draft only affects speed, never the output: fall back to the last 128 rows one by one

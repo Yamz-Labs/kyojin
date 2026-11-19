@@ -73,11 +73,9 @@ def indexer_static_init(ix, cap):
 
 
 @torch.no_grad()
-def indexer_forward_static(ix, x, qr, pos, Nb, ar):
-    """x [T, E], qr [T, R], pos [T] long (device, ascending), Nb rows -> allow [T, Nb] bool (T = 1 decode, T > 1 verify rows). Same maths and op order as FusedKPoolIndexer.forward for one
-    token; no host value is read: group slot and rope position come from `pos`, the visible groups from a mask (gend < pos).
-    Returns None (all keys causal) while the bucket is small enough that no query can see more than n_top groups: only the pool state is updated."""
-    k, d, H = ix.k, ix.d, ix.H
+def indexer_keys_static(ix, x, pos, ar):
+    """key side of indexer_forward_static: the per-position (value | gate) rows and the pool groups they complete (x [T, E], pos [T] long device, ascending). Needs no query and no selection."""
+    k, d = ix.k, ix.d
     ik = _rms(x @ ix.w["attn_k"].T, ix.w["k_norm"], ix.eps)
     vg_new = torch.cat([ik @ ix.w["value"].T, ik @ ix.w["gate"].T], -1)
     vr = getattr(ix, "vg_ring", 0)
@@ -93,6 +91,15 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
         p = (torch.softmax(g + ix.w["ape"][None], dim=1) * v).sum(1)
         pooled = ix._rope(_rms(p, ix.w["pool_norm"], ix.eps), g0)
         ix.pool.index_copy_(0, pos // k, pooled)            # a group still open holds partial data here; it stays masked until it is complete
+
+
+@torch.no_grad()
+def indexer_forward_static(ix, x, qr, pos, Nb, ar):
+    """x [T, E], qr [T, R], pos [T] long (device, ascending), Nb rows -> allow [T, Nb] bool (T = 1 decode, T > 1 verify rows). Same maths and op order as FusedKPoolIndexer.forward for one
+    token; no host value is read: group slot and rope position come from `pos`, the visible groups from a mask (gend < pos).
+    Returns None (all keys causal) while the bucket is small enough that no query can see more than n_top groups: only the pool state is updated."""
+    k, d, H = ix.k, ix.d, ix.H
+    indexer_keys_static(ix, x, pos, ar)
     if Nb <= (ix.n_top + 1) * k:        # every position of this bucket sees <= n_top groups: the selection is all-causal (the eager path returns None)
         return None
     T = x.shape[0]

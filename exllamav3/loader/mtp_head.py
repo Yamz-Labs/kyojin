@@ -160,6 +160,24 @@ class Hy4MTP:
         y = nm(s2, self.shn)
         return y, self.logits(y[-1:].float())
 
+    @torch.no_grad()
+    def fill(self, tok, h, pos):
+        """draft-cache fill of prompt rows: writes ONLY what the draft chain reads at decode (K row of every position, indexer value / gate rows, pool groups). All of it depends on the
+        layer input alone (token embedding + trunk state), so it is the same state as step() leaves, without the queries, the selection, the attention and the 512-expert MoE whose outputs
+        a fill discards. tok / h / pos as in step()."""
+        nm = self._rmsw
+        e = _ns.embed(self.fw, tok)
+        x = torch.cat([nm(e, self.enorm), nm(h, self.hnorm)], -1) @ self.eh.T
+        cur = nm(x, self.attn_norm)
+        self.kbuf.index_copy_(0, pos, self.mla.kv(cur, pos))
+        SG.indexer_keys_static(self.ix, cur, pos, self.ar)
+
+    def prime(self, tok, h, pos, N):
+        """one batched draft-cache fill call (HY4_PRIME_KVONLY=0: the full step, whose outputs are dropped)"""
+        if os.environ.get("HY4_PRIME_KVONLY", "1") == "1":
+            return self.fill(tok, h, pos)
+        return self.step(tok, h, pos, N)
+
     def _rmsw(self, x, w):
         if self.fast:
             from . import attn_eager as _AE

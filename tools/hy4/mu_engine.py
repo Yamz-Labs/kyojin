@@ -58,7 +58,7 @@ class MuEngine(Hy4Engine):
             f16 = os.environ.get("HY4_PF_F16")
             os.environ["HY4_PF_F16"] = "0"          # the fp16 attention chain is tuned for the trunk's matrices; the draft layer takes the generic prefill path
             try:
-                MT.step(s.tok_dev[a + 1:e_end + 1], hs[:e_end - a], MT.ar[a:e_end], ((e_end + 3) // 4) * 4)
+                MT.prime(s.tok_dev[a + 1:e_end + 1], hs[:e_end - a], MT.ar[a:e_end], ((e_end + 3) // 4) * 4)
             finally:
                 if f16 is None:
                     os.environ.pop("HY4_PF_F16", None)
