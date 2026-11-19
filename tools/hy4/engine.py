@@ -40,6 +40,7 @@ class Hy4Engine:
         self.ngram_gate = os.environ.get("HY4_NGRAM_GATE", "0") == "1"
         self.ngram_fill = os.environ.get("HY4_NGRAM_FILL", "0") == "1"
         self.ngram_long = int(os.environ.get("HY4_NGRAM_LONG", "0"))      # >= 1: a match of at least this many tokens REPLACES the MTP draft chain (verify y + up to TM - 1 copied tokens; the draft cache is refilled from the trunk states); 0 = off
+        self._tune = None           # torch.cuda.tunable module while a frozen TunableOp results file is loaded (HY4_TUNABLEOP_FILE)
         self.ready = False
         self.meta = None
         self.last_stats: dict = {}
@@ -52,6 +53,16 @@ class Hy4Engine:
         if cap < self.ctx + 64:
             raise RuntimeError(f"HY4_NOSYNC_CAP={cap} must be set (before import) to at least ctx + 64 = {self.ctx + 64}")
         _stub_package(self.tree)
+        tf = os.environ.get("HY4_TUNABLEOP_FILE", "")
+        if tf and os.path.exists(tf):      # frozen TunableOp results for the prefill GEMMs (no tuning at run time; shapes missing from the file use the default kernel)
+            import torch.cuda.tunable as tu
+            tu.set_filename(tf, insert_device_ordinal=False)
+            tu.tuning_enable(False)
+            tu.enable(True)
+            self._tune = tu
+            progress(f"TunableOp results {tf}")
+        elif tf:
+            progress(f"TunableOp file missing: {tf}")
         from exllamav3.loader.gguf_collection import GGUFCollection
         from exllamav3.loader import hy4_forward as hf
         from exllamav3.loader import mla_hy4 as mh
@@ -96,12 +107,22 @@ class Hy4Engine:
     def phase(self, name: str):
         """prefill: decode kernels off, prefill kernels on (the configuration the prefill numbers were measured in); decode: decode kernels restored"""
         pre = name == "prefill"
+        if self._tune is not None:
+            self._tune.enable(pre)          # prefill GEMMs only: the decode graph keeps the default kernels
         for m, a, v in self._dec:
             setattr(m, a, False if pre else v)
         hf, mh = self.hf, self.mh
         hf.PF_MOE = hf.PF_DENSE = hf.PF_IX = True
         hf.PF_MOE_I8 = hf.PF_MOE_REF = hf.PF_DENSE_I8 = hf.PF_ROUTER = hf.PF_DIAG = False
         mh.PF_ATTN, mh.PF_ATTN_FLASH = True, False          # (rows <= 16 never take the prefill branches)
+
+    def warmup(self, n: int):
+        """one synthetic request of n prompt tokens + 8 decode tokens: compiles the Triton prefill kernels (they would land in the first user chunk, about 0.3 s) and captures the decode graphs"""
+        ids = [(i * 7919 + 13) % 50000 for i in range(n)]
+        t0 = time.perf_counter()
+        self.generate(ids, 8, lambda toks: False)
+        self.reset()
+        print(f"warm-up {n} tokens: {time.perf_counter() - t0:.1f} s", flush=True)
 
     # ------------------------------------------------------------------------------------------ request state
     def reset(self):

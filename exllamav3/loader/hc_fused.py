@@ -21,6 +21,7 @@ ENABLED = os.environ.get("HY4_HC_FUSED", "0") == "1"
 ONEPASS = os.environ.get("HY4_PF_FUSE", "0") == "1"      # one program per row: [optional residual add], mix dots, sigmoid, collapse, norm in ONE read of the stream (replaces K1 + K2)
 BK = int(os.environ.get("HY4_HC_BK", "512"))      # K1 chunk (elements of the flattened H*D row)
 EMIT16 = [os.environ.get("HY4_PF_FUSE", "0") == "1"]     # the one-pass kernel also writes the saturating fp16 copy of cur (registered with to_f16)
+PF_MIN_ROWS = 16                                    # rows <= 16 are decode / verify steps (never take the prefill-only kernels)
 MAX_D = 16384                                       # K2/K3 keep one row of D in registers
 
 
@@ -166,7 +167,7 @@ def _mix(x, y, post_prev, hw, w, eps, hc_eps, mag):
     NOP = _p2(NO)
     NCH = triton.cdiv(K, BK)
     dev = x.device
-    if ONEPASS and H <= 8:
+    if ONEPASS and H <= 8 and T > PF_MIN_ROWS:      # prefill rows only: the decode / verify rows keep the two-kernel path of the decode graph
         has_res = y is not None
         s = torch.empty_like(x) if has_res else x
         post = torch.empty(T, H, dtype=torch.float32, device=dev) if NO == 2 * H else None
@@ -215,6 +216,7 @@ def resid(s, f, post, w_post, eps):
 def rmsw(x, w, eps, emit16=False):
     """rms(x, eps) * w over the last dim, fp32 [R, D] (one launch instead of 5). emit16: also writes the saturating fp16 copy and registers it with to_f16"""
     x = x.float().contiguous()
+    emit16 = emit16 and x.shape[0] > PF_MIN_ROWS
     o = torch.empty_like(x)
     o16 = torch.empty(x.shape, dtype=torch.float16, device=x.device) if emit16 else o
     _k4_rmsw[(x.shape[0],)](x, w.contiguous(), o, o16, x.shape[1], eps, EMIT16=bool(emit16), BD=_p2(x.shape[1]), num_warps=8)

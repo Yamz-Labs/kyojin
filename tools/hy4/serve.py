@@ -34,10 +34,11 @@ SHIPPED_ENV = {
     "HY4_NOSYNC": "1",                                                     # static-buffer step (needed by the graph)
     "HY4_HC_FUSED": "1", "HY4_HEAD_BF16": "1", "HY4_MLA_BG": "1", "HY4_ATTN_EAGER": "2", "HY4_KV_FUSED": "1",
     "HY4_IDX_POOLK": "1", "HY4_REF_FUSED": "1", "HY4_REF_ROUTER": "1", "HY4_REF_MLA": "1", "HY4_ROUTER_GEMV": "1", "HY4_MOE_SORT": "1",   # decode set
-    "HY4_MTP_FAST": "1", "HY4_MTP_HEAD": "q8",                             # draft head
-    "HY4_NGRAM_EXT": "4", "HY4_NGRAM_MIN": "8", "HY4_NGRAM_GATE": "1",   # prompt-lookup rows on top of the MTP drafts: up to 4 extra verify rows when the last 8 tokens occurred earlier; paused while their acceptance is low
+    "HY4_MTP_FAST": "1", "HY4_MTP_HEAD": "q5k",                            # draft head
+    "HY4_NGRAM_EXT": "4", "HY4_NGRAM_MIN": "8", "HY4_NGRAM_GATE": "1", "HY4_NGRAM_LONG": "12",   # prompt-lookup rows on top of the MTP drafts: up to 4 extra verify rows when the last 8 tokens occurred earlier; paused while their acceptance is low
     "HY4_PREFILL_MOE": "1", "HY4_PREFILL_DENSE": "1", "HY4_PREFILL_ATTN": "1", "HY4_PREFILL_IX": "1", "HY4_ENGRAM_PREFETCH": "1",
     "HY4_PF_F16": "1", "HY4_MOE_NFIRST": "1", "KEEPCACHE": "1",           # prefill set
+    "HY4_PF_WOT": "0", "HY4_MOE_HIP": "2", "HY4_PF_CK": "1", "HY4_PF_FUSE": "1",      # prefill set 2: shared gm_ext WMMA experts (HY4_GM_EXT), CK MLA core (EXL3_CKMLA_SO), one-pass hc / norm / indexer kernels
 }
 
 
@@ -271,6 +272,10 @@ def load_in_background(st: State):
                 st.stage = s
                 print("load:", s, flush=True)
             eng.load(progress)
+            if os.environ.get("HY4_WARMUP_TOKENS", "0") != "0":
+                st.stage = "warm-up"
+                print("load: warm-up", flush=True)
+                eng.warmup(int(os.environ["HY4_WARMUP_TOKENS"]))
             st.stage = "tokenizer"
             st.vocab = C.Vocab(eng.meta)
             st.engine = eng
