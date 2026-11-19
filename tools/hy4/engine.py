@@ -125,11 +125,11 @@ class Hy4Engine:
         y = int(torch.argmax(lg))
         H = torch.cat(states) if len(states) > 1 else states[0]
         hcur = H[-1:].clone()
-        t = time.time()
+        t = time.perf_counter()
         self.last_stats["prefill_trunk_s"] = t - self._t0
         self._prime_draft(ids, H)
         torch.cuda.synchronize()
-        self.last_stats["prime_s"] = time.time() - t
+        self.last_stats["prime_s"] = time.perf_counter() - t
         return y, hcur
 
     def _prime_draft(self, ids: list[int], H):
