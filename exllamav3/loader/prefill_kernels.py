@@ -962,6 +962,19 @@ def dequant_q8(packed):
     return out
 
 
+def mm_rows(x2, w):
+    """torch.mm(x2 [M, K] fp16, w [K, N] fp16) in row pieces of HY4_PF_MM_SPLIT (default 8192, 0 = off): the TunableOp results only cover M = 4096 / 8192, so a merged
+    tail chunk (8192 + up to 2048 rows) fell back to the default GEMM solution (35 TF instead of 42, wo K = 16384 24 instead of 34): the first 8192 rows take the tuned entry"""
+    M = x2.shape[0]
+    S = int(os.environ.get("HY4_PF_MM_SPLIT", "8192"))
+    if S <= 0 or M <= S:
+        return torch.mm(x2, w)
+    out = torch.empty(M, w.shape[1], dtype=x2.dtype, device=x2.device)
+    for a in range(0, M, S):
+        torch.mm(x2[a:a + S], w, out=out[a:a + S])
+    return out
+
+
 def qdense_tm(x, packed, tm=None):
     """x [.., K] -> [.., N] fp32 = x @ W.T: dequantise the stored Q8_0 weight to fp16 once per call, then the vendor fp16 GEMM (tm = optional stage timers)"""
     N, nb, bb = packed.shape
@@ -973,7 +986,7 @@ def qdense_tm(x, packed, tm=None):
     with t(f"f dense N={N} K={K}: dequant"):
         w16 = dequant_q8(packed)
     with t(f"f dense N={N} K={K}: mm"):
-        o = torch.mm(x2, w16)
+        o = mm_rows(x2, w16)
     with t(f"f dense N={N} K={K}: float"):
         out = f32_sat(o)
     return out.reshape(*lead, N)
@@ -1059,7 +1072,7 @@ def qdense_raw16(x, packed, tm=None, tag=""):
     with t(f"f dense N={N} K={nb * 32}: dequant"):
         w16 = dequant_q8(packed)
     with t(f"f dense N={N} K={nb * 32}: mm"):
-        return torch.mm(x2, w16)
+        return mm_rows(x2, w16)
 
 
 @triton.jit

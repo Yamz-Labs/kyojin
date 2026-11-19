@@ -93,7 +93,7 @@ def raw16(lin, x, tm=None):
     if lin.ty == 8:
         return pk.qdense_raw16(x, lin.packed, tm)
     x2 = pk.to_f16(x.reshape(-1, lin.shape[1])).contiguous()
-    return torch.mm(x2, dequant16(lin))
+    return pk.mm_rows(x2, dequant16(lin))
 
 
 def full(lin, x, tm=None):
@@ -108,7 +108,7 @@ def qdense_kq(lin, x):
     pk = _pk()
     lead = x.shape[:-1]
     x2 = pk.to_f16(x.reshape(-1, lin.shape[1])).contiguous()
-    o = torch.mm(x2, dequant16(lin))
+    o = pk.mm_rows(x2, dequant16(lin))
     out = torch.nan_to_num(o.float(), nan=0.0, posinf=pk.F16MAX, neginf=-pk.F16MAX)
     return out.reshape(*lead, lin.shape[0])
 
