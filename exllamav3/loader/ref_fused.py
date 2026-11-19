@@ -13,6 +13,9 @@ import os
 import torch
 
 ENABLED = os.environ.get("HY4_REF_FUSED", "0") == "1"
+HB = os.environ.get("HY4_MLA_HB", "0") == "1"      # head-batched fp16 tl.dot decode attention (opt-in)
+HB_BN = int(os.environ.get("HY4_MLA_HB_BN", "32"))
+HB_NW = int(os.environ.get("HY4_MLA_HB_NW", "4"))
 MAX_T = 16                  # rows per call handled by the attention kernel (decode / short verify); more = prefill -> torch GEMMs
 CLAMP_MIN = 6.103515625e-5  # the old router's `sum.clamp(min=...)`
 
@@ -164,6 +167,49 @@ if triton is not None:
             m = mn
         tl.store(O + t * s_o_t + h * s_o_h + offr, acc / l, mask=mr)
 
+    @triton.jit
+    def _mla_hb_kernel(QL, QP, CK, KP, QPOS, SINK, O, N, scale, window,
+                       s_ql_t, s_ql_h, s_qp_t, s_qp_h, s_ck, s_kp, s_o_t, s_o_h,
+                       R: tl.constexpr, P: tl.constexpr, BH: tl.constexpr, BN: tl.constexpr, HAS_WIN: tl.constexpr, RING: tl.constexpr):
+        """head-batched decode attention: ONE program = one query row t x BH heads. The latent K rows are shared by every head (MLA), so each K tile is loaded once for
+        BH heads and both products run as fp16 tl.dot (fp32 accumulation, like the prefill kernel); online softmax with the per-head sink as a key of zero value."""
+        t = tl.program_id(0)
+        h0 = tl.program_id(1) * BH
+        offh = h0 + tl.arange(0, BH)
+        offr = tl.arange(0, R)
+        offp = tl.arange(0, P)
+        q = tl.load(QL + t * s_ql_t + offh[:, None] * s_ql_h + offr[None, :]).to(tl.float16)
+        qp = tl.load(QP + t * s_qp_t + offh[:, None] * s_qp_h + offp[None, :]).to(tl.float16)
+        qpos = tl.load(QPOS + t)
+        m = tl.load(SINK + offh).to(tl.float32)
+        l = tl.zeros([BH], dtype=tl.float32) + 1.0
+        acc = tl.zeros([BH, R], dtype=tl.float32)
+        lo = 0
+        hi = tl.minimum(N, qpos + 1)
+        if HAS_WIN:
+            lo = tl.maximum(0, qpos - window + 1) // BN * BN
+        for n0 in range(lo, hi, BN):
+            offn = n0 + tl.arange(0, BN)
+            inb = offn < N
+            vis = inb & (offn <= qpos)
+            if HAS_WIN:
+                vis = vis & ((qpos - offn) < window)
+            if RING > 0:
+                offs = offn % RING
+            else:
+                offs = offn
+            ck = tl.load(CK + offs[:, None] * s_ck + offr[None, :], mask=inb[:, None], other=0.0).to(tl.float16)
+            kp = tl.load(KP + offs[:, None] * s_kp + offp[None, :], mask=inb[:, None], other=0.0).to(tl.float16)
+            s = (tl.dot(q, tl.trans(ck)) + tl.dot(qp, tl.trans(kp))) * scale
+            s = tl.where(vis[None, :], s, float("-inf"))
+            mn = tl.maximum(m, tl.max(s, axis=1))
+            alpha = tl.exp(m - mn)
+            pr = tl.exp(s - mn[:, None])
+            l = l * alpha + tl.sum(pr, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(pr.to(tl.float16), ck)
+            m = mn
+        tl.store(O + t * s_o_t + offh[:, None] * s_o_h + offr[None, :], acc / l[:, None])
+
 
 def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, window=0, allow=None, kpos_is_arange=False, ring=0):
     """drop-in for mla_sink_attend: q_lat [T,H,R], q_pe [T,H,P], ckv [N,R], k_pe [N,P] (row strides free), qpos [T], kpos [N],
@@ -179,6 +225,12 @@ def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, windo
         if ring:
             raise RuntimeError("ring K buffer: the fused kernel declined and the torch reference cannot read a ring")
         return mla_sink_attend_ref(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks, window, allow)
+    if HB and allow is None and kpos_is_arange and R == triton.next_power_of_2(R) and P == triton.next_power_of_2(P) and H % 16 == 0 and not (ring and not window):
+        out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
+        _mla_hb_kernel[(T, H // 16)](q_lat, q_pe, ckv, k_pe, qpos, sinks.float().contiguous(), out, (1 << 30) if ring else N, float(scale), int(window),
+                                     q_lat.stride(0), q_lat.stride(1), q_pe.stride(0), q_pe.stride(1), ckv.stride(0), k_pe.stride(0), out.stride(0), out.stride(1),
+                                     R=R, P=P, BH=16, BN=HB_BN, HAS_WIN=bool(window), RING=int(ring), num_warps=HB_NW)
+        return out
     out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
     al = allow.view(torch.uint8) if allow is not None else qpos
     BN = 16
