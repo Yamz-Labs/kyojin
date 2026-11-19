@@ -106,4 +106,83 @@ __device__ __forceinline__ void fq_kq_item_q6_k(const uint8_t* __restrict__ wr, 
     }
 }
 
+// ---- Q3_K and Q8_0 lane dots (verbatim fq_dot_q3_k_q8 / fq_dot_q8_0_q8 of fq_gemv_hip.cuh: lane tid of nthreads sums sub-chunks c = tid, tid + nthreads, ...) ----
+#ifndef FQ_Q3_K_BYTES
+#define FQ_Q3_K_BYTES 110
+#endif
+#ifndef FQ_Q8_0_BYTES
+#define FQ_Q8_0_BYTES 34
+#endif
+
+__device__ __forceinline__ float gm_dot_q3_k(const uint8_t* __restrict__ wr, const uint8_t* __restrict__ aqb, int K, int tid, int nthreads)
+{
+    const int nsub = K / 16;
+    float acc = 0.0f;
+    for (int c = tid; c < nsub; c += nthreads)
+    {
+        const int b = c >> 4;
+        const int iqs = c & 15;
+        const uint8_t* blk = wr + (size_t)b * FQ_Q3_K_BYTES;
+        const int bq8_offset = 4 * (iqs / 8);
+        const int scale_offset = iqs - iqs % 8 + (iqs % 8) / 4;
+        int32_t vl, vm;
+        memcpy(&vl, blk + 32 + 4 * iqs, 4);
+        memcpy(&vm, blk + 4 * (iqs % 8), 4);
+        const int32_t vh = ~vm >> bq8_offset;
+        const uint8_t* scales = blk + 96;
+        __half dh;
+        memcpy(&dh, blk + 108, 2);
+        const float d = __half2float(dh);
+        float sumf = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 4; i++)
+        {
+            const int isc = scale_offset + 2 * i;
+            const int sc_low = (scales[isc % 8] >> (4 * (isc / 8))) & 0xF;
+            const int sc_high = ((scales[8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
+            const int sc = (sc_low | sc_high) - 32;
+            const uint32_t vil = ((uint32_t)vl >> (2 * i)) & 0x03030303u;
+            const uint32_t vih = (uint32_t)((vh >> i) << 2) & 0x04040404u;
+            const uint32_t vi = fq_vsub4(vil, vih);
+            const uint8_t* aqb_blk = aqb + (size_t)(b * 8 + bq8_offset + i) * FQ_Q8_1_BYTES;
+            __half dah;
+            memcpy(&dah, aqb_blk, 2);
+            const float d8 = __half2float(dah);
+            int32_t u;
+            memcpy(&u, aqb_blk + 4 + 4 * (iqs % 8), 4);
+            sumf = __fadd_rn(sumf, __fmul_rn(d8, (float)(fq_dp4a((int32_t)vi, u, 0) * sc)));
+        }
+        acc = __fadd_rn(acc, __fmul_rn(d, sumf));
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float gm_dot_q8_0(const uint8_t* __restrict__ wr, const uint8_t* __restrict__ aqb, int K, int tid, int nthreads)
+{
+    const int nchunks = K / 32;
+    float acc = 0.0f;
+    for (int c = tid; c < nchunks; c += nthreads)
+    {
+        const uint8_t* blk = wr + (size_t)c * FQ_Q8_0_BYTES;
+        __half dwh;
+        memcpy(&dwh, blk, 2);
+        const float dw = __half2float(dwh);
+        __half dah;
+        memcpy(&dah, aqb + (size_t)c * FQ_Q8_1_BYTES, 2);
+        const float da = __half2float(dah);
+        const int8_t* aq = reinterpret_cast<const int8_t*>(aqb + (size_t)c * FQ_Q8_1_BYTES + 4);
+        const uint16_t* w16 = reinterpret_cast<const uint16_t*>(blk + 2);
+        const int32_t* aq32 = reinterpret_cast<const int32_t*>(aq);
+        int sumi = 0;
+        #pragma unroll
+        for (int j2 = 0; j2 < 8; j2++)
+        {
+            const int32_t w4 = (int32_t)(w16[j2 * 2] | ((uint32_t)w16[j2 * 2 + 1] << 16));
+            sumi = fq_dp4a(w4, aq32[j2], sumi);
+        }
+        acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(dw, da), (float)sumi));
+    }
+    return acc;
+}
+
 }  // namespace

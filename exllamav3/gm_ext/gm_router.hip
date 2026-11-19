@@ -256,4 +256,138 @@ void gm_routing_std_bsz1
     TORCH_CHECK(hipPeekAtLastError() == hipSuccess, "gm_routing_std_bsz1: launch failed");
 }
 
+// ---------------------------------------------------------------------------------------------------------------------------------
+// Generic router (any hidden size / expert count <= 1024 / top-k <= 32, fp32 or fp16 gate weights, fp32 or fp16 activations, 1..16 rows):
+// logits = x . gate^T (fp32 accumulation, one wave per expert), then ONE block per row selects the top-k by rank counting (ties -> lowest expert id,
+// i.e. a stable descending sort) and forms the weights.
+//   gating 0: softmax over all experts (selection on the logits), w = exp(l - max) / sum_all, or / (sum_selected + 1e-20) when norm (Qwen3 / Mixtral / gpt-oss)
+//   gating 2: sigmoid; selection on sigmoid + bias (bias optional, selection only), w = sigmoid[sel], / max(sum_sel, eps) when norm (GLM / DeepSeek / Hy4)
+//   w *= scale. Outputs: sel int64 [R, k], w half [R, k].
+// ---------------------------------------------------------------------------------------------------------------------------------
+namespace {
+
+template <typename T> __device__ __forceinline__ float gm_ld_f(const T v);
+template <> __device__ __forceinline__ float gm_ld_f<float>(const float v) { return v; }
+template <> __device__ __forceinline__ float gm_ld_f<half>(const half v) { return __half2float(v); }
+
+template <typename XT, typename WT>
+__global__ __launch_bounds__(128) void gm_rt_logits_kernel(const XT* __restrict__ x, const WT* __restrict__ g, float* __restrict__ scores, int H, int E)
+{
+    const int row = blockIdx.y;
+    const int wave = threadIdx.x / WAVE_SIZE;
+    const int lane = threadIdx.x % WAVE_SIZE;
+    const int expert = blockIdx.x * 4 + wave;
+    if (expert >= E) return;
+    const XT* xr = x + (size_t)row * H;
+    const WT* gr = g + (size_t)expert * H;
+    float sum = 0.0f;
+    #pragma unroll 4
+    for (int h = lane; h < H; h += WAVE_SIZE)
+        sum = fmaf(gm_ld_f<XT>(xr[h]), gm_ld_f<WT>(gr[h]), sum);
+    sum = wave_reduce_sum(sum);
+    if (lane == 0) scores[(size_t)row * E + expert] = sum;
+}
+
+__global__ __launch_bounds__(1024) void gm_rt_topk_kernel(const float* __restrict__ scores, const float* __restrict__ bias, int64_t* __restrict__ sel,
+                                                          half* __restrict__ wout, int E, int topk, int gating, int norm, float scale, float eps)
+{
+    __shared__ float key[1024];
+    __shared__ float prob[1024];
+    __shared__ float wred[32];
+    __shared__ float s_max, s_sum;
+    __shared__ float selw[32];
+    __shared__ int selidx[32];
+    const int tid = threadIdx.x, lane = tid % WAVE_SIZE, wave = tid / WAVE_SIZE;
+    const int nwaves = (blockDim.x + WAVE_SIZE - 1) / WAVE_SIZE;
+    const float* sc = scores + (size_t)blockIdx.x * E;
+    const bool valid = tid < E;
+    const float logit = valid ? sc[tid] : NEG_INF;
+    float p, k;
+    if (gating == 2)
+    {
+        p = valid ? 1.0f / (1.0f + expf(-logit)) : 0.0f;
+        k = valid ? (bias != nullptr ? p + bias[tid] : p) : NEG_INF;
+    }
+    else
+    {
+        float m = wave_reduce_max(logit);
+        if (lane == 0) wred[wave] = m;
+        __syncthreads();
+        if (wave == 0)
+        {
+            float mm = lane < nwaves ? wred[lane] : NEG_INF;
+            mm = wave_reduce_max(mm);
+            if (lane == 0) s_max = mm;
+        }
+        __syncthreads();
+        p = valid ? expf(logit - s_max) : 0.0f;       // unnormalized exp
+        k = logit;
+        float t = wave_reduce_sum(p);
+        __syncthreads();
+        if (lane == 0) wred[wave] = t;
+        __syncthreads();
+        if (wave == 0)
+        {
+            float tt = lane < nwaves ? wred[lane] : 0.0f;
+            tt = wave_reduce_sum(tt);
+            if (lane == 0) s_sum = tt;
+        }
+    }
+    key[tid] = k;
+    prob[tid] = p;
+    __syncthreads();
+    int rank = 0;
+    if (valid)
+    {
+        #pragma unroll 8
+        for (int j = 0; j < E; ++j)
+        {
+            const float o = key[j];
+            rank += (o > k || (o == k && j < tid)) ? 1 : 0;
+        }
+        if (rank < topk) { selw[rank] = p; selidx[rank] = tid; }
+    }
+    __syncthreads();
+    if (wave == 0)
+    {
+        const float w = lane < topk ? selw[lane] : 0.0f;
+        const float ssum = wave_reduce_sum(w);
+        if (lane < topk)
+        {
+            float o;
+            if (gating == 2) o = norm ? w / fmaxf(ssum, eps) : w;
+            else o = norm ? w / (ssum + 1.0e-20f) : w / s_sum;
+            sel[(size_t)blockIdx.x * topk + lane] = (int64_t)selidx[lane];
+            wout[(size_t)blockIdx.x * topk + lane] = __float2half_rn(o * scale);
+        }
+    }
+}
+
+}  // namespace
+
+void gm_route(const at::Tensor& x, const at::Tensor& gate, const at::Tensor& bias, at::Tensor& scores, at::Tensor& sel, at::Tensor& w,
+              int64_t gating, bool norm, double scale, double eps)
+{
+    TORCH_CHECK(x.is_cuda() && x.dim() == 2 && gate.is_cuda() && gate.dim() == 2 && x.is_contiguous() && gate.is_contiguous(), "gm_route: x [R, H] and gate [E, H] contiguous device tensors");
+    const at::cuda::OptionalCUDAGuard guard(x.device());
+    const int R = (int)x.size(0), H = (int)x.size(1), E = (int)gate.size(0), topk = (int)sel.size(1);
+    TORCH_CHECK(R >= 1 && R <= MAX_ROUTER_ROWS && gate.size(1) == H && E <= 1024 && topk >= 1 && topk <= 32 && topk <= E, "gm_route: unsupported shape R=", R, " H=", H, " E=", E, " k=", topk);
+    TORCH_CHECK(gating == 0 || gating == 2, "gm_route: gating 0 (softmax) or 2 (sigmoid)");
+    TORCH_CHECK(sel.dtype() == at::kLong && w.dtype() == at::kHalf && scores.dtype() == at::kFloat && scores.numel() >= (int64_t)R * E && sel.size(0) == R && w.size(0) == R && w.size(1) == topk,
+                "gm_route: sel int64 [R, k], w half [R, k], scores float scratch [R, E]");
+    TORCH_CHECK(bias.numel() == 0 || (bias.dtype() == at::kFloat && bias.numel() == E && bias.is_contiguous()), "gm_route: bias float [E] or empty");
+    hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    float* sp = scores.data_ptr<float>();
+    const dim3 grid((E + 3) / 4, R);
+    const bool xf = x.dtype() == at::kFloat, gf = gate.dtype() == at::kFloat;
+    TORCH_CHECK((xf || x.dtype() == at::kHalf) && (gf || gate.dtype() == at::kHalf), "gm_route: x / gate float or half");
+    #define GM_RT(XT, WT)hipLaunchKernelGGL(( gm_rt_logits_kernel<XT, WT>), dim3(grid), dim3(128), 0, stream, reinterpret_cast<const XT*>(x.data_ptr()), reinterpret_cast<const WT*>(gate.data_ptr()), sp, H, E)
+    if (xf && gf) GM_RT(float, float); else if (xf) GM_RT(float, half); else if (gf) GM_RT(half, float); else GM_RT(half, half);
+    #undef GM_RT
+    const int nt = ((E + 31) / 32) * 32;
+   hipLaunchKernelGGL(( gm_rt_topk_kernel), dim3(R), dim3(nt), 0, stream, sp, bias.numel() ? bias.data_ptr<float>() : nullptr, sel.data_ptr<int64_t>(), reinterpret_cast<half*>(w.data_ptr()),
+                                            E, topk, (int)gating, norm ? 1 : 0, (float)scale, (float)eps);
+    TORCH_CHECK(hipPeekAtLastError() == hipSuccess, "gm_route: launch failed");
+}
+
 #endif // USE_ROCM

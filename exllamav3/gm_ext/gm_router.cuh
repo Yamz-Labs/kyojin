@@ -16,4 +16,7 @@ void gm_routing_std_bsz1
     at::Tensor& topk_weights
 );
 
+void gm_route(const at::Tensor& x, const at::Tensor& gate, const at::Tensor& bias, at::Tensor& scores, at::Tensor& sel, at::Tensor& w,
+              int64_t gating, bool norm, double scale, double eps);
+
 #endif

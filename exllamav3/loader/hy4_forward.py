@@ -211,6 +211,21 @@ def _dq_q8_0_t(packed):
 # rows <= DENSE_MAXR run the extension GEMV (activation quantised to q8_1 inside, like llama.cpp), more rows dequantise per call (no resident fp32 copy).
 GG_DENSE = {8: (32, 34, "fq_gemv_q8_0", _dq_q8_0_t)}
 DENSE_MAXR = 16
+GM_FFN = os.environ.get("HY4_GM_FFN", "0") == "1"       # 1 = decode FFN (<= 8 rows) through the shared gm_ext ops: gm_route + one Q8_0 launch (rdown, shared gate, shared up) + gm_moe_kq_decode + rup / shared swiglu-down in one buffer
+_GMX = []
+
+
+def _gm():
+    if not _GMX:
+        try:
+            from .. import gm_ext
+            _GMX.append(gm_ext.get())
+        except Exception as ex:            # noqa: BLE001
+            print("hy4_forward: gm_ext unavailable:", repr(ex)[:160], flush=True)
+            _GMX.append(None)
+    return _GMX[0]
+
+
 NO_ALIAS_LAT = os.environ.get("HY4_LAT_CLONE", "0") == "1"     # 1 = copy the grouped MoE output before the rup matmul (old behaviour)
 DENSE_DQ = os.environ.get("HY4_DENSE_DQ", "0") == "1"       # 1 = old path: dense matrices dequantised once to fp32 and kept resident
 
@@ -539,6 +554,8 @@ class Hy4Forward:
             with tm.t("other"):
                 return self._mm(torch.nn.functional.silu(self._mm(x, gt)) * self._mm(x, up), dn), None
         T, dev = x.shape[0], self.dev
+        if self._gm_ok(i, L, x):
+            return self._ffn_gm(i, L, x), None
         rsp = self.res.get(i)
         pf = bool(PF_MOE and T > MMVQ_MAXR and dev.type == "cuda" and rsp is not None and rsp.fu in _pk().FROM_GROUPED and rsp.fd in _pk().FROM_GROUPED)
         with tm.t("router"):
@@ -623,6 +640,48 @@ class Hy4Forward:
         with tm.t("shared expert"):
             sh = self._mm(torch.nn.functional.silu(self._mm(x, gt)) * self._mm(x, up), dn)
         return y + sh, lat
+
+    def _gm_ok(self, i, L, x):
+        """layer i FFN can run on the gm_ext ops: resident experts in a gm format, Q8_0 latent / shared matrices, 1..8 rows, no hooks"""
+        if not GM_FFN or self.hook is not None or self.dev.type != "cuda" or i < self.n_dense or x.shape[0] > 8:
+            return False
+        rs = self.res.get(i)
+        if rs is None or rs.fu not in (0, 8) or rs.fd not in (0, 2) or _gm() is None:
+            return False
+        return all(isinstance(q, QLinear) and q.ty == 8 for q in (L.rdown, L.rup, *L.shexp))
+
+    def _ffn_gm(self, i, L, x):
+        gm, rs, dev = _gm(), self.res[i], self.dev
+        T, S = x.shape[0], self.topk
+        w3 = getattr(L, "gm_w", None)
+        if w3 is None:
+            q8 = lambda q: q.packed.reshape(q.packed.shape[0], -1)
+            w3 = L.gm_w = ([q8(L.rdown), q8(L.shexp[0]), q8(L.shexp[1])], [q8(L.rup)], q8(L.shexp[2]))
+        N, D = L.rdown.shape[0], L.rup.shape[0]
+        st = getattr(self, "_gms", None)
+        if st is None:
+            E = L.router.shape[0]
+            st = self._gms = SimpleNamespace(
+                sc=torch.empty(8, E, dtype=torch.float32, device=dev), sel=torch.empty(8, S, dtype=torch.int64, device=dev), w=torch.empty(8, S, dtype=torch.float16, device=dev),
+                z3=torch.empty(8 * 3 * N, dtype=torch.float16, device=dev), qa=torch.empty(8 * max(x.shape[1], N) // 32 * 36, dtype=torch.uint8, device=dev),
+                qm=torch.empty(8 * N // 32 * 36, dtype=torch.uint8, device=dev), act=torch.empty(8 * S, N, dtype=torch.float16, device=dev),
+                part=torch.empty(8 * S, N, dtype=torch.float32, device=dev), lat=torch.empty(8, N, dtype=torch.float32, device=dev),
+                meta=torch.zeros(8 * S * 9, dtype=torch.int32, device=dev), nometa=torch.empty(0, dtype=torch.int32, device=dev), nores=torch.empty(0, dtype=torch.float32, device=dev))
+        sel, w = st.sel[:T], st.w[:T]
+        xc = x.contiguous()
+        gm.gm_route(xc, L.router, L.rbias, st.sc[:T], sel, w, 2, True, self.w_scale, 6.103515625e-5)
+        z3 = st.z3[:3 * T * N]
+        gm.gm_qkv_decode(xc, w3[0], [3, 3, 3], z3.view(1, -1), st.qa)
+        z, g, u = z3[:T * N].view(T, N), z3[T * N:2 * T * N].view(T, N), z3[2 * T * N:].view(T, N)
+        if T >= 2:
+            st.meta.zero_()
+        gm.gm_moe_kq_decode(z, sel.reshape(-1), w.reshape(-1), *rs.ptrs, *rs.strides[:3], rs.fd, st.act, st.qm, st.part, st.lat[:T], st.nores, rs.fu, float(self.clamp[i]),
+                            st.meta if T >= 2 else st.nometa)
+        y = torch.empty(T, D, dtype=torch.float32, device=dev)
+        gm.gm_qkv_decode(st.lat[:T], w3[1], [3], y.view(1, -1), st.qm)
+        gm.gm_q8_swiglu_down(g, u, w3[2], y, True)
+        self.stats["gm_ffn_calls"] = self.stats.get("gm_ffn_calls", 0) + 1
+        return y
 
     def _engram(self, i, x, ids, start):
         if os.environ.get("HY4_ENGRAM_GPU", "0") in ("1", "2") and self.dev.type == "cuda":      # flag off: the old CPU path below, untouched
