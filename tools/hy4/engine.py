@@ -18,7 +18,7 @@ import types
 from typing import Callable
 
 CHUNK_DEFAULT = 8192
-PRIME_ROWS = 512            # rows per batched MTP draft-cache fill call
+PRIME_ROWS = 2048           # rows per batched MTP draft-cache fill call
 
 
 def _stub_package(tree: str):
@@ -141,6 +141,8 @@ class Hy4Engine:
         tok = torch.tensor(ids, dtype=torch.long, device=self.dev)
         ar = MT.ar
         s = lo
+        f16 = os.environ.get("HY4_PF_F16")
+        os.environ["HY4_PF_F16"] = "0"      # the fp16 attention chain is tuned for the trunk's matrices; the draft layer takes the generic prefill path
         try:
             while s < n - 1:
                 e = min(n - 1, s + PRIME_ROWS)
@@ -154,6 +156,11 @@ class Hy4Engine:
             for j in range(max(0, n - 129), n - 1):
                 MT.chain(tok[j + 1:j + 2], H[j:j + 1], j, 1)
             self.last_stats["prime_mode"] = "per-row tail 128 (batched failed)"
+        finally:
+            if f16 is None:
+                os.environ.pop("HY4_PF_F16", None)
+            else:
+                os.environ["HY4_PF_F16"] = f16
 
     # ------------------------------------------------------------------------------------------ generate
     def generate(self, ids: list[int], max_new: int, on_tokens: Callable[[list[int]], bool], speculative: bool = True,

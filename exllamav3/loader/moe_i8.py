@@ -84,3 +84,29 @@ def experts_forward(gate, up, down, z, sel, w, lim):
     out = torch.empty(down.N, dtype=torch.float32, device=z.device)
     _k_down[(triton.cdiv(down.N, 8),)](down.q, down.s, sel, h, w, out, down.N, down.K, S=S, BN=8, BK=128, num_warps=4)
     return out
+
+
+def experts_rows(gate, up, down, z, sel, w, lim):
+    """many rows at once (prefill of the draft cache): z [T, K] fp32, sel [T, S] int64, w [T, S] fp32 -> lat [T, down.N] fp32.
+    Rows are grouped per expert (each expert's int8 stack is read once per call) and run as fp16 GEMMs with fp32 accumulation; same maths as experts_forward."""
+    T, S = sel.shape
+    flat = sel.reshape(-1)
+    order = torch.argsort(flat, stable=True)
+    counts = torch.bincount(flat, minlength=gate.E).tolist()
+    out = torch.zeros(T, down.N, dtype=torch.float32, device=z.device)
+    zh = z.clamp(-6e4, 6e4).to(torch.float16)
+    wf = w.reshape(-1)
+    pos = 0
+    for e, c in enumerate(counts):
+        if c == 0:
+            continue
+        pr = order[pos:pos + c]
+        pos += c
+        rows = pr // S
+        x = zh[rows]
+        g = (x @ gate.q[e].to(torch.float16).T).float() * gate.s[e]
+        u = (x @ up.q[e].to(torch.float16).T).float() * up.s[e]
+        h = (torch.nn.functional.silu(g.clamp(max=lim)) * u.clamp(-lim, lim)).to(torch.float16)
+        d = (h @ down.q[e].to(torch.float16).T).float() * down.s[e]
+        out.index_add_(0, rows, d * wf[pr][:, None])
+    return out

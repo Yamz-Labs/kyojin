@@ -113,7 +113,10 @@ class Hy4MTP:
             w = torch.gather(p, 1, sel)
             w = w / w.sum(-1, keepdim=True).clamp(min=6.103515625e-5) * fw.w_scale
         z = x @ self.rdown.T
-        lat = torch.stack([MI.experts_forward(self.ex[0], self.ex[1], self.ex[2], z[r].contiguous(), sel[r].contiguous(), w[r].contiguous(), self.lim) for r in range(x.shape[0])])
+        if x.shape[0] > 16:       # draft-cache fill of a prompt: rows grouped per expert
+            lat = MI.experts_rows(self.ex[0], self.ex[1], self.ex[2], z.float().contiguous(), sel, w, self.lim)
+        else:
+            lat = torch.stack([MI.experts_forward(self.ex[0], self.ex[1], self.ex[2], z[r].contiguous(), sel[r].contiguous(), w[r].contiguous(), self.lim) for r in range(x.shape[0])])
         gt, up, dn = self.shexp
         sh = (torch.nn.functional.silu(x @ gt.T) * (x @ up.T)) @ dn.T
         return lat @ self.rup.T + sh
