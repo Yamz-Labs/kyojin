@@ -54,7 +54,7 @@ def indexer_static_init(ix, cap):
 
 @torch.no_grad()
 def indexer_forward_static(ix, x, qr, pos, Nb, ar):
-    """x [1, E], qr [1, R], pos [1] long (device), Nb rows -> allow [1, Nb] bool. Same maths and op order as FusedKPoolIndexer.forward for one
+    """x [T, E], qr [T, R], pos [T] long (device, ascending), Nb rows -> allow [T, Nb] bool (T = 1 decode, T > 1 verify rows). Same maths and op order as FusedKPoolIndexer.forward for one
     token; no host value is read: group slot and rope position come from `pos`, the visible groups from a mask (gend < pos).
     Returns None (all keys causal) while the bucket is small enough that no query can see more than n_top groups: only the pool state is updated."""
     k, d, H = ix.k, ix.d, ix.H
@@ -69,7 +69,8 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     ix.pool.index_copy_(0, pos // k, pooled)            # a group still open holds partial data here; it stays masked until it is complete
     if Nb <= (ix.n_top + 1) * k:        # every position of this bucket sees <= n_top groups: the selection is all-causal (the eager path returns None)
         return None
-    iq = ix._rope((qr @ ix.w["q_b"].T).reshape(1, H, d), pos)
+    T = x.shape[0]
+    iq = ix._rope((qr @ ix.w["q_b"].T).reshape(T, H, d), pos)
     wt = (x.float() @ ix.w["proj"].T) / math.sqrt(d * H)
     Pb = Nb // k
     kq = torch.relu(torch.einsum("nhd,pd->nhp", iq, ix.pool[:Pb]))
@@ -78,10 +79,10 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     vis = (gend[None] < pos[:, None]) if ix.tail else (gend[None] <= pos[:, None])
     sc = torch.where(vis, sc, torch.full_like(sc, -math.inf))
     idx = torch.topk(sc, min(ix.n_top, Pb), dim=1).indices
-    gsel = torch.zeros(1, Pb, dtype=torch.bool, device=ix.dev)
+    gsel = torch.zeros(T, Pb, dtype=torch.bool, device=ix.dev)
     gsel.scatter_(1, idx, True)
     gsel &= vis
-    allow = torch.zeros(1, Nb, dtype=torch.bool, device=ix.dev)
+    allow = torch.zeros(T, Nb, dtype=torch.bool, device=ix.dev)
     allow[:, :Pb * k] = gsel.repeat_interleave(k, dim=1)
     lo = (pos - (pos % k)) if ix.tail else (pos - ((pos + 1) % k) + 1)
     j = ar[:Nb][None]
@@ -163,12 +164,9 @@ class _GS:
         return b[:self.Nb]
 
     def indexer(self, fw, i, cur, qr, N):
-        ix = fw._indexer_fused(i)
-        if self.T == 1:
-            return indexer_forward_static(ix, cur, qr, self.pos, N, self.ar)
-        # verify rows: positions in order, each row writes its pool / vg state before the next row selects (same state as T eager steps)
-        outs = [indexer_forward_static(ix, cur[r:r + 1], qr[r:r + 1], self.pos[r:r + 1], N, self.ar) for r in range(self.T)]
-        return None if outs[0] is None else torch.cat(outs, 0)
+        # T rows in one pass: every row writes its vg row first, then the pooled groups are computed (a group completed inside this round gets its
+        # final value, a group still open stays masked), then each row selects with its own visibility (gend < pos): the state of T sequential steps
+        return indexer_forward_static(fw._indexer_fused(i), cur, qr, self.pos, N, self.ar)
 
 
 _T = {}
