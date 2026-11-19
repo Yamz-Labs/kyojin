@@ -47,7 +47,10 @@ class FakeEng:
             out[s] = [s.y]
         return out
 
-    spec_round = plain_round
+    def spec_round(self, sess):
+        out = self.plain_round(sess)
+        self.log[-1] = ("spec", self.log[-1][1])
+        return out
 
 
 def run(reqs, eng, chunk=4, spec=False):
@@ -85,7 +88,7 @@ def test_prefill_chunk_is_interleaved_with_decode_rounds():
     b.done.wait(10)
     a.done.wait(10)
     sch.shutdown()
-    seq = [x[0] for x in eng.log if x[0] in ("pf", "dec")]
+    seq = [("dec" if x[0] == "spec" else x[0]) for x in eng.log if x[0] in ("pf", "dec", "spec")]
     i0 = seq.index("pf", 1)                                                  # b's chunks (a's single chunk comes first)
     run_pf = 0
     longest = 0
@@ -107,3 +110,12 @@ def test_cancel_context_and_error():
     bad = ME.Request(list(range(4)), 5)
     run([bad], FakeEng(boom=True))
     assert bad.error and "boom" in bad.error
+
+
+def test_speculation_only_while_few_sessions_decode():
+    eng = FakeEng(slots=4)
+    reqs = [ME.Request(list(range(4)), 30) for _ in range(4)]
+    run(reqs, eng, spec=True)
+    kinds = {(x[0], len(x[1])) for x in eng.log if x[0] in ("spec", "dec")}
+    assert all(not (k == "spec" and n > 2) for k, n in kinds) and ("spec", 1) in kinds or ("spec", 2) in kinds
+    assert any(k == "dec" and n >= 3 for k, n in kinds)

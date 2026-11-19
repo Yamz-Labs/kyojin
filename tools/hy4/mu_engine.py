@@ -209,9 +209,11 @@ class Request:
 class MuScheduler(threading.Thread):
     """admit -> prefill chunk (oldest prefilling) -> one decode round of all decoding sessions -> repeat"""
 
-    def __init__(self, eng: MuEngine, chunk: int = 1024, spec: bool = True):
+    def __init__(self, eng: MuEngine, chunk: int = 1024, spec: bool = True, spec_max_b: int | None = None):
         super().__init__(daemon=True)
         self.eng, self.chunk, self.spec = eng, chunk, spec
+        # cost policy (box A/B 19/11): a verify row costs about what a new session's row costs (+7.7 ms), so speculation only pays while rows are shared among few sessions
+        self.spec_max_b = int(os.environ.get("HY4_MU_SPEC_MAXB", "2")) if spec_max_b is None else spec_max_b
         self.cv = threading.Condition()
         self.pending: deque = deque()
         self.free = list(range(eng.slots))
@@ -293,7 +295,7 @@ class MuScheduler(threading.Thread):
                 if self.dec:
                     sess = [r.sess for r in self.dec]
                     t0 = pc()
-                    spec = self.spec and all(r.speculative for r in self.dec)
+                    spec = self.spec and len(self.dec) <= self.spec_max_b and all(r.speculative for r in self.dec)
                     out = eng.spec_round(sess) if spec else eng.plain_round(sess)
                     t1 = pc()
                     self.stats["rounds"] += 1
