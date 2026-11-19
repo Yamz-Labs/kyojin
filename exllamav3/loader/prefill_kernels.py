@@ -397,6 +397,15 @@ def _pf_indexer_forward(self, x, qr, n_keys=None):
         iq = self._rope((qr @ self.w["q_b"].T).reshape(T, H, d), pos)
         wt = (x.float() @ self.w["proj"].T) / math.sqrt(d * H)
     P = self.P
+    if PF_FUSE and PF_SPARSE and IX_BLOCKED:      # blocked score + linear-time top-k: no [T, P] fp32 matrix, cost linear in N
+        N = self.n if n_keys is None else n_keys
+        last = start + T - 1
+        if (last // k if self.tail else (last + 1) // k) <= self.n_top:
+            return None
+        if N >= SPARSE_MINN and N >= P * k:
+            with t("f ix: scores + select (blocked)"):
+                self.last_scores = None
+                return ix_select_blocked(to_f16(iq), to_f16(self.pool[:P]), wt, start, k, self.tail, self.n_top, N)
     with t("f ix: scores"):
         if PF_FUSE:
             sc = ix_scores_fused(to_f16(iq), to_f16(self.pool[:P]), wt, start, k, self.tail)
@@ -631,6 +640,160 @@ def ix_select(sc, start, N, n_top, kpool, tail, want_bias=True, sparse=False):
     if want_bias:
         allow._ck_bias = bias
     return allow
+
+
+# ------------------------------------------------------------------------------------------------ blocked score + linear-time exact top-k (HY4_PF_SPARSE=1)
+@triton.jit
+def _fkey(x):
+    """fp32 -> int32 key with the same order (-0.0 == +0.0)"""
+    b = (x + 0.0).to(tl.int32, bitcast=True)
+    return tl.where(b < 0, b ^ 0x7FFFFFFF, b)
+
+
+@triton.jit
+def _kth_key(key, valid, k):
+    """largest L with count(valid & key >= L) >= k (int32 keys of one vector; -2^31 when fewer than k valid entries)"""
+    zero = tl.sum(tl.zeros([1], dtype=tl.int32), axis=0).to(tl.int64)
+    lo = zero - 2147483648
+    hi = zero + 2147483647
+    k64 = key.to(tl.int64)
+    for _ in range(32):
+        mid = lo + (hi - lo + 1) // 2
+        cnt = tl.sum(((k64 >= mid) & valid).to(tl.int32), axis=0)
+        ge = cnt >= k
+        lo = tl.where(ge, mid, lo)
+        hi = tl.where(ge, hi, mid - 1)
+    return lo
+
+
+@triton.jit
+def _ix_topk_kernel(SC, CK, CI, GIDX, NSEL, P, start, n_top, KP: tl.constexpr, TAIL: tl.constexpr, BLK: tl.constexpr, SM: tl.constexpr, CAP: tl.constexpr,
+                    TARGET: tl.constexpr, NATT: tl.constexpr):
+    """One row per program, cost linear in the visible groups nv (no power-of-two row vector, no 32 passes):
+    1. sample SM groups (stride ceil(nv / SM)), threshold = the key giving ~TARGET expected hits; one counting pass; accept when n_top <= count <= CAP (NATT tries, the
+       expected count is rescaled after a miss);
+    2. accepted: one pass compacts the candidates (ascending group order) into the row scratch CK / CI; exact n_top-th key on that buffer (ties: lowest index first);
+    3. not accepted (heavy ties / odd score law): exact 32-step bisection with tiled passes, then one compacting pass.
+    nv <= CAP skips the sampling (every visible group is a candidate). Output = GIDX [T, n_top] ascending group ids + NSEL, same selection as _ix_select_kernel."""
+    r = tl.program_id(0)
+    pos = start + r
+    if TAIL:
+        nv = pos // KP
+    else:
+        nv = (pos + 1) // KP
+    nv = tl.minimum(nv, P)
+    row = SC + r.to(tl.int64) * P
+    zero = tl.sum(tl.zeros([1], dtype=tl.int32), axis=0)
+    thr = zero.to(tl.int64) - 2147483648
+    ok = zero + 1
+    if nv > CAP:
+        ok = zero
+        s = (nv + SM - 1) // SM
+        sidx = tl.arange(0, SM) * s
+        sm = sidx < nv
+        skey = _fkey(tl.load(row + sidx, mask=sm, other=float("-inf")))
+        m = tl.sum(sm.to(tl.int32), axis=0)
+        kk = tl.maximum((TARGET * m + nv - 1) // nv, 1)
+        for _a in range(NATT):
+            if ok == 0:
+                ta = _kth_key(skey, sm, kk)
+                cnt = zero
+                for t0 in range(0, nv, BLK):
+                    g = t0 + tl.arange(0, BLK)
+                    gm = g < nv
+                    key = _fkey(tl.load(row + g, mask=gm, other=float("-inf")))
+                    cnt += tl.sum(((key.to(tl.int64) >= ta) & gm).to(tl.int32), axis=0)
+                good = (cnt >= n_top) & (cnt <= CAP)
+                thr = tl.where(good, ta, thr)
+                ok = good.to(tl.int32)
+                # rescale the sample rank so the next try expects CAP / 2 hits (too many) or 2 * n_top hits (too few)
+                want = tl.where(cnt > CAP, CAP // 2, 2 * n_top)
+                kk = tl.minimum(tl.maximum(kk * want // tl.maximum(cnt, 1), 1), m)
+    if ok != 0:
+        crow = r.to(tl.int64) * CAP
+        off = zero
+        for t0 in range(0, nv, BLK):
+            g = t0 + tl.arange(0, BLK)
+            gm = g < nv
+            key = _fkey(tl.load(row + g, mask=gm, other=float("-inf")))
+            sel = gm & (key.to(tl.int64) >= thr)
+            si = sel.to(tl.int32)
+            pb = off + tl.cumsum(si, axis=0) - 1
+            tl.store(CK + crow + pb, key, mask=sel)
+            tl.store(CI + crow + pb, g, mask=sel)
+            off += tl.sum(si, axis=0)
+        tl.debug_barrier()
+        c = tl.arange(0, CAP)
+        cm = c < off
+        bk = tl.load(CK + crow + c, mask=cm, other=0)
+        bi = tl.load(CI + crow + c, mask=cm, other=0)
+        lo = _kth_key(bk, cm, n_top)
+        k64 = bk.to(tl.int64)
+        gt = cm & (k64 > lo)
+        eq = cm & (k64 == lo)
+        need = n_top - tl.sum(gt.to(tl.int32), axis=0)
+        sel = gt | (eq & (tl.cumsum(eq.to(tl.int32), axis=0) <= need))
+        si = sel.to(tl.int32)
+        tl.store(GIDX + r.to(tl.int64) * n_top + tl.cumsum(si, axis=0) - 1, bi, mask=sel)
+        tl.store(NSEL + r, tl.sum(si, axis=0))
+    else:
+        lo = zero.to(tl.int64) - 2147483648
+        hi = zero.to(tl.int64) + 2147483647
+        for _b in range(32):
+            mid = lo + (hi - lo + 1) // 2
+            cnt = zero
+            for t0 in range(0, nv, BLK):
+                g = t0 + tl.arange(0, BLK)
+                gm = g < nv
+                key = _fkey(tl.load(row + g, mask=gm, other=float("-inf")))
+                cnt += tl.sum(((key.to(tl.int64) >= mid) & gm).to(tl.int32), axis=0)
+            ge = cnt >= n_top
+            lo = tl.where(ge, mid, lo)
+            hi = tl.where(ge, hi, mid - 1)
+        ngt = zero
+        for t0 in range(0, nv, BLK):
+            g = t0 + tl.arange(0, BLK)
+            gm = g < nv
+            key = _fkey(tl.load(row + g, mask=gm, other=float("-inf")))
+            ngt += tl.sum(((key.to(tl.int64) > lo) & gm).to(tl.int32), axis=0)
+        need = n_top - ngt
+        ce = zero
+        off = zero
+        for t0 in range(0, nv, BLK):
+            g = t0 + tl.arange(0, BLK)
+            gm = g < nv
+            key = _fkey(tl.load(row + g, mask=gm, other=float("-inf")))
+            gt = gm & (key.to(tl.int64) > lo)
+            eq = gm & (key.to(tl.int64) == lo)
+            sel = gt | (eq & ((ce + tl.cumsum(eq.to(tl.int32), axis=0)) <= need))
+            si = sel.to(tl.int32)
+            tl.store(GIDX + r.to(tl.int64) * n_top + off + tl.cumsum(si, axis=0) - 1, g, mask=sel)
+            ce += tl.sum(eq.to(tl.int32), axis=0)
+            off += tl.sum(si, axis=0)
+        tl.store(NSEL + r, off)
+
+
+IX_BLOCKED = os.environ.get("HY4_PF_IXBLK", "1") == "1"      # HY4_PF_SPARSE=1 only: 0 = the unblocked score matrix + ix_select
+IX_BLOCK_ELEMS = 1 << 27      # fp32 score elements of one query block (512 MB): the [T, P] matrix is never materialised, so the cost per layer stays linear in N
+
+
+def ix_select_blocked(iq16, pk16, wt, start, kpool, tail, n_top, N, rows=None, cap=4096, blk=2048, sm=4096, target=2048, natt=3):
+    """score + exact top-k per query block -> PfSparse (same selection as ix_scores_fused + ix_select(sparse=True)); iq16 [T, H, d] fp16, pk16 [P, d] fp16, wt [T, H] fp32"""
+    T = iq16.shape[0]
+    P = pk16.shape[0]
+    TB = rows or max(64, min(T, (IX_BLOCK_ELEMS // max(P, 1)) // 64 * 64))
+    dev = iq16.device
+    gidx = torch.empty(T, n_top, dtype=torch.int32, device=dev)
+    nsel = torch.empty(T, dtype=torch.int32, device=dev)
+    ck = torch.empty(min(TB, T), cap, dtype=torch.int32, device=dev)
+    ci = torch.empty(min(TB, T), cap, dtype=torch.int32, device=dev)
+    for t0 in range(0, T, TB):
+        t1 = min(T, t0 + TB)
+        sc = ix_scores_fused(iq16[t0:t1], pk16, wt[t0:t1], start + t0, kpool, tail)
+        _ix_topk_kernel[(t1 - t0,)](sc, ck, ci, gidx[t0:t1], nsel[t0:t1], P, start + t0, n_top, KP=kpool, TAIL=int(bool(tail)), BLK=blk, SM=sm, CAP=cap, TARGET=target,
+                                    NATT=natt, num_warps=8)
+        del sc
+    return PfSparse(gidx, nsel, kpool, tail, start, N)
 
 
 MOE_NF = None             # tests: force the grid order (None = env HY4_MOE_NFIRST)
