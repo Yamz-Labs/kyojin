@@ -1,0 +1,282 @@
+"""Multi-session Hy4 engine + scheduler (perf/hy4-strix-mu): 2-4 sessions decoded in ONE batched trunk step, new requests prefilled in chunks between decode rounds.
+
+  MuEngine     Hy4Engine with a MultiDecoder (loader/step_mu.py): per-session K / indexer slabs, per-session MTP head state, per-session n-gram + Engram history.
+  MuScheduler  one thread: admit requests into free slots, one prefill chunk of the oldest prefilling request, then one decode round of every decoding session
+               (plain: one row each; speculative: the MTP drafts + n-gram rows of each session share ONE verify replay, TM = 8 rows split evenly).
+Greedy: a session's stream equals plain greedy decoding of the trunk (the verifier keeps only the rows the trunk agrees with)."""
+from __future__ import annotations
+
+import os
+import threading
+import time
+from collections import deque
+
+from engine import Hy4Engine, PRIME_ROWS
+
+
+class MuEngine(Hy4Engine):
+    def __init__(self, *a, slots: int = 4, **kw):
+        super().__init__(*a, **kw)
+        self.slots = slots
+
+    def _decoder(self, M):
+        from exllamav3.loader import step_mu
+        self.SM = step_mu
+        return step_mu.MultiDecoder(M, self.slots)
+
+    def _mtp_graph(self):
+        self.GR.attach_mtp(self.MT)
+        return self.SM.MTPGraphMU(self.MT, self.k)
+
+    # ------------------------------------------------------------------------------------------ sessions
+    def open(self, slot):
+        return self.GR.new_session(slot)
+
+    def prefill_begin(self, s, ids, chunk):
+        s.ids, s.pf_pos, s.H, s.chunk = list(ids), 0, [], chunk
+
+    def prefill_step(self, s):
+        """one chunk of the prompt of s (eager prefill set). -> True when the prompt is done: s.y = first token, s.hcur, draft cache primed"""
+        torch, M, GR = self.torch, self.M, self.GR
+        a = s.pf_pos
+        b = min(len(s.ids), a + s.chunk)
+        self.phase("prefill")
+        GR.bind(s)
+        if a == 0:
+            M.prefetch_engram(s.ids, s.chunk)      # the row prefetch list is global: one prefill is in flight at a time, it starts with its first chunk
+        lg = M.step(s.ids[a:b])
+        s.H.append(M.head_state(M._x))
+        M._x = None
+        torch.cuda.synchronize()
+        GR.save(s)
+        s.pf_pos = b
+        if b < len(s.ids):
+            return False
+        H = torch.cat(s.H) if len(s.H) > 1 else s.H[0]
+        s.H = []
+        s.y = int(torch.argmax(lg))
+        s.hcur = H[-1:].clone()
+        self._prime_draft(s.ids, H)               # MT is bound to s
+        torch.cuda.synchronize()
+        GR.start_graph_state(s)
+        self.phase("decode")
+        return True
+
+    # ------------------------------------------------------------------------------------------ decode rounds
+    def plain_round(self, sess):
+        """one row per session -> {session: [new token]}"""
+        rows = [(s, [s.y]) for s in sess]
+        _lg, am, _x, hv = self.GR.step_slots(rows)
+        amh = am.reshape(-1).tolist()
+        out = {}
+        for r, s in enumerate(sess):
+            s.y = amh[r]
+            out[s] = [s.y]
+        return out
+
+    def _ng(self, s):
+        if s.ng is None and self.ngram_ext > 0:
+            from ngram import NGram
+            s.ng = NGram(self.ngram_min, self.ngram_ext)
+            s.ng.reset(list(s.ids) + [s.y])
+            s.extra.update(rate=0.7, since=0)
+        return s.ng
+
+    def spec_round(self, sess):
+        """speculative round of every session in sess: drafts per session (own head state), ONE verify replay over all rows. -> {session: [new tokens]}"""
+        torch, GR, MG, MT, k = self.torch, self.GR, self.MG, self.MT, self.k
+        TM = self.SG.TM
+        Rs = max(1, TM // len(sess))               # verify rows per session
+        ks = min(k, Rs - 1)
+        plan = []
+        for s in sess:
+            if Rs == 1:
+                plan.append((s, [s.y], False, 0, None))
+                continue
+            j = s.n - 1
+            ng = self._ng(s)
+            skip, cl = False, []
+            if ng is not None and self.ngram_long > 0:
+                cl, ml = ng.propose([], Rs - 1)
+                skip = bool(cl) and ml >= self.ngram_long
+            if skip:
+                plan.append((s, [s.y] + cl, True, j, s.hcur.clone()))
+                continue
+            GR.bind(s)
+            MG.slot = s.slot
+            plan.append((s, None, False, j, MG.run(s.y, s.hcur, j)))      # drafts launched; read below
+        rows, meta = [], []
+        for s, toks, skip, j, h in plan:
+            if toks is None:
+                d = h.tolist()[:ks]
+                ext = []
+                ng = s.ng
+                if ng is not None:
+                    lim = min(self.ngram_ext, Rs - 1 - ks)
+                    if self.ngram_gate:
+                        st = s.extra
+                        st["since"] += 1
+                        rate, since = st["rate"], st["since"]
+                        lim = lim if rate >= 0.6 else (2 if rate >= 0.4 else (lim if since >= 8 else 0))
+                    ext, ml = ng.propose(d, lim) if lim > 0 else ([], 0)
+                    if self.ngram_adapt and ext:
+                        ext = ext[:max(1, (ml - self.ngram_min + 1) * 2)]
+                toks = [s.y] + d + ext
+                meta.append((s, toks, False, j, len(ext), ks))
+            else:
+                meta.append((s, toks, skip, j, 0, ks))
+            rows.append((s, toks))
+        starts = {s: s.n for s, _ in rows}
+        _lg, amv, _x, hv = GR.step_slots(rows)
+        amh_all = amv.reshape(-1).tolist()
+        out, o = {}, 0
+        for s, toks, skip, j, next_, kk in meta:
+            T = len(toks)
+            amh = amh_all[o:o + T]
+            hs = hv[o:o + T]
+            o += T
+            acc, nd = 0, T - 1
+            while acc < nd and toks[acc + 1] == amh[acc]:
+                acc += 1
+            st = s.extra
+            if next_ and not skip:
+                st["rate"] = 0.75 * st["rate"] + 0.25 * (max(0, acc - kk) / next_)
+                st["since"] = 0
+            new = toks[1:acc + 1] + [amh[acc]]
+            GR.rewind(s, starts[s] + 1 + acc)
+            if skip:                                   # the chain wrote no head rows: pairs (token m, state before it) for head positions j .. j + acc
+                GR.bind(s)
+                N = ((j + acc + 1 + 3) // 4) * 4
+                sts = torch.cat([skip_h(plan, s), hs[:acc]]) if acc > 0 else skip_h(plan, s)
+                MT.step(torch.tensor(toks[:acc + 1], dtype=torch.long, device=self.dev), sts, MT.ar[j:j + acc + 1], N)
+            elif self.ngram_fill and acc >= kk and kk > 0:
+                GR.bind(s)
+                N = ((j + acc + 1 + 3) // 4) * 4
+                MT.step(torch.tensor(toks[kk:acc + 1], dtype=torch.long, device=self.dev), hs[kk - 1:acc], MT.ar[j + kk:j + acc + 1], N)
+            if s.ng is not None:
+                s.ng.add(new)
+            s.y, s.hcur = amh[acc], hs[acc:acc + 1].clone()
+            s.extra["hist"] = s.extra.get("hist", 0) + 1
+            s.extra["acc_sum"] = s.extra.get("acc_sum", 0) + acc
+            out[s] = new
+        return out
+
+
+def skip_h(plan, s):
+    for p in plan:
+        if p[0] is s:
+            return p[4]
+    raise KeyError
+
+
+class Request:
+    def __init__(self, ids, max_new, speculative=True, on_tokens=None):
+        self.ids, self.max_new, self.speculative = list(ids), max_new, speculative
+        self.on_tokens = on_tokens
+        self.out: list[int] = []
+        self.times: list[tuple[float, int]] = []      # (time, tokens emitted by this event)
+        self.t_submit = time.perf_counter()
+        self.t_first = self.t_done = None
+        self.done = threading.Event()
+        self.error = None
+        self.sess = None
+        self.stats: dict = {}
+
+
+class MuScheduler(threading.Thread):
+    """admit -> prefill chunk (oldest prefilling) -> one decode round of all decoding sessions -> repeat"""
+
+    def __init__(self, eng: MuEngine, chunk: int = 1024, spec: bool = True):
+        super().__init__(daemon=True)
+        self.eng, self.chunk, self.spec = eng, chunk, spec
+        self.cv = threading.Condition()
+        self.pending: deque = deque()
+        self.free = list(range(eng.slots))
+        self.pf: deque = deque()
+        self.dec: list = []
+        self.stop_flag = False
+        self.stats = {"rounds": 0, "round_rows": 0, "pf_chunks": 0, "pf_s": 0.0, "dec_s": 0.0}
+        self.trace: list = []                       # (t0, t1, kind, n) per scheduler action
+
+    def submit(self, req: Request):
+        with self.cv:
+            self.pending.append(req)
+            self.cv.notify()
+        return req
+
+    def shutdown(self):
+        with self.cv:
+            self.stop_flag = True
+            self.cv.notify()
+
+    def _emit(self, req, new, now):
+        room = req.max_new - len(req.out)
+        new = new[:room]
+        req.out += new
+        req.times.append((now, len(new)))
+        stop = bool(req.on_tokens(new)) if req.on_tokens else False
+        return stop or len(req.out) >= req.max_new
+
+    def _finish(self, req):
+        req.t_done = time.perf_counter()
+        self.free.append(req.sess.slot)
+        if req in self.dec:
+            self.dec.remove(req)
+        req.done.set()
+
+    def run(self):
+        eng, pc = self.eng, time.perf_counter
+        try:
+            eng.phase("decode")
+            while True:
+                with self.cv:
+                    while not (self.pending or self.pf or self.dec) and not self.stop_flag:
+                        self.cv.wait()
+                    if self.stop_flag:
+                        return
+                    while self.pending and self.free:
+                        req = self.pending.popleft()
+                        req.sess = eng.open(self.free.pop(0))
+                        req.stats["admit"] = pc()
+                        if len(req.ids) + req.max_new + eng.k + 2 > eng.ctx:
+                            req.error = "context"
+                            self._finish(req)
+                            continue
+                        eng.prefill_begin(req.sess, req.ids, self.chunk)
+                        req.sess.req = req
+                        self.pf.append(req)
+                if self.pf:
+                    req = self.pf[0]
+                    t0 = pc()
+                    done = eng.prefill_step(req.sess)
+                    t1 = pc()
+                    self.stats["pf_chunks"] += 1
+                    self.stats["pf_s"] += t1 - t0
+                    self.trace.append((t0, t1, "pf", req.sess.pf_pos))
+                    if done:
+                        self.pf.popleft()
+                        req.t_first = t1
+                        req.stats["ttft"] = t1 - req.t_submit
+                        if self._emit(req, [req.sess.y], t1):
+                            self._finish(req)
+                        else:
+                            self.dec.append(req)
+                if self.dec:
+                    sess = [r.sess for r in self.dec]
+                    t0 = pc()
+                    spec = self.spec and all(r.speculative for r in self.dec)
+                    out = eng.spec_round(sess) if spec else eng.plain_round(sess)
+                    t1 = pc()
+                    self.stats["rounds"] += 1
+                    self.stats["round_rows"] += len(sess)
+                    self.stats["dec_s"] += t1 - t0
+                    self.trace.append((t0, t1, "dec", len(sess)))
+                    for r in list(self.dec):
+                        if self._emit(r, out[r.sess], t1):
+                            self._finish(r)
+        except Exception as ex:           # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            for r in list(self.dec) + list(self.pf) + list(self.pending):
+                r.error = repr(ex)
+                r.done.set()

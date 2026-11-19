@@ -11,6 +11,8 @@ import pytest
 import torch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEV = os.environ.get("MU_DEV", "cpu")      # MU_DEV=cuda: the same tests on the GPU (compiled Triton kernels)
+torch.set_default_device(DEV)
 
 
 def _load():
@@ -28,11 +30,11 @@ CAP, S = 64, 4
 
 
 def make_ix(seed=0, cap=CAP):
-    g = torch.Generator().manual_seed(seed)
+    g = torch.Generator(device=DEV).manual_seed(seed)
     r = lambda *s: torch.randn(*s, generator=g) * 0.5
     w = {"attn_k": r(D, E), "q_b": r(H * D, RQ), "value": r(D, D), "gate": r(D, D), "k_norm": 1 + r(D) * 0.1, "proj": r(H, E), "ape": r(K, D) * 0.1,
          "pool_norm": 1 + r(D) * 0.1}
-    return IXF.FusedKPoolIndexer(w, "cpu", n_head=H, head_dim=D, top_k=16, kpool=K, select_tail=True, rope_dim=8, rope_base=1e4, eps=1e-5, cap=cap)
+    return IXF.FusedKPoolIndexer(w, DEV, n_head=H, head_dim=D, top_k=16, kpool=K, select_tail=True, rope_dim=8, rope_base=1e4, eps=1e-5, cap=cap)
 
 
 def solo_ix(w_from, cap=CAP):
@@ -48,7 +50,7 @@ def causal(pos, Nb):
 
 def run_case(plan, scramble=False, poolk=False, seed=1):
     """plan: list of steps, each a list of (slot, T) rows; returns (ok flags) comparing the batched slab ops with solo ops per session"""
-    g = torch.Generator().manual_seed(seed)
+    g = torch.Generator(device=DEV).manual_seed(seed)
     ixb = make_ix(0)
     SG.indexer_static_init(ixb, CAP)
     sl = MS.IxSlabs(ixb, S, CAP)
@@ -126,7 +128,7 @@ def test_indexer_sentinel_slots_outside_the_batch_keep_their_values():
     sl.vgb.fill_(7.0)
     sl.pool.fill_(7.0)
     ar = torch.arange(CAP)
-    g = torch.Generator().manual_seed(5)
+    g = torch.Generator(device=DEV).manual_seed(5)
     T = 8
     for n0 in range(0, CAP, T):                           # slot S - 1 (the last slab) and slot 1 run to their last position
         pos = torch.cat([torch.arange(n0, n0 + T)] * 2)
@@ -138,14 +140,14 @@ def test_indexer_sentinel_slots_outside_the_batch_keep_their_values():
 
 
 def test_indexer_poolk_triton_interpreter_matches_torch_path():
-    if os.environ.get("TRITON_INTERPRET") != "1":
+    if (os.environ.get("TRITON_INTERPRET") != "1" and DEV == "cpu"):
         pytest.skip("needs TRITON_INTERPRET=1")
     run_case(PLAN[:12], poolk=True)
 
 
 # ------------------------------------------------------------------------------------------------ attention core
 def attn_inputs(seed=3):
-    g = torch.Generator().manual_seed(seed)
+    g = torch.Generator(device=DEV).manual_seed(seed)
     R, P = 8, 4
     kflat = torch.randn(S * CAP, R + P, generator=g)
     return g, R, P, kflat
@@ -186,7 +188,7 @@ def test_mla_slots_other_slabs_and_future_rows_are_not_read():
     assert torch.isfinite(b).all() and torch.equal(a, b)
 
 
-@pytest.mark.skipif(os.environ.get("TRITON_INTERPRET") != "1", reason="needs TRITON_INTERPRET=1")
+@pytest.mark.skipif((os.environ.get("TRITON_INTERPRET") != "1" and DEV == "cpu"), reason="needs TRITON_INTERPRET=1")
 @pytest.mark.parametrize("window", [0, 9])
 def test_mla_slots_kernel_interpreter_equals_reference(window):
     g, R, P, kflat = attn_inputs()
