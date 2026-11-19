@@ -29,19 +29,22 @@ class NGram:
         ext = self.ext if ext is None else ext
         if ext <= 0:
             return [], 0
-        ss = s + list(d)
-        if len(ss) < n:
+        d = list(d)
+        L, nd = len(s), len(d)
+        if L + nd < n:
             return [], 0
-        end = len(ss) - 1
+        g = lambda j: s[j] if j < L else d[j - L]                       # the combined sequence s + d without copying it (O(n) per call at 64K tokens)
+        end = L + nd - 1
         # the draft region ends at `end`; the index holds only positions < len(s), so a hit is always an earlier occurrence
-        key = tuple(ss[-n:])
+        key = tuple((s[L - (n - nd):] if n > nd else []) + d[max(0, nd - n):])
         i = self.idx.get(key)
         if i is not None and i >= end:           # no drafts: the suffix of the sequence is its own latest occurrence, use the one before it
             i = self.prev.get(key)
         if i is None or i >= end:
             return [], 0
         m = n                                    # extend the match backwards
-        while i - m >= 0 and end - m >= 0 and ss[i - m] == ss[end - m] and m < 32:
+        while i - m >= 0 and end - m >= 0 and g(i - m) == g(end - m) and m < 32:
             m += 1
-        cont = ss[i + 1:i + 1 + ext]
+        a, b = i + 1, i + 1 + ext
+        cont = (s[a:min(b, L)] if a < L else []) + d[max(0, a - L):max(0, b - L)]
         return cont, m

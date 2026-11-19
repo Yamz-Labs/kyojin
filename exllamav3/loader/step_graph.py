@@ -30,6 +30,8 @@ TM = int(os.environ.get("HY4_GRAPH_TM", "8"))          # max rows of one graph s
 MASK64 = (1 << 64) - 1
 PERT = None                      # [cap, D] fp32 noise table (measurement arms only)
 _IO_W = int(os.environ.get("HY4_GRAPH_IO", "64"))
+PRIME_IX = os.environ.get("HY4_LC_PRIME", "0") == "1"      # draft-cache fill rows (T > 16) select with the prefill scorer (fp16 GEMM, exact top-k)
+VG_RING = 4096 if int(os.environ.get("HY4_SWA_RING", "0")) else 0      # rows of the indexer (value | gate) ring: one prime call (2048 rows) + the open group
 RING_ROWS = int(os.environ.get("HY4_SWA_RING", "0"))      # >= 1: K rows of window layers in a ring buffer of this many rows (e.g. 1024) instead of cap rows
 _POOL = ThreadPoolExecutor(max_workers=_IO_W)
 SPLIT = os.environ.get("HY4_GRAPH_SPLIT", "1") == "1"      # 3 graphs per step, cut before the first two Engram layers: the rows of the later layers are staged while the GPU runs the earlier ones
@@ -59,10 +61,11 @@ def indexer_static_init(ix, cap):
         ix.pool = big
     vgb = getattr(ix, "vgb", None)             # per-position (value | gate) rows [cap, 2d]: a rejected / re-run position just overwrites its row
     if vgb is None:
-        vgb = ix.vgb = torch.zeros(cap, 2 * d, device=ix.dev)
+        ix.vg_ring = VG_RING if (VG_RING and VG_RING < cap) else 0       # HY4_SWA_RING: only the open group (+ the rows of one batch call) is ever read: slot = position % VG_RING
+        vgb = ix.vgb = torch.zeros(ix.vg_ring or cap, 2 * d, device=ix.dev)
     if ix.vg is not None:                      # open group of an eager prefill (< k rows)
         m = ix.vg.shape[0]
-        vgb[ix.n - m:ix.n] = ix.vg
+        vgb[(torch.arange(ix.n - m, ix.n, device=ix.dev) % ix.vg_ring) if ix.vg_ring else slice(ix.n - m, ix.n)] = ix.vg
     ix._max_pos = cap
     ix._table(cap)
 
@@ -75,12 +78,15 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     k, d, H = ix.k, ix.d, ix.H
     ik = _rms(x @ ix.w["attn_k"].T, ix.w["k_norm"], ix.eps)
     vg_new = torch.cat([ik @ ix.w["value"].T, ik @ ix.w["gate"].T], -1)
-    ix.vgb.index_copy_(0, pos, vg_new)
+    vr = getattr(ix, "vg_ring", 0)
+    assert not vr or x.shape[0] + k <= vr, "vg ring smaller than one call"
+    ix.vgb.index_copy_(0, pos % vr if vr else pos, vg_new)
     if _PF.ENABLED:                                     # one Triton kernel for the whole pool update (HY4_IDX_POOLK)
         _PF.pool_update(ix, pos)
     else:
         g0 = (pos // k) * k
-        rows = ix.vgb[g0[:, None] + ar[:k][None, :]]                       # [1, k, 2d]: the (partial) group of this position
+        gi = g0[:, None] + ar[:k][None, :]
+        rows = ix.vgb[gi % vr if vr else gi]                                # [1, k, 2d]: the (partial) group of this position
         v, g = rows[..., :d].reshape(-1, k, d), rows[..., d:].reshape(-1, k, d)
         p = (torch.softmax(g + ix.w["ape"][None], dim=1) * v).sum(1)
         pooled = ix._rope(_rms(p, ix.w["pool_norm"], ix.eps), g0)
@@ -91,6 +97,12 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     iq = ix._rope((qr @ ix.w["q_b"].T).reshape(T, H, d), pos)
     wt = (x.float() @ ix.w["proj"].T) / math.sqrt(d * H)
     Pb = Nb // k
+    if PRIME_IX and T > 16 and ix.tail and iq.is_cuda:       # draft-cache fill of a long prompt (T up to 2048 rows): fused fp16 scorer + exact select instead of the fp32 [T, 16, Pb] einsum
+        off = (pos.data_ptr() - ar.data_ptr()) // ar.element_size()
+        if pos.dim() == 1 and 0 <= off < ar.shape[0] and Nb == Pb * k:
+            from . import prefill_kernels as _pkm
+            sc = _pkm.ix_scores_fused(_pkm.to_f16(iq), _pkm.to_f16(ix.pool[:Pb]), wt, int(off), k, ix.tail)
+            return _pkm.ix_select(sc, int(off), Nb, ix.n_top, k, ix.tail, want_bias=False)
     if _LS.ENABLED and ix.tail and T <= 16 and _LS._usable(iq):        # HY4_LC_SPARSE: exact top-k over the pools + sparse attend (no [T, Nb] mask, no dense key scan)
         idx, nsel = _LS.select_groups(iq.contiguous(), wt.contiguous(), ix.pool, pos, Pb, ix.n_top, k, ix.tail)
         sel = _LS.SparseSel(idx, nsel, k, ix.tail)
