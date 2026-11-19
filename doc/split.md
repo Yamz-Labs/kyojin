@@ -90,18 +90,25 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
 ### Pre-flight guard
 
 The guard estimates each device's footprint from actual bytes: weights, KV/recurrent cache,
-the part0 load slab and a prefill workspace. The device cap is the device itself:
+the part0 load slab and, on unified-memory devices only, a prefill workspace. The device cap is
+the device itself:
 
 ```text
 device_cap = min(mem_get_info().free, mem_get_info().total)
 host_cap   = MemAvailable - (host_floor + preflight_margin)
 ```
 
+Dedicated devices plan without a workspace: `auto` refuses only a hard overcommit of
+weights+cache+slab, and does not refuse a load that merely leaves less than the workspace
+estimate. A dedicated prefill allocation failure is a process-level error. Unified devices add
+the configurable workspace estimate and must also satisfy the host cap; only the unified
+footprints are summed against the host.
+
 There is **no GTT or VRAM reserve**. A dedicated-VRAM allocation failure is a process-level
 error; the host floor is what prevents a unified-memory box from starving. The only
 tunables are `MEMGUARD_FLOOR` (default 8), the planning margin (default 1)
-and the prefill workspace (default 2.0 GiB). The host floor is shared with the supervisor;
-the margin keeps the planner above the supervisor's kill threshold.
+and the unified prefill workspace (default 2.0 GiB). The host floor is shared with the
+supervisor; the margin keeps the planner above the supervisor's kill threshold.
 
 `--oom-guard auto` refuses before allocating weights, cache or slabs, and prints a per-device
 table plus the chosen N/context and the largest N/context that fits. `off` disables it. The

@@ -744,8 +744,7 @@ def _fake_guard_probe(dm, monkeypatch, *, mg, part0_total=16 * 1024 ** 3,
                         lambda i: part0_total if i == 1 else part1_total)
     monkeypatch.setattr(dm, "device_free_bytes",
                         lambda i: part0_total if i == 1 else part1_total)
-    monkeypatch.setattr(mg, "is_unified_device",
-                        lambda i, arch=None, total=None: i == 0)
+    monkeypatch.setattr(mg, "is_unified_device", lambda i: i == 0)
     monkeypatch.setattr(dm, "host_available_bytes", lambda: host_available)
 
 
@@ -764,6 +763,12 @@ def test_split_plan_guard_passes_or_refuses_before_allocation(split_modules, mon
     plan.add("text", small, config = small_cfg)
     plan.build()
     assert plan.guard_report is not None and plan.guard_report.ok
+    footprints = {r.footprint.index: r.footprint for r in plan.guard_report.device_results}
+    # cuda:0 is the unified part1: configured workspace plus the host check.
+    assert footprints[0].unified and footprints[0].workspace_bytes == 2 * gib
+    # cuda:1 is a dedicated part0: no workspace, only the hard-fit device cap.
+    assert not footprints[1].unified and footprints[1].workspace_bytes == 0
+    assert plan.guard_report.host_result is not None
 
     huge = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
     huge_cfg = FakeConfig({f"layer.{i}": 40 * gib for i in range(4)})
@@ -798,7 +803,7 @@ def test_single_device_guard_includes_extra_components(split_modules, monkeypatc
     monkeypatch.setattr(mg, "device_total_bytes", lambda _i: 118 * gib)
     monkeypatch.setattr(mg, "device_free_bytes", lambda _i: 118 * gib)
     monkeypatch.setattr(mg, "host_available_bytes", lambda: 120 * gib)
-    monkeypatch.setattr(mg, "is_unified_device", lambda *_a, **_k: True)
+    monkeypatch.setattr(mg, "is_unified_device", lambda _i: True)
 
     target = FakeModel([FakeModule("layer.0", layer_idx = 0)])
     target_cfg = FakeConfig({"layer.0": 1 * gib})

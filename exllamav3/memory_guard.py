@@ -9,12 +9,11 @@ processes.  A supervisor enforces the same floor from outside the process; the p
 adds a small planning margin so it does not deliberately plan at the kill threshold.
 
 Models are loaded from actual measured bytes: module weights, cache/recurrent bytes, the
-part0 load slab and a prefill workspace.  A dedicated-VRAM OOM is left to the process
-(and is normally a recoverable allocation error); the host floor is what prevents the
-unified-memory box from starving.
+part0 load slab and, on unified devices only, a prefill workspace.  A dedicated-VRAM OOM is
+left to the process (and is normally a recoverable allocation error); the host floor is what
+prevents the unified-memory box from starving.
 """
 
-import glob
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -43,7 +42,12 @@ class OOMGuardError(RuntimeError):
 
 @dataclass
 class GuardPolicy:
-    """The only tunables: host reserve, planner margin and the prefill workspace."""
+    """The only tunables: host reserve, planner margin and the prefill workspace.
+
+    ``workspace_gib`` is the unified-memory prefill planning estimate and applies
+    only to devices the runtime reports as integrated; dedicated devices plan with
+    no workspace.
+    """
 
     mode: str = "auto"
     host_floor_gib: float = DEFAULT_HOST_FLOOR_GIB
@@ -115,11 +119,6 @@ def host_available_bytes() -> int | None:
     return int(value) if value is not None else None
 
 
-def host_total_bytes() -> int | None:
-    value = meminfo().get("MemTotal")
-    return int(value) if value is not None else None
-
-
 def device_total_bytes(index: int) -> int | None:
     try:
         return int(_torch().cuda.get_device_properties(int(index)).total_memory)
@@ -135,28 +134,18 @@ def device_free_bytes(index: int) -> int | None:
         return None
 
 
-def is_unified_device(index: int, arch: str | None = None, total: int | None = None) -> bool:
-    """Positive unified/GTT detection, independent of a hardcoded device index."""
-    arch_key = (arch or "").strip().lower()
-    if arch_key.startswith("gfx115"):
-        return True
-    props = None
+def is_unified_device(index: int) -> bool:
+    """True only when the runtime reports unified/integrated memory for the device.
+
+    ROCm exposes the flag as ``is_integrated``; some runtimes use ``integrated``.
+    An unavailable property or a failed probe means dedicated, which loses the
+    host-pool check rather than guessing from an arch, name or size ratio.
+    """
     try:
         props = _torch().cuda.get_device_properties(int(index))
-    except Exception:                                    # noqa: BLE001, S110 - unavailable probe
-        pass
-    if props is not None:
-        if getattr(props, "is_integrated", False) or getattr(props, "integrated", False):
-            return True
-        name = (getattr(props, "name", "") or "").lower()
-        if "gb10" in name or "dgx spark" in name:
-            return True
-    total = device_total_bytes(index) if total is None else total
-    host = host_total_bytes()
-    # A dedicated GPU can be more than half of host RAM, so require a near-host total
-    # together with an AMD GTT pool before treating it as unified.
-    return (total is not None and host is not None and total >= 0.9 * host
-            and bool(glob.glob("/sys/class/drm/card*/device/mem_info_gtt_total")))
+    except Exception:                                    # noqa: BLE001 - unavailable probe
+        return False
+    return bool(getattr(props, "is_integrated", False) or getattr(props, "integrated", False))
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -174,7 +163,7 @@ class DeviceFootprint:
     weights_bytes: int = 0
     cache_bytes: int = 0
     slab_bytes: int = 0
-    workspace_bytes: int = 0
+    workspace_bytes: int = 0        # unified devices only; dedicated devices plan 0
 
     @property
     def need_bytes(self) -> int:
@@ -303,13 +292,14 @@ class OOMGuard:
             total_bytes = device_total_bytes(index)
         if free_bytes is None:
             free_bytes = device_free_bytes(index)
+        unified = is_unified_device(index)
         return DeviceFootprint(
             index = index, arch = arch, name = name,
-            unified = is_unified_device(index, arch, total_bytes),
+            unified = unified,
             total_bytes = total_bytes, free_bytes = free_bytes,
             weights_bytes = int(weights_bytes), cache_bytes = int(cache_bytes),
             slab_bytes = int(reserve_bytes),
-            workspace_bytes = int(self.policy.workspace_gib * GIB),
+            workspace_bytes = int(self.policy.workspace_gib * GIB) if unified else 0,
         )
 
     def evaluate(self, footprints: Iterable[DeviceFootprint],

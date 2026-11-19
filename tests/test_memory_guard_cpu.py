@@ -144,19 +144,85 @@ def test_single_device_uses_the_automatic_policy(mg, monkeypatch):
     monkeypatch.setattr(mg, "device_total_bytes", lambda _i: 118 * GIB)
     monkeypatch.setattr(mg, "device_free_bytes", lambda _i: 118 * GIB)
     monkeypatch.setattr(mg, "host_available_bytes", lambda: 120 * GIB)
-    monkeypatch.setattr(mg, "is_unified_device", lambda *_a, **_k: True)
+    monkeypatch.setattr(mg, "is_unified_device", lambda _i: True)
     # Device fits, host planning capacity (112) does not.
     with pytest.raises(mg.OOMGuardError, match="refused the load"):
         mg.check_single_device(116 * GIB, 0, 0, logger=lambda *_a: None)
 
 
-def test_unified_detection_does_not_flag_a_large_dedicated_gpu(mg, monkeypatch):
-    monkeypatch.setattr(mg, "device_total_bytes", lambda _i: 80 * GIB)
-    monkeypatch.setattr(mg, "host_total_bytes", lambda: 128 * GIB)
-    monkeypatch.setattr(mg, "_torch", lambda: SimpleNamespace(cuda=SimpleNamespace(
-        get_device_properties=lambda _i: (_ for _ in ()).throw(RuntimeError("no gpu")))))
-    assert mg.is_unified_device(0, "gfx1201", 80 * GIB) is False
-    assert mg.is_unified_device(0, "gfx1151", 80 * GIB) is True
+def test_unified_detection_uses_only_the_integrated_property(mg, monkeypatch):
+    # fake props -> expected classification.  A runtime without the property is
+    # dedicated, including a large AMD dGPU whose total is close to host RAM.
+    cases = [
+        (SimpleNamespace(name = "AMD Radeon 8060S", total_memory = 114 * GIB,
+                         is_integrated = 1), True),
+        (SimpleNamespace(name = "AMD Radeon Graphics", total_memory = 112 * GIB,
+                         integrated = True), True),
+        (SimpleNamespace(name = "NVIDIA GeForce RTX 3080", total_memory = 10 * GIB), False),
+        (SimpleNamespace(name = "NVIDIA GeForce RTX 3080 Ti Laptop GPU",
+                         total_memory = 16 * GIB), False),
+        (SimpleNamespace(name = "NVIDIA GeForce RTX 3090", total_memory = 24 * GIB), False),
+        (SimpleNamespace(name = "AMD Radeon RX 9070 XT", total_memory = 118 * GIB), False),
+    ]
+    for props, expected in cases:
+        monkeypatch.setattr(mg, "_torch", lambda props = props: SimpleNamespace(cuda = SimpleNamespace(
+            get_device_properties = lambda _i, props = props: props)))
+        assert mg.is_unified_device(0) is expected
+
+    # A failed probe means dedicated, not a guess.
+    monkeypatch.setattr(mg, "_torch", lambda: SimpleNamespace(cuda = SimpleNamespace(
+        get_device_properties = lambda _i: (_ for _ in ()).throw(RuntimeError("no gpu")))))
+    assert mg.is_unified_device(0) is False
+
+
+def test_dedicated_footprint_has_no_workspace_and_only_the_hard_fit_cap(mg, monkeypatch):
+    monkeypatch.setattr(mg, "is_unified_device", lambda _i: False)
+    guard = _guard(mg)
+
+    fp = guard.footprint(0, total_bytes = 16 * GIB, free_bytes = 16 * GIB,
+                         weights_bytes = int(15.5 * GIB))
+    assert fp.unified is False and fp.workspace_bytes == 0
+    # Fits by 0.5 GiB: the old unconditional 2 GiB workspace would have refused it.
+    assert fp.need_bytes <= fp.capacity_bytes() < fp.need_bytes + 2 * GIB
+    report = guard.check([fp], host_available = 1)
+    assert report.ok and report.host_result is None
+
+    # Hard overcommit is still refused under auto.
+    over = guard.footprint(0, total_bytes = 16 * GIB, free_bytes = 16 * GIB,
+                           weights_bytes = 17 * GIB)
+    with pytest.raises(mg.OOMGuardError, match = "deficit"):
+        guard.check([over], host_available = 1)
+
+    # A model resident on the card lowers free; the cap follows it.
+    resident = guard.footprint(0, total_bytes = 16 * GIB, free_bytes = 14 * GIB,
+                               weights_bytes = 15 * GIB)
+    with pytest.raises(mg.OOMGuardError, match = "deficit"):
+        guard.check([resident], host_available = 1)
+
+
+def test_unified_footprint_adds_the_workspace_and_plans_against_host(mg, monkeypatch):
+    monkeypatch.setattr(mg, "is_unified_device", lambda _i: True)
+    guard = _guard(mg)
+
+    fp = guard.footprint(0, total_bytes = 118 * GIB, free_bytes = 118 * GIB,
+                         weights_bytes = 106 * GIB)
+    assert fp.unified is True and fp.workspace_bytes == 2 * GIB
+    # Device fits (108/118); host capacity is 120 - (7 + 1) = 112.
+    report = guard.check([fp], host_available = 120 * GIB)
+    assert report.ok and report.host_result is not None
+
+    # A resident host process lowers MemAvailable below the plan.
+    with pytest.raises(mg.OOMGuardError, match = "deficit"):
+        guard.check([fp], host_available = 109 * GIB)
+
+    # The workspace estimate is env-tunable for unified devices.
+    for key in ("KYOJIN_OOM_GUARD", "MEMGUARD_FLOOR",
+                "KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB", "KYOJIN_OOM_GUARD_WORKSPACE_GIB"):
+        monkeypatch.delenv(key, raising = False)
+    monkeypatch.setenv("KYOJIN_OOM_GUARD_WORKSPACE_GIB", "5")
+    fp = mg.OOMGuard(mg.GuardPolicy.from_env(), logger = lambda *_a: None).footprint(
+        0, total_bytes = 118 * GIB, free_bytes = 118 * GIB, weights_bytes = 100 * GIB)
+    assert fp.workspace_bytes == 5 * GIB
 
 
 def test_supervisor_host_floor_is_env_tunable(guard_mod, monkeypatch):

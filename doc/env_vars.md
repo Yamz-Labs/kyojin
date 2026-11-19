@@ -741,9 +741,10 @@ exactly at the floor.
 
 ### `KYOJIN_OOM_GUARD_WORKSPACE_GIB` (default: `2.0`)
 
-Estimated transient prefill workspace added to every device footprint. This is model/context
-dependent; raise it for a model with a larger prefill scratch area. It is not a reserve: the
-device cap remains its own reported free memory.
+Estimated transient prefill workspace added to unified (integrated-memory) device footprints;
+dedicated devices use 0. The default 2.0 GiB is a planning estimate, not a universal measurement.
+This is model/context dependent; raise it for a model with a larger prefill scratch area. It is
+not a reserve: the device cap remains its own reported free memory.
 
 ### `EXL3_LOAD_ARENA` (default: `1`)
 
