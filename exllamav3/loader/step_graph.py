@@ -26,7 +26,8 @@ BUCKET = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
 TM = int(os.environ.get("HY4_GRAPH_TM", "8"))          # max rows of one graph step (verify rows)
 MASK64 = (1 << 64) - 1
 PERT = None                      # [cap, D] fp32 noise table (measurement arms only)
-_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("HY4_GRAPH_IO", "16")))
+_IO_W = int(os.environ.get("HY4_GRAPH_IO", "64"))
+_POOL = ThreadPoolExecutor(max_workers=_IO_W)
 
 
 # ---------------------------------------------------------------------------------------------------- static indexer
@@ -228,6 +229,7 @@ class GraphDecoder:
         self.rpin = torch.zeros(nE, TM, nc, rb, dtype=torch.uint8).pin_memory()
         self.vpin = torch.zeros(nE, TM, nc, dtype=torch.float32).pin_memory()
         self.rnp = self.rpin.numpy()
+        self._rmv = None
         for i in range(fw.n_layers):
             if fw._layer(i).ix:
                 indexer_static_init(fw._indexer_fused(i), self.cap)
@@ -304,10 +306,23 @@ class GraphDecoder:
                 ids, valid = engram_row_ids(e, toks, start + t)
                 self.vpin[e.e, t] = torch.tensor(valid)
                 jobs += [(e, t, c, r) for c, r in enumerate(ids)]
-        def rd(j):
-            e, t, c, r = j
-            self.rnp[e.e, t, c] = e.table.raw_row(r)
-        list(_POOL.map(rd, jobs))
+        tab = fw.table
+        fi = tab.off >> 48
+        fd, o0, rb, nrows = fw.g.fds[fi], fw.g.bases[fi] + (tab.off & ((1 << 48) - 1)), tab.row_bytes, tab.rows
+        mvs = self._rmv
+        if mvs is None:
+            mvs = self._rmv = {}
+        def rd(chunk):
+            for e, t, c, r in chunk:
+                if not 0 <= r < nrows:
+                    raise IndexError(f"{tab.name}: row {r} outside 0..{nrows - 1}")
+                mv = mvs.get((e.e, t, c))
+                if mv is None:
+                    mv = mvs[(e.e, t, c)] = memoryview(self.rnp[e.e, t, c])
+                if os.preadv(fd, [mv], o0 + r * rb) != rb:
+                    raise IOError(f"{tab.name}: short read of row {r}")
+        per = max(1, -(-len(jobs) // _IO_W))
+        list(_POOL.map(rd, [jobs[a:a + per] for a in range(0, len(jobs), per)]))
         self.gs.eng_raw.copy_(self.rpin, non_blocking=True)
         self.gs.eng_valid.copy_(self.vpin, non_blocking=True)
 
