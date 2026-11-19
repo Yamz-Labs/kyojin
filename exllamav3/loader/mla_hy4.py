@@ -61,7 +61,7 @@ _SPHIP = [None]
 
 def _sp_hip_call(mla, kcache, T, sel, qcat):
     """HY4_PF_SPARSE_HIP (default 1): hand-written HIP/WMMA sparse MLA (hipsp/sp_mla.cu built to libspmla.so: path in SP_SO, else hipsp/libspmla.so); None = use the Triton kernel"""
-    if os.environ.get("HY4_PF_SPARSE_HIP", "1") != "1" or mla.H != 64 or mla.R != 512 or qcat.shape[-1] != 576:
+    if os.environ.get("HY4_PF_SPARSE_HIP", "1") != "1" or mla.H not in (32, 64) or mla.R != 512 or qcat.shape[-1] != 576:
         return None
     if _SPHIP[0] is None:
         hd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "hipsp")
@@ -77,7 +77,7 @@ def _sp_hip_call(mla, kcache, T, sel, qcat):
         return None
     tm = mla.tm
     with tm.t("f sp: kc16 cast"):
-        kc16 = kcache.clamp(-65504.0, 65504.0).half().contiguous()
+        kc16 = kcache if kcache.dtype == torch.float16 and kcache.is_contiguous() else kcache.clamp(-65504.0, 65504.0).half().contiguous()      # an fp16 K cache is already saturated: no copy
     with tm.t("f sp: hip kernel"):
         return _SPHIP[0].mla_sparse_hip(mla.R, kc16, kcache.shape[0] - T, mla.scale, mla.sinks, sel, qcat)
 
