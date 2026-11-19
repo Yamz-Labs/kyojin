@@ -9,6 +9,7 @@ die() { echo "install_strix: $*" >&2; exit 1; }
 export EXL3_VENV=${EXL3_VENV:-${VIRTUAL_ENV:-$ROOT/.venv}}; export VIRTUAL_ENV=$EXL3_VENV
 [ -x "$EXL3_VENV/bin/python" ] || die "no venv at $EXL3_VENV: create it as in doc/install.md or set EXL3_VENV"
 export PATH=$EXL3_VENV/bin:$PATH
+ls "$ROOT"/exllamav3_ext*.so >/dev/null 2>&1 || die "the extension of the repository is not built: run ./build.sh as in doc/install.md first"
 command -v rocm-sdk >/dev/null || die "rocm-sdk not found in the venv: install the ROCm devel wheel as in doc/install.md"
 export EXL3_ROCM_SDK=${EXL3_ROCM_SDK:-$(rocm-sdk path --root)}
 CK_PIN=6f44fdf90f69adee742ec3660b95d32963b9bd2d
