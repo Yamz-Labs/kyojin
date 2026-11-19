@@ -383,6 +383,14 @@ def init(
             printp(not quiet, f" -- layer split: {text_map.describe()}")
         if split_plan.auto:
             printp(not quiet, f" -- layer split: auto chose {text_map.part0_layers} part0 layer(s)")
+    elif single_device and not args.tensor_parallel:
+        # Single-device loads use the same automatic preflight; KYOJIN_OOM_GUARD=off
+        # disables it.
+        from .device_map import check_single_device_guard
+        extras = [(draft_model, draft_config or config, draft_cache)] if draft_model is not None else []
+        check_single_device_guard(model, config, cache, single_device,
+                                  extra_components = extras,
+                                  logger = lambda m: printp(not quiet, m))
 
     # Parallelism options
     tp_options = {

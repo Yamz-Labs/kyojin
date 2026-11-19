@@ -12,7 +12,6 @@ Usage (from the repo root, after `source tools/strix_halo/env.sh`):
 from __future__ import annotations
 
 import argparse
-import os
 import resource
 import time
 
@@ -39,9 +38,11 @@ def main() -> None:
     p.add_argument("--num-draft", type=int, default=2)
     p.add_argument("--no-vision", action="store_true")
     p.add_argument("--baseline", action="store_true", help="load everything on cuda:0, for the host-RAM comparison")
+    p.add_argument("--oom-guard", choices=("auto", "off"), default=None)
     args = p.parse_args()
 
     import torch
+
     from exllamav3 import Cache, CacheLayer_quant, Config, Model
     from exllamav3.device_map import SplitPlan, resolve_devices
 
@@ -54,7 +55,8 @@ def main() -> None:
 
     # Same cache format as tools/glm/serve.py defaults: TurboQuant 6-bit latent.
     qkw = dict(layer_type=CacheLayer_quant, k_bits=6, v_bits=6)
-    from exllamav3.cache.tq import CacheLayer_tq, supported as tq_supported
+    from exllamav3.cache.tq import CacheLayer_tq
+    from exllamav3.cache.tq import supported as tq_supported
     if tq_supported(512, 6):
         qkw = dict(layer_type=CacheLayer_tq, k_bits=6, v_bits=6)
     max_history = max(args.num_draft, 1)
@@ -72,7 +74,7 @@ def main() -> None:
             try:
                 vision = Model.from_config(config, component="vision")
                 vision.load(device="cuda:0", progressbar=True)
-            except Exception as exc:                    # noqa: BLE001
+            except Exception as exc:
                 print(f"[baseline] vision not loaded: {type(exc).__name__}: {exc}", flush=True)
         print(f"[baseline] load {time.perf_counter() - t0:.1f} s; "
               f"cuda:0 allocated {torch.cuda.memory_allocated(torch.device('cuda:0')) / 2**30:.2f} GiB; "
@@ -83,8 +85,26 @@ def main() -> None:
         return
 
     devices = resolve_devices(args.part0_device, args.part1_device)
+    # Declare MTP/vision before build so the pre-flight guard includes them.
+    draft = draft_cache = None
+    if args.num_draft > 0:
+        draft = Model.from_config(config, component="mtp")
+        draft_cache = Cache(draft, max_num_tokens=args.cache_size + 4096,
+                            max_history=max_history, max_batch_size=1, **qkw)
+    vision = None
+    vision_error = None
+    if not args.no_vision:
+        try:
+            vision = Model.from_config(config, component="vision")
+        except Exception as exc:
+            vision_error = exc
+
     plan = SplitPlan(devices, endcaps=endcaps, part0_layers=args.part0_layers,
-                     part0_reserve_gb=args.part0_reserve_gb)
+                     part0_reserve_gb=args.part0_reserve_gb, guard_mode=args.oom_guard)
+    if draft is not None:
+        plan.add("mtp", draft, config=config, cache=draft_cache, load_order=1)
+    if vision is not None:
+        plan.add("vision", vision, config=config, load_order=2)
     plan.add("text", model, config=config, cache=cache, load_order=0)
     plan.build()
     text_map = plan.map("text")
@@ -98,28 +118,22 @@ def main() -> None:
     t_model = time.perf_counter() - t0
     plan.record_load("text", t_model)
 
-    draft = draft_cache = None
-    if args.num_draft > 0:
-        draft = Model.from_config(config, component="mtp")
-        draft_cache = Cache(draft, max_num_tokens=args.cache_size + 4096,
-                            max_history=max_history, max_batch_size=1, **qkw)
-        plan.add("mtp", draft, config=config, cache=draft_cache, load_order=1)
+    if draft is not None:
         t1 = time.perf_counter()
         draft.load(device_map=plan.map("mtp"), progressbar=True, max_chunk_size=4096)
         plan.record_load("mtp", time.perf_counter() - t1)
         print(f"[split] drafter loaded in {time.perf_counter() - t1:.1f} s", flush=True)
 
-    vision = None
-    if not args.no_vision:
+    if vision_error is not None:
+        print(f"[split] vision not loaded: {type(vision_error).__name__}: {vision_error}", flush=True)
+    elif vision is not None:
         try:
-            vision = Model.from_config(config, component="vision")
-            plan.add("vision", vision, config=config, load_order=2)
             t1 = time.perf_counter()
             vision.load(device_map=plan.map("vision"), progressbar=True)
             plan.record_load("vision", time.perf_counter() - t1)
             print(f"[split] vision loaded in {time.perf_counter() - t1:.1f} s "
                   f"on {plan.map('vision').placed_devices}", flush=True)
-        except Exception as exc:                        # noqa: BLE001
+        except Exception as exc:
             print(f"[split] vision not loaded: {type(exc).__name__}: {exc}", flush=True)
             vision = None
 

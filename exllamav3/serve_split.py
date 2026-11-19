@@ -84,6 +84,7 @@ class SplitSettings:
     part0_reserve_gb: float = DEFAULT_PART0_RESERVE_GB
     preset: str = "auto"
     split_graphs: str = "auto"
+    oom_guard: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -93,12 +94,17 @@ class SplitSettings:
     def auto(self) -> bool:
         return self.part0_layers == "auto"
 
+    @property
+    def guard_mode(self) -> str | None:
+        """CLI mode only; ``None`` lets GuardPolicy read KYOJIN_OOM_GUARD."""
+        return self.oom_guard.strip().lower() if self.oom_guard else None
+
     def describe(self) -> str:
         return (f"part0_layers={self.part0_layers} part1_device={self.part1_device} "
                 f"part0_device={self.part0_device} "
                 f"endcaps={'on' if self.endcaps else 'off'} "
                 f"reserve={self.part0_reserve_gb:.2f}GiB preset={self.preset} "
-                f"graphs={self.split_graphs}")
+                f"graphs={self.split_graphs} oom_guard={self.guard_mode or 'auto/env'}")
 
 
 def add_split_arguments(parser: argparse.ArgumentParser) -> None:
@@ -123,6 +129,9 @@ def add_split_arguments(parser: argparse.ArgumentParser) -> None:
                         help = "per-model split preset (default: KYOJIN_SPLIT_PRESET, else auto)")
     parser.add_argument("--split-graphs", choices = ("auto", "on", "off"), default = None,
                         help = "per-segment graphs (Stage 6); auto forces graphs off for now")
+    parser.add_argument("--oom-guard", choices = ("auto", "off"), default = None,
+                        help = "pre-flight memory guard: auto refuses before allocating, off disables "
+                               "(default: KYOJIN_OOM_GUARD, else auto)")
 
 
 def settings_from_namespace(args) -> SplitSettings:
@@ -147,6 +156,7 @@ def settings_from_namespace(args) -> SplitSettings:
         part0_reserve_gb = float(reserve),
         preset = (preset or "auto").strip().lower(),
         split_graphs = graphs,
+        oom_guard = getattr(args, "oom_guard", None),
     )
 
 
@@ -204,6 +214,7 @@ class SplitController:
                 part0_layers = self.settings.part0_layers,
                 part0_reserve_gb = self.settings.part0_reserve_gb,
                 preset = self.settings.preset,
+                guard_mode = self.settings.guard_mode,
                 logger = self.logger,
             )
         return self.plan

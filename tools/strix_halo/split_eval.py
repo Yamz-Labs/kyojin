@@ -33,9 +33,7 @@ import argparse
 import json
 import os
 import re
-import sys
 import time
-
 
 # Kept in sync with exllamav3/serve_split.py:GRAPH_ENV_OFF; the consistency test
 # asserts the key sets match so a new graph flag cannot silently bypass this gate.
@@ -96,6 +94,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--endcaps", choices=("on", "off"), default="on")
     p.add_argument("--part0-reserve-gb", type=float, default=1.2)
     p.add_argument("--part1-reserve-gb", type=float, default=0.0)
+    p.add_argument("--oom-guard", choices=("auto", "off"), default=None,
+                   help="pre-flight memory guard (default: KYOJIN_OOM_GUARD, else auto)")
     p.add_argument("-c", "--max-ctx", type=int, default=131072)
     p.add_argument("--num-draft", type=int, default=2)
     p.add_argument("--no-vision", action="store_true")
@@ -176,6 +176,7 @@ def ids_of(text: str, tokenizer) -> torch.Tensor:
 
 def run_job(gen, job_cls, ids, n: int):
     import torch
+
     from exllamav3.generator.sampler import GreedySampler
     job = job_cls(input_ids = ids, max_new_tokens = n, sampler = GreedySampler(),
                   stop_conditions = gen.model.config.eos_token_id_list)
@@ -373,7 +374,16 @@ def main() -> None:
     configure_env(args)
 
     import torch
-    from exllamav3 import Cache, CacheLayer_quant, Config, Generator, Job, Model, Tokenizer
+
+    from exllamav3 import (
+        Cache,
+        CacheLayer_quant,
+        Config,
+        Generator,
+        Job,
+        Model,
+        Tokenizer,
+    )
     from exllamav3.generator import generator as GM
 
     torch.set_grad_enabled(False)
@@ -383,12 +393,28 @@ def main() -> None:
     model = Model.from_config(config)
 
     qkw = dict(layer_type = CacheLayer_quant, k_bits = 6, v_bits = 6)
-    from exllamav3.cache.tq import CacheLayer_tq, supported as tq_supported
+    from exllamav3.cache.tq import CacheLayer_tq
+    from exllamav3.cache.tq import supported as tq_supported
     if tq_supported(512, 6):
         qkw = dict(layer_type = CacheLayer_tq, k_bits = 6, v_bits = 6)
     max_history = max(args.num_draft, 1)
     cache = Cache(model, max_num_tokens = args.max_ctx + 4096, max_history = max_history,
                   max_batch_size = 1, **qkw)
+
+    # Declare every component before build so the pre-flight guard sees the MTP
+    # and vision footprints too; previously they were added after the text load.
+    draft = draft_cache = None
+    if args.num_draft > 0:
+        draft = Model.from_config(config, component = "mtp")
+        draft_cache = Cache(draft, max_num_tokens = args.max_ctx + 4096, max_history = max_history,
+                            max_batch_size = 1, **qkw)
+    vision = None
+    vision_error = None
+    if not args.no_vision:
+        try:
+            vision = Model.from_config(config, component = "vision")
+        except Exception as exc:                    # noqa: BLE001
+            vision_error = exc
 
     plan = None
     text_map = None
@@ -398,7 +424,11 @@ def main() -> None:
         plan = SplitPlan(
             devices, endcaps = args.endcaps == "on", part0_layers = args.part0_layers,
             part0_reserve_gb = 0.0 if args.no_budget else args.part0_reserve_gb,
-            part1_reserve_gb = args.part1_reserve_gb)
+            part1_reserve_gb = args.part1_reserve_gb, guard_mode = args.oom_guard)
+        if draft is not None:
+            plan.add("mtp", draft, config = config, cache = draft_cache, load_order = 1)
+        if vision is not None:
+            plan.add("vision", vision, config = config, load_order = 2)
         plan.add("text", model, config = config, cache = cache, load_order = 0)
         plan.build()
         text_map = plan.map("text")
@@ -416,26 +446,20 @@ def main() -> None:
     if plan is not None:
         plan.record_load("text", load_s)
 
-    draft = draft_cache = None
-    if args.num_draft > 0:
-        draft = Model.from_config(config, component = "mtp")
-        draft_cache = Cache(draft, max_num_tokens = args.max_ctx + 4096, max_history = max_history,
-                            max_batch_size = 1, **qkw)
+    if draft is not None:
         t1 = time.perf_counter()
         if plan is not None:
-            plan.add("mtp", draft, config = config, cache = draft_cache, load_order = 1)
             draft.load(device_map = plan.map("mtp"), progressbar = True, max_chunk_size = 4096)
             plan.record_load("mtp", time.perf_counter() - t1)
         else:
             draft.load(device = "cuda:0", progressbar = True)
         print(f"[eval] drafter loaded in {time.perf_counter() - t1:.1f} s", flush = True)
 
-    vision = None
-    if not args.no_vision:
+    if vision_error is not None:
+        print(f"[eval] vision not loaded: {type(vision_error).__name__}: {vision_error}", flush = True)
+    elif vision is not None:
         try:
-            vision = Model.from_config(config, component = "vision")
             if plan is not None:
-                plan.add("vision", vision, config = config, load_order = 2)
                 t1 = time.perf_counter()
                 vision.load(device_map = plan.map("vision"), progressbar = True)
                 plan.record_load("vision", time.perf_counter() - t1)
