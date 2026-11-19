@@ -15,6 +15,9 @@ ENABLED = os.environ.get("HY4_MLA_BG", "0") == "1"
 BN = int(os.environ.get("HY4_BG_BN", "16"))
 BK = int(os.environ.get("HY4_BG_BK", "128"))
 ROW_TILES = os.environ.get("HY4_ROW_TILES", "0") == "1"     # 1 = tile sizes tuned on the Strix for verify rows (T >= 4: BN 32, BK 32; box microbench 19/11)
+DOT = os.environ.get("HY4_BG_DOT", "0") == "1"             # 1 = verify rows (T >= 2) on tl.dot: int8 -> fp16 exact, x = hi + lo fp16, block scale applied to the fp32 partial (rel ~1e-7)
+DOT_BN = int(os.environ.get("HY4_BG_DOT_BN", "64"))
+DOT_NW = int(os.environ.get("HY4_BG_DOT_NW", "4"))
 MAXT = 8                                   # rows served by the batched kernels (verify rows)
 
 
@@ -58,6 +61,31 @@ def _k_bgt(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, sxt, sxh, T, BT: tl.constexpr, 
     tl.store(o_ptr + (tt[:, None] * (tl.num_programs(0) * N)) + h * N + rows[None, :], acc, mask=tm[:, None] & rm[None, :])
 
 
+@triton.jit
+def _k_bgd(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, sxt, sxh, T, BT: tl.constexpr, BN: tl.constexpr):
+    """T rows on the matrix units. One fp16 dot per 32-wide Q8_0 block: int8 -> fp16 is exact, x (fp32) = hi + lo fp16 pieces, the fp16 block scale multiplies the fp32 partial
+    sum, so the result matches sum_k (q * d)[n, k] * x[t, k] to ~1e-7. Each weight tile is read once for all T rows."""
+    h = tl.program_id(0)
+    rows = tl.program_id(1) * BN + tl.arange(0, BN)
+    rm = rows < N
+    tt = tl.arange(0, BT)
+    tm = tt < T
+    c32 = tl.arange(0, 32)
+    acc = tl.zeros([BT, BN], dtype=tl.float32)
+    qrow = (h * N + rows)[:, None] * K
+    drow = (h * N + rows) * NB
+    for kb in range(0, NB):
+        cols = kb * 32 + c32
+        q = tl.load(q_ptr + qrow + cols[None, :], mask=rm[:, None], other=0).to(tl.float16)
+        d = tl.load(d_ptr + drow + kb, mask=rm, other=0.0).to(tl.float32)
+        xv = tl.load(x_ptr + tt[:, None] * sxt + h * sxh + cols[None, :], mask=tm[:, None], other=0.0)
+        xh = xv.to(tl.float16)
+        xl = (xv - xh.to(tl.float32)).to(tl.float16)
+        qt = tl.trans(q)
+        acc += (tl.dot(xh, qt) + tl.dot(xl, qt)) * d[None, :]
+    tl.store(o_ptr + (tt[:, None] * (tl.num_programs(0) * N)) + h * N + rows[None, :], acc, mask=tm[:, None] & rm[None, :])
+
+
 class Q8Batched:
     """[H, N, K] Q8_0 matrix as int8 + fp16 scales on a device"""
 
@@ -72,6 +100,9 @@ class Q8Batched:
         if x.dim() == 3 and x.shape[0] > 1 and x.stride(-1) == 1:
             T = x.shape[0]
             out = torch.empty(T, self.H, self.N, dtype=torch.float32, device=x.device)
+            if DOT and T <= 16 and self.K % 32 == 0:
+                _k_bgd[(self.H, triton.cdiv(self.N, DOT_BN))](self.q, self.d, x, out, self.N, self.K, self.K // 32, x.stride(0), x.stride(1), T, BT=16, BN=DOT_BN, num_warps=DOT_NW)
+                return out
             bn, bk = (32, 32) if (ROW_TILES and T >= 4) else (BN, min(BK, 64))
             _k_bgt[(self.H, triton.cdiv(self.N, bn))](self.q, self.d, x, out, self.N, self.K, self.K // 32, x.stride(0), x.stride(1), T,
                                                       BT=triton.next_power_of_2(T), BN=bn, BK=bk, num_warps=4)
