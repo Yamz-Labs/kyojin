@@ -7,6 +7,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))     # tests/hardware.py, whatever the --import-mode
 import hardware  # noqa: E402
 
+os.environ.setdefault("HY4_ALLOW_SLOW", "1")     # hy4_forward stops without the built kernels; tests cover the slow path too
+
 
 def pytest_configure(config):
     for need, reason in hardware.REASONS.items():

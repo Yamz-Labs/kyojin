@@ -28,7 +28,7 @@ The script uses the repository venv (`EXL3_VENV`, default `.venv`), builds three
 - `~/.cache/exl3_gm_ext/exl3_gm_ext.so`: the MoE expert kernels (`EXL3_GM_BUILD_DIR` moves the build, `HY4_GM_EXT` points the server to it).
 - `~/.cache/kyojin/ck-fmha/libckmla.so`: CK latent attention (`EXL3_CKMLA_OUT` moves the build, `EXL3_CKMLA_SO` points the server to it). The script fetches composable_kernel at the pinned commit once into `~/.cache/kyojin/ck-src`; `CK_SRC` names your own checkout.
 
-The server stops at start when the MoE extension is missing and names this script (`HY4_ALLOW_SLOW=1` starts on the slow path anyway). A missing attention library prints a warning.
+The server stops at start when a built library is missing (the repository extension, the MoE extension or an attention library) and names the install step (`HY4_ALLOW_SLOW=1` starts on the slow path anyway). The kernel loaders stop the same way at run time.
 
 Optional: a Q5_K copy of the output head for the MTP drafts (0.255 GB instead of 0.394 GB for Q8_0, which the server uses when no file is given). It needs the `libggml-base.so` of a llama.cpp build:
 

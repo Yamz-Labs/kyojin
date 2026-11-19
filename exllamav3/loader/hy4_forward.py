@@ -172,6 +172,14 @@ def moe_ref(z, sel, w, rsp, lim, group=16):
     return lat
 
 
+def _slow_path(what):
+    """A fast kernel library is missing. The shipped speed needs it, so stop with the install step; HY4_ALLOW_SLOW=1 continues on the slow path (tests, CPU debugging)."""
+    msg = "hy4_forward: " + what
+    if os.environ.get("HY4_ALLOW_SLOW") != "1":
+        raise RuntimeError(msg + ". HY4_ALLOW_SLOW=1 continues on the slow path anyway.")
+    print(msg + " -> slow path (HY4_ALLOW_SLOW=1)", flush=True)
+
+
 def _ext():
     """the compiled extension: $HY4_EXT_DIR/exllamav3_ext*.so if set (a tree built for THIS torch, e.g. the HIP tree on the Strix), else the tree root"""
     if not _EXT:
@@ -186,7 +194,8 @@ def _ext():
             _EXT.append(e)
         except Exception as ex:            # noqa: BLE001
             sys.modules.pop("exllamav3_ext", None)
-            print("hy4_forward: extension unavailable:", repr(ex)[:160], flush=True)
+            _slow_path("the repository extension exllamav3_ext is not built or does not load (" + repr(ex)[:160] + "). Build it once: ./build.sh (doc/install.md), "
+                       "then bash tools/hy4/install_strix.sh (HY4_EXT_DIR points at a tree built elsewhere)")
             _EXT.append(None)
     return _EXT[0]
 
@@ -221,12 +230,15 @@ _GMX = []
 
 def _gm():
     if not _GMX:
+        ex = None
         try:
             from .. import gm_ext
-            _GMX.append(gm_ext.get())
-        except Exception as ex:            # noqa: BLE001
-            print("hy4_forward: gm_ext unavailable:", repr(ex)[:160], flush=True)
-            _GMX.append(None)
+            g = gm_ext.get()
+        except Exception as e:            # noqa: BLE001
+            g, ex = None, e
+        if g is None and (ex is not None or os.environ.get("EXL3_GM", "1") != "0"):       # EXL3_GM=0 is the explicit opt-out
+            _slow_path("the MoE kernel extension (gm_ext) is not built or does not load" + (f" ({ex!r:.160})" if ex else "") + ". Build it once: bash tools/hy4/install_strix.sh")
+        _GMX.append(g)
     return _GMX[0]
 
 
@@ -436,7 +448,8 @@ class Hy4Forward:
             return
         e = _ext()
         if e is None or not hasattr(e, "fq_moe_kq_grouped_mixed_q8") or not hasattr(e, "fq_moe_kq_set_swiglu_limit"):
-            print("hy4_forward: grouped kernel unavailable -> experts stay on the pread path", flush=True)
+            _slow_path("the grouped MoE kernel is missing from exllamav3_ext (stale build?). Rebuild it: ./build.sh (doc/install.md)")
+            print("hy4_forward: experts stay on the pread path", flush=True)
             return
         g, dev, budget, skipped = self.g, self.dev, int(RESIDENT_GB * 2**30), []
         for i in range(self.n_dense, self.n_layers):

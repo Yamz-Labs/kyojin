@@ -12,3 +12,4 @@ Hy4-flash (GGUF Q3_K) on one Strix Halo machine. Numbers: see the benchmark tabl
 - The server applies the frozen TunableOp results (`tools/hy4/tunableop_gfx1151.csv`) and a start-up warm-up request by default (`HY4_TUNABLEOP_FILE`, `HY4_WARMUP_TOKENS=0` to skip it), and picks up `head_q5_k.bin` next to the GGUF.
 - Generic GGUF loader (`EXL3_GGUF_GENERIC=1`, off by default) and its CPU tests.
 - Context: 128K tokens. Single user (`--slots` is experimental). Greedy decoding only.
+- A missing built kernel library (repository extension, MoE extension, attention libraries) stops the server with the install step; `HY4_ALLOW_SLOW=1` keeps the old slow-path start.

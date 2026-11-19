@@ -12,6 +12,7 @@ and needs the kernels of tools/hy4/install_strix.sh (once). It takes no GPU lock
 from __future__ import annotations
 
 import argparse
+import glob
 import asyncio
 import json
 import os
@@ -58,17 +59,25 @@ SHIPPED_ENV = {
 
 
 def check_kernels() -> None:
-    """The built kernels (tools/hy4/install_strix.sh) are part of the shipped speed. A missing MoE extension stops the start with the install step
-    (HY4_ALLOW_SLOW=1 starts anyway on the slow path); a missing attention library prints a warning."""
+    """The built kernels (doc/install.md ./build.sh, then tools/hy4/install_strix.sh) are part of the shipped speed. A missing library stops the start with the install step
+    (HY4_ALLOW_SLOW=1 starts anyway on the slow path)."""
     home_cache = os.path.expanduser("~/.cache")
+    ext_dir = os.environ.get("HY4_EXT_DIR") or TREE
     gm = os.environ.get("HY4_GM_EXT", os.path.join(home_cache, "exl3_gm_ext", "exl3_gm_ext.so"))
     sp = os.environ.get("SP_SO", os.path.join(TREE, "hipsp", "libspmla.so"))
     ck = os.environ.get("EXL3_CKMLA_SO") or os.path.join(os.environ.get("XDG_CACHE_HOME", home_cache), "kyojin", "ck-fmha", "libckmla.so")
-    if os.environ.get("HY4_MOE_HIP", "0") in ("1", "2") and not os.path.isfile(gm) and os.environ.get("HY4_ALLOW_SLOW") != "1":
-        sys.exit(f"hy4 serve: the MoE kernel extension is missing ({gm}).\nBuild the kernels once: bash tools/hy4/install_strix.sh (HY4_ALLOW_SLOW=1 starts on the slow path anyway).")
-    for flag, path, what in (("HY4_PF_SPARSE", sp, "sparse prefill attention (Triton fallback)"), ("HY4_PF_CK", ck, "CK latent attention (slower fallback)")):
+    miss = []
+    if not glob.glob(os.path.join(ext_dir, "exllamav3_ext*.so")):
+        miss.append(f"the repository extension exllamav3_ext*.so is missing in {ext_dir} (build it: ./build.sh, doc/install.md)")
+    if os.environ.get("HY4_MOE_HIP", "0") in ("1", "2") and not os.path.isfile(gm):
+        miss.append(f"the MoE kernel extension is missing ({gm}; build it: bash tools/hy4/install_strix.sh)")
+    for flag, path, what in (("HY4_PF_SPARSE", sp, "the sparse prefill attention library"), ("HY4_PF_CK", ck, "the CK latent attention library")):
         if os.environ.get(flag, "0") == "1" and not os.path.isfile(path):
-            print(f"hy4 serve: WARNING {path} is missing: {what}. Build it with: bash tools/hy4/install_strix.sh", file=sys.stderr, flush=True)
+            miss.append(f"{what} is missing ({path}; build it: bash tools/hy4/install_strix.sh)")
+    if miss and os.environ.get("HY4_ALLOW_SLOW") != "1":
+        sys.exit("hy4 serve: " + "\n".join(miss) + "\nHY4_ALLOW_SLOW=1 starts on the slow path anyway.")
+    for m in miss:
+        print(f"hy4 serve: WARNING {m}: slow path (HY4_ALLOW_SLOW=1)", file=sys.stderr, flush=True)
 
 
 def apply_env(ctx: int, model: str = "") -> None:
