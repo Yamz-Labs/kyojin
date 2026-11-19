@@ -38,7 +38,7 @@ for (qstart, T, n_top, tail) in ((0, 9, 6, 1), (0, 9, 6, 0), (37, 11, 6, 1), (37
     sinks = torch.randn(H)
     scale = 0.125
     ref = ref64(qc, kc.float(), scale, sinks, dense, R)
-    o = PA.mla_sparse(R, kc.float(), qstart, scale, sinks, sp, qc, cfg={"HB": 16, "BG": 4, "warps": 4, "stages": 1}).double()
+    o = PA.mla_sparse(R, kc.float(), qstart, scale, sinks, sp, qc, cfg={"HB": 16, "BG": 4, "warps": 4, "stages": 1, "qres": int(os.environ.get("QRES", "0"))}).double()
     e = float((o - ref).norm() / ref.norm())
     ok = same and e < 3e-3 and bool(torch.isfinite(o).all())
     bad += not ok

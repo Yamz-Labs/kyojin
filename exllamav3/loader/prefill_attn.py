@@ -270,7 +270,7 @@ SPCFG = {"HB": 32, "BG": 16, "warps": 4, "stages": 1}
 @triton.jit
 def _mla_sparse_kernel(Q, KC, SINK, GIDX, NSEL, O, T, qstart, H, GS, scale,
                        R: tl.constexpr, P: tl.constexpr, HB: tl.constexpr, BG: tl.constexpr, KP: tl.constexpr, TAIL: tl.constexpr,
-                       HAS_SINK: tl.constexpr):
+                       HAS_SINK: tl.constexpr, QRES: tl.constexpr):
     DC: tl.constexpr = R // 4
     D: tl.constexpr = R + P
     BK: tl.constexpr = BG * KP
@@ -288,6 +288,11 @@ def _mla_sparse_kernel(Q, KC, SINK, GIDX, NSEL, O, T, qstart, H, GS, scale,
     else:
         m = tl.full((HB,), -1e30, dtype=tl.float32)
         l = tl.zeros((HB,), dtype=tl.float32)
+    if QRES:        # Q fragments stay in registers for the whole key loop (one load, no per-tile reload)
+        q0 = tl.load(Q + rowq[:, None] * D + 0 * DC + cd[None, :])
+        q1 = tl.load(Q + rowq[:, None] * D + 1 * DC + cd[None, :])
+        q2 = tl.load(Q + rowq[:, None] * D + 2 * DC + cd[None, :])
+        q3 = tl.load(Q + rowq[:, None] * D + 3 * DC + cd[None, :])
     a0 = tl.zeros((HB, DC), dtype=tl.float32)
     a1 = tl.zeros((HB, DC), dtype=tl.float32)
     a2 = tl.zeros((HB, DC), dtype=tl.float32)
@@ -312,10 +317,20 @@ def _mla_sparse_kernel(Q, KC, SINK, GIDX, NSEL, O, T, qstart, H, GS, scale,
         krow = tl.where(kin, kidx, 0).to(tl.int64) * D
         kp = tl.load(KC + krow[:, None] + R + cp[None, :], mask=kin[:, None], other=0.0)
         s = tl.dot(qp, tl.trans(kp))
-        for c in tl.static_range(4):
-            qc = tl.load(Q + rowq[:, None] * D + c * DC + cd[None, :], volatile=True)
-            kc = tl.load(KC + krow[:, None] + c * DC + cd[None, :], mask=kin[:, None], other=0.0)
-            s = tl.dot(qc, tl.trans(kc), s)
+        if QRES:
+            k0 = tl.load(KC + krow[:, None] + 0 * DC + cd[None, :], mask=kin[:, None], other=0.0)
+            s = tl.dot(q0, tl.trans(k0), s)
+            k1 = tl.load(KC + krow[:, None] + 1 * DC + cd[None, :], mask=kin[:, None], other=0.0)
+            s = tl.dot(q1, tl.trans(k1), s)
+            k2 = tl.load(KC + krow[:, None] + 2 * DC + cd[None, :], mask=kin[:, None], other=0.0)
+            s = tl.dot(q2, tl.trans(k2), s)
+            k3 = tl.load(KC + krow[:, None] + 3 * DC + cd[None, :], mask=kin[:, None], other=0.0)
+            s = tl.dot(q3, tl.trans(k3), s)
+        else:
+            for c in tl.static_range(4):
+                qc = tl.load(Q + rowq[:, None] * D + c * DC + cd[None, :], volatile=True)
+                kc = tl.load(KC + krow[:, None] + c * DC + cd[None, :], mask=kin[:, None], other=0.0)
+                s = tl.dot(qc, tl.trans(kc), s)
         s = s * sc
         s = tl.where(kin[None, :], s, -1e30)
         mn = tl.maximum(m, tl.max(s, 1))
@@ -355,5 +370,6 @@ def mla_sparse(R, kc, qstart, scale, sinks, sel, qcat, cfg=None):
     o = torch.empty(H, T, R, dtype=torch.float16, device=kc.device)
     sk = sinks.float().contiguous() if sinks is not None else qcat
     _mla_sparse_kernel[(H // HB, T)](qcat, kc16, sk, sel.gidx, sel.nsel, o, T, qstart, H, sel.gidx.shape[1], float(scale), R=R, P=P, HB=HB, BG=c["BG"],
-                                     KP=int(sel.kpool), TAIL=int(bool(sel.tail)), HAS_SINK=sinks is not None, num_warps=c["warps"], num_stages=c["stages"])
+                                     KP=int(sel.kpool), TAIL=int(bool(sel.tail)), HAS_SINK=sinks is not None, QRES=int(c.get("qres", 0)), num_warps=c["warps"], num_stages=c["stages"],
+                                     **({"waves_per_eu": c["wpe"]} if c.get("wpe") else {}))
     return o
