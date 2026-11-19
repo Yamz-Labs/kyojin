@@ -144,6 +144,33 @@ def engram_hash(tokens, start, n_tokens, token_map, pad_id, mult, primes, offs, 
     return torch.from_numpy(ids), torch.from_numpy(valid)
 
 
+def engram_hash_np(tokens, start, n_tokens, token_map, pad_id, mult, primes, offs, n_gram, n_head):
+    """engram_hash, vectorised over the positions (uint64 arithmetic wraps exactly like the Python `& MASK64`; same ids / valid, bit for bit)."""
+    n_cols = (n_gram - 1) * n_head
+    tm = np.asarray(list(token_map), dtype=np.int64)
+    pad = int(tm[pad_id])
+    pos = start + np.arange(n_tokens, dtype=np.int64)
+    toks_all = np.asarray(tokens[:start + n_tokens], dtype=np.int64)
+
+    def cid(q):          # q: positions (may be < 0) -> compressed id, -1 = dead
+        t = toks_all[np.clip(q, 0, None)]
+        ok = (q >= 0) & (t >= 0) & (t < len(tm))
+        return np.where(ok, tm[np.clip(t, 0, len(tm) - 1)], -1)
+
+    cs = [cid(pos - s) for s in range(n_gram)]
+    dead = cs[0] == -1
+    toks = [np.where(c == -1, pad, c).astype(np.uint64) for c in cs]
+    ids = np.zeros((n_tokens, n_cols), dtype=np.int64)
+    rolling = toks[0] * np.uint64(int(mult[0]) & MASK64)
+    for o in range(1, n_gram):
+        rolling = rolling ^ (toks[o] * np.uint64(int(mult[o]) & MASK64))
+        for h in range(n_head):
+            col = (o - 1) * n_head + h
+            ids[:, col] = (rolling % np.uint64(int(primes[col]))).astype(np.int64) + int(offs[col])
+    valid = np.broadcast_to(np.where(dead, 0.0, 1.0).astype(np.float32)[:, None], (n_tokens, n_cols)).copy()
+    return torch.from_numpy(ids), torch.from_numpy(valid)
+
+
 # ------------------------------------------------------------------------------------------------ weights
 def _dequant_q8_0(raw: np.ndarray, K: int, N: int) -> torch.Tensor:
     b = np.ascontiguousarray(raw).reshape(N, K // 32, 34)
@@ -212,7 +239,7 @@ class Hy4Engram:
         assert self.table.width == self.head_dim
 
     def row_ids(self, tokens, start, n):
-        return engram_hash(tokens, start, n, self.token_map, self.pad_id, self.mult, self.primes, self.offs, self.n_gram, self.n_head)
+        return (engram_hash_np if os.environ.get("HY4_ENGRAM_NPHASH", "0") == "1" else engram_hash)(tokens, start, n, self.token_map, self.pad_id, self.mult, self.primes, self.offs, self.n_gram, self.n_head)
 
     def apply(self, x: torch.Tensor, rows: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [T, hc, n_embd] fp32 stream, rows [T, n_cols, head_dim] decoded table rows, valid [T, n_cols] -> x + delta (M:5292-5353)."""

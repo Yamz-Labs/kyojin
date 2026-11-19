@@ -777,7 +777,7 @@ class Hy4Forward:
                 self.eng[i] = Hy4EngramGPU(self.g, i, self.dev, table=self.table, lin=None if os.environ.get("HY4_ENGRAM_GPU") == "2" else self._lin)
         toks = [int(t) for t in ids_all]
         self._eng_pf = {}
-        ex = ThreadPoolExecutor(max_workers=2)
+        ex = ThreadPoolExecutor(max_workers=int(os.environ.get("HY4_ENGRAM_PF_WORKERS", "2")))      # 1 with HY4_ENGRAM_NATIVE_IO: one layer at a time gets the whole read queue
         for s, e in chunk_plan(self.n, len(toks), chunk):
             n = e - s
             for i in layers:

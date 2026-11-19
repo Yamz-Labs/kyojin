@@ -28,6 +28,47 @@ def _tabs(dev):
     return _TABS[k]
 
 
+_NAT = [None, False]          # [ctypes lib or None, tried]
+
+
+def _native_lib():
+    """HY4_ENGRAM_NATIVE_IO=1: the row reads of one fetch run in C threads (engram_io.c: pread per distinct row, no GIL). Built once with gcc into the cache dir; None = Python path."""
+    if os.environ.get("HY4_ENGRAM_NATIVE_IO", "0") != "1":
+        return None
+    if _NAT[0] is not None or _NAT[1]:
+        return _NAT[0]
+    _NAT[1] = True
+    import ctypes, hashlib, shutil, subprocess
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engram_io.c")
+    try:
+        tag = hashlib.sha1(open(src, "rb").read()).hexdigest()[:10]
+        d = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "kyojin", "engram_io")
+        so = os.path.join(d, f"libengram_io_{tag}.so")
+        if not os.path.exists(so):
+            os.makedirs(d, exist_ok=True)
+            tmp = so + f".{os.getpid()}.tmp"
+            subprocess.run([shutil.which("gcc") or "gcc", "-O2", "-shared", "-fPIC", "-pthread", src, "-o", tmp], check=True, capture_output=True)
+            os.replace(tmp, so)
+        lib = ctypes.CDLL(so)
+        lib.engram_read_rows.restype = ctypes.c_int
+        lib.engram_read_rows.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int]
+        _NAT[0] = lib
+    except Exception as ex:      # noqa: BLE001 - speed only: the Python reader below does the same reads
+        print(f"engram native io unavailable ({type(ex).__name__}: {ex}); Python reader", flush=True)
+    return _NAT[0]
+
+
+def _read_rows_native(lib, table: F8Rows, uniq, view):
+    g = table.g
+    fds = np.ascontiguousarray(np.asarray(g.fds, dtype=np.int32))
+    bases = np.ascontiguousarray(np.asarray(g.bases, dtype=np.int64))
+    rows = np.ascontiguousarray(uniq, dtype=np.int64)
+    nt = int(os.environ.get("HY4_ENGRAM_NATIVE_THREADS", "32"))
+    rc = lib.engram_read_rows(fds.ctypes.data, bases.ctypes.data, rows.ctypes.data, len(rows), int(table.off), int(table.row_bytes), view.ctypes.data, nt)
+    if rc != 0:
+        raise IOError(f"{table.name}: native row read failed (rc {rc})")
+
+
 def fetch_rows_host(table: F8Rows, ids):
     """CPU half of fetch_rows: distinct rows pread once (threaded) into one pinned buffer. -> (shape, uniq, inv, buf). Safe to run in a worker thread."""
     ids = np.asarray(torch.as_tensor(ids, dtype=torch.int64).numpy())
@@ -38,7 +79,10 @@ def fetch_rows_host(table: F8Rows, ids):
 
     if len(uniq) and (int(uniq[0]) < 0 or int(uniq[-1]) >= table.rows):
         raise IndexError(f"{table.name}: row outside 0..{table.rows - 1}")
-    if len(uniq) > 8:
+    lib = _native_lib() if len(uniq) > 8 else None
+    if lib is not None:
+        _read_rows_native(lib, table, uniq, view)
+    elif len(uniq) > 8:
         # one task per slice of the sorted row list (a task per row cost more in future / GIL hand-offs than the read itself); preadv straight into the pinned buffer
         nw = _IO_THREADS
         step = (len(uniq) + nw - 1) // nw

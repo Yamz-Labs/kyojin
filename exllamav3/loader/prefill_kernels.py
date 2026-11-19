@@ -885,7 +885,10 @@ def route_blocks(sel, E, BM):
     P = T * S
     ex = sel.reshape(-1)
     order = torch.argsort(ex, stable=True)
-    counts = torch.bincount(ex, minlength=E)
+    if os.environ.get("HY4_PF_NOSYNC_ROUTE", "0") == "1":      # torch.bincount reads max / min back to the host (2 syncs per MoE layer: the host waits for the whole queued layer); integer scatter-add = same counts, no sync
+        counts = torch.zeros(E, dtype=torch.int64, device=ex.device).scatter_add_(0, ex, torch.ones_like(ex))
+    else:
+        counts = torch.bincount(ex, minlength=E)
     nblk = (counts + (BM - 1)) // BM
     csum = torch.cumsum(nblk, 0)
     bstart = csum - nblk
