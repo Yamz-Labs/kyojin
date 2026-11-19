@@ -39,6 +39,10 @@ def _rms(x, w, eps):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
 
 
+from . import pool_fused as _PF
+_PF.ENABLED = os.environ.get("HY4_IDX_POOLK", "0") == "1"
+
+
 def indexer_static_init(ix, cap):
     """FusedKPoolIndexer -> fixed buffers: pool [cap // k, d], per-position (value | gate) rows vgb [cap, 2d] (open group filled from the eager state), rope table to cap"""
     k, d = ix.k, ix.d
@@ -66,12 +70,15 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     ik = _rms(x @ ix.w["attn_k"].T, ix.w["k_norm"], ix.eps)
     vg_new = torch.cat([ik @ ix.w["value"].T, ik @ ix.w["gate"].T], -1)
     ix.vgb.index_copy_(0, pos, vg_new)
-    g0 = (pos // k) * k
-    rows = ix.vgb[g0[:, None] + ar[:k][None, :]]                       # [1, k, 2d]: the (partial) group of this position
-    v, g = rows[..., :d].reshape(-1, k, d), rows[..., d:].reshape(-1, k, d)
-    p = (torch.softmax(g + ix.w["ape"][None], dim=1) * v).sum(1)
-    pooled = ix._rope(_rms(p, ix.w["pool_norm"], ix.eps), g0)
-    ix.pool.index_copy_(0, pos // k, pooled)            # a group still open holds partial data here; it stays masked until it is complete
+    if _PF.ENABLED:                                     # one Triton kernel for the whole pool update (HY4_IDX_POOLK)
+        _PF.pool_update(ix, pos)
+    else:
+        g0 = (pos // k) * k
+        rows = ix.vgb[g0[:, None] + ar[:k][None, :]]                       # [1, k, 2d]: the (partial) group of this position
+        v, g = rows[..., :d].reshape(-1, k, d), rows[..., d:].reshape(-1, k, d)
+        p = (torch.softmax(g + ix.w["ape"][None], dim=1) * v).sum(1)
+        pooled = ix._rope(_rms(p, ix.w["pool_norm"], ix.eps), g0)
+        ix.pool.index_copy_(0, pos // k, pooled)            # a group still open holds partial data here; it stays masked until it is complete
     if Nb <= (ix.n_top + 1) * k:        # every position of this bucket sees <= n_top groups: the selection is all-causal (the eager path returns None)
         return None
     T = x.shape[0]
@@ -298,17 +305,20 @@ class GraphDecoder:
         self.stats["captures"] += 1
         return g
 
-    def stage(self, start, T=1):
-        """host side of T tokens: Engram hash + threaded pread of their rows into pinned staging, one H2D each (fw.tokens holds them at start .. start + T - 1)"""
+    def _jobs(self, start, t0, t1, toks):
         fw = self.fw
         jobs = []
-        toks = fw.tokens
         for i in sorted(fw.ple):
             e = fw.eng[i]
-            for t in range(T):
+            for t in range(t0, t1):
                 ids, valid = engram_row_ids(e, toks, start + t)
                 self.vpin[e.e, t] = torch.tensor(valid)
                 jobs += [(e, t, c, r) for c, r in enumerate(ids)]
+        return jobs
+
+    def _submit(self, jobs):
+        """spread the row reads over the thread pool; returns futures (preadv releases the GIL)"""
+        fw = self.fw
         tab = fw.table
         fi = tab.off >> 48
         fd, o0, rb, nrows = fw.g.fds[fi], fw.g.bases[fi] + (tab.off & ((1 << 48) - 1)), tab.row_bytes, tab.rows
@@ -325,7 +335,29 @@ class GraphDecoder:
                 if os.preadv(fd, [mv], o0 + r * rb) != rb:
                     raise IOError(f"{tab.name}: short read of row {r}")
         per = max(1, -(-len(jobs) // _IO_W))
-        list(_POOL.map(rd, [jobs[a:a + per] for a in range(0, len(jobs), per)]))
+        return [_POOL.submit(rd, jobs[a:a + per]) for a in range(0, len(jobs), per)]
+
+    def prestage(self, tok):
+        """HY4_STAGE_OV: row 0 of the next verify (token tok at position fw.n) does not depend on the drafts: start its Engram reads now, while the draft chain runs on the GPU"""
+        fw = self.fw
+        if self.ev_set:
+            self.ev.synchronize()           # the previous replay has finished reading the pinned staging rows
+        start = fw.n
+        jobs = self._jobs(start, 0, 1, fw.tokens + [int(tok)])
+        self._pre = (start, int(tok), self._submit(jobs))
+
+    def stage(self, start, T=1):
+        """host side of T tokens: Engram hash + threaded pread of their rows into pinned staging, one H2D each (fw.tokens holds them at start .. start + T - 1)"""
+        fw = self.fw
+        pre, self._pre = getattr(self, "_pre", None), None
+        t0 = 0
+        if pre is not None and pre[0] == start and pre[1] == fw.tokens[start]:
+            t0 = 1
+        futs = self._submit(self._jobs(start, t0, T, fw.tokens)) if T > t0 else []
+        if t0:
+            futs += pre[2]
+        for f in futs:
+            f.result()
         self.gs.eng_raw.copy_(self.rpin, non_blocking=True)
         self.gs.eng_valid.copy_(self.vpin, non_blocking=True)
 
