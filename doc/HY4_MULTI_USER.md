@@ -1,6 +1,6 @@
-# Hy4 multi-session decode (perf/hy4-strix-mu, on perf/hy4-strix-int e834628)
+# Hy4 multi-session decode (experimental, `--slots`)
 
-## Where a session enters the step (read 19/11)
+## Where a session enters the step
 - `tools/hy4/serve.py` takes an asyncio lock around `Hy4Engine.generate`: ONE request at a time. `generate` calls `reset()` (zeroes every static buffer) then prefill then the decode loop.
 - `step_graph.GraphDecoder.step_rows(toks)` appends T consecutive tokens of ONE sequence to static buffers and replays a HIP graph keyed (bucket, T); T <= TM = 8.
 - Per-session state in the solo engine: K rows `_ns.State.kv[layer]` [cap, 576] fp32 (every trunk layer), indexer `pool` [cap/k, d] + `vgb` [cap, 2d] (+ eager `n`, `P`, `vg`),
