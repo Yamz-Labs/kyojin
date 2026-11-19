@@ -16,6 +16,9 @@ from engine import Hy4Engine, PRIME_ROWS
 
 class MuEngine(Hy4Engine):
     def __init__(self, *a, slots: int = 4, **kw):
+        for f in ("HY4_SWA_RING", "HY4_LC_SPARSE"):        # long-context levers act on the single-session K / indexer buffers, not on the slot slabs
+            if os.environ.get(f, "0") not in ("", "0"):
+                raise RuntimeError(f + " is not supported with --slots > 1")
         super().__init__(*a, **kw)
         self.slots = slots
 

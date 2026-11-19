@@ -165,7 +165,7 @@ def indexer_forward_slots(ix, sl, x, qr, pos, base, Nb, ar, poolk=False):
     if poolk:                                              # the one Triton kernel on flat positions; rope table tiled per slab
         from . import pool_fused as _pf
         cs, sn = sl.tiled_table(ix)
-        _pf._pool_kernel[(pos.shape[0],)](sl.vgb, flat, ix.w["ape"], ix.w["pool_norm"], cs, sn, sl.pool, ix.eps, k=k, d=d, rd=ix.rope_dim)
+        _pf._pool_kernel[(pos.shape[0],)](sl.vgb, flat, ix.w["ape"], ix.w["pool_norm"], cs, sn, sl.pool, ix.eps, k=k, d=d, rd=ix.rope_dim, VR=0)
     else:
         g0 = (flat // k) * k
         rows = sl.vgb[g0[:, None] + ar[:k][None, :]]
