@@ -204,7 +204,7 @@ class Hy4Engine:
                 ng = NGram(self.ngram_min, self.ngram_ext)
                 ng.reset(list(ids) + [y])
             n_ext = n_hit = n_extacc = 0
-            rate, since = 0.7, 0          # recent acceptance of the extra rows; below 0.3 the proposer pauses (a probe every 8 rounds)
+            rate, since = 0.7, 0          # recent acceptance of the extra rows; below 0.4 the proposer pauses (a probe every 8 rounds)
             while out_n < max_new and not stop and not cancel():
                 j = GR.fw.n - 1
                 ta = pc()
@@ -215,7 +215,7 @@ class Hy4Engine:
                     lim = min(self.ngram_ext, self.SG.TM - 1 - k)
                     if self.ngram_gate:
                         since += 1
-                        lim = lim if rate >= 0.5 else (2 if rate >= 0.3 else (lim if since >= 8 else 0))
+                        lim = lim if rate >= 0.6 else (2 if rate >= 0.4 else (lim if since >= 8 else 0))
                     ext, ml = ng.propose(d, lim)
                     if self.ngram_adapt and ext:           # longer match, more rows: 2 rows at the minimum match, +2 per extra matched token
                         ext = ext[:max(1, (ml - self.ngram_min + 1) * 2)]
