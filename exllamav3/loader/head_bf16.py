@@ -12,6 +12,7 @@ BV = int(os.environ.get("HY4_HEAD_BV", "8"))
 BD = int(os.environ.get("HY4_HEAD_BD", "512"))
 DOT = os.environ.get("HY4_HEAD_DOT", "0") == "1"             # 1 = verify rows (T >= 2) on tl.dot: fp16 WMMA, h split hi + lo (rel ~1e-7), W bf16 -> fp16 exact above 6e-8
 DOT_BV = int(os.environ.get("HY4_HEAD_DOT_BV", "64"))
+DOT_MINT = int(os.environ.get("HY4_HEAD_DOT_MINT", "3"))        # fewest rows on the dot path (box A/B: T 2 +0.2 ms, T 6 -4.2 ms)
 DOT_BD = int(os.environ.get("HY4_HEAD_DOT_BD", "64"))
 DOT_NW = int(os.environ.get("HY4_HEAD_DOT_NW", "4"))
 ROW_TILES = os.environ.get("HY4_ROW_TILES", "0") == "1"     # 1 = verify-row tiles tuned on the Strix (T 2..4: BD 64 + 2 warps; T >= 5: BV 16, BD 32)
@@ -79,7 +80,7 @@ def gemv(h, W):
     T = h.shape[0]
     if T > 1:
         out = torch.empty(T, V, dtype=torch.float32, device=W.device)
-        if DOT and D % DOT_BD == 0 and W.dtype in (torch.bfloat16, torch.float16):
+        if DOT and T >= DOT_MINT and D % DOT_BD == 0 and W.dtype in (torch.bfloat16, torch.float16):
             _k_headd[(triton.cdiv(V, DOT_BV),)](W, h.contiguous(), out, V, D, T, BT=16, BV=DOT_BV, BD=DOT_BD, num_warps=DOT_NW)
             return out
         bv, bd, nw = BV, min(BD, 128), 4

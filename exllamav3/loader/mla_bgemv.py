@@ -17,6 +17,7 @@ BK = int(os.environ.get("HY4_BG_BK", "128"))
 ROW_TILES = os.environ.get("HY4_ROW_TILES", "0") == "1"     # 1 = tile sizes tuned on the Strix for verify rows (T >= 4: BN 32, BK 32; box microbench 19/11)
 DOT = os.environ.get("HY4_BG_DOT", "0") == "1"             # 1 = verify rows (T >= 2) on tl.dot: int8 -> fp16 exact, x = hi + lo fp16, block scale applied to the fp32 partial (rel ~1e-7)
 DOT_BN = int(os.environ.get("HY4_BG_DOT_BN", "64"))
+DOT_MINT = int(os.environ.get("HY4_BG_DOT_MINT", "5"))        # fewest rows on the dot path (box A/B: T 3-4 +-0.2 ms, T 6 -5 ms, T 2 +0.9 ms)
 DOT_NW = int(os.environ.get("HY4_BG_DOT_NW", "4"))
 MAXT = 8                                   # rows served by the batched kernels (verify rows)
 
@@ -100,7 +101,7 @@ class Q8Batched:
         if x.dim() == 3 and x.shape[0] > 1 and x.stride(-1) == 1:
             T = x.shape[0]
             out = torch.empty(T, self.H, self.N, dtype=torch.float32, device=x.device)
-            if DOT and T <= 16 and self.K % 32 == 0:
+            if DOT and DOT_MINT <= T <= 16 and self.K % 32 == 0:
                 _k_bgd[(self.H, triton.cdiv(self.N, DOT_BN))](self.q, self.d, x, out, self.N, self.K, self.K // 32, x.stride(0), x.stride(1), T, BT=16, BN=DOT_BN, num_warps=DOT_NW)
                 return out
             bn, bk = (32, 32) if (ROW_TILES and T >= 4) else (BN, min(BK, 64))
