@@ -70,6 +70,7 @@ class Hy4Engine:
         self.GR.prepare()                          # static K / indexer / Engram buffers at the full context size: addresses never change after this
         self.MT = MH.Hy4MTP(M)
         self.MG = MH.MTPGraph(self.MT, self.k)
+        MH._STAGE_OV[0] = os.environ.get("HY4_SERVE_STAGE_OV", "1") == "1"     # Engram row 0 of the next verify staged during the draft chain
         torch.cuda.synchronize()
         self.load_s = time.time() - t0
         self.ready = True
@@ -81,7 +82,7 @@ class Hy4Engine:
         import importlib
         self._dec = []
         for mod, attrs in (("attn_eager", ("ENABLED", "RMS")), ("ref_fused", ("ENABLED",)), ("head_bf16", ("ENABLED",)), ("mla_bgemv", ("ENABLED",)),
-                           ("kv_fused", ("ENABLED",)), ("router_gemv", ("ENABLED",))):
+                           ("kv_fused", ("ENABLED",)), ("router_gemv", ("ENABLED",)), ("pool_fused", ("ENABLED",))):
             m = importlib.import_module(f"{L}.{mod}")
             for a in attrs:
                 self._dec.append((m, a, getattr(m, a)))

@@ -33,7 +33,7 @@ SHIPPED_ENV = {
     "HY4_HEAD_CPU": "0", "HY4_EXPERT_RESIDENT_GB": "72", "HY4_ENGRAM_GPU": "1", "HY4_ATTN_GROUPED": "1", "HY4_INDEXER_FUSED": "1",
     "HY4_NOSYNC": "1",                                                     # static-buffer step (needed by the graph)
     "HY4_HC_FUSED": "1", "HY4_HEAD_BF16": "1", "HY4_MLA_BG": "1", "HY4_ATTN_EAGER": "2", "HY4_KV_FUSED": "1",
-    "HY4_REF_FUSED": "1", "HY4_REF_ROUTER": "1", "HY4_REF_MLA": "1", "HY4_ROUTER_GEMV": "1", "HY4_MOE_SORT": "1",   # decode set
+    "HY4_IDX_POOLK": "1", "HY4_REF_FUSED": "1", "HY4_REF_ROUTER": "1", "HY4_REF_MLA": "1", "HY4_ROUTER_GEMV": "1", "HY4_MOE_SORT": "1",   # decode set
     "HY4_MTP_FAST": "1", "HY4_MTP_HEAD": "q8",                             # draft head
     "HY4_PREFILL_MOE": "1", "HY4_PREFILL_DENSE": "1", "HY4_PREFILL_ATTN": "1", "HY4_PREFILL_IX": "1", "HY4_ENGRAM_PREFETCH": "1",
     "HY4_PF_F16": "1", "HY4_MOE_NFIRST": "1", "KEEPCACHE": "1",           # prefill set
