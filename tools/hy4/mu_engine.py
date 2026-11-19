@@ -178,9 +178,21 @@ class Request:
         self.t_submit = time.perf_counter()
         self.t_first = self.t_done = None
         self.done = threading.Event()
+        self.cancel = threading.Event()               # set by the server when the client went away
+        self.on_done = None                           # called once from the scheduler thread when the request ends (any reason)
         self.error = None
         self.sess = None
         self.stats: dict = {}
+        self.rounds = 0
+
+    def engine_stats(self, k):
+        """the stats dict the single-session engine returns from generate() (what serve.py prints / reports as timings)"""
+        t_first = self.t_first or self.t_done
+        dec = max((self.t_done or t_first) - t_first, 1e-9)
+        n = max(len(self.out) - 1, 0)
+        return {"prompt_tokens": len(self.ids), "speculative": self.speculative, "k": k, "prefill_s": t_first - self.t_submit, "ttft_s": t_first - self.t_submit,
+                "decode_s": dec, "decode_tokens": n, "rounds": self.rounds, "accept_hist": [], "tau": (n / self.rounds) if self.rounds else None,
+                "prefill_trunk_s": self.stats.get("pf_s", 0.0), "prime_s": 0.0, "generated": len(self.out), "cancelled": self.cancel.is_set()}
 
 
 class MuScheduler(threading.Thread):
@@ -215,14 +227,17 @@ class MuScheduler(threading.Thread):
         req.out += new
         req.times.append((now, len(new)))
         stop = bool(req.on_tokens(new)) if req.on_tokens else False
-        return stop or len(req.out) >= req.max_new
+        return stop or len(req.out) >= req.max_new or req.cancel.is_set()
 
     def _finish(self, req):
         req.t_done = time.perf_counter()
-        self.free.append(req.sess.slot)
+        if req.sess is not None:
+            self.free.append(req.sess.slot)
         if req in self.dec:
             self.dec.remove(req)
         req.done.set()
+        if req.on_done is not None:
+            req.on_done()
 
     def run(self):
         eng, pc = self.eng, time.perf_counter
@@ -238,18 +253,21 @@ class MuScheduler(threading.Thread):
                         req = self.pending.popleft()
                         req.sess = eng.open(self.free.pop(0))
                         req.stats["admit"] = pc()
-                        if len(req.ids) + req.max_new + eng.k + 2 > eng.ctx:
-                            req.error = "context"
+                        if req.cancel.is_set() or len(req.ids) + req.max_new + eng.k + 2 > eng.ctx:
+                            req.error = None if req.cancel.is_set() else "context"
                             self._finish(req)
                             continue
                         eng.prefill_begin(req.sess, req.ids, self.chunk)
                         req.sess.req = req
                         self.pf.append(req)
+                if self.pf and self.pf[0].cancel.is_set():
+                    self._finish(self.pf.popleft())
                 if self.pf:
                     req = self.pf[0]
                     t0 = pc()
                     done = eng.prefill_step(req.sess)
                     t1 = pc()
+                    req.stats["pf_s"] = req.stats.get("pf_s", 0.0) + t1 - t0
                     self.stats["pf_chunks"] += 1
                     self.stats["pf_s"] += t1 - t0
                     self.trace.append((t0, t1, "pf", req.sess.pf_pos))
@@ -272,6 +290,7 @@ class MuScheduler(threading.Thread):
                     self.stats["dec_s"] += t1 - t0
                     self.trace.append((t0, t1, "dec", len(sess)))
                     for r in list(self.dec):
+                        r.rounds += 1
                         if self._emit(r, out[r.sess], t1):
                             self._finish(r)
         except Exception as ex:           # noqa: BLE001
@@ -280,3 +299,16 @@ class MuScheduler(threading.Thread):
             for r in list(self.dec) + list(self.pf) + list(self.pending):
                 r.error = repr(ex)
                 r.done.set()
+                if r.on_done is not None:
+                    r.on_done()
+
+
+def warmup(sch: MuScheduler, n: int, new: int = 24):
+    """compile / capture what a served mix needs at the first bucket: B = 1 .. slots concurrent requests of n prompt tokens (graphs per (bucket, rows), MTP chains per slot)"""
+    eng = sch.eng
+    ids = [(i * 7919 + 13) % 50000 for i in range(n)]
+    for B in range(1, eng.slots + 1):
+        reqs = [sch.submit(Request(ids[i:] + ids[:i], new)) for i in range(B)]
+        for r in reqs:
+            r.done.wait(900)
+    print(f"mu warm-up: {n} prompt tokens, 1..{eng.slots} sessions", flush=True)

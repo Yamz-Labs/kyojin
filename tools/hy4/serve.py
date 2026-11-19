@@ -57,6 +57,7 @@ class State:
         self.error: str | None = None
         self.stage = "starting"
         self.lock: asyncio.Lock | None = None
+        self.sched = None            # mu_engine.MuScheduler with --slots > 1
         self.served = 0
 
 
@@ -102,8 +103,47 @@ def build_app(st: State):
         if n + max_new + args.num_draft + 2 > args.max_ctx:
             raise C.RequestError(f"prompt ({n} tokens) + max_tokens ({max_new}) exceeds the context window ({args.max_ctx})", 400, "context_length_exceeded")
 
+    async def run_job_mu(ids, r, in_think, request):
+        """--slots > 1: the request joins the scheduler (own slot, batched decode with the other sessions); same events as run_job"""
+        from mu_engine import Request
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+        out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"])
+
+        def on_tokens(toks):
+            for ch, tx in out.push(toks):
+                loop.call_soon_threadsafe(q.put_nowait, ("delta", ch, tx))
+            return out.done
+
+        req = Request(ids, r["max_tokens"], speculative=r["speculative"], on_tokens=on_tokens)
+        req.on_done = lambda: loop.call_soon_threadsafe(q.put_nowait, ("end",))
+        st.sched.submit(req)
+        try:
+            while True:
+                ev = await q.get()
+                if ev[0] == "end":
+                    break
+                yield ev
+        finally:
+            req.cancel.set()
+        for ch, tx in out.finish():
+            yield ("delta", ch, tx)
+        if req.error:
+            raise RuntimeError(req.error)
+        stats = req.engine_stats(st.engine.k)
+        finish = out.finish_reason or "length"
+        st.served += 1
+        pf, dc = stats["prefill_s"], stats["decode_s"]
+        print(f"req {st.served}: prompt {stats['prompt_tokens']} tok ttft {pf:.2f} s (own prefill {stats['prefill_trunk_s']:.2f} s) | decode {stats['decode_tokens']} tok {dc:.2f} s = "
+              f"{stats['decode_tokens'] / dc if dc else 0:.2f} tok/s spec={stats['speculative']} rounds {stats['rounds']} tau {stats['tau']} | {finish}", flush=True)
+        yield ("end", stats, finish, out.n_tokens)
+
     async def run_job(ids, r, in_think, request):
         """async generator of ("delta", channel, text) events, then ("end", stats, finish_reason, n_generated)"""
+        if st.sched is not None:
+            async for ev in run_job_mu(ids, r, in_think, request):
+                yield ev
+            return
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
         out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"])
@@ -266,13 +306,24 @@ def load_in_background(st: State):
         try:
             from engine import Hy4Engine
             a = st.args
-            eng = Hy4Engine(TREE, a.model, ctx=a.max_ctx, k=a.num_draft, chunk=a.prefill_chunk, prime_rows=a.draft_fill_rows)
+            if a.slots > 1:
+                from mu_engine import MuEngine
+                eng = MuEngine(TREE, a.model, ctx=a.max_ctx, k=a.num_draft, chunk=a.prefill_chunk, prime_rows=a.draft_fill_rows, slots=a.slots)
+            else:
+                eng = Hy4Engine(TREE, a.model, ctx=a.max_ctx, k=a.num_draft, chunk=a.prefill_chunk, prime_rows=a.draft_fill_rows)
 
             def progress(s):
                 st.stage = s
                 print("load:", s, flush=True)
             eng.load(progress)
-            if os.environ.get("HY4_WARMUP_TOKENS", "0") != "0":
+            if a.slots > 1:
+                import mu_engine
+                st.sched = mu_engine.MuScheduler(eng, chunk=a.sched_chunk)
+                st.sched.start()
+                if os.environ.get("HY4_WARMUP_TOKENS", "0") != "0":
+                    st.stage = "warm-up"
+                    mu_engine.warmup(st.sched, int(os.environ["HY4_WARMUP_TOKENS"]))
+            elif os.environ.get("HY4_WARMUP_TOKENS", "0") != "0":
                 st.stage = "warm-up"
                 print("load: warm-up", flush=True)
                 eng.warmup(int(os.environ["HY4_WARMUP_TOKENS"]))
@@ -298,6 +349,8 @@ def main(argv=None):
     ap.add_argument("--prefill-chunk", type=int, default=8192)
     ap.add_argument("--draft-fill-rows", type=int, default=0, help="fill the draft head's cache for the last N prompt rows only (0 = the whole prompt)")
     ap.add_argument("--default-max-tokens", type=int, default=1024)
+    ap.add_argument("--slots", type=int, default=1, help="concurrent sessions decoded in ONE batched step (1 = the single-request engine behind the lock)")
+    ap.add_argument("--sched-chunk", type=int, default=1024, help="prefill rows per scheduler turn with --slots > 1 (a decode round of the other sessions runs between chunks)")
     args = ap.parse_args(argv)
     apply_env(args.max_ctx)
     st = State(args)

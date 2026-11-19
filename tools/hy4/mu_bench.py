@@ -194,6 +194,87 @@ if "prof" in PH:
                 del s_.tokens[s_.n:]
         print("PROF T", Tn, "eager total ms", round(dt * 1000, 1), {k: round(v * 1000, 1) for k, v in sorted(fw.tm.acc.items(), key=lambda kv: -kv[1])}, flush=True)
 
+if "nll" in PH:
+    # teacher-forced NLL per session: batched slot step (B = 4 rows, B = 1 row) vs the legacy solo graph (R = 1, R = 4 rows) and the 1e-6 embedding-noise null arms of the solo path.
+    # Same text per session in every arm; per-token paired differences give the se. A batched arm inside the null band = the batched step is the same maths up to noise.
+    import numpy as np
+    wiki = json.load(open("/path/to/wiki_ids.json"))
+    PRE, NN = int(os.environ.get("MU_PRE", "200")), int(os.environ.get("MU_NN", "240"))
+    segs = [wiki[1000 * i:1000 * i + PRE + NN + 8] for i in range(4)]
+    SG, MH = e.SG, e.MH
+    GRm, MGm = e.GR, e.MG
+    if not hasattr(e, "GR1"):
+        e.GR1 = SG.GraphDecoder(e.M)
+        e.GR1.prepare()
+        e.MG1 = MH.MTPGraph(e.MT, e.k)
+
+    def lp_of(lg, tgt):
+        lp = torch.log_softmax(lg.reshape(len(tgt), -1).float(), -1)
+        return (-lp[torch.arange(len(tgt), device=e.dev), torch.tensor(tgt, device=e.dev)]).tolist()
+
+    def solo_nll(i, R, seed=None):
+        seg = segs[i]
+        e.GR, e.MG = e.GR1, e.MG1
+        try:
+            SG.PERT = None if seed is None else (torch.randn(e.GR1.cap, e.M.D, generator=torch.Generator().manual_seed(seed)) * 1e-6).to(e.dev)
+            e.GR1.clear()
+            s0 = GRm.new_session(0)
+            GRm.bind(s0)
+            e._t0 = time.perf_counter()
+            e.reset()
+            e.prefill(seg[:PRE])
+            e.phase("decode")
+            out, j = [], 0
+            while j < NN:
+                r = min(R, NN - j)
+                lg, _am, _x, _h = e.GR1.step_rows(seg[PRE + j:PRE + j + r])
+                out.extend(lp_of(lg, seg[PRE + j + 1:PRE + j + r + 1]))
+                j += r
+        finally:
+            SG.PERT = None
+            e.GR1.clear()
+            e.GR, e.MG = GRm, MGm
+        return np.array(out)
+
+    def slot_nll(B):
+        sess = []
+        e.phase("prefill")
+        for i in range(B):
+            s_ = GRm.new_session(i)
+            e.prefill_begin(s_, segs[i][:PRE], 1024)
+            while not e.prefill_step(s_):
+                pass
+            sess.append(s_)
+        e.phase("decode")
+        outs = [[] for _ in range(B)]
+        for j in range(NN):
+            rows = [(sess[i], [segs[i][PRE + j]]) for i in range(B)]
+            lg, _am, _x, _h = GRm.step_slots(rows)
+            lg = lg.reshape(B, -1)
+            for i in range(B):
+                outs[i].extend(lp_of(lg[i], [segs[i][PRE + j + 1]]))
+        return [np.array(o) for o in outs]
+
+    arms = {}
+    for i in range(4):
+        for name, R, sd in (("R1", 1, None), ("R1_n1", 1, 1), ("R1_n2", 1, 2), ("R4", 4, None)):
+            arms[(name, i)] = solo_nll(i, R, sd)
+        print("NLL solo session", i, {n: round(float(arms[(n, i)].mean()), 4) for n in ("R1", "R1_n1", "R1_n2", "R4")}, flush=True)
+    for B in (4, 1):
+        o = slot_nll(B)
+        for i in range(B):
+            arms[(f"slotB{B}", i)] = o[i]
+    for i in range(4):
+        base = arms[("R1", i)]
+        null = [arms[(n, i)].mean() for n in ("R1", "R1_n1", "R1_n2", "R4")]
+        row = {"null_band_spread": round(float(max(null) - min(null)), 4), "R1_mean": round(float(base.mean()), 4)}
+        for n in ("R1_n1", "R1_n2", "R4", "slotB4", "slotB1"):
+            if (n, i) in arms:
+                d = arms[(n, i)] - base
+                row[n] = [round(float(d.mean()), 4), round(float(d.std(ddof=1) / np.sqrt(len(d))), 4), round(float(np.abs(d).max()), 3)]
+        print("NLLD session", i, json.dumps(row), flush=True)
+        RES.setdefault("nll", []).append(row)
+
 if "pf" in PH:
     pfl = int(os.environ.get("MU_PFLEN", "2048"))
     import json as _j
