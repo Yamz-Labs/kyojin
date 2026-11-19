@@ -130,7 +130,6 @@ PF_DENSE = os.environ.get("HY4_PREFILL_DENSE", "0") in ("1", "i8")    # 1 = pref
 PF_DENSE_I8 = os.environ.get("HY4_PREFILL_DENSE", "0") == "i8"
 PF_DIAG = os.environ.get("HY4_PREFILL_DIAG", "0") == "1"           # log fast-path vs exact error of every prefill dense matmul (debug)
 PF_IX = os.environ.get("HY4_PREFILL_IX", "0") == "1"                # 1 = k-pool indexer scores of prefill rows as an fp16 GEMM (indexer_fused scoring is fp32, 2 GB temporaries at T = 8192)
-PF_ROUTER2 = os.environ.get("HY4_PREFILL_ROUTER", "0") == "2"       # 2 = router logits of prefill rows from the split-fp16 kernel (hi + lo parts, near-fp32 accuracy)
 PF_ROUTER = os.environ.get("HY4_PREFILL_ROUTER", "0") == "1"       # 1 = router logits of prefill rows as an fp16 GEMM (fp32 accumulate): fp32 matmul runs at 2.7 TFLOPS here
 
 

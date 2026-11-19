@@ -492,46 +492,6 @@ def register_f16(x, x16):
         _F16_MEMO[0], _F16_MEMO[1] = (x, x16), (x.data_ptr(), x.shape, x._version)
 
 
-# ------------------------------------------------------------------------------------------------ router logits, split fp16 (HY4_PREFILL_ROUTER=2)
-@triton.jit
-def _rt_split_kernel(X, W, O, T, E, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    """O[t, e] = sum_k X[t, k] * W[e, k] with both operands split into fp16 hi + lo parts: hi*hi + hi*lo + lo*hi, fp32 accumulation (error ~ 2^-21 relative)"""
-    pm = tl.program_id(0)
-    pn = tl.program_id(1)
-    rm = pm * BM + tl.arange(0, BM)
-    rn = pn * BN + tl.arange(0, BN)
-    rk = tl.arange(0, BK)
-    acc = tl.zeros([BM, BN], dtype=tl.float32)
-    for k0 in range(0, K, BK):
-        kk = k0 + rk
-        x = tl.load(X + rm[:, None].to(tl.int64) * K + kk[None, :], mask=(rm[:, None] < T) & (kk[None, :] < K), other=0.0)
-        w = tl.load(W + rn[None, :].to(tl.int64) * K + kk[:, None], mask=(rn[None, :] < E) & (kk[:, None] < K), other=0.0)       # [BK, BN]
-        x = tl.minimum(tl.maximum(x, -65504.0), 65504.0)
-        xh = x.to(tl.float16)
-        xl = (x - xh.to(tl.float32)).to(tl.float16)
-        wh = w.to(tl.float16)
-        wl = (w - wh.to(tl.float32)).to(tl.float16)
-        acc = tl.dot(xh, wh, acc)
-        acc = tl.dot(xh, wl, acc)
-        acc = tl.dot(xl, wh, acc)
-    tl.store(O + rm[:, None].to(tl.int64) * E + rn[None, :], acc, mask=(rm[:, None] < T) & (rn[None, :] < E))
-
-
-RT_CFG = (64, 64, 32, 4)
-
-
-def router_logits(x, w, cfg=None):
-    """x [T, K] fp32 @ w[E, K].T -> [T, E] fp32 with near-fp32 accuracy at fp16 tensor-core speed (fp32 matmul runs at 2.7 TFLOPS here)"""
-    T, K = x.shape
-    E = w.shape[0]
-    x = x.contiguous()
-    w = w.contiguous()
-    o = torch.empty(T, E, dtype=torch.float32, device=x.device)
-    bm, bn, bk, nw = cfg or RT_CFG
-    _rt_split_kernel[(triton.cdiv(T, bm), triton.cdiv(E, bn))](x, w, o, T, E, K, BM=bm, BN=bn, BK=bk, num_warps=nw)
-    return o
-
-
 # ------------------------------------------------------------------------------------------------ fused indexer scorer + exact top-k selection (HY4_PF_FUSE=1)
 @triton.jit
 def _ix_score_kernel(IQ, PK, WT, SC, T, P, start, H: tl.constexpr, D: tl.constexpr, KP: tl.constexpr, TAIL: tl.constexpr, BT: tl.constexpr, BP: tl.constexpr):
