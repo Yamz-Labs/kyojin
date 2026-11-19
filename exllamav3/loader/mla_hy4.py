@@ -75,8 +75,11 @@ def _sp_hip_call(mla, kcache, T, sel, qcat):
         _SPHIP[0] = mod
     if not _SPHIP[0]:
         return None
-    kc16 = kcache.clamp(-65504.0, 65504.0).half().contiguous()
-    return _SPHIP[0].mla_sparse_hip(mla.R, kc16, kcache.shape[0] - T, mla.scale, mla.sinks, sel, qcat)
+    tm = mla.tm
+    with tm.t("f sp: kc16 cast"):
+        kc16 = kcache.clamp(-65504.0, 65504.0).half().contiguous()
+    with tm.t("f sp: hip kernel"):
+        return _SPHIP[0].mla_sparse_hip(mla.R, kc16, kcache.shape[0] - T, mla.scale, mla.sinks, sel, qcat)
 
 
 class Hy4MLA:
@@ -215,7 +218,8 @@ class Hy4MLA:
             if allow.__class__.__name__ == "PfSparse":      # HY4_PF_SPARSE=1: per-query gather of the selected groups
                 o = _sp_hip_call(self, kcache, T, allow, qcat)
                 if o is None:
-                    o = _pa.mla_sparse(self.R, kcache, kcache.shape[0] - T, self.scale, self.sinks, allow, qcat)      # [H, T, R] fp16
+                    with tm.t("f sp: triton kernel"):
+                        o = _pa.mla_sparse(self.R, kcache, kcache.shape[0] - T, self.scale, self.sinks, allow, qcat)      # [H, T, R] fp16
             else:
                 o = _pa.mla_banded(self.R, None, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow, qcat=qcat, o16=True, ht=True)      # [H, T, R] fp16
         with tm.t("attn proj"):
