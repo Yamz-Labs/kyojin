@@ -56,6 +56,29 @@ def rope_norm(x: torch.Tensor, pos: torch.Tensor, base: float) -> torch.Tensor:
     return out
 
 
+_SPHIP = [None]
+
+
+def _sp_hip_call(mla, kcache, T, sel, qcat):
+    """HY4_PF_SPARSE_HIP (default 1): hand-written HIP/WMMA sparse MLA (hipsp/sp_mla.cu built to libspmla.so: path in SP_SO, else hipsp/libspmla.so); None = use the Triton kernel"""
+    if os.environ.get("HY4_PF_SPARSE_HIP", "1") != "1" or mla.H != 64 or mla.R != 512 or qcat.shape[-1] != 576:
+        return None
+    if _SPHIP[0] is None:
+        hd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "hipsp")
+        so = os.environ.get("SP_SO") or os.path.join(hd, "libspmla.so")
+        mod = False
+        if os.path.exists(so) and os.path.exists(os.path.join(hd, "sp_hip.py")):
+            spec = importlib.util.spec_from_file_location("hy4_sp_hip", os.path.join(hd, "sp_hip.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            os.environ["SP_SO"] = so
+        _SPHIP[0] = mod
+    if not _SPHIP[0]:
+        return None
+    kc16 = kcache.clamp(-65504.0, 65504.0).half().contiguous()
+    return _SPHIP[0].mla_sparse_hip(mla.R, kc16, kcache.shape[0] - T, mla.scale, mla.sinks, sel, qcat)
+
+
 class Hy4MLA:
     """One attention layer: cur [T, n_embd] (normed collapsed stream) -> kqv / gated / out, with a K cache the caller keeps."""
 
@@ -190,7 +213,9 @@ class Hy4MLA:
             qcat = self.q16(cur, pos, qa)
         with tm.t("MLA core + sinks"):
             if allow.__class__.__name__ == "PfSparse":      # HY4_PF_SPARSE=1: per-query gather of the selected groups
-                o = _pa.mla_sparse(self.R, kcache, kcache.shape[0] - T, self.scale, self.sinks, allow, qcat)      # [H, T, R] fp16
+                o = _sp_hip_call(self, kcache, T, allow, qcat)
+                if o is None:
+                    o = _pa.mla_sparse(self.R, kcache, kcache.shape[0] - T, self.scale, self.sinks, allow, qcat)      # [H, T, R] fp16
             else:
                 o = _pa.mla_banded(self.R, None, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow, qcat=qcat, o16=True, ht=True)      # [H, T, R] fp16
         with tm.t("attn proj"):
