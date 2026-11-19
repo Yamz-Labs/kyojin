@@ -435,58 +435,62 @@ struct Gm3
 __global__ void __launch_bounds__(64) gm_gemv3_kernel(Gm3 a, const uint8_t* __restrict__ aqb, int K, int nt4, int nt6)
 {
     __shared__ __align__(16) float part[260];
-    const int row = blockIdx.y;
-    aqb += (int64_t)row * (K / 32) * FQ_Q8_1_BYTES;
     int blk = blockIdx.x, mi = 0;
     if (blk >= a.N[0]) { blk -= a.N[0]; mi = 1; if (blk >= a.N[1]) { blk -= a.N[1]; mi = 2; } }
     const int j = threadIdx.x;
     const uint8_t* wr = a.w[mi] + (int64_t)blk * a.stride[mi];
     const int f = a.fmt[mi];
     const int nt = (f == 0) ? nt4 : nt6;      // fq_kq_nt(K, 16) for Q4_K, fq_kq_nt(K, 8) for Q6_K
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (f == 0)
+    // All R rows run inside this block, one after the other on the same weight row: the weights are read from HBM once and the other rows hit L1 / L2.
+    for (int row = 0; row < a.R; row++)
     {
-        const int nitems = (K / 256) * 4;
-        for (int it = j; it < nitems; it += 64)
+        const uint8_t* aq = aqb + (int64_t)row * (K / 32) * FQ_Q8_1_BYTES;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (f == 0)
         {
-            float t[4];
-            fq_kq_item_q4_k(wr, aqb, it, t);
-            #pragma unroll
-            for (int q = 0; q < 4; q++) acc[q] = __fadd_rn(acc[q], t[q]);
+            const int nitems = (K / 256) * 4;
+            for (int it = j; it < nitems; it += 64)
+            {
+                float t[4];
+                fq_kq_item_q4_k(wr, aq, it, t);
+                #pragma unroll
+                for (int q = 0; q < 4; q++) acc[q] = __fadd_rn(acc[q], t[q]);
+            }
         }
-    }
-    else
-    {
-        const int nitems = (K / 256) * 8;
-        for (int it = j; it < nitems; it += 64)
+        else
         {
-            float t[4];
-            fq_kq_item_q6_k(wr, aqb, it, t);
-            #pragma unroll
-            for (int q = 0; q < 4; q++) acc[q] = __fadd_rn(acc[q], t[q]);
+            const int nitems = (K / 256) * 8;
+            for (int it = j; it < nitems; it += 64)
+            {
+                float t[4];
+                fq_kq_item_q6_k(wr, aq, it, t);
+                #pragma unroll
+                for (int q = 0; q < 4; q++) acc[q] = __fadd_rn(acc[q], t[q]);
+            }
         }
-    }
-    #pragma unroll
-    for (int q = 0; q < 4; q++)
-    {
-        const int lane = (f == 0) ? (4 * j + q) : (32 * (j >> 3) + (j & 7) + 8 * q);
-        if (lane < nt) part[lane] = acc[q];
-    }
-    __syncthreads();
-    if (j == 0)
-    {
-        const float4* pv = reinterpret_cast<const float4*>(part);
-        float s = 0.0f;
-        #pragma unroll 8
-        for (int l = 0; l < nt / 4; l++)
+        #pragma unroll
+        for (int q = 0; q < 4; q++)
         {
-            const float4 v = pv[l];
-            s = __fadd_rn(s, v.x);
-            s = __fadd_rn(s, v.y);
-            s = __fadd_rn(s, v.z);
-            s = __fadd_rn(s, v.w);
+            const int lane = (f == 0) ? (4 * j + q) : (32 * (j >> 3) + (j & 7) + 8 * q);
+            if (lane < nt) part[lane] = acc[q];
         }
-        a.out[mi][(int64_t)row * a.N[mi] + blk] = __float2half_rn(s);
+        __syncthreads();
+        if (j == 0)
+        {
+            const float4* pv = reinterpret_cast<const float4*>(part);
+            float s = 0.0f;
+            #pragma unroll 8
+            for (int l = 0; l < nt / 4; l++)
+            {
+                const float4 v = pv[l];
+                s = __fadd_rn(s, v.x);
+                s = __fadd_rn(s, v.y);
+                s = __fadd_rn(s, v.z);
+                s = __fadd_rn(s, v.w);
+            }
+            a.out[mi][(int64_t)row * a.N[mi] + blk] = __float2half_rn(s);
+        }
+        __syncthreads();
     }
 }
 
@@ -500,30 +504,32 @@ struct Gm3q
 };
 
 template <typename OUT>
-__global__ void gm_gemv_q8_kernel(Gm3q a, const uint8_t* __restrict__ aqb, int K, int nt, int64_t row_bytes)
+__global__ void gm_gemv_q8_kernel(Gm3q a, const uint8_t* __restrict__ aqb, int K, int nt, int64_t row_bytes, int R)
 {
     extern __shared__ float red[];
-    const int row = blockIdx.y;
-    aqb += (int64_t)row * (K / 32) * FQ_Q8_1_BYTES;
     int blk = blockIdx.x, mi = 0;
     if (blk >= a.N[0]) { blk -= a.N[0]; mi = 1; if (blk >= a.N[1]) { blk -= a.N[1]; mi = 2; } }
     const int tid = threadIdx.x;
-    red[tid] = gm_dot_q8_0(a.w[mi] + (int64_t)blk * row_bytes, aqb, K, tid, nt);
-    __syncthreads();
-    if (tid == 0)
+    for (int row = 0; row < R; row++)      // rows inside the block: the weight row is read from HBM once
     {
-        float sum = 0.0f;
-        for (int l = 0; l < nt; l++) sum = __fadd_rn(sum, red[l]);
-        OUT* o = reinterpret_cast<OUT*>(a.out[mi]);
-        if constexpr (std::is_same<OUT, __half>::value) o[(int64_t)row * a.N[mi] + blk] = __float2half_rn(sum);
-        else o[(int64_t)row * a.N[mi] + blk] = sum;
+        red[tid] = gm_dot_q8_0(a.w[mi] + (int64_t)blk * row_bytes, aqb + (int64_t)row * (K / 32) * FQ_Q8_1_BYTES, K, tid, nt);
+        __syncthreads();
+        if (tid == 0)
+        {
+            float sum = 0.0f;
+            for (int l = 0; l < nt; l++) sum = __fadd_rn(sum, red[l]);
+            OUT* o = reinterpret_cast<OUT*>(a.out[mi]);
+            if constexpr (std::is_same<OUT, __half>::value) o[(int64_t)row * a.N[mi] + blk] = __float2half_rn(sum);
+            else o[(int64_t)row * a.N[mi] + blk] = sum;
+        }
+        __syncthreads();
     }
 }
 
 __device__ __forceinline__ float gm_to_f(float v) { return v; }
 __device__ __forceinline__ float gm_to_f(__half v) { return __half2float(v); }
 
-// SwiGLU of the shared expert fused into its Q8_0 down projection: act = half(silu(g) * u) (g, u half or float [R, I]), quantized to q8_1 in shared memory,
+// SwiGLU of the shared expert fused into its Q8_0 down projection: act = silu(g) * u in fp32 (torch silu) (g, u half or float [R, I]), quantized to q8_1 in shared memory,
 // then the Q8_0 dot of fq_gemv_q8_q8_kernel. accumulate: out += result (fp32 add), else out = result.
 template <typename GT>
 __global__ void gm_swiglu_down_q8_kernel(const GT* __restrict__ g, const GT* __restrict__ u, const uint8_t* __restrict__ wd, float* __restrict__ out,
@@ -535,16 +541,16 @@ __global__ void gm_swiglu_down_q8_kernel(const GT* __restrict__ g, const GT* __r
     const int nb = I / 32;
     if (tid < nb)
     {
-        __half a32[32];
+        // fp32 activation, as Hy4's shared expert (silu(g.float()) * u.float() into the fp32-input Q8_0 GEMV): torch's silu = g / (1 + exp(-g)), no half rounding
+        float a32[32];
         #pragma unroll
         for (int i = 0; i < 32; i++)
         {
             const float gv = gm_to_f(g[(int64_t)row * I + tid * 32 + i]);
             const float uv = gm_to_f(u[(int64_t)row * I + tid * 32 + i]);
-            const float sig = 1.0f / (1.0f + expf(-gv));
-            a32[i] = __float2half_rn(sig * gv * uv);
+            a32[i] = (gv / (1.0f + expf(-gv))) * uv;
         }
-        gm_quant_block(a32, qa + tid * FQ_Q8_1_BYTES);
+        gm_quant_block_f(a32, qa + tid * FQ_Q8_1_BYTES);
     }
     __syncthreads();
     red[tid] = gm_dot_q8_0(wd + (int64_t)n * row_bytes, qa, I, tid, nt);
@@ -599,8 +605,8 @@ void gm_qkv_decode(const at::Tensor& x, const std::vector<at::Tensor>& ws, const
         TORCH_CHECK(out.numel() >= (int64_t)R * total, "gm_qkv_decode: out too small");
         const int nt = nb32 >= 256 ? 256 : ((nb32 + 31) / 32) * 32;
         quant();
-        if (out.dtype() == at::kHalf) { gm_gemv_q8_kernel<__half><<<dim3(total, R), nt, nt * sizeof(float), stream>>>(a, qbp, K, nt, rb); }
-        else { gm_gemv_q8_kernel<float><<<dim3(total, R), nt, nt * sizeof(float), stream>>>(a, qbp, K, nt, rb); }
+        if (out.dtype() == at::kHalf) { gm_gemv_q8_kernel<__half><<<total, nt, nt * sizeof(float), stream>>>(a, qbp, K, nt, rb, R); }
+        else { gm_gemv_q8_kernel<float><<<total, nt, nt * sizeof(float), stream>>>(a, qbp, K, nt, rb, R); }
         TORCH_CHECK(hipPeekAtLastError() == hipSuccess, "gm_qkv_decode: launch failed");
         return;
     }
@@ -627,7 +633,7 @@ void gm_qkv_decode(const at::Tensor& x, const std::vector<at::Tensor>& ws, const
     auto ntf = [](int nsub) { return nsub >= 256 ? 256 : ((nsub + 31) / 32) * 32; };
     const int nt4 = ntf(K / 16), nt6 = ntf(K / 8);
     quant();
-    gm_gemv3_kernel<<<dim3(total, R), 64, 0, stream>>>(a, qbp, K, nt4, nt6);
+    gm_gemv3_kernel<<<total, 64, 0, stream>>>(a, qbp, K, nt4, nt6);
     TORCH_CHECK(hipPeekAtLastError() == hipSuccess, "gm_qkv_decode: launch failed");
 }
 

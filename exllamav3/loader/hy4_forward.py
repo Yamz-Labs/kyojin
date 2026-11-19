@@ -648,6 +648,8 @@ class Hy4Forward:
         rs = self.res.get(i)
         if rs is None or rs.fu not in (0, 8) or rs.fd not in (0, 2) or _gm() is None:
             return False
+        if rs.fu == 8 and x.shape[0] >= 2:       # Q3_K gate/up: gm_moe_kq_decode matches stock only at R = 1 (GGUF agent 19/11); the stock grouped kernel is 1-2 % faster for verify rows
+            return False
         return all(isinstance(q, QLinear) and q.ty == 8 for q in (L.rdown, L.rup, *L.shexp))
 
     def _ffn_gm(self, i, L, x):

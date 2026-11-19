@@ -86,7 +86,7 @@ for R in (1, 4):
     for gd in (torch.half, torch.float):
         wd = rnd((N,), I // 32, 3, g).view(N, I // 32 * 34)
         gg = (torch.randn(R, I, device=dev) * 2).to(gd); uu = (torch.randn(R, I, device=dev)).to(gd)
-        act = ((1.0 / (1.0 + torch.exp(-gg.float()))) * gg.float() * uu.float()).half()
+        act = torch.nn.functional.silu(gg.float()) * uu.float()       # fp32 product (Hy4 shared expert), quantized from fp32
         qb = torch.empty(R, I // 32 * 36, dtype=torch.uint8, device=dev); ext.fq_quant_q8_1_rows(act, qb)
         ref = torch.empty(R, N, dtype=torch.float, device=dev); ext.fq_gemv_q8_0_q8(qb, wd.view(N, I // 32, 34), ref)
         out = torch.empty(R, N, dtype=torch.float, device=dev); gm.gm_q8_swiglu_down(gg, uu, wd, out, False)
