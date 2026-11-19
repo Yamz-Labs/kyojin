@@ -258,3 +258,102 @@ def mla_banded(q_lat, q_pe, kc, qstart, scale, sinks=None, window=0, allow=None,
                                                                          num_warps=c["pwarps"], num_stages=c.get("qs", 1))
         t0 += Bq
     return o
+
+
+# ------------------------------------------------------------------------------------------------ per-query sparse gather (HY4_PF_SPARSE=1)
+# DSA layers: query t attends only the groups the indexer selected for it (gidx [T, GS] group ids, nsel [T] valid count, KP keys per group) plus its own open
+# group (tail keys lo_t..pos). One program = one query x a block of heads: the selected latent rows are gathered once and serve every head of the block.
+# Same maths as _mla_kernel with an allow mask (masked keys contribute exactly 0); the sink joins the denominator only.
+SPCFG = {"HB": 32, "BG": 16, "warps": 4, "stages": 1}
+
+
+@triton.jit
+def _mla_sparse_kernel(Q, KC, SINK, GIDX, NSEL, O, T, qstart, H, GS, scale,
+                       R: tl.constexpr, P: tl.constexpr, HB: tl.constexpr, BG: tl.constexpr, KP: tl.constexpr, TAIL: tl.constexpr,
+                       HAS_SINK: tl.constexpr):
+    DC: tl.constexpr = R // 4
+    D: tl.constexpr = R + P
+    BK: tl.constexpr = BG * KP
+    hb = tl.program_id(0)
+    t = tl.program_id(1)
+    pos = qstart + t
+    h = hb * HB + tl.arange(0, HB)
+    rowq = (h * T + t).to(tl.int64)
+    cd = tl.arange(0, DC)
+    cp = tl.arange(0, P)
+    qp = tl.load(Q + rowq[:, None] * D + R + cp[None, :])
+    if HAS_SINK:
+        m = tl.load(SINK + h).to(tl.float32) * LOG2E
+        l = tl.full((HB,), 1.0, dtype=tl.float32)
+    else:
+        m = tl.full((HB,), -1e30, dtype=tl.float32)
+        l = tl.zeros((HB,), dtype=tl.float32)
+    a0 = tl.zeros((HB, DC), dtype=tl.float32)
+    a1 = tl.zeros((HB, DC), dtype=tl.float32)
+    a2 = tl.zeros((HB, DC), dtype=tl.float32)
+    a3 = tl.zeros((HB, DC), dtype=tl.float32)
+    ns = tl.load(NSEL + t)
+    nit = (ns + BG - 1) // BG
+    if TAIL:
+        lo_t = pos - (pos % KP)
+    else:
+        lo_t = pos - ((pos + 1) % KP) + 1
+    sc = scale * LOG2E
+    jb = tl.arange(0, BK)
+    for it in range(0, nit + 1):                     # the last pass is the tail tile (own open group)
+        istail = it == nit
+        gi = it * BG + jb // KP
+        gv = (gi < ns) & (it < nit)
+        g = tl.load(GIDX + t.to(tl.int64) * GS + gi, mask=gv, other=0)
+        kg = g.to(tl.int64) * KP + (jb % KP)
+        kt = lo_t + jb
+        kidx = tl.where(istail, kt, kg)
+        kin = tl.where(istail, (kt <= pos) & (jb < KP), gv)
+        krow = tl.where(kin, kidx, 0).to(tl.int64) * D
+        kp = tl.load(KC + krow[:, None] + R + cp[None, :], mask=kin[:, None], other=0.0)
+        s = tl.dot(qp, tl.trans(kp))
+        for c in tl.static_range(4):
+            qc = tl.load(Q + rowq[:, None] * D + c * DC + cd[None, :], volatile=True)
+            kc = tl.load(KC + krow[:, None] + c * DC + cd[None, :], mask=kin[:, None], other=0.0)
+            s = tl.dot(qc, tl.trans(kc), s)
+        s = s * sc
+        s = tl.where(kin[None, :], s, -1e30)
+        mn = tl.maximum(m, tl.max(s, 1))
+        alpha = tl.exp2(m - mn)
+        p = tl.exp2(s - mn[:, None])
+        p = tl.where(kin[None, :], p, 0.0)
+        l = l * alpha + tl.sum(p, 1)
+        p16 = p.to(tl.float16)
+        v0 = tl.load(KC + krow[:, None] + 0 * DC + cd[None, :], mask=kin[:, None], other=0.0)
+        a0 = tl.dot(p16, v0, a0 * alpha[:, None])
+        v1 = tl.load(KC + krow[:, None] + 1 * DC + cd[None, :], mask=kin[:, None], other=0.0)
+        a1 = tl.dot(p16, v1, a1 * alpha[:, None])
+        v2 = tl.load(KC + krow[:, None] + 2 * DC + cd[None, :], mask=kin[:, None], other=0.0)
+        a2 = tl.dot(p16, v2, a2 * alpha[:, None])
+        v3 = tl.load(KC + krow[:, None] + 3 * DC + cd[None, :], mask=kin[:, None], other=0.0)
+        a3 = tl.dot(p16, v3, a3 * alpha[:, None])
+        m = mn
+    inv = 1.0 / tl.maximum(l, 1e-30)
+    lim = 65504.0
+    tl.store(O + rowq[:, None] * R + 0 * DC + cd[None, :], tl.minimum(tl.maximum(a0 * inv[:, None], -lim), lim).to(tl.float16))
+    tl.store(O + rowq[:, None] * R + 1 * DC + cd[None, :], tl.minimum(tl.maximum(a1 * inv[:, None], -lim), lim).to(tl.float16))
+    tl.store(O + rowq[:, None] * R + 2 * DC + cd[None, :], tl.minimum(tl.maximum(a2 * inv[:, None], -lim), lim).to(tl.float16))
+    tl.store(O + rowq[:, None] * R + 3 * DC + cd[None, :], tl.minimum(tl.maximum(a3 * inv[:, None], -lim), lim).to(tl.float16))
+
+
+def mla_sparse(R, kc, qstart, scale, sinks, sel, qcat, cfg=None):
+    """qcat fp16 [H, T, R + P] (q16 layout, saturated), kc [N, R + P] latent rows of ALL positions (N = qstart + T), sel = PfSparse (gidx, nsel, kpool, tail),
+    sinks [H] or None -> o_lat [H, T, R] fp16 (saturated). Visible keys of query t = its selected groups + its own open group."""
+    c = cfg or SPCFG
+    H, T, D = qcat.shape
+    P = D - R
+    N = kc.shape[0]
+    assert N == qstart + T and sel.gidx.shape[0] == T and H % min(c["HB"], H) == 0
+    HB = min(c["HB"], H)
+    kc16 = kc.clamp(-65504.0, 65504.0).half().contiguous()
+    qcat = qcat.contiguous()
+    o = torch.empty(H, T, R, dtype=torch.float16, device=kc.device)
+    sk = sinks.float().contiguous() if sinks is not None else qcat
+    _mla_sparse_kernel[(H // HB, T)](qcat, kc16, sk, sel.gidx, sel.nsel, o, T, qstart, H, sel.gidx.shape[1], float(scale), R=R, P=P, HB=HB, BG=c["BG"],
+                                     KP=int(sel.kpool), TAIL=int(bool(sel.tail)), HAS_SINK=sinks is not None, num_warps=c["warps"], num_stages=c["stages"])
+    return o

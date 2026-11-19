@@ -189,7 +189,10 @@ class Hy4MLA:
         with tm.t("attn proj"):
             qcat = self.q16(cur, pos, qa)
         with tm.t("MLA core + sinks"):
-            o = _pa.mla_banded(self.R, None, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow, qcat=qcat, o16=True, ht=True)      # [H, T, R] fp16
+            if allow.__class__.__name__ == "PfSparse":      # HY4_PF_SPARSE=1: per-query gather of the selected groups
+                o = _pa.mla_sparse(self.R, kcache, kcache.shape[0] - T, self.scale, self.sinks, allow, qcat)      # [H, T, R] fp16
+            else:
+                o = _pa.mla_banded(self.R, None, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow, qcat=qcat, o16=True, ht=True)      # [H, T, R] fp16
         with tm.t("attn proj"):
             with tm.t("f attend: wv_b bmm"):
                 kv = torch.bmm(o, self._w16("wv_b").transpose(1, 2))      # [H, T, vd] fp16
@@ -272,6 +275,10 @@ class Hy4MLA:
         T, H = cur.shape[0], self.H
         tm = self.tm
         qa, self._qa_pre = self._qa_pre, None
+        if allow.__class__.__name__ == "PfSparse":
+            if self._f16_ok(cur) and self.H % 32 == 0:
+                return self.attend16(cur, pos, kcache, allow, qa)
+            allow = allow.to_dense()
         if self._ck_ok(cur):
             r = self.attend_ck(cur, pos, kcache, allow, qa)
             if r is not None:

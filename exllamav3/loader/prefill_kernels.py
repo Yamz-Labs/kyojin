@@ -413,7 +413,8 @@ def _pf_indexer_forward(self, x, qr, n_keys=None):
     N = self.n if n_keys is None else n_keys
     if PF_FUSE and N >= P * k:
         with t("f ix: select + allow + bias"):
-            return ix_select(sc, start, N, self.n_top, k, self.tail, want_bias=CK_BIAS[0])
+            sp = PF_SPARSE and N >= SPARSE_MINN
+            return ix_select(sc, start, N, self.n_top, k, self.tail, want_bias=CK_BIAS[0] and not sp, sparse=sp)
     with t("f ix: topk"):
         idx = torch.topk(sc, min(self.n_top, P), dim=1).indices
     with t("f ix: allow mask"):
@@ -543,7 +544,7 @@ def ix_scores_fused(iq16, pk16, wt, start, kpool, tail):
 
 
 @triton.jit
-def _ix_select_kernel(SC, ALLOW, BIAS, P, N, NP, start, n_top, PP: tl.constexpr, KP: tl.constexpr, TAIL: tl.constexpr, WRITE_BIAS: tl.constexpr):
+def _ix_select_kernel(SC, ALLOW, BIAS, GIDX, NSEL, P, N, NP, start, n_top, PP: tl.constexpr, KP: tl.constexpr, TAIL: tl.constexpr, WRITE_BIAS: tl.constexpr, SPARSE: tl.constexpr):
     """one row per program: the n_top highest scores (ties: lowest group index first; invisible groups never selected) -> group mask expanded to keys,
     OR the row's own open group (tail); writes allow [T, N] (int8) and optionally the CK bias [T, NP] fp16 (0 / -30000)"""
     r = tl.program_id(0)
@@ -568,6 +569,11 @@ def _ix_select_kernel(SC, ALLOW, BIAS, P, N, NP, start, n_top, PP: tl.constexpr,
     need = n_top - tl.sum(gt.to(tl.int32), axis=0)
     rank = tl.cumsum(eq.to(tl.int32), axis=0)
     sel = (gt | (eq & (rank <= need))) & vis
+    if SPARSE:      # compact group ids (ascending) + count; the own open group is added by the attention kernel
+        si = sel.to(tl.int32)
+        tl.store(GIDX + r.to(tl.int64) * n_top + tl.cumsum(si, axis=0) - 1, g, mask=sel)
+        tl.store(NSEL + r, tl.sum(si, axis=0))
+        return
     selx = tl.reshape(tl.broadcast_to(sel.to(tl.int8)[:, None], [PP, KP]), [PP * KP])
     j = tl.arange(0, PP * KP)
     if TAIL:
@@ -582,14 +588,46 @@ def _ix_select_kernel(SC, ALLOW, BIAS, P, N, NP, start, n_top, PP: tl.constexpr,
         tl.store(BIAS + r.to(tl.int64) * NP + j2, tl.full([8], -30000.0, dtype=tl.float16), mask=j2 < NP)
 
 
-def ix_select(sc, start, N, n_top, kpool, tail, want_bias=True):
-    """sc [T, P] fp32 (-inf = invisible) -> allow [T, N] bool (+ its CK bias [T, ceil8(N)] fp16 attached as allow._ck_bias when want_bias)"""
+SPARSE_MINN = int(os.environ.get("HY4_PF_SPARSE_MINN", "0"))     # HY4_PF_SPARSE=1 (per-query sparse gather attention) only when the key count N >= this
+PF_SPARSE = os.environ.get("HY4_PF_SPARSE", "0") == "1"
+
+
+class PfSparse:
+    """indexer selection of a prefill call without the dense mask: gidx [T, n_top] int32 group ids (ascending), nsel [T] int32 valid counts, kpool keys per group,
+    tail = the own-open-group convention of the indexer. Visible keys of row t = its groups + the open group (mla_sparse); to_dense() gives the equivalent allow mask"""
+
+    def __init__(self, gidx, nsel, kpool, tail, start, N):
+        self.gidx, self.nsel, self.kpool, self.tail, self.start, self.N = gidx, nsel, kpool, bool(tail), start, N
+
+    def to_dense(self):
+        T, k = self.gidx.shape[0], self.kpool
+        dev = self.gidx.device
+        P = (self.N + k - 1) // k
+        ok = torch.arange(self.gidx.shape[1], device=dev)[None] < self.nsel[:, None]
+        gs = torch.zeros(T, P + 1, dtype=torch.bool, device=dev)
+        gs.scatter_(1, torch.where(ok, self.gidx.long(), P), True)
+        allow = gs[:, :P].repeat_interleave(k, dim=1)[:, :self.N].clone()
+        pos = self.start + torch.arange(T, device=dev)
+        lo = (pos - (pos % k)) if self.tail else (pos - ((pos + 1) % k) + 1)
+        j = torch.arange(self.N, device=dev)[None]
+        allow |= (j >= lo[:, None]) & (j <= pos[:, None])
+        return allow
+
+
+def ix_select(sc, start, N, n_top, kpool, tail, want_bias=True, sparse=False):
+    """sc [T, P] fp32 (-inf = invisible) -> allow [T, N] bool (+ its CK bias [T, ceil8(N)] fp16 attached as allow._ck_bias when want_bias);
+    sparse=True -> PfSparse (compact group ids, no [T, N] mask)"""
     T, P = sc.shape
     PP = 1 << max(1, int(P).bit_length())          # strictly above P: PP * kpool >= N + 1
     NP = (N + 7) // 8 * 8
+    if sparse:
+        gidx = torch.empty(T, n_top, dtype=torch.int32, device=sc.device)
+        nsel = torch.empty(T, dtype=torch.int32, device=sc.device)
+        _ix_select_kernel[(T,)](sc, sc, sc, gidx, nsel, P, N, NP, start, n_top, PP=PP, KP=kpool, TAIL=int(bool(tail)), WRITE_BIAS=False, SPARSE=True, num_warps=8)
+        return PfSparse(gidx, nsel, kpool, tail, start, N)
     allow = torch.empty(T, N, dtype=torch.bool, device=sc.device)
     bias = torch.empty(T, NP, dtype=torch.float16, device=sc.device) if want_bias else allow
-    _ix_select_kernel[(T,)](sc, allow.view(torch.int8), bias, P, N, NP, start, n_top, PP=PP, KP=kpool, TAIL=int(bool(tail)), WRITE_BIAS=bool(want_bias), num_warps=8)
+    _ix_select_kernel[(T,)](sc, allow.view(torch.int8), bias, sc, sc, P, N, NP, start, n_top, PP=PP, KP=kpool, TAIL=int(bool(tail)), WRITE_BIAS=bool(want_bias), SPARSE=False, num_warps=8)
     if want_bias:
         allow._ck_bias = bias
     return allow
