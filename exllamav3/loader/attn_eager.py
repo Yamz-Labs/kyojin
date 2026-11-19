@@ -92,7 +92,7 @@ def q(m, cur, pos):
         qr = rms(qa, m.eps) * m.q_a_norm
     qq = (m._q(qr, "wq_b") @ m.wq_b.T).view(T, H, m.hd)
     qn = qq[..., :m.nope]
-    if _KVF.ENABLED and T == 1 and qq.is_cuda:         # HY4_KV_FUSED: the pe rotation in one launch (no slice copies)
+    if _KVF.ENABLED and 1 <= T <= _KVF.MAXT and qq.is_cuda:         # HY4_KV_FUSED: the pe rotation in one launch (no slice copies)
         qp = _KVF.rope_q(qq, table(m.rope_dim, m.theta, qq.device, pos), pos, m.nope, m.rope_dim)
     else:
         qp = rope(qq[..., m.nope:], pos, m.theta)

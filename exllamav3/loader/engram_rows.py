@@ -216,6 +216,9 @@ class Hy4Engram:
 
     def apply(self, x: torch.Tensor, rows: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x [T, hc, n_embd] fp32 stream, rows [T, n_cols, head_dim] decoded table rows, valid [T, n_cols] -> x + delta (M:5292-5353)."""
+        if not self.q8_act and x.is_cuda and x.dtype == torch.float32 and os.environ.get("HY4_ENGRAM_FUSED", "0") == "1":     # two fused launches around the GEMM (engram_fused.py)
+            from . import engram_fused as _EF
+            return _EF.apply(self, x, rows, valid)
         T, eps = x.shape[0], self.eps
         r = rms(rows, eps) * self.lookup_norm * valid[:, :, None]              # delta 1
         r = r.reshape(T, -1)
