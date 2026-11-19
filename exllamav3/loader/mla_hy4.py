@@ -9,6 +9,7 @@ from .engram_rows import load_dense, _dequant_q8_0, q8_0_roundtrip, rms
 from . import ref_fused as _rf
 from . import mla_bgemv as _BG
 from . import attn_eager as _ae
+from . import dense_req as _DR
 
 PF_ATTN = os.environ.get("HY4_PREFILL_ATTN", "0") in ("1", "flash")
 PF_ATTN_FLASH = os.environ.get("HY4_PREFILL_ATTN", "0") == "flash"       # 1 = prefill rows (T > PF_ATTN_MIN): flash-style MLA kernel (prefill_attn.py)
@@ -164,7 +165,7 @@ class Hy4MLA:
         with tm.t("f q: norm"):
             qr = rms(qa, self.eps) * self.q_a_norm
         with tm.t("f q: wq_b mm"):
-            q = _pk.qdense_raw16(qr, self.wq_b.packed, tm)
+            q = _DR.raw16(self.wq_b, qr, tm)
         with tm.t("f q: rope"):
             P = self.rope_dim
             rc = pos.__dict__.setdefault("_rope_tabs", {})      # the tables depend only on (positions, theta): one fp64 evaluation per step, not per layer
@@ -188,9 +189,9 @@ class Hy4MLA:
             with tm.t("f attend: wv_b bmm"):
                 kv = torch.bmm(o, self._w16("wv_b").transpose(1, 2))      # [H, T, vd] fp16
             with tm.t("f gate: wgate mm + sigmoid"):
-                gated = _pk.gate16(kv, _pk.qdense_raw16(cur, self.wgate.packed, tm))
+                gated = _pk.gate16(kv, _DR.raw16(self.wgate, cur, tm))
             with tm.t("f gate: wo mm"):
-                out = _pk.qdense_tm(gated, self.wo.packed, tm)
+                out = _DR.full(self.wo, gated, tm)
             with tm.t("f gate: post norm"):
                 out = rms(out, self.eps) * self.post_norm if self.post_norm is not None else out
         return None, gated, out

@@ -34,6 +34,7 @@ from . import head_bf16 as _HB
 from . import attn_eager as _AE
 from . import router_gemv as _RG
 from . import mla_hy4 as _mla_mod
+from . import dense_req as _DR
 
 _HCF = None
 if os.environ.get("HY4_HC_FUSED", "0") == "1":      # fused hyper-connection sites (loader/hc_fused.py)
@@ -248,6 +249,8 @@ class QLinear:
     def __init__(self, packed, ty, spec, gemv, stats=None):
         self.packed, self.ty, self.spec, self.gemv, self.stats = packed, int(ty), spec, gemv, stats
         self.shape = (packed.shape[0], packed.shape[1] * spec[0])
+        self.gname = None
+        _DR.register(self)
 
     @property
     def T(self):
@@ -266,6 +269,8 @@ class QLinear:
             self.gemv(xf, self.packed, out)
             if self.stats is not None:
                 self.stats["dense_gemv"] = self.stats.get("dense_gemv", 0) + 1
+        elif PF_DENSE and self.ty in (13, 14) and x2.is_cuda:       # requantised dense (HY4_DENSE_REQ_ARMS): fp16 dequant + fp16 GEMM, like the Q8_0 prefill path
+            out = _DR.qdense_kq(self, x2)
         elif PF_DENSE and self.ty == 8 and x2.is_cuda:
             k_ = _pk()
             out = k_.qdense_i8(x2, self.packed) if PF_DENSE_I8 else (k_.qdense_tm(x2, self.packed, _TM_HOLD[0]) if x2.shape[0] >= k_.DENSE_TM_MIN_M else k_.qdense(x2, self.packed, k_.FMT_Q8))
@@ -304,7 +309,9 @@ def load_linear(g, name, dev, stats=None):
     spec, fn = f
     K, N = dims[0], dims[1]
     raw = np.ascontiguousarray(g._pread(off, N * (K // spec[0]) * spec[1]))
-    return QLinear(torch.from_numpy(raw).reshape(N, K // spec[0], spec[1]).to(dev), ty, spec, fn, stats)
+    q = QLinear(torch.from_numpy(raw).reshape(N, K // spec[0], spec[1]).to(dev), ty, spec, fn, stats)
+    q.gname = name
+    return q
 
 
 HEAD_CHUNK = 8192

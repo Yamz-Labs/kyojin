@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 
 from .hy4_forward import QLinear, DENSE_MAXR
+from . import dense_req as _DR
 
 # attribute names of the MLA object that read the layer input `cur` (wq_a, wkv_a, wgate); keyed by role, not by model
 INPUT_SHARED = ("wq_a", "wkv_a", "wgate")
@@ -22,6 +23,10 @@ class _Group:
         self.K, self.gemv, self.stats = lins[0].shape[1], lins[0].gemv, lins[0].stats
         self.packed = torch.cat([q.packed for q in lins], 0)
         self.ref = None                       # (x, x._version, outs)
+        self.ty, self.spec, self.shape = lins[0].ty, lins[0].spec, (sum(self.sizes), self.K)
+        self.gnames = [q.gname for q in lins] if all(q.gname for q in lins) else None
+        self.members = []
+        _DR.register(self)
 
     def run(self, x):
         r = self.ref
@@ -73,7 +78,8 @@ def group_linears(lins):
     if any((q.shape[1], q.ty, q.gemv) != k for q in lins) or len({q.packed.device for q in lins}) != 1:
         return None
     grp = _Group(lins)
-    return [GroupedView(q, grp, i, grp.packed[o:o + n]) for i, (q, o, n) in enumerate(zip(lins, grp.offs, grp.sizes))]
+    grp.members = [GroupedView(q, grp, i, grp.packed[o:o + n]) for i, (q, o, n) in enumerate(zip(lins, grp.offs, grp.sizes))]
+    return grp.members
 
 
 def install(mla, names=INPUT_SHARED):
