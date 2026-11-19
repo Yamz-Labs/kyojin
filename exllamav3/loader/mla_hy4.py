@@ -196,11 +196,78 @@ class Hy4MLA:
                 out = rms(out, self.eps) * self.post_norm if self.post_norm is not None else out
         return None, gated, out
 
+    def _ck_ok(self, cur):
+        """un-absorbed CK path (HY4_PF_CK=1): prefill rows >= 1024, fp16 chain, hd == vd == 256 (nope + rope), R == 512, libckmla loadable"""
+        if os.environ.get("HY4_PF_CK", "0") != "1" or not self._f16_ok(cur) or cur.shape[0] < int(os.environ.get("HY4_PF_CK_MINT", "1024")):
+            return False
+        from . import ck_mla
+        return self.hd == 256 and self.vd == 256 and self.R == 512 and self.rope_dim == 64 and ck_mla.available()
+
+    def _kvw(self):
+        w = self.__dict__.get("_kvw_c")
+        if w is None:
+            from . import prefill_unabs as _pu
+            w = self._kvw_c = _pu.kv_weight(self._w16("wk_b"), self._w16("wv_b"))
+        return w
+
+    def attend_ck(self, cur, pos, kcache, allow, qa):
+        """prefill attention in the un-absorbed form: K / V decompressed from the latent cache by one GEMM per call, CK fmha (hd 256 / 256) with the
+        sink, the sliding window and the indexer mask (fp16 elementwise bias) inside; None when CK declines (caller keeps attend16)"""
+        from . import prefill_kernels as _pk, prefill_unabs as _pu, ck_mla
+        T, H, R, P = cur.shape[0], self.H, self.R, self.rope_dim
+        tm = self.tm
+        N = kcache.shape[0]
+        with tm.t("attn proj"):
+            with tm.t("f q: wq_a mm"):
+                if qa is None:
+                    qa = cur @ self.wq_a.T
+            with tm.t("f q: norm"):
+                qr = rms(qa, self.eps) * self.q_a_norm
+            with tm.t("f q: wq_b mm"):
+                q = _pk.qdense_raw16(qr, self.wq_b.packed, tm)
+            with tm.t("f q: rope"):
+                rc = pos.__dict__.setdefault("_rope_tabs", {})
+                if self.theta not in rc:
+                    th = pos.double()[:, None] * (self.theta ** (-2.0 * torch.arange(P // 2, dtype=torch.float64, device=pos.device) / P))[None, :]
+                    rc[self.theta] = (th.cos().float().contiguous(), th.sin().float().contiguous())
+                _pu.qrope_inplace(q, rc[self.theta][0], rc[self.theta][1], H, self.hd, self.hd - P, P)
+            with tm.t("f ck: kv decompress"):
+                klo = max(0, N - T - self.window + 1) if self.window else 0
+                kc = kcache[klo:]
+                lat16 = kc[:, :R].clamp(-65504.0, 65504.0).half().contiguous()
+                pe16 = kc[:, R:].clamp(-65504.0, 65504.0).half().contiguous()
+                kk, vv = _pu.kv_decompress(lat16, pe16, self._kvw(), H)
+            bias = None
+            if allow is not None:
+                with tm.t("f ck: allow bias"):
+                    Nk = N - klo
+                    bias = torch.empty(T, (Nk + 7) // 8 * 8, dtype=torch.float16, device=cur.device)
+                    bias[:, :Nk] = torch.where(allow[:, klo:], 0.0, -30000.0).half()
+        with tm.t("MLA core + sinks"):
+            o = ck_mla.fmha(q.view(T, H, self.hd), kk, vv, self.scale, self.sinks, bias, self.window)
+        if o is None:
+            return None
+        with tm.t("attn proj"):
+            with tm.t("f gate: wgate mm + sigmoid"):
+                g = _pk.qdense_raw16(cur, self.wgate.packed, tm)
+                gated = _pk.gate16t(o.view(T, H * self.vd), g)
+            with tm.t("f gate: wo mm"):
+                out = _pk.qdense_tm(gated, self.wo.packed, tm)
+            with tm.t("f gate: post norm"):
+                if self.post_norm is not None:
+                    from . import hc_fused as _hf
+                    out = _hf.rmsw(out, self.post_norm, self.eps) if _hf.ENABLED else rms(out, self.eps) * self.post_norm
+        return None, gated, out
+
     def attend(self, cur, pos, kcache, kpos, allow=None):
         """cur [T, n_embd] at positions pos; kcache [N, R+rope] at kpos (includes the T new rows). -> (kqv, gated, out)"""
         T, H = cur.shape[0], self.H
         tm = self.tm
         qa, self._qa_pre = self._qa_pre, None
+        if self._ck_ok(cur):
+            r = self.attend_ck(cur, pos, kcache, allow, qa)
+            if r is not None:
+                return r
         if self._f16_ok(cur):
             return self.attend16(cur, pos, kcache, allow, qa)
         with tm.t("attn proj"):
