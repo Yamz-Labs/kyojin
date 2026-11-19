@@ -116,12 +116,18 @@ if "speed" in ARMS:
         st = e.generate(ids, n, lambda t: out.extend(t) or False, speculative=spec)
         return out, st["decode_tokens"] / st["decode_s"], st
 
-    order = [("q8", "gemv"), ("q6_k", "gemv"), ("q6_k", "mmvq"), ("q5_k", "gemv"), ("q5_k", "mmvq"), ("q8", "gemv")]
-    for mode, kern in order:
+    hb = DR.head_arms(e.MT, ["q6_k", "q5_k"]) if e.MT.head_q8 is not None else None
+    print("HEAD_BYTES", hb, flush=True)
+    order = [("q8", "gemv", "q8"), ("q6_k", "gemv", "q8"), ("q6_k", "mmvq", "q8"), ("q5_k", "gemv", "q8"), ("q5_k", "mmvq", "q8"),
+             ("q8", "gemv", "q6_k"), ("q8", "gemv", "q5_k"), ("q8", "gemv", "q8")] if hb else [("q8", "gemv", "q8")]
+    for mode, kern, head in order:
         setmode(mode, kern)
+        if hb:
+            DR.set_head(e.MT, e.MG, head)
         gen(False, 20)
         _, tps, st = gen(False, NT)
         gen(True, 30)
         _, tps2, st2 = gen(True, 150)
-        print("SRES", json.dumps(dict(mode=mode, kern=kern, plain_tok_s=round(tps, 2), spec_tok_s=round(tps2, 2), tau=round(st2["tau"], 2), rounds=st2["rounds"])), flush=True)
+        print("SRES", json.dumps(dict(mode=mode, kern=kern, head=head, plain_tok_s=round(tps, 2), spec_tok_s=round(tps2, 2), tau=round(st2["tau"], 2), rounds=st2["rounds"],
+                                round_ms=[round(x, 1) for x in st2.get("round_ms", [])])), flush=True)
 print("REQ_DONE", flush=True)

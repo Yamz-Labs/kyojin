@@ -22,6 +22,36 @@ _OWNERS: list = []
 _EXT = []
 
 
+GGML_LIB = os.environ.get("GGML_LIB", "/path/to/libggml-base.so")
+_KIND_TY = {"q6_k": 14, "q5_k": 13}        # ggml type ids
+_LIB = []
+
+
+def quantize_rows(w, kind, nth=12, rows_per=64):
+    """fp32 numpy [N, K] (K % 256 == 0) -> uint8 [N, K / 256 * bb]: ggml_quantize_chunk (libggml-base, no imatrix) = the bytes of llama-quantize --allow-requantize"""
+    import ctypes
+    from concurrent.futures import ThreadPoolExecutor
+    if not _LIB:
+        lib = ctypes.CDLL(GGML_LIB)
+        lib.ggml_quantize_chunk.restype = ctypes.c_size_t
+        lib.ggml_quantize_chunk.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+        _LIB.append(lib)
+    lib = _LIB[0]
+    N, K = w.shape
+    rb = K // 256 * KQ[kind]["bb"]
+    dst = np.empty((N, rb), dtype=np.uint8)
+    w = np.ascontiguousarray(w, dtype=np.float32)
+
+    def run(r0):
+        r1 = min(N, r0 + rows_per)
+        n = lib.ggml_quantize_chunk(_KIND_TY[kind], ctypes.c_void_p(w[r0:].ctypes.data), ctypes.c_void_p(dst[r0:].ctypes.data), 0, r1 - r0, K, None)
+        assert n == (r1 - r0) * rb, (n, r1 - r0, rb)
+
+    with ThreadPoolExecutor(nth) as pool:
+        list(pool.map(run, range(0, N, rows_per)))
+    return dst
+
+
 def register(owner):
     if ENABLED:
         _OWNERS.append(weakref.ref(owner))
@@ -179,3 +209,25 @@ def set_mode(mode, kern="gemv"):
 def resident_bytes(mode):
     """dense weight bytes the decode step reads for the current mode (prepared owners only)"""
     return sum(o.packed.numel() for o in _owners() if "alt" in o.__dict__)
+
+
+def head_arms(mt, kinds):
+    """MTP draft head (HY4_MTP_HEAD=q8: a Q8_0 copy of the trunk's bf16 vocab head): add K-quant copies quantised from the bf16 original. Returns bytes per mode."""
+    from .hy4_forward import QLinear
+    W = mt.fw.out_w
+    V, D = W.shape
+    mt.head_q8_orig, mt.head_alt = mt.head_q8, {}
+    for k in kinds:
+        arr = np.concatenate([quantize_rows(W[a:a + 8192].float().cpu().numpy(), k) for a in range(0, V, 8192)]).reshape(V, D // 256, KQ[k]["bb"])
+        mt.head_alt[k] = QLinear(torch.from_numpy(arr).to(W.device), _KIND_TY[k], (256, KQ[k]["bb"], "fq_gemv_" + k, _dq_fn(k)), _gemv(k, "gemv"), None)
+    return {"q8": mt.head_q8_orig.packed.numel(), **{k: v.packed.numel() for k, v in mt.head_alt.items()}}
+
+
+def set_head(mt, mg, mode):
+    """draft head bytes = `mode` ("q8" | "q6_k" | "q5_k"); the draft chain graphs are dropped (they bake the head kernel and pointer)"""
+    mt.head_q8 = mt.head_q8_orig if mode == "q8" else mt.head_alt[mode]
+    mg.graphs.clear()
+    mg.pool = torch.cuda.graph_pool_handle()
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
