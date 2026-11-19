@@ -60,7 +60,11 @@ class Hy4Engine:
             tu.tuning_enable(False)
             tu.enable(True)
             self._tune = tu
-            progress(f"TunableOp results {tf}")
+            try:
+                ok = tu.read_file()      # load now: a validator mismatch (torch / rocBLAS / hipBLASLt version) would otherwise drop the file silently
+                progress(f"TunableOp results {tf}: read={ok} entries={len(tu.get_results())}")
+            except Exception as e:      # noqa: BLE001
+                progress(f"TunableOp results {tf}: {type(e).__name__} {e}")
         elif tf:
             progress(f"TunableOp file missing: {tf}")
         from exllamav3.loader.gguf_collection import GGUFCollection
