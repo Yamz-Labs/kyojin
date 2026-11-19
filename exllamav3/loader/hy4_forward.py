@@ -734,18 +734,21 @@ class Hy4Forward:
         with self.tm.t("head"):
             return self._head(x, all_pos)
 
-    def _head(self, x, all_pos=False):
+    def head_state(self, xl):
+        """xl [R, hc, n_embd] -> [R, n_embd]: the trunk state the output head reads (hyper-head mix + output norm), no vocabulary GEMM"""
         fn, base, scale = self.hh
-        xl = x if all_pos else x[-1:]
         R = xl.shape[0]
         if _HCF is not None and self.hook is None and _HCF.ok(xl, self.hh, self.hc):
-            h = _HCF.site(xl, self.hh, self.out_norm, self.eps, self.hc_eps, self.magnitude)[1]
-        else:
-            mix = rms(xl.reshape(R, -1), self.eps) @ fn.T
-            pre = torch.sigmoid(mix * scale[0] + base) + self.hc_eps
-            col = (xl * pre[:, :, None]).sum(1)
-            self._hk("hc_head", -1, col)
-            h = rms(col, self.eps) * self.out_norm
+            return _HCF.site(xl, self.hh, self.out_norm, self.eps, self.hc_eps, self.magnitude)[1]
+        mix = rms(xl.reshape(R, -1), self.eps) @ fn.T
+        pre = torch.sigmoid(mix * scale[0] + base) + self.hc_eps
+        col = (xl * pre[:, :, None]).sum(1)
+        self._hk("hc_head", -1, col)
+        return rms(col, self.eps) * self.out_norm
+
+    def _head(self, x, all_pos=False):
+        xl = x if all_pos else x[-1:]
+        h = self.head_state(xl)
         self._h = h           # the trunk state the output head reads (MTP draft input)
         if self.head_cpu:
             h = h.cpu()
