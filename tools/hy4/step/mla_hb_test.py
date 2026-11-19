@@ -2,8 +2,9 @@
 import os, sys, time, statistics
 import torch
 tree = os.getcwd()
-sys.path.insert(0, tree)
-from exllamav3.loader import ref_fused as rf
+import importlib.util
+spec = importlib.util.spec_from_file_location("ref_fused", os.path.join(tree, "exllamav3", "loader", "ref_fused.py"))
+rf = importlib.util.module_from_spec(spec); spec.loader.exec_module(rf)
 dev = "cuda"
 R, P = 512, 64
 torch.manual_seed(0)
