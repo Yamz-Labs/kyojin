@@ -9,13 +9,15 @@ The hash (integer, token ids only) stays on the CPU: it never touches activation
 Generic: config comes from the GGUF header keys, the row form from F8Rows.layout; nothing keyed on a model name.
 """
 from __future__ import annotations
+import os
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
 from .engram_rows import Hy4Engram, F8Rows, load_dense, rms, E4M3, E8M0, QB
 
-_POOL = ThreadPoolExecutor(max_workers=16)
+_IO_THREADS = int(os.environ.get("HY4_ENGRAM_IO_THREADS", "96"))
+_POOL = ThreadPoolExecutor(max_workers=_IO_THREADS)
 _TABS: dict = {}
 
 
@@ -34,15 +36,31 @@ def fetch_rows_host(table: F8Rows, ids):
     buf = torch.empty(len(uniq), rb, dtype=torch.uint8).pin_memory() if torch.cuda.is_available() else torch.empty(len(uniq), rb, dtype=torch.uint8)
     view = buf.numpy()
 
-    def one(a):
-        j, r = a
-        view[j] = table.raw_row(int(r))
+    if len(uniq) and (int(uniq[0]) < 0 or int(uniq[-1]) >= table.rows):
+        raise IndexError(f"{table.name}: row outside 0..{table.rows - 1}")
     if len(uniq) > 8:
-        list(_POOL.map(one, enumerate(uniq)))
+        # one task per slice of the sorted row list (a task per row cost more in future / GIL hand-offs than the read itself); preadv straight into the pinned buffer
+        nw = _IO_THREADS
+        step = (len(uniq) + nw - 1) // nw
+        list(_POOL.map(lambda lo: _read_rows(table, uniq, view, lo, min(len(uniq), lo + step)), range(0, len(uniq), step)))
     else:
-        for a in enumerate(uniq):
-            one(a)
+        _read_rows(table, uniq, view, 0, len(uniq))
     return ids.shape, uniq, inv, buf
+
+
+def _read_rows(table: F8Rows, uniq, view, lo: int, hi: int):
+    g, rb, off0 = table.g, table.row_bytes, table.off
+    for j in range(lo, hi):
+        o = off0 + int(uniq[j]) * rb
+        fi, o = o >> 48, o & ((1 << 48) - 1)
+        fd, pos = g.fds[fi], g.bases[fi] + o
+        mv = memoryview(view[j])
+        got = 0
+        while got < rb:
+            n = os.preadv(fd, [mv[got:]], pos + got)
+            if n <= 0:
+                raise IOError(f"short read at row {int(uniq[j])}")
+            got += n
 
 
 def rows_to_dev(table: F8Rows, host, dev) -> torch.Tensor:
