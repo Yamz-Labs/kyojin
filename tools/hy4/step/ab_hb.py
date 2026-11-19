@@ -8,11 +8,11 @@ import serve
 serve.apply_env(16384)
 import torch
 from engine import Hy4Engine
-from exllamav3.loader import ref_fused as rf
 GGUF = "/path/to/models/hy4-flash-gguf/Hy4-flash-Q3_K-00001-of-00002.gguf"
 e = Hy4Engine(tree, GGUF, ctx=16384, k=3)
 e.load(print)
 GR = e.GR
+rf = sys.modules[type(GR.fw).__module__]._rf
 wiki = json.load(open("/path/to/wiki_ids.json"))
 pc = time.perf_counter
 sync = torch.cuda.synchronize

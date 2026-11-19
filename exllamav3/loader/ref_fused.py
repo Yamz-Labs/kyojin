@@ -14,8 +14,9 @@ import torch
 
 ENABLED = os.environ.get("HY4_REF_FUSED", "0") == "1"
 HB = os.environ.get("HY4_MLA_HB", "0") == "1"      # head-batched fp16 tl.dot decode attention (opt-in)
-HB_BN = int(os.environ.get("HY4_MLA_HB_BN", "32"))
+HB_BN = int(os.environ.get("HY4_MLA_HB_BN", "16"))
 HB_NW = int(os.environ.get("HY4_MLA_HB_NW", "4"))
+HB_SPLIT = int(os.environ.get("HY4_MLA_HB_SPLIT", "0"))      # key splits per (row, head group): 0 = auto (fill the GPU: ~96 programs), 1 = off, n = fixed
 MAX_T = 16                  # rows per call handled by the attention kernel (decode / short verify); more = prefill -> torch GEMMs
 CLAMP_MIN = 6.103515625e-5  # the old router's `sum.clamp(min=...)`
 
@@ -211,6 +212,82 @@ if triton is not None:
         tl.store(O + t * s_o_t + offh[:, None] * s_o_h + offr[None, :], acc / l[:, None])
 
 
+    @triton.jit
+    def _mla_hb_split_kernel(QL, QP, CK, KP, QPOS, SINK, WA, WM, WL, N, scale, window,
+                             s_ql_t, s_ql_h, s_qp_t, s_qp_h, s_ck, s_kp,
+                             R: tl.constexpr, P: tl.constexpr, BH: tl.constexpr, BN: tl.constexpr, HAS_WIN: tl.constexpr, RING: tl.constexpr, S: tl.constexpr):
+        """_mla_hb_kernel over one key split: grid (T, H / BH, S). Split s walks its share of the visible key blocks; split 0 carries the sink (m = sink, l = 1), the others start empty
+        (m = -1e30 finite, l = 0). Writes the unnormalised partial (acc [BH, R], m, l) for _mla_hb_combine."""
+        t = tl.program_id(0)
+        g = tl.program_id(1)
+        sp = tl.program_id(2)
+        NG = tl.num_programs(1)
+        h0 = g * BH
+        offh = h0 + tl.arange(0, BH)
+        offr = tl.arange(0, R)
+        offp = tl.arange(0, P)
+        q = tl.load(QL + t * s_ql_t + offh[:, None] * s_ql_h + offr[None, :]).to(tl.float16)
+        qp = tl.load(QP + t * s_qp_t + offh[:, None] * s_qp_h + offp[None, :]).to(tl.float16)
+        qpos = tl.load(QPOS + t)
+        first = (sp == 0)
+        m = tl.where(first, tl.load(SINK + offh).to(tl.float32), -1e30)
+        l = tl.where(first, 1.0, 0.0) + tl.zeros([BH], dtype=tl.float32)
+        acc = tl.zeros([BH, R], dtype=tl.float32)
+        lo = 0
+        hi = tl.minimum(N, qpos + 1)
+        if HAS_WIN:
+            lo = tl.maximum(0, qpos - window + 1) // BN * BN
+        nblk = tl.maximum(0, (hi - lo + BN - 1) // BN)
+        per = (nblk + S - 1) // S
+        b0 = tl.minimum(nblk, sp * per)
+        b1 = tl.minimum(nblk, b0 + per)
+        for n0 in range(lo + b0 * BN, lo + b1 * BN, BN):
+            offn = n0 + tl.arange(0, BN)
+            inb = offn < N
+            vis = inb & (offn <= qpos)
+            if HAS_WIN:
+                vis = vis & ((qpos - offn) < window)
+            if RING > 0:
+                offs = offn % RING
+            else:
+                offs = offn
+            ck = tl.load(CK + offs[:, None] * s_ck + offr[None, :], mask=inb[:, None], other=0.0).to(tl.float16)
+            kp = tl.load(KP + offs[:, None] * s_kp + offp[None, :], mask=inb[:, None], other=0.0).to(tl.float16)
+            s = (tl.dot(q, tl.trans(ck)) + tl.dot(qp, tl.trans(kp))) * scale
+            s = tl.where(vis[None, :], s, float("-inf"))
+            mn = tl.maximum(m, tl.max(s, axis=1))
+            alpha = tl.exp(m - mn)
+            pr = tl.exp(s - mn[:, None])
+            l = l * alpha + tl.sum(pr, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(pr.to(tl.float16), ck)
+            m = mn
+        wi = (t * NG + g) * S + sp
+        tl.store(WA + wi * (BH * R) + tl.arange(0, BH)[:, None] * R + offr[None, :], acc)
+        tl.store(WM + wi * BH + tl.arange(0, BH), m)
+        tl.store(WL + wi * BH + tl.arange(0, BH), l)
+
+    @triton.jit
+    def _mla_hb_combine(WA, WM, WL, O, s_o_t, s_o_h, R: tl.constexpr, BH: tl.constexpr, S: tl.constexpr):
+        """grid (T, H / BH): merge the S key-split partials (flash-decoding combine): O = sum_s e^(m_s - M) acc_s / sum_s e^(m_s - M) l_s"""
+        t = tl.program_id(0)
+        g = tl.program_id(1)
+        NG = tl.num_programs(1)
+        offb = tl.arange(0, BH)
+        offr = tl.arange(0, R)
+        base = (t * NG + g) * S
+        M = tl.load(WM + base * BH + offb)
+        for sp in range(1, S):
+            M = tl.maximum(M, tl.load(WM + (base + sp) * BH + offb))
+        L = tl.zeros([BH], dtype=tl.float32)
+        A = tl.zeros([BH, R], dtype=tl.float32)
+        for sp in range(0, S):
+            w = tl.exp(tl.load(WM + (base + sp) * BH + offb) - M)
+            L += w * tl.load(WL + (base + sp) * BH + offb)
+            A += w[:, None] * tl.load(WA + (base + sp) * (BH * R) + offb[:, None] * R + offr[None, :])
+        h = g * BH + offb
+        tl.store(O + t * s_o_t + h[:, None] * s_o_h + offr[None, :], A / L[:, None])
+
+
 def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, window=0, allow=None, kpos_is_arange=False, ring=0):
     """drop-in for mla_sink_attend: q_lat [T,H,R], q_pe [T,H,P], ckv [N,R], k_pe [N,P] (row strides free), qpos [T], kpos [N],
     sinks [H] or None -> o_lat [T,H,R] fp32. kpos_is_arange (default False = generic): the caller's kpos is torch.arange(N)
@@ -227,6 +304,17 @@ def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, windo
         return mla_sink_attend_ref(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks, window, allow)
     if HB and allow is None and kpos_is_arange and R == triton.next_power_of_2(R) and P == triton.next_power_of_2(P) and H % 16 == 0 and not (ring and not window):
         out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
+        ng = H // 16
+        S = HB_SPLIT if HB_SPLIT > 0 else min(16, max(1, -(-96 // (T * ng))))
+        if S > 1:
+            wa = torch.empty(T * ng * S * 16 * R, dtype=torch.float32, device=q_lat.device)
+            wm = torch.empty(T * ng * S * 16, dtype=torch.float32, device=q_lat.device)
+            wl = torch.empty(T * ng * S * 16, dtype=torch.float32, device=q_lat.device)
+            _mla_hb_split_kernel[(T, ng, S)](q_lat, q_pe, ckv, k_pe, qpos, sinks.float().contiguous(), wa, wm, wl, (1 << 30) if ring else N, float(scale), int(window),
+                                             q_lat.stride(0), q_lat.stride(1), q_pe.stride(0), q_pe.stride(1), ckv.stride(0), k_pe.stride(0),
+                                             R=R, P=P, BH=16, BN=HB_BN, HAS_WIN=bool(window), RING=int(ring), S=S, num_warps=HB_NW)
+            _mla_hb_combine[(T, ng)](wa, wm, wl, out, out.stride(0), out.stride(1), R=R, BH=16, S=S, num_warps=4)
+            return out
         _mla_hb_kernel[(T, H // 16)](q_lat, q_pe, ckv, k_pe, qpos, sinks.float().contiguous(), out, (1 << 30) if ring else N, float(scale), int(window),
                                      q_lat.stride(0), q_lat.stride(1), q_pe.stride(0), q_pe.stride(1), ckv.stride(0), k_pe.stride(0), out.stride(0), out.stride(1),
                                      R=R, P=P, BH=16, BN=HB_BN, HAS_WIN=bool(window), RING=int(ring), num_warps=HB_NW)
