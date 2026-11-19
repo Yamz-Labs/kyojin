@@ -44,8 +44,18 @@ class EngramStager:
         self.fd, self.o0, self.rb, self.nrows = tab.g.fds[fi], tab.g.bases[fi] + (tab.off & ((1 << 48) - 1)), tab.row_bytes, tab.rows
         self.views = {}                                       # (e, t, c) -> memoryview of the staging row
         self.pool = pool
-        self.workers = workers if workers is not None else int(os.environ.get("HY4_STAGE_WORKERS", "4"))
-        self.inline_max = int(os.environ.get("HY4_STAGE_INLINE", "0"))     # <= this many reads: no pool at all
+        self.workers = workers if workers is not None else int(os.environ.get("HY4_STAGE_WORKERS", "64"))
+        # cached rows are copied inline with preadv(RWF_NOWAIT) (0.1 ms for a whole step, no thread hand-off); the rows that are NOT in the page cache (the table is 65 GB:
+        # most rows of new text) go to the thread pool on a private fd with readahead off (4 KB per miss instead of ~13 KB)
+        self.nowait = hasattr(os, "RWF_NOWAIT") and os.environ.get("HY4_STAGE_NOWAIT", "1") == "1"
+        self.force_miss = False                                # tests: treat every row as a page-cache miss
+        self.fd_c = os.open(f"/proc/self/fd/{self.fd}", os.O_RDONLY)
+        self.fd_r = os.open(f"/proc/self/fd/{self.fd}", os.O_RDONLY)
+        try:
+            os.posix_fadvise(self.fd_r, 0, 0, os.POSIX_FADV_RANDOM)
+        except OSError:
+            pass
+        self.stats = {"rows": 0, "miss": 0}
 
     # -- hash ----------------------------------------------------------------------------------------------------------------------------
     @staticmethod
@@ -88,27 +98,55 @@ class EngramStager:
         return v
 
     def _read(self, items):
-        fd, o0, rb = self.fd, self.o0, self.rb
+        fd, o0, rb = self.fd_r, self.o0, self.rb
         for e, t, c, r in items:
             mv = self._view(e, t, c)
-            if os.preadv(fd, [mv], o0 + r * rb) != rb:
-                raise IOError(f"{self.table.name}: short read of row {r}")
+            got = 0
+            while got < rb:
+                n = os.preadv(fd, [mv[got:]], o0 + r * rb + got)
+                if n <= 0:
+                    raise IOError(f"{self.table.name}: short read of row {r}")
+                got += n
 
-    def submit(self, ids, valid, t0: int):
-        """ids int64 [nE, T, nc] (from hash), valid [T]: fill the staging rows t0 .. t0 + T - 1 -> futures to wait on (the calling thread's own share is already done)"""
+    def _read_cached(self, items):
+        """items whose bytes are all in the page cache are copied now; returns the others"""
+        fd, o0, rb = self.fd_c, self.o0, self.rb
+        miss = []
+        for it in items:
+            e, t, c, r = it
+            try:
+                n = os.preadv(fd, [self._view(e, t, c)], o0 + r * rb, os.RWF_NOWAIT)
+            except BlockingIOError:
+                n = 0
+            if n != rb:
+                miss.append(it)
+        return miss
+
+    def submit(self, ids, valid, t0: int, es=None):
+        """ids int64 [nE, T, nc] (from hash), valid [T]: fill the staging rows t0 .. t0 + T - 1 of the layers `es` (default all) -> futures to wait on (the calling
+        thread's own share is already done)"""
         T = ids.shape[1]
-        if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= self.nrows):
+        es = list(range(self.nE)) if es is None else list(es)
+        sel = ids[es]
+        if sel.size and (int(sel.min()) < 0 or int(sel.max()) >= self.nrows):
             raise IndexError(f"{self.table.name}: row id outside 0..{self.nrows - 1}")
         if t0 + T > self.TM:
             raise IndexError(f"rows {t0}..{t0 + T - 1} past the staging buffer ({self.TM})")
-        self.vnp[:, t0:t0 + T, :] = valid[None, :, None]
-        items = [(e, t0 + t, c, int(ids[e, t, c])) for e in range(self.nE) for t in range(T) for c in range(self.nc)]
-        n = len(items)
-        if self.pool is None or self.workers <= 1 or n <= self.inline_max:
+        for e in es:
+            self.vnp[e, t0:t0 + T, :] = valid[:, None]
+        idl = ids.tolist()
+        items = [(e, t0 + t, c, idl[e][t][c]) for e in es for t in range(T) for c in range(self.nc)]
+        self.stats["rows"] += len(items)
+        if self.nowait and not self.force_miss:
+            items = self._read_cached(items)
+        self.stats["miss"] += len(items)
+        if not items:
+            return []
+        if self.pool is None or self.workers <= 1:
             self._read(items)
             return []
-        per = -(-n // self.workers)
-        chunks = [items[a:a + per] for a in range(0, n, per)]
+        per = -(-len(items) // self.workers)
+        chunks = [items[a:a + per] for a in range(0, len(items), per)]
         futs = [self.pool.submit(self._read, ch) for ch in chunks[1:]]
         self._read(chunks[0])
         return futs

@@ -14,6 +14,7 @@ Generic: shapes and config come from the Hy4Forward object; nothing is keyed on 
 from __future__ import annotations
 import math
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -30,6 +31,7 @@ MASK64 = (1 << 64) - 1
 PERT = None                      # [cap, D] fp32 noise table (measurement arms only)
 _IO_W = int(os.environ.get("HY4_GRAPH_IO", "64"))
 _POOL = ThreadPoolExecutor(max_workers=_IO_W)
+SPLIT = os.environ.get("HY4_GRAPH_SPLIT", "1") == "1"      # 3 graphs per step, cut before the first two Engram layers: the rows of the later layers are staged while the GPU runs the earlier ones
 STAGE_VEC = os.environ.get("HY4_STAGE_VEC", "1") == "1"   # vectorised Engram hash + a few big read chunks (engram_stage); 0 = the per-row python path
 
 
@@ -206,6 +208,8 @@ class GraphDecoder:
         self.hin = torch.zeros(2, TM, dtype=torch.long).pin_memory()
         self.hnp = self.hin.numpy()
         self.stager = None
+        self.split = SPLIT
+        self.t_launch = 0.0
         self._pre = None
         self.stats = {"captures": 0, "replays": 0, "capture_s": 0.0}
         self.ev = torch.cuda.Event()
@@ -274,20 +278,50 @@ class GraphDecoder:
                 ix.vgb.zero_()
 
     # -- the step body (eager warm-up and capture run exactly this)
-    def body(self):
+    def bounds(self):
+        """layer ranges of the graph segments. Engram rows are applied at the START of an Engram layer, so the cuts sit before the first two Engram layers:
+        [embedding + layers before ple[0]) | [ple[0], ple[1]) | [ple[1], end + head). The rows of ple[0] are staged while segment 0 runs, those of the later
+        layers while segment 1 runs (the host never holds the GPU back for them). One segment when split is off or the model has < 2 Engram layers."""
+        fw = self.fw
+        ple = sorted(fw.ple)
+        if self.split and self.stager is not None and len(ple) >= 2 and 0 < ple[0] < ple[1]:
+            return [(0, ple[0]), (ple[0], ple[1]), (ple[1], fw.n_layers)]
+        return [(0, fw.n_layers)]
+
+    def groups(self, bnds):
+        """per segment: the Engram module range [a, b) whose rows must be on the device before the segment starts (None = none)"""
+        ple = sorted(self.fw.ple)
+        out = []
+        for lo, hi in bnds:
+            es = [e for e, L in enumerate(ple) if lo <= L < hi]
+            out.append((es[0], es[-1] + 1) if es else None)
+        return out
+
+    def body_seg(self, si, x, bnds):
         fw, gs = self.fw, self.gs
-        e = _ns.gather_dequant_q8_0(self.st.table, gs.tok)
-        if PERT is not None:                      # noise-ensemble null arm: 1e-6 fixed-seed perturbation of the embedding output (quality gate, never in production)
-            e = e + PERT[gs.pos]
-        x = e[:, None, :].expand(-1, fw.hc, -1).contiguous()
-        for i in range(fw.n_layers):
+        lo, hi = bnds[si]
+        if si == 0:
+            e = _ns.gather_dequant_q8_0(self.st.table, gs.tok)
+            if PERT is not None:                      # noise-ensemble null arm: 1e-6 fixed-seed perturbation of the embedding output (quality gate, never in production)
+                e = e + PERT[gs.pos]
+            x = e[:, None, :].expand(-1, fw.hc, -1).contiguous()
+        for i in range(lo, hi):
             x = fw.layer(i, x, gs.pos, None, 0)
+        if si < len(bnds) - 1:
+            return x
         fw._ns_dev = True
         try:
             lg = fw._head(x, gs.T > 1)              # T > 1: logits of every row [T, V]
         finally:
             fw._ns_dev = False
         return lg, torch.argmax(lg, -1), x, fw._h
+
+    def body(self, bnds=None):
+        bnds = bnds or self.bounds()
+        x = None
+        for si in range(len(bnds)):
+            x = self.body_seg(si, x, bnds)
+        return x
 
     def bucket(self, start, T=1):
         """context bucket Nb of a step of T rows at positions start .. start + T - 1 (rows past the last position are masked inside the graph)"""
@@ -312,7 +346,7 @@ class GraphDecoder:
             assert 1 <= T <= TM
             for Nb in nbs:
                 assert Nb % BUCKET == 0 and Nb <= self.cap
-                if (Nb, T) in self.graphs:
+                if (Nb, T, len(self.bounds())) in self.graphs:
                     continue
                 t = time.perf_counter()
                 self._graph(Nb, T)
@@ -322,7 +356,8 @@ class GraphDecoder:
         return out
 
     def _graph(self, Nb, T=1):
-        g = self.graphs.get((Nb, T))
+        key = (Nb, T, len(self.bounds()))
+        g = self.graphs.get(key)
         if g is not None:
             return g
         import time
@@ -330,20 +365,24 @@ class GraphDecoder:
         fw, gs = self.fw, self.gs
         gs.Nb, gs.T = Nb, T
         fw._gs = gs
+        bnds = self.bounds()
         try:
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
                 for _ in range(2):
-                    self.body()
+                    self.body(bnds)
             torch.cuda.current_stream().wait_stream(s)
             torch.cuda.synchronize()
-            cg = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(cg, pool=self.pool):
-                out = self.body()
+            cgs, x = [], None
+            for si in range(len(bnds)):
+                cg = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cg, pool=self.pool):
+                    x = self.body_seg(si, x, bnds)
+                cgs.append(cg)
         finally:
             fw._gs = None
-        g = self.graphs[(Nb, T)] = (cg, out)
+        g = self.graphs[key] = (cgs, x)
         self.stats["captures"] += 1
         self.stats["capture_s"] += time.perf_counter() - t_cap
         return g
@@ -400,8 +439,8 @@ class GraphDecoder:
             futs = self._submit(self._jobs(start, 0, 1, fw.tokens + [int(tok)]))
         self._pre = (start, int(tok), futs)
 
-    def stage(self, start, T=1):
-        """host side of T tokens: Engram hash + threaded pread of their rows into pinned staging, one H2D each (fw.tokens holds them at start .. start + T - 1)"""
+    def _stage_begin(self, start, T):
+        """host side of a step, part 1: match the prestaged row 0 (token fw.tokens[start]) and hash every (layer, row) still to read"""
         fw = self.fw
         pre, self._pre = self._pre, None
         t0 = 0
@@ -411,16 +450,34 @@ class GraphDecoder:
             for f in pre[2]:                # stale staged row: its reads still write into the staging rows below
                 f.result()
             pre = None
+        hs = self.stager.hash(fw.tokens, start, t0, T) if self.stager is not None and T > t0 else None
+        self._sp = [start, T, t0, pre, hs]
+
+    def _stage_group(self, a, b):
+        """part 2: read the rows of the Engram modules a .. b - 1 into the pinned staging, then ONE H2D of those layers (stream-ordered before the next replay)"""
+        sp = self._sp
+        start, T, t0, pre, hs = sp
+        fw = self.fw
         if self.stager is not None:
-            futs = self.stager.stage(fw.tokens, start, t0, T) if T > t0 else []
+            futs = self.stager.submit(hs[0], hs[1], t0, es=range(a, b)) if hs is not None else []
         else:
             futs = self._submit(self._jobs(start, t0, T, fw.tokens)) if T > t0 else []
-        if t0:
-            futs += pre[2]
+        if pre is not None:
+            futs = futs + pre[2]
+            sp[3] = None
         for f in futs:
             f.result()
-        self.gs.eng_raw.copy_(self.rpin, non_blocking=True)
-        self.gs.eng_valid.copy_(self.vpin, non_blocking=True)
+        if a == 0 and b == self.rpin.shape[0]:
+            self.gs.eng_raw.copy_(self.rpin, non_blocking=True)
+            self.gs.eng_valid.copy_(self.vpin, non_blocking=True)
+        else:
+            self.gs.eng_raw[a:b].copy_(self.rpin[a:b], non_blocking=True)
+            self.gs.eng_valid[a:b].copy_(self.vpin[a:b], non_blocking=True)
+
+    def stage(self, start, T=1):
+        """host side of T tokens, all layers at once (fw.tokens holds them at start .. start + T - 1)"""
+        self._stage_begin(start, T)
+        self._stage_group(0, self.rpin.shape[0])
 
     def step(self, tok):
         """append host token id `tok` at position fw.n; returns the DEVICE logits [V] of this position (valid until the next step)"""
@@ -449,11 +506,24 @@ class GraphDecoder:
         self.hnp[0, :T] = toks
         self.hnp[1, :T] = np.arange(start, start + T)
         self.gs.inp.copy_(self.hin, non_blocking=True)
-        self.stage(start, T)
-        cg, _out = self._graph(Nb, T)
+        bnds = self.bounds()
+        g = self.graphs.get((Nb, T, len(bnds)))
+        full = g is None
+        if full:                                  # first use of this (bucket, rows): stage everything, then build the graphs (their warm-up bodies see the real inputs)
+            self.stage(start, T)
+            g = self._graph(Nb, T)
+        cgs, _out = g
         self.x_out = _out[2]
         fw._h = _out[3]
-        cg.replay()
+        grp = self.groups(bnds)
+        if not full:
+            self._stage_begin(start, T)
+        for si, cg in enumerate(cgs):
+            if not full and grp[si] is not None:
+                self._stage_group(*grp[si])       # segment si - 1 is already running on the GPU
+            cg.replay()
+            if si == 0:
+                self.t_launch = time.perf_counter()
         self.ev.record()
         self.ev_set = True
         fw.n += T

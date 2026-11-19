@@ -256,6 +256,7 @@ class Hy4Engine:
             cap0, caps0 = GR.stats["captures"], GR.stats["capture_s"]
             lt = [0.0]                    # time of the last draft launch (set by plan)
             td_prev = None
+            busy = [0.0]                  # host time of the whole verify launch call (includes the staging that overlaps the GPU)
             gap = [0.0, 0.0]              # host time with the GPU idle: verify result known -> next draft launched, draft tokens known -> verify launched
 
             def plan(y_, hcur_, j_):
@@ -316,7 +317,8 @@ class Hy4Engine:
                 tm[0] += tb - ta
                 tm[1] += tc - tb
                 tm[2] += td - tc
-                gap[1] += tc - tb
+                gap[1] += GR.t_launch - tb               # draft tokens known -> the verify's first graph launched (the later segments' rows are staged while the GPU runs)
+                busy[0] += tc - tb
                 acc = 0
                 nd = len(toks) - 1
                 while acc < nd and toks[acc + 1] == amh[acc]:
@@ -358,6 +360,7 @@ class Hy4Engine:
                 stop = on_tokens(new)
             st["round_ms"] = [x / max(rounds, 1) * 1000 for x in tm]
             st["gap_ms"] = [x / max(rounds, 1) * 1000 for x in gap]       # host time per round with the GPU idle: [after verify, before verify]
+            st["busy_ms"] = busy[0] / max(rounds, 1) * 1000
             st["captures"] = GR.stats["captures"] - cap0
             st["capture_s"] = GR.stats["capture_s"] - caps0
             if self.policy is not None:

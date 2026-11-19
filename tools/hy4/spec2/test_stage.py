@@ -17,7 +17,7 @@ NC = (NG - 1) * NH
 def make_mods(rng, nE, vocab, rows):
     tm = [rng.choice([-1, rng.randrange(0, 5000)]) if rng.random() < 0.1 else rng.randrange(0, 5000) for _ in range(vocab)]
     pad_id = next(i for i, x in enumerate(tm) if x != -1)
-    mods = []
+    mods, top = [], 0
     for e in range(nE):
         primes = [rng.randrange(rows // 40, rows // 20) | 1 for _ in range(NC)]
         offs = [0] * NC
@@ -26,7 +26,8 @@ def make_mods(rng, nE, vocab, rows):
             offs[c] = acc; acc += primes[c]
         mods.append(types.SimpleNamespace(e=e, n_gram=NG, n_head=NH, n_cols=NC, token_map=tm, pad_id=pad_id,
                                           mult=[rng.getrandbits(64) | 1 for _ in range(NG)], primes=primes, offs=offs))
-    return mods, acc
+        top = max(top, acc)
+    return mods, top
 
 def make_table(path, rows, rb, rng, shard_off=4096):
     data = np.frombuffer(bytes(rng.getrandbits(8) for _ in range(rows * rb)), dtype=np.uint8)
@@ -62,7 +63,7 @@ def test_hash_matches_reference():
         assert np.array_equal(ids, ids2) and np.array_equal(valid, valid2)
     print("hash == engram_hash: ok")
 
-def run_reads(workers, inline):
+def run_reads(workers, nowait, force_miss):
     rng = random.Random(7)
     nE, rb, TM = 4, 99, 8
     mods, tot = make_mods(rng, nE, 3000, 400000)
@@ -72,7 +73,7 @@ def run_reads(workers, inline):
         for trial in range(40):
             rnp = np.full((nE, TM, NC, rb), 0xCD, dtype=np.uint8); vnp = np.full((nE, TM, NC), -7.0, dtype=np.float32)
             st = ES.EngramStager(mods, tab, rnp, vnp, pool=pool, workers=workers)
-            st.inline_max = inline
+            st.nowait, st.force_miss = nowait, force_miss
             n = rng.randrange(3, 50)
             hist = [rng.randrange(0, 3000) for _ in range(n)]
             T = rng.randrange(1, TM + 1); start = n - 1; hist = hist + [rng.randrange(0, 3000) for _ in range(T)]
@@ -86,10 +87,31 @@ def run_reads(workers, inline):
                     assert (vnp[e, t0 + t] == valid[t]).all()
             assert (rnp[:, :t0] == 0xCD).all() and (rnp[:, T:] == 0xCD).all()          # canary: rows outside the staged range are untouched
             assert (vnp[:, :t0] == -7.0).all() and (vnp[:, T:] == -7.0).all()
-    print(f"reads == table rows (workers {workers}, inline {inline}): ok")
+    print(f"reads == table rows (workers {workers}, nowait {nowait}, force_miss {force_miss}): ok")
+
+def test_groups():
+    """reading the layers in two groups (as the split graph does) gives the same staging as one pass; layers outside a group are untouched by that call"""
+    rng = random.Random(9)
+    nE, rb, TM = 4, 96, 8
+    mods, tot = make_mods(rng, nE, 3000, 400000)
+    with tempfile.TemporaryDirectory() as d:
+        tab, data = make_table(os.path.join(d, "t.bin"), tot, rb, rng)
+        pool = ThreadPoolExecutor(max_workers=8)
+        for fm in (False, True):
+            rnp = np.full((nE, TM, NC, rb), 0xCD, dtype=np.uint8); vnp = np.full((nE, TM, NC), -7.0, dtype=np.float32)
+            st = ES.EngramStager(mods, tab, rnp, vnp, pool=pool, workers=8); st.force_miss = fm
+            hist = [rng.randrange(0, 3000) for _ in range(30)]
+            ids, valid = st.hash(hist, 20, 0, 5)
+            for f in st.submit(ids, valid, 0, es=range(0, 1)): f.result()
+            assert (rnp[1:] == 0xCD).all() and (vnp[1:] == -7.0).all()
+            for f in st.submit(ids, valid, 0, es=range(1, 4)): f.result()
+            for e in range(nE):
+                for t in range(5):
+                    assert np.array_equal(rnp[e, t], data[ids[e, t]])
+    print("layer groups: ok")
 
 def test_reads():
-    run_reads(1, 0); run_reads(4, 0); run_reads(4, 10 ** 9); run_reads(8, 0)
+    run_reads(1, False, False); run_reads(4, False, False); run_reads(4, True, False); run_reads(4, True, True); run_reads(64, True, True); run_reads(1, True, True)
 
 def test_bounds():
     rng = random.Random(3)
@@ -139,5 +161,5 @@ def test_bucket():
     print("bucket: ok")
 
 if __name__ == "__main__":
-    test_hash_matches_reference(); test_reads(); test_bounds(); test_bucket()
+    test_hash_matches_reference(); test_reads(); test_groups(); test_bounds(); test_bucket()
     print("ALL_OK")

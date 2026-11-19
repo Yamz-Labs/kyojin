@@ -65,9 +65,11 @@ N = int(os.environ.get("BN", "120"))
 STG = GR.stager
 def set_arm(a):
     if a == "old":
-        e.pipe, GR.stager, e.MH._STAGE_OV[0] = False, None, False
+        e.pipe, GR.stager, e.MH._STAGE_OV[0], GR.split = False, None, False, False
+    elif a == "nosplit":
+        e.pipe, GR.stager, e.MH._STAGE_OV[0], GR.split = True, STG, True, False
     else:
-        e.pipe, GR.stager, e.MH._STAGE_OV[0] = True, STG, True
+        e.pipe, GR.stager, e.MH._STAGE_OV[0], GR.split = True, STG, True, True
 def q(v, p):
     s = sorted(v); return s[min(len(s) - 1, int(p * len(s)))]
 def summ(v):
@@ -81,7 +83,7 @@ def run(tag, arm, pn, ids):
     st = e.generate(ids, N, cb)
     gaps = [(b - a) * 1000 for a, b in zip(stamps[1:], stamps[2:])]
     thr = 150.0
-    print(f"RUN {tag} arm={arm} {pn} tok_s {st['decode_tokens'] / st['decode_s']:.2f} tau {st['tau']:.3f} rounds {st['rounds']} md5 {hashlib.md5(str(out).encode()).hexdigest()[:8]} round_ms {[round(x, 1) for x in st['round_ms']]} gap_ms {[round(x, 2) for x in st.get('gap_ms', [])]} caps {st.get('captures')} cap_s {st.get('capture_s', 0):.1f}", flush=True)
+    print(f"RUN {tag} arm={arm} {pn} tok_s {st['decode_tokens'] / st['decode_s']:.2f} tau {st['tau']:.3f} rounds {st['rounds']} md5 {hashlib.md5(str(out).encode()).hexdigest()[:8]} round_ms {[round(x, 1) for x in st['round_ms']]} gap_ms {[round(x, 2) for x in st.get('gap_ms', [])]} busy {st.get('busy_ms', 0):.2f} caps {st.get('captures')} cap_s {st.get('capture_s', 0):.1f}", flush=True)
     print(f"   read_bytes {(rbytes() - rb0) / 1e6:.1f} MB; steady step_rows {summ([x for x in REC['step_rows'] if x < thr])}; stage {summ([x for x in REC.get('stage', []) if x < thr])}; hash {summ(REC.get('hash', []))}; submit {summ(REC.get('submit', []))}; ng_propose {summ(REC.get('ng_propose', []))}; ng_add {summ(REC.get('ng_add', []))}; round wall {summ([g for g in gaps if g < 450])}; capture keys {CAPKEYS}", flush=True)
     return out
 for pn in PA:
