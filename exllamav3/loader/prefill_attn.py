@@ -192,8 +192,8 @@ BCFG = {"BM": 128, "BN": 128, "BK": 32, "warps": 8, "PBN": 128, "PBK": 32, "pwar
 
 
 # measured (test_pf2, 2048 queries): sliding window H=64 best 7.9 TFLOPS at S=8 MiB; full + allow mask H=32 best 17.7 at S=16 MiB with a 64-wide key tile
-BCFG_SWA = dict(BCFG, S_BYTES=8 << 20)
-BCFG_FULL = dict(BCFG, S_BYTES=16 << 20, BN=64, PBK=64)
+BCFG_SWA = dict(BCFG, S_BYTES=8 << 20, PBN=64, pwarps=4, qs=2)       # random config sweep (gb/sweep_att.py, 8K-class shapes): 14.3 -> 16.6 TFLOPS, bit-identical output
+BCFG_FULL = dict(BCFG, S_BYTES=16 << 20, BM=64, BN=64, warps=4, PBN=64, PBK=128, pwarps=4, qs=2)       # sweep: 19.6 -> 24.6 TFLOPS, bit-identical
 
 
 def mla_banded(q_lat, q_pe, kc, qstart, scale, sinks=None, window=0, allow=None, cfg=None, qcat=None, o16=False, ht=False):
@@ -252,9 +252,9 @@ def mla_banded(q_lat, q_pe, kc, qstart, scale, sinks=None, window=0, allow=None,
         row0 = t0 * H
         _qk_kernel[(triton.cdiv(M, c["BM"]), triton.cdiv(NKP, c["BN"]))](qcat, kc16, sbuf, al, M, NK, NKP, row0, t0, qstart, lo, klo_all, N, H, float(scale) * 1.4426950408889634, T,
                                                                           D=D, WIN=int(window), HAS_ALLOW=allow is not None, BM=c["BM"], BN=c["BN"], BK=c["BK"], HT=ht,
-                                                                          num_warps=c["warps"], num_stages=1)
+                                                                          num_warps=c["warps"], num_stages=c.get("qs", 1))
         _softmax_kernel[(M,)](sbuf, pbuf, sk, NKP, H, BLOCK=triton.next_power_of_2(NKP), HAS_SINK=sinks is not None, num_warps=4)
         _pv_kernel[(triton.cdiv(M, c["BM"]), triton.cdiv(R, c["PBN"]))](pbuf, kc16, o, M, NK, NKP, row0, lo, klo_all, H, T, D=D, R=R, BM=c["BM"], BN=c["PBN"], BK=c["PBK"], O16=o16, HT=ht,
-                                                                         num_warps=c["pwarps"], num_stages=1)
+                                                                         num_warps=c["pwarps"], num_stages=c.get("qs", 1))
         t0 += Bq
     return o

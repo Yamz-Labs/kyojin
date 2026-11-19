@@ -375,8 +375,12 @@ def _pf_indexer_forward(self, x, qr, n_keys=None):
     self._max_pos = start + T
     pos = torch.arange(start, start + T, device=self.dev)
     with t("f ix: key pool"):
-        ik = _rms(x @ self.w["attn_k"].T, self.w["k_norm"], self.eps)
-        vg_new = torch.cat([ik @ self.w["value"].T, ik @ self.w["gate"].T], -1)
+        with t("f ixk: attn_k mm"):
+            ikr = x @ self.w["attn_k"].T
+        with t("f ixk: norm"):
+            ik = _rms(ikr, self.w["k_norm"], self.eps)
+        with t("f ixk: value/gate mm"):
+            vg_new = torch.cat([ik @ self.w["value"].T, ik @ self.w["gate"].T], -1)
         buf = vg_new if self.vg is None else torch.cat([self.vg, vg_new], 0)
         m = buf.shape[0] // k
         if m:
@@ -384,7 +388,8 @@ def _pf_indexer_forward(self, x, qr, n_keys=None):
                 big = torch.empty(max(2 * self.pool.shape[0], self.P + m), d, device=self.dev)
                 big[:self.P] = self.pool[:self.P]
                 self.pool = big
-            self.pool[self.P:self.P + m] = self._pool_groups(buf[:m * k], self.P)
+            with t("f ixk: pool groups"):
+                self.pool[self.P:self.P + m] = self._pool_groups(buf[:m * k], self.P)
             self.P += m
         self.vg = buf[m * k:] if buf.shape[0] - m * k else None
         self.n += T
@@ -796,6 +801,52 @@ def gate16(kv, g):
     out = torch.empty(T, H * VD, dtype=torch.float16, device=kv.device)
     _gate_kernel[(T, triton.cdiv(H * VD, 1024))](kv, g, out, T, H * VD, VD=VD, BC=1024, num_warps=4)
     return out
+
+
+
+@triton.jit
+def _gate_ew_kernel(KV, G, OUT, n, BLK: tl.constexpr):
+    """OUT = KV * sigmoid(G) elementwise, the maths of _gate_kernel (gate logits nan -> 0 and clamped, saturating fp16 result); all three operands in the SAME layout"""
+    i = tl.program_id(0).to(tl.int64) * BLK + tl.arange(0, BLK)
+    m = i < n
+    g = tl.load(G + i, mask=m, other=0.0).to(tl.float32)
+    g = tl.where(g != g, 0.0, tl.minimum(tl.maximum(g, -65504.0), 65504.0))
+    kv = tl.load(KV + i, mask=m, other=0.0).to(tl.float32)
+    o = kv * (1.0 / (1.0 + tl.exp(-g)))
+    tl.store(OUT + i, tl.minimum(tl.maximum(o, -65504.0), 65504.0).to(tl.float16), mask=m)
+
+
+def gate16t(kvt, gt):
+    """transposed-layout gate: kvt [H * VD, T] (wv_b GEMM output with the head rows stacked), gt [H * VD, T] (raw gate GEMM output, transposed) -> gated [H * VD, T] fp16"""
+    out = torch.empty_like(kvt)
+    n = out.numel()
+    _gate_ew_kernel[(triton.cdiv(n, 4096),)](kvt, gt, out, n, BLK=4096, num_warps=4)
+    return out
+
+
+def qdense_raw16_t(x, packed, tm=None):
+    """qdense_raw16 with a TRANSPOSED result: x [M, K] -> [N, M] fp16 = (x @ W.T).T, from the GEMM W.T-view @ x.T-view (both operands read in their stored layout)"""
+    N, nb, bb = packed.shape
+    t = tm.t if tm is not None and tm.on else (lambda n: contextlib.nullcontext())
+    with t(f"f dense N={N} K={nb * 32}: to_f16"):
+        x2 = to_f16(x.reshape(-1, nb * 32)).contiguous()
+    with t(f"f dense N={N} K={nb * 32}: dequant"):
+        w16 = dequant_q8(packed)
+    with t(f"f dense N={N} K={nb * 32}: mm"):
+        return torch.mm(w16.t(), x2.t())
+
+
+def qdense_t(xt, packed, tm=None):
+    """qdense_tm for an activation stored TRANSPOSED: xt [K, M] fp16 contiguous -> [M, N] fp32 = xt.T @ W.T (the GEMM reads A column-major)"""
+    N, nb, bb = packed.shape
+    K = nb * 32
+    t = tm.t if tm is not None and tm.on else (lambda n: contextlib.nullcontext())
+    with t(f"f dense N={N} K={K}: dequant"):
+        w16 = dequant_q8(packed)
+    with t(f"f dense N={N} K={K}: mm"):
+        o = torch.mm(xt.t(), w16)
+    with t(f"f dense N={N} K={K}: float"):
+        return torch.nan_to_num(o.float(), nan=0.0, posinf=F16MAX, neginf=-F16MAX)
 
 
 def qdense_raw16(x, packed, tm=None, tag=""):

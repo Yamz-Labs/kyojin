@@ -14,6 +14,9 @@ from . import dense_req as _DR
 PF_ATTN = os.environ.get("HY4_PREFILL_ATTN", "0") in ("1", "flash")
 PF_ATTN_FLASH = os.environ.get("HY4_PREFILL_ATTN", "0") == "flash"       # 1 = prefill rows (T > PF_ATTN_MIN): flash-style MLA kernel (prefill_attn.py)
 PF_ATTN_MIN = 16
+def pf_wot():
+    return os.environ.get("HY4_PF_WOT", "0") == "1"
+#           # HY4_PF_WOT=1: gate output written transposed [H*vd, T] so the wo GEMM reads A column-major (faster vendor kernel at K=8192-16384)
 def pf_f16():
     return os.environ.get("HY4_PF_F16", "0") == "1"
 
