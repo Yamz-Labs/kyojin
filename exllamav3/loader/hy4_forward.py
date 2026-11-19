@@ -33,6 +33,7 @@ from . import mla_bgemv as _BGM
 from . import head_bf16 as _HB
 from . import attn_eager as _AE
 from . import router_gemv as _RG
+from . import mla_hy4 as _mla_mod
 
 _HCF = None
 if os.environ.get("HY4_HC_FUSED", "0") == "1":      # fused hyper-connection sites (loader/hc_fused.py)
@@ -121,6 +122,53 @@ GG_GROUPED = {12: (0, 256, 144), 13: (1, 256, 176), 14: (2, 256, 210), 23: (3, 2
 GROUPED_UG = (0, 1, 2, 3, 4, 5, 8)
 EXPERT_PREAD = os.environ.get("HY4_EXPERT_PREAD", "0") == "1"                    # 1 = old path: experts pread from the GGUF every step ((1a) mmvq)
 RESIDENT_GB = float(os.environ.get("HY4_EXPERT_RESIDENT_GB", "72"))               # VRAM byte budget for resident routed experts (stored bytes)
+PF_MOE = os.environ.get("HY4_PREFILL_MOE", "0") in ("1", "i8", "ref")       # 1 = prefill rows (T > MMVQ_MAXR) of resident experts: sorted-token fused dequant GEMM (prefill_kernels.py)
+PF_MOE_I8 = os.environ.get("HY4_PREFILL_MOE", "0") == "i8"                 # i8 = Q8_K activations on int8 WMMA (llama.cpp mmq style)
+PF_MOE_REF = os.environ.get("HY4_PREFILL_MOE", "0") == "ref"         # ref = exact fp32 torch math on batched-dequantised resident experts (quality reference, same maths as the pread path)
+PF_DENSE = os.environ.get("HY4_PREFILL_DENSE", "0") in ("1", "i8")    # 1 = prefill rows of stored Q8_0 dense matrices: fused dequant fp16 GEMM; i8 = Q8 activations on int8 WMMA (prefill_kernels.py)
+PF_DENSE_I8 = os.environ.get("HY4_PREFILL_DENSE", "0") == "i8"
+PF_DIAG = os.environ.get("HY4_PREFILL_DIAG", "0") == "1"           # log fast-path vs exact error of every prefill dense matmul (debug)
+PF_IX = os.environ.get("HY4_PREFILL_IX", "0") == "1"                # 1 = k-pool indexer scores of prefill rows as an fp16 GEMM (indexer_fused scoring is fp32, 2 GB temporaries at T = 8192)
+PF_ROUTER = os.environ.get("HY4_PREFILL_ROUTER", "0") == "1"       # 1 = router logits of prefill rows as an fp16 GEMM (fp32 accumulate): fp32 matmul runs at 2.7 TFLOPS here
+
+
+def _pk():
+    from . import prefill_kernels
+    return prefill_kernels
+
+
+def moe_ref(z, sel, w, rsp, lim, group=16):
+    """exact fp32 reference of the prefill MoE on the resident stored bytes: experts dequantised `group` at a time (torch dq_q4k / dq_q3k, same values as
+    the pread path), per-expert fp32 matmuls, weighted index_add. Slow (host sync for the counts); for quality gates only."""
+    ty = {0: 12, 8: 11}
+    T, S = sel.shape
+    dev = z.device
+    nff, nout, E, K = rsp.nff, rsp.nout, rsp.E, z.shape[1]
+    lat = torch.zeros(T, nout, device=dev)
+    flat = sel.reshape(-1)
+    order = torch.argsort(flat, stable=True)
+    counts = torch.bincount(flat, minlength=E).tolist()
+    starts = [0]
+    for c in counts:
+        starts.append(starts[-1] + c)
+    wf = w.reshape(-1)
+    for e0 in range(0, E, group):
+        e1 = min(E, e0 + group)
+        if starts[e1] == starts[e0]:
+            continue
+        n = e1 - e0
+        Wg = dq_expert(rsp.bufs["gate"][e0 * rsp.ebytes[0]:e1 * rsp.ebytes[0]], ty[rsp.fu], n * nff, K, dev).view(n, nff, K)
+        Wu = dq_expert(rsp.bufs["up"][e0 * rsp.ebytes[0]:e1 * rsp.ebytes[0]], ty[rsp.fu], n * nff, K, dev).view(n, nff, K)
+        Wd = dq_expert(rsp.bufs["down"][e0 * rsp.ebytes[1]:e1 * rsp.ebytes[1]], ty[rsp.fd], n * nout, nff, dev).view(n, nout, nff)
+        for e in range(e0, e1):
+            if counts[e] == 0:
+                continue
+            pr = order[starts[e]:starts[e + 1]]
+            rows = pr // S
+            x = z[rows]
+            hh = torch.nn.functional.silu((x @ Wg[e - e0].T).clamp(max=lim)) * (x @ Wu[e - e0].T).clamp(-lim, lim)
+            lat.index_add_(0, rows, (hh @ Wd[e - e0].T) * wf[pr].unsqueeze(-1))
+    return lat
 
 
 def _ext():
@@ -175,6 +223,9 @@ def dense_fn(ty, K):
     return spec, (getattr(e, spec[2], None) if e is not None else None)
 
 
+_TM_HOLD = [None]          # the live _Tm (stage timers inside prefill dense calls)
+
+
 class QLinear:
     """a dense [N, K] matrix kept as STORED bytes on the device; `x @ q.T` / q(x) = x [.., K] -> [.., N]"""
 
@@ -199,6 +250,18 @@ class QLinear:
             self.gemv(xf, self.packed, out)
             if self.stats is not None:
                 self.stats["dense_gemv"] = self.stats.get("dense_gemv", 0) + 1
+        elif PF_DENSE and self.ty == 8 and x2.is_cuda:
+            k_ = _pk()
+            out = k_.qdense_i8(x2, self.packed) if PF_DENSE_I8 else (k_.qdense_tm(x2, self.packed, _TM_HOLD[0]) if x2.shape[0] >= k_.DENSE_TM_MIN_M else k_.qdense(x2, self.packed, k_.FMT_Q8))
+            if PF_DIAG:
+                ex = x2.float() @ self.dense().T
+                df = out.float() - ex
+                rr = df.norm(dim=1) / ex.norm(dim=1).clamp_min(1e-30)
+                w_ = int(rr.argmax())
+                print(f"DIAG dense N={N} K={K} M={x2.shape[0]} rel={float(df.norm() / ex.norm()):.2e} worst_row={w_} {float(rr[w_]):.2e} row0={float(rr[0]):.2e} max|x|={float(x2.abs().max()):.3e} "
+                      f"clamped_in={int((x2.abs() > 65504).sum())} max|out|={float(ex.abs().max()):.3e} out_over={int((ex.abs() > 65504).sum())}", flush=True)
+            if self.stats is not None:
+                self.stats["dense_pf"] = self.stats.get("dense_pf", 0) + 1
         else:
             out = x2.float() @ self.dense().T
             if self.stats is not None:
@@ -302,6 +365,7 @@ class Hy4Forward:
                         rope_base=float(m[p + "rope.freq_base"]), eps=self.eps)
         self.use_indexer, self.q8_act = use_indexer, q8_act
         self.tm = _Tm()
+        _TM_HOLD[0] = self.tm
         self.expert_dq = os.environ.get("HY4_EXPERT_DQ", "0") == "1"       # 1 = old path (torch dequant) for decode rows too
         self.dense_dq = DENSE_DQ
         self.head_cpu = os.environ.get("HY4_HEAD_CPU", "0") == "1" or self.dev.type != "cuda"     # 1 = old path: head on the CPU, last position only
@@ -361,7 +425,8 @@ class Hy4Forward:
                 bufs[n], strides[n] = buf, rb
                 ptrs[n] = torch.arange(E, dtype=torch.int64, device=dev) * (r * rb) + buf.data_ptr()
             self.res[i] = SimpleNamespace(bufs=bufs, ptrs=(ptrs["gate"], ptrs["up"], ptrs["down"]), strides=(strides["gate"], strides["up"], strides["down"]),
-                                          fu=f["gate"][0], fd=f["down"][0])
+                                          fu=f["gate"][0], fd=f["down"][0], nff=rows["gate"][0], nout=rows["down"][0], E=rows["gate"][2],
+                                          ebytes=(rows["gate"][0] * rows["gate"][1], rows["down"][0] * rows["down"][1]))
             self.res_bytes += need
         for fd in getattr(g, "fds", []):
             try:
@@ -448,6 +513,8 @@ class Hy4Forward:
             w.update({k: load_dense(g, b + s).to(self.dev) for k, s in small.items()})
             w = {k: (v.to(self.dev) if isinstance(v, torch.Tensor) else v) for k, v in w.items()}
             fx[i] = FusedKPoolIndexer(w, self.dev, **self.ixc)
+            if PF_IX and self.dev.type == "cuda":
+                fx[i] = _pk().pf_indexer(fx[i], self.tm)
         return fx[i]
 
     # -- pieces
@@ -471,21 +538,39 @@ class Hy4Forward:
             with tm.t("other"):
                 return self._mm(torch.nn.functional.silu(self._mm(x, gt)) * self._mm(x, up), dn), None
         T, dev = x.shape[0], self.dev
+        rsp = self.res.get(i)
+        pf = bool(PF_MOE and T > MMVQ_MAXR and dev.type == "cuda" and rsp is not None and rsp.fu in _pk().FROM_GROUPED and rsp.fd in _pk().FROM_GROUPED)
         with tm.t("router"):
             if _rf.ENABLED:       # HY4_REF_FUSED=1: one router kernel; the host sync (tolist) only where the pread loop needs it
                 sel, w = _rf.router_select(_RG.logits(x, L.router) if _RG.usable(x, L.router) else x @ L.router.T, L.rbias, self.topk, self.w_scale)
-                sel_l = [] if (self.res.get(i) is not None and T <= MMVQ_MAXR and dev.type == "cuda") else sorted(set(sel.flatten().tolist()))
+                sel_l = [] if (pf or (self.res.get(i) is not None and T <= MMVQ_MAXR and dev.type == "cuda")) else sorted(set(sel.flatten().tolist()))
             else:
-                p = torch.sigmoid(_RG.logits(x, L.router) if _RG.usable(x, L.router) else x @ L.router.T)
-                sel = torch.sort(p + L.rbias, dim=-1, descending=True, stable=True).indices[:, :self.topk]      # stable: near-tied experts resolve to the lowest id every call
+                if PF_ROUTER and T > MMVQ_MAXR and dev.type == "cuda":
+                    if getattr(L, "router16", None) is None:
+                        L.router16 = L.router.half().contiguous()
+                    p = torch.sigmoid(_pk().mm_f32(_pk().to_f16(x), L.router16.T))
+                else:
+                    p = torch.sigmoid(_RG.logits(x, L.router) if _RG.usable(x, L.router) else x @ L.router.T)
+                sel = torch.sort(p + L.rbias, dim=-1, descending=True, stable=True).indices[:, :self.topk]      # stable: tied experts resolve to the lowest id every call (torch.topk tie order varies between calls on gfx1151)
                 w = torch.gather(p, 1, sel)
                 w = w / w.sum(-1, keepdim=True).clamp(min=6.103515625e-5) * self.w_scale
-                sel_l = [] if _ns.skip_host_ids(self, i, T, MMVQ_MAXR) else sorted(set(sel.flatten().tolist()))
+                sel_l = [] if (pf or _ns.skip_host_ids(self, i, T, MMVQ_MAXR)) else sorted(set(sel.flatten().tolist()))
         with tm.t("other"):
             z = self._mm(x, L.rdown)
             lat = torch.zeros(T, z.shape[1], device=dev)
         lim, N = float(self.clamp[i]), z.shape[1]
         b = f"blk.{i}."
+        if pf and PF_MOE_REF:
+            with tm.t("routed experts"):
+                lat = moe_ref(z, sel, w, rsp, lim)
+            sel_l = []
+        elif pf:
+            with tm.t("routed experts"):
+                k_ = _pk()
+                lat = (k_.moe_prefill_i8 if PF_MOE_I8 else k_.moe_prefill)(z, sel, w, (rsp.bufs["gate"], rsp.bufs["up"], rsp.bufs["down"]), (k_.FROM_GROUPED[rsp.fu], k_.FROM_GROUPED[rsp.fd]), lim,
+                                     rsp.nff, rsp.nout, (rsp.strides[0], rsp.strides[2]), rsp.ebytes, rsp.E, tm=tm)
+            self.stats["prefill_moe_calls"] = self.stats.get("prefill_moe_calls", 0) + 1
+            sel_l = []
         rs = self.res.get(i) if (T <= MMVQ_MAXR and dev.type == "cuda") else None
         if rs is not None:
             with tm.t("routed experts"):
@@ -541,11 +626,34 @@ class Hy4Forward:
                 from .engram_gpu import Hy4EngramGPU
                 self.eng[i] = Hy4EngramGPU(self.g, i, self.dev, table=self.table, lin=None if os.environ.get("HY4_ENGRAM_GPU") == "2" else self._lin)    # 2 = dense fp32 kv (bit-exact vs CPU path)
             with self.tm.t("Engram"):
-                return self.eng[i](x, ids, start)
+                fut = getattr(self, "_eng_pf", {}).pop((i, start, x.shape[0]), None)
+                with self.tm.t("f engram: wait for prefetched rows"):
+                    pre = fut.result() if fut is not None else None
+                return self.eng[i](x, ids, start, pre=pre)
         if i not in self.eng:
             self.eng[i] = Hy4Engram(self.g, i, table=self.table)
         with self.tm.t("Engram"):
             return self.eng[i](x.cpu(), ids, start).to(self.dev)
+
+    def prefetch_engram(self, ids_all, chunk):
+        """HY4_ENGRAM_PREFETCH=1: the Engram row ids depend on token ids only, so hash + pread of every (chunk, Engram layer) of a known prompt run in a
+        background thread, in consumption order, while the GPU works on earlier layers / chunks. Consumed by _engram (entries are dropped when used)."""
+        if os.environ.get("HY4_ENGRAM_PREFETCH", "0") != "1" or os.environ.get("HY4_ENGRAM_GPU", "0") not in ("1", "2") or self.dev.type != "cuda":
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        from .engram_gpu import Hy4EngramGPU
+        layers = sorted(i for i in self.ple if i < self.n_layers)
+        for i in layers:
+            if i not in self.eng:
+                self.eng[i] = Hy4EngramGPU(self.g, i, self.dev, table=self.table, lin=None if os.environ.get("HY4_ENGRAM_GPU") == "2" else self._lin)
+        toks = [int(t) for t in ids_all]
+        self._eng_pf = {}
+        ex = ThreadPoolExecutor(max_workers=2)
+        for s in range(self.n, len(toks), chunk):
+            n = min(chunk, len(toks) - s)
+            for i in layers:
+                self._eng_pf[(i, s, n)] = ex.submit(self.eng[i].host_rows, toks, s, n)
+        ex.shutdown(wait=False)
 
     def _hk(self, name, i, t):
         if self.hook is not None:
@@ -579,6 +687,8 @@ class Hy4Forward:
         if L.ix:
           with tm.t("indexer / kpool"):
             qr = mla._q(cur, "wq_a") @ mla.wq_a.T
+            if _mla_mod.pf_f16():
+                mla._qa_pre = qr
             qr = _HCF.rmsw(qr, mla.q_a_norm, mla.eps) if _HCF is not None else rms(qr, mla.eps) * mla.q_a_norm
             if os.environ.get("HY4_INDEXER_FUSED", "0") == "1" and self.dev.type == "cuda":      # flag off: the old CPU path below, untouched
                 allow = gs.indexer(self, i, cur, qr, N) if gs is not None else self._indexer_fused(i).forward(cur, qr, N)

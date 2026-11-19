@@ -10,6 +10,16 @@ from . import ref_fused as _rf
 from . import mla_bgemv as _BG
 from . import attn_eager as _ae
 
+PF_ATTN = os.environ.get("HY4_PREFILL_ATTN", "0") in ("1", "flash")
+PF_ATTN_FLASH = os.environ.get("HY4_PREFILL_ATTN", "0") == "flash"       # 1 = prefill rows (T > PF_ATTN_MIN): flash-style MLA kernel (prefill_attn.py)
+PF_ATTN_MIN = 16
+def pf_f16():
+    return os.environ.get("HY4_PF_F16", "0") == "1"
+
+
+# HY4_PF_F16=1 (read live, per call): 1 = prefill attention chain in fp16 end to end (no fp32 [T, H, R] intermediates; same values, fewer passes)
+PF_DENSE_ON = os.environ.get("HY4_PREFILL_DENSE", "0") == "1"
+
 
 def _sinks_mod():
     p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "modules", "attention_fn", "mla_sinks.py")
@@ -82,50 +92,149 @@ class Hy4MLA:
     def _h(self, x, part="k"):
         return x.half().float() if self.f16_kv and part in self.f16_parts else x
 
+    def _w16(self, name):
+        c = self.__dict__.setdefault("_w16c", {})
+        if name not in c:
+            c[name] = getattr(self, name).clamp(-65504.0, 65504.0).half().contiguous()
+        return c[name]
+
+    @staticmethod
+    def _f16(x):
+        return x.clamp(-65504.0, 65504.0).half()
+
+    @staticmethod
+    def _bmm_th(w16, x16):
+        """w16 [H, Nout, K] fp16, x16 [T, H, K] fp16 -> [T, H, Nout] fp32 ROW-major: the batch-over-heads GEMM writes [H, T, Nout]; the permute-back copy keeps Nout contiguous.
+        (Writing the result as a permuted view [T, H, Nout] with T fastest made every later elementwise / cat / clamp on it a stride-T gather: 10-30x slower.)"""
+        o = torch.bmm(x16.permute(1, 0, 2), w16.transpose(1, 2))
+        return o.permute(1, 0, 2).contiguous().float()
+
     def kv(self, cur, pos):
         """cur [T, n_embd], pos [T] -> K cache rows [T, R + rope] = [rms(kv_a)*w | rope(k_pe)] (V is the first R columns)"""
         if _ae.ENABLED:       # HY4_ATTN_EAGER: table rope, no cat
             return _ae.kv(self, cur, pos)
-        c = self._q(cur, "wkv_a") @ self.wkv_a.T
-        lat = rms(c[:, :self.R], self.eps) * self.kv_a_norm
-        pe = rope_norm(c[:, self.R:], pos, self.theta)
-        return self._h(torch.cat([lat, pe], -1))
+        tm = self.tm
+        with tm.t("f kv: wkv_a mm"):
+            c = self._q(cur, "wkv_a") @ self.wkv_a.T
+        with tm.t("f kv: norm+rope"):
+            lat = rms(c[:, :self.R], self.eps) * self.kv_a_norm
+            pe = rope_norm(c[:, self.R:], pos, self.theta)
+            return self._h(torch.cat([lat, pe], -1))
 
-    def q(self, cur, pos):
+    def q(self, cur, pos, qa=None):
         """-> q_lat [T,H,R], q_pe [T,H,rope] (q_nope absorbed with k_b; rope on the pe part)"""
         if _ae.ENABLED:
             return _ae.q(self, cur, pos)
         T, H = cur.shape[0], self.H
-        qr = rms(self._q(cur, "wq_a") @ self.wq_a.T, self.eps) * self.q_a_norm
-        q = (self._q(qr, "wq_b") @ self.wq_b.T).view(T, H, self.hd)
-        qn, qp = q[..., :self.nope], rope_norm(q[..., self.nope:].contiguous(), pos, self.theta)
-        qlat = self.bg_kb.mv(self._q(qn, "kb")) if (_BG.ENABLED and T <= _BG.MAXT and getattr(self, "bg_kb", None) is not None) else torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
+        tm = self.tm
+        with tm.t("f q: wq_a mm"):
+            if qa is None or self.q8_act:
+                qa = self._q(cur, "wq_a") @ self.wq_a.T
+        with tm.t("f q: norm"):
+            qr = rms(qa, self.eps) * self.q_a_norm
+        with tm.t("f q: wq_b mm"):
+            q = (self._q(qr, "wq_b") @ self.wq_b.T).view(T, H, self.hd)
+        with tm.t("f q: rope"):
+            qn, qp = q[..., :self.nope], rope_norm(q[..., self.nope:].contiguous(), pos, self.theta)
+        with tm.t("f q: wk_b bmm"):
+            if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:       # prefill rows: fp16 batched GEMM over heads (fp32 einsum is ~3x slower)
+                qlat = self._bmm_th(self._w16("wk_b"), self._f16(qn))
+            elif _BG.ENABLED and T <= _BG.MAXT and getattr(self, "bg_kb", None) is not None:
+                qlat = self.bg_kb.mv(self._q(qn, "kb"))
+            else:
+                qlat = torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
         return self._h(qlat, "q"), self._h(qp, "q")
+
+    _qa_pre = None       # raw wq_a output of this call's rows, left by the indexer branch (same expression): reused instead of a second GEMM
+
+    def _f16_ok(self, cur):
+        T = cur.shape[0]
+        return (pf_f16() and PF_ATTN and not PF_ATTN_FLASH and T > PF_ATTN_MIN and cur.is_cuda and getattr(self, "kpos_arange", False)
+                and not self.f16_kv and not self.q8_act and os.environ.get("HY4_PREFILL_DENSE", "0") == "1" and T >= 1024
+                and all(getattr(getattr(self, n), "ty", 0) == 8 for n in ("wq_a", "wq_b", "wgate", "wo")))
+
+    def q16(self, cur, pos, qa=None):
+        """prefill rows -> qc [H, T, R + rope] fp16 (saturated): [wk_b(q_nope) | rope(q_pe)] laid out per head, the layout the banded attention (ht=True) reads"""
+        from . import prefill_kernels as _pk
+        T, H = cur.shape[0], self.H
+        tm = self.tm
+        with tm.t("f q: wq_a mm"):
+            if qa is None:
+                qa = cur @ self.wq_a.T
+        with tm.t("f q: norm"):
+            qr = rms(qa, self.eps) * self.q_a_norm
+        with tm.t("f q: wq_b mm"):
+            q = _pk.qdense_raw16(qr, self.wq_b.packed, tm)
+        with tm.t("f q: rope"):
+            P = self.rope_dim
+            rc = pos.__dict__.setdefault("_rope_tabs", {})      # the tables depend only on (positions, theta): one fp64 evaluation per step, not per layer
+            if self.theta not in rc:
+                th = pos.double()[:, None] * (self.theta ** (-2.0 * torch.arange(P // 2, dtype=torch.float64, device=pos.device) / P))[None, :]
+                rc[self.theta] = (th.cos().float().contiguous(), th.sin().float().contiguous())
+            xh, qc = _pk.qprep(q, rc[self.theta][0], rc[self.theta][1], H, self.hd, self.nope, P, self.R)
+        with tm.t("f q: wk_b bmm"):
+            torch.bmm(xh, self._w16("wk_b").transpose(1, 2), out=qc[..., :self.R])
+        return qc
+
+    def attend16(self, cur, pos, kcache, allow, qa):
+        from . import prefill_attn as _pa, prefill_kernels as _pk
+        T, H = cur.shape[0], self.H
+        tm = self.tm
+        with tm.t("attn proj"):
+            qcat = self.q16(cur, pos, qa)
+        with tm.t("MLA core + sinks"):
+            o = _pa.mla_banded(self.R, None, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow, qcat=qcat, o16=True, ht=True)      # [H, T, R] fp16
+        with tm.t("attn proj"):
+            with tm.t("f attend: wv_b bmm"):
+                kv = torch.bmm(o, self._w16("wv_b").transpose(1, 2))      # [H, T, vd] fp16
+            with tm.t("f gate: wgate mm + sigmoid"):
+                gated = _pk.gate16(kv, _pk.qdense_raw16(cur, self.wgate.packed, tm))
+            with tm.t("f gate: wo mm"):
+                out = _pk.qdense_tm(gated, self.wo.packed, tm)
+            with tm.t("f gate: post norm"):
+                out = rms(out, self.eps) * self.post_norm if self.post_norm is not None else out
+        return None, gated, out
 
     def attend(self, cur, pos, kcache, kpos, allow=None):
         """cur [T, n_embd] at positions pos; kcache [N, R+rope] at kpos (includes the T new rows). -> (kqv, gated, out)"""
         T, H = cur.shape[0], self.H
         tm = self.tm
+        qa, self._qa_pre = self._qa_pre, None
+        if self._f16_ok(cur):
+            return self.attend16(cur, pos, kcache, allow, qa)
         with tm.t("attn proj"):
-            qlat, qpe = self.q(cur, pos)
+            qlat, qpe = self.q(cur, pos, qa)
         with tm.t("MLA core + sinks"):
-            if _rf.ENABLED:       # HY4_REF_FUSED=1: one online-softmax kernel (sinks / window / allow inside)
+            if PF_ATTN and T > PF_ATTN_MIN and qlat.is_cuda and getattr(self, "kpos_arange", False):
+                from . import prefill_attn as _pa     # prefill rows: flash-style kernel, keys visited only inside the window / causal range
+                o = (_pa.mla_flash if PF_ATTN_FLASH else _pa.mla_banded)(qlat, qpe, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow)
+            elif _rf.ENABLED:       # HY4_REF_FUSED=1: one online-softmax kernel (sinks / window / allow inside)
                 o = _rf.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window, allow,
                                         kpos_is_arange=getattr(self, "kpos_arange", False))
             else:
                 o = self.S.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window, allow)
         with tm.t("attn proj"):
-            kqv = (self.bg_vb.mv(self._q(o, "vb")) if (_BG.ENABLED and T <= _BG.MAXT and getattr(self, "bg_vb", None) is not None) else torch.einsum("hdr,thr->thd", self.wv_b, self._q(o, "vb"))).reshape(T, H * self.vd)
+            with tm.t("f attend: wv_b bmm"):
+                if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:
+                    kqv = self._bmm_th(self._w16("wv_b"), self._f16(o)).reshape(T, H * self.vd)
+                elif _BG.ENABLED and T <= _BG.MAXT and getattr(self, "bg_vb", None) is not None:
+                    kqv = self.bg_vb.mv(self._q(o, "vb")).reshape(T, H * self.vd)
+                else:
+                    kqv = torch.einsum("hdr,thr->thd", self.wv_b, self._q(o, "vb")).reshape(T, H * self.vd)
             gated, out = self.gate_out(cur, kqv)
         return kqv, gated, out
 
     def gate_out(self, cur, kqv):
         """isolated tail (gate, then wo, then post norm): oracle attn_kqv + cur -> (gated, out)"""
-        gated = self.S.sigmoid_gate(kqv, self._q(cur, "wgate") @ self.wgate.T)
-        out = self._q(gated, "wo") @ self.wo.T
-        if _ae.RMS and self.post_norm is not None:      # HY4_ATTN_EAGER=2
-            return gated, _ae.rmsw(out, self.post_norm, self.eps)
-        return gated, (rms(out, self.eps) * self.post_norm if self.post_norm is not None else out)
+        tm = self.tm
+        with tm.t("f gate: wgate mm + sigmoid"):
+            gated = self.S.sigmoid_gate(kqv, self._q(cur, "wgate") @ self.wgate.T)
+        with tm.t("f gate: wo mm"):
+            out = self._q(gated, "wo") @ self.wo.T
+        with tm.t("f gate: post norm"):
+            if _ae.RMS and self.post_norm is not None:      # HY4_ATTN_EAGER=2
+                return gated, _ae.rmsw(out, self.post_norm, self.eps)
+            return gated, (rms(out, self.eps) * self.post_norm if self.post_norm is not None else out)
 
 
 POST_NORM = "post_attention_norm.weight"

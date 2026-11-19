@@ -9,13 +9,15 @@ The hash (integer, token ids only) stays on the CPU: it never touches activation
 Generic: config comes from the GGUF header keys, the row form from F8Rows.layout; nothing keyed on a model name.
 """
 from __future__ import annotations
+import os
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
 from .engram_rows import Hy4Engram, F8Rows, load_dense, rms, E4M3, E8M0, QB
 
-_POOL = ThreadPoolExecutor(max_workers=16)
+_IO_THREADS = int(os.environ.get("HY4_ENGRAM_IO_THREADS", "96"))
+_POOL = ThreadPoolExecutor(max_workers=_IO_THREADS)
 _TABS: dict = {}
 
 
@@ -26,22 +28,44 @@ def _tabs(dev):
     return _TABS[k]
 
 
-def fetch_rows(table: F8Rows, ids, dev) -> torch.Tensor:
-    """ids (any int shape) -> float32 [*shape, width] on `dev`. Distinct rows are pread once (threaded), copied once, decoded on `dev`."""
+def fetch_rows_host(table: F8Rows, ids):
+    """CPU half of fetch_rows: distinct rows pread once (threaded) into one pinned buffer. -> (shape, uniq, inv, buf). Safe to run in a worker thread."""
     ids = np.asarray(torch.as_tensor(ids, dtype=torch.int64).numpy())
     uniq, inv = np.unique(ids.reshape(-1), return_inverse=True)
     rb = table.row_bytes
-    buf = torch.empty(len(uniq), rb, dtype=torch.uint8).pin_memory() if torch.device(dev).type == "cuda" else torch.empty(len(uniq), rb, dtype=torch.uint8)
+    buf = torch.empty(len(uniq), rb, dtype=torch.uint8).pin_memory() if torch.cuda.is_available() else torch.empty(len(uniq), rb, dtype=torch.uint8)
     view = buf.numpy()
 
-    def one(a):
-        j, r = a
-        view[j] = table.raw_row(int(r))
+    if len(uniq) and (int(uniq[0]) < 0 or int(uniq[-1]) >= table.rows):
+        raise IndexError(f"{table.name}: row outside 0..{table.rows - 1}")
     if len(uniq) > 8:
-        list(_POOL.map(one, enumerate(uniq)))
+        # one task per slice of the sorted row list (a task per row cost more in future / GIL hand-offs than the read itself); preadv straight into the pinned buffer
+        nw = _IO_THREADS
+        step = (len(uniq) + nw - 1) // nw
+        list(_POOL.map(lambda lo: _read_rows(table, uniq, view, lo, min(len(uniq), lo + step)), range(0, len(uniq), step)))
     else:
-        for a in enumerate(uniq):
-            one(a)
+        _read_rows(table, uniq, view, 0, len(uniq))
+    return ids.shape, uniq, inv, buf
+
+
+def _read_rows(table: F8Rows, uniq, view, lo: int, hi: int):
+    g, rb, off0 = table.g, table.row_bytes, table.off
+    for j in range(lo, hi):
+        o = off0 + int(uniq[j]) * rb
+        fi, o = o >> 48, o & ((1 << 48) - 1)
+        fd, pos = g.fds[fi], g.bases[fi] + o
+        mv = memoryview(view[j])
+        got = 0
+        while got < rb:
+            n = os.preadv(fd, [mv[got:]], pos + got)
+            if n <= 0:
+                raise IOError(f"short read at row {int(uniq[j])}")
+            got += n
+
+
+def rows_to_dev(table: F8Rows, host, dev) -> torch.Tensor:
+    """device half of fetch_rows: one H2D copy + exact E4M3 [* E8M0] decode + gather -> float32 [*shape, width]"""
+    shape, uniq, inv, buf = host
     u = buf.to(dev, non_blocking=True)
     t4, t8 = _tabs(dev)
     w = table.width
@@ -50,7 +74,12 @@ def fetch_rows(table: F8Rows, ids, dev) -> torch.Tensor:
     else:                                                    # width e4m3 values, then width/32 e8m0 scales (same as F8Rows.decode_raw)
         rows = (t4[u[:, :w].long()].reshape(len(uniq), -1, QB) * t8[u[:, w:].long()][:, :, None]).reshape(len(uniq), w)
     sel = torch.from_numpy(inv.astype(np.int64)).to(dev)
-    return rows[sel].reshape(*ids.shape, w)
+    return rows[sel].reshape(*shape, w)
+
+
+def fetch_rows(table: F8Rows, ids, dev) -> torch.Tensor:
+    """ids (any int shape) -> float32 [*shape, width] on `dev`. Distinct rows are pread once (threaded), copied once, decoded on `dev`."""
+    return rows_to_dev(table, fetch_rows_host(table, ids), dev)
 
 
 class Hy4EngramGPU:
@@ -97,7 +126,12 @@ class Hy4EngramGPU:
         anyv = (valid.sum(-1) > 0).float()
         return x + delta * anyv[:, None, None]
 
-    def __call__(self, x: torch.Tensor, tokens, start: int = 0) -> torch.Tensor:
-        ids, valid = self.row_ids(tokens, start, x.shape[0])
-        rows = fetch_rows(self.table, ids, self.dev)
+    def host_rows(self, tokens, start: int, n: int):
+        """CPU part for positions start..start+n-1: hash + row pread. -> (valid, host) for rows_to_dev. Worker-thread safe (no CUDA compute)."""
+        ids, valid = self.row_ids(tokens, start, n)
+        return valid, fetch_rows_host(self.table, ids)
+
+    def __call__(self, x: torch.Tensor, tokens, start: int = 0, pre=None) -> torch.Tensor:
+        valid, host = pre if pre is not None else self.host_rows(tokens, start, x.shape[0])
+        rows = rows_to_dev(self.table, host, self.dev)
         return self.apply(x, rows, valid.to(self.dev, non_blocking=True))
