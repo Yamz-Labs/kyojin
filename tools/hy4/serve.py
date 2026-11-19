@@ -54,6 +54,7 @@ SHIPPED_ENV = {
     "HY4_PF_F16": "1", "HY4_MOE_NFIRST": "1", "KEEPCACHE": "1",           # prefill set
     "HY4_LC_SPARSE": "1", "HY4_LC_PRIME": "1",                             # long context: exact top-k sparse decode attend (NLL inside the dense-vs-null band at 8K / 16K), draft-cache fill selects with the prefill scorer
     "HY4_PF_SPARSE": "1", "HY4_PF_SPARSE_MINN": "16384",            # sparse prefill attention (HIP kernel via SP_SO, Triton fallback) from 16K keys: 33K prefill 60.6 -> 42 s, 128K flat ~790 tok/s; NLL 32K 4.5226 vs dense 4.5231 (nulls 4.511-4.515); below 16K dense CK (KL at 4096 with sparse 0.1089 vs nulls 0.0988-0.1054)
+    "HY4_MLA_HB": "1", "HY4_BG_DOT": "1", "HY4_HEAD_DOT": "1", "HY4_RG_F16": "1",   # decode levers (box A/B 20/11, 256 tok x2: verify round -7 % at 4K, -4 % at 32K, plain flat; qual6 KL 0.94 x noise null)
     "HY4_PF_WOT": "0", "HY4_MOE_HIP": "2", "HY4_PF_CK": "1", "HY4_PF_FUSE": "1",      # prefill set 2: shared gm_ext WMMA experts (HY4_GM_EXT), CK MLA core (EXL3_CKMLA_SO), one-pass hc / norm / indexer kernels
 }
 
