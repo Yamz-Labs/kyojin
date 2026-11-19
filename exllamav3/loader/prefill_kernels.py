@@ -329,7 +329,7 @@ def _gmm_i8_kernel(XQ, XD, XS, W, OUT, wts, sorted_pairs, block_expert, P, topk,
 
 @triton.jit
 def _deq_q8_kernel(W, OUT, N, K: tl.constexpr, ROWB: tl.constexpr, BN: tl.constexpr, SPP: tl.constexpr):
-    """stored Q8_0 [N, K/32, 34] -> fp16 [N, K]; one program = BN rows x SPP sub-blocks"""
+    """stored Q8_0 [N, K/32, 34] -> fp16 W^T [K, N]; one program = BN rows x SPP sub-blocks"""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     offs_n = pid_n * BN + tl.arange(0, BN)
@@ -339,7 +339,88 @@ def _deq_q8_kernel(W, OUT, N, K: tl.constexpr, ROWB: tl.constexpr, BN: tl.conste
     for i in range(0, SPP):
         sb = pid_k * SPP + i
         w = _wtile(W, wrow, sb, 2, BN)
-        tl.store(OUT + offs_n.to(tl.int64)[:, None] * K + sb * 32 + lane[None, :], w, mask=nm[:, None])
+        # transposed store: OUT is W^T [K, N] row-major (the vendor GEMM runs about 2x faster on the NN layout than on the NT view of [N, K])
+        tl.store(OUT + (sb * 32 + lane).to(tl.int64)[:, None] * N + offs_n[None, :], tl.trans(w), mask=nm[None, :])
+
+
+# ------------------------------------------------------------------------------------------------ k-pool indexer scoring (prefill rows)
+IX_ALLOW_CPU = [False]      # tests only
+
+
+def ix_scores(iq, pk, wt):
+    """sc [T, P] = sum_h wt[t, h] * relu(iq[t, h, :] . pk[p, :]): iq [T, H, d], pk [P, d], wt [T, H] (fp32 in / out). fp16 GEMM with fp32 accumulation instead of
+    an fp32 einsum plus two [T, H, P] fp32 temporaries (about 2 GB each at T = 8192); the weighted head sum is one batched GEMM."""
+    T, H, d = iq.shape
+    P = pk.shape[0]
+    kq = torch.mm(to_f16(iq.reshape(T * H, d)), to_f16(pk).T.contiguous())          # [T*H, P] fp16
+    kq.relu_()
+    sc = torch.bmm(to_f16(wt)[:, None, :], kq.view(T, H, P))                         # [T, 1, P]
+    return sc[:, 0].float()
+
+
+def _pf_indexer_forward(self, x, qr, n_keys=None):
+    """FusedKPoolIndexer.forward with ix_scores for T > 16 rows (same maths otherwise; see indexer_fused.py)"""
+    import math
+    base = type(self).__mro__[1]
+    if x.shape[0] <= 16 or (not x.is_cuda and not IX_ALLOW_CPU[0]):
+        return base.forward(self, x, qr, n_keys)
+    mod = __import__(base.__module__, fromlist=["_rms"])
+    _rms = mod._rms
+    T, k, d, H = x.shape[0], self.k, self.d, self.H
+    tm = getattr(self, "_tm", None)
+    t = tm.t if tm is not None and tm.on else (lambda n: contextlib.nullcontext())
+    start = self.n
+    self._max_pos = start + T
+    pos = torch.arange(start, start + T, device=self.dev)
+    with t("f ix: key pool"):
+        ik = _rms(x @ self.w["attn_k"].T, self.w["k_norm"], self.eps)
+        vg_new = torch.cat([ik @ self.w["value"].T, ik @ self.w["gate"].T], -1)
+        buf = vg_new if self.vg is None else torch.cat([self.vg, vg_new], 0)
+        m = buf.shape[0] // k
+        if m:
+            if self.P + m > self.pool.shape[0]:
+                big = torch.empty(max(2 * self.pool.shape[0], self.P + m), d, device=self.dev)
+                big[:self.P] = self.pool[:self.P]
+                self.pool = big
+            self.pool[self.P:self.P + m] = self._pool_groups(buf[:m * k], self.P)
+            self.P += m
+        self.vg = buf[m * k:] if buf.shape[0] - m * k else None
+        self.n += T
+    with t("f ix: q_b + rope + proj"):
+        iq = self._rope((qr @ self.w["q_b"].T).reshape(T, H, d), pos)
+        wt = (x.float() @ self.w["proj"].T) / math.sqrt(d * H)
+    P = self.P
+    with t("f ix: scores"):
+        sc = ix_scores(iq, self.pool[:P], wt)
+        gend = torch.arange(P, device=self.dev) * k + (k - 1)
+        vis = (gend[None] < pos[:, None]) if self.tail else (gend[None] <= pos[:, None])
+        sc = torch.where(vis, sc, torch.full_like(sc, -math.inf))
+        self.last_scores = sc
+    last = start + T - 1
+    nvis_max = last // k if self.tail else (last + 1) // k
+    if nvis_max <= self.n_top:
+        return None
+    N = self.n if n_keys is None else n_keys
+    with t("f ix: topk"):
+        idx = torch.topk(sc, min(self.n_top, P), dim=1).indices
+    with t("f ix: allow mask"):
+        gsel = torch.zeros(T, P, dtype=torch.bool, device=self.dev)
+        gsel.scatter_(1, idx, True)
+        gsel &= vis
+        allow = torch.zeros(T, N, dtype=torch.bool, device=self.dev)
+        allow[:, :P * k] = gsel.repeat_interleave(k, dim=1)
+        j = torch.arange(N, device=self.dev)[None]
+        lo = (pos - (pos % k)) if self.tail else (pos - ((pos + 1) % k) + 1)
+        allow |= (j >= lo[:, None]) & (j <= pos[:, None])
+    return allow
+
+
+def pf_indexer(obj, tm=None):
+    """re-class a FusedKPoolIndexer instance so its forward uses ix_scores for prefill rows (tm = optional stage timers)"""
+    obj._tm = tm
+    if not getattr(type(obj), "_pf", False):
+        obj.__class__ = type("PFIndexer", (type(obj),), {"forward": _pf_indexer_forward, "_pf": True})
+    return obj
 
 
 # ------------------------------------------------------------------------------------------------ host side
@@ -486,10 +567,10 @@ def mm_f32(a, b):
 
 
 def dequant_q8(packed):
-    """stored Q8_0 [N, K/32, 34] uint8 -> fp16 [N, K]"""
+    """stored Q8_0 [N, K/32, 34] uint8 -> fp16 W^T [K, N] (contiguous)"""
     N, nb, bb = packed.shape
     K = nb * 32
-    out = torch.empty(N, K, dtype=torch.float16, device=packed.device)
+    out = torch.empty(K, N, dtype=torch.float16, device=packed.device)
     spp = 8 if nb % 8 == 0 else 1
     _deq_q8_kernel[(triton.cdiv(N, 64), nb // spp)](packed, out, N, K=K, ROWB=nb * bb, BN=64, SPP=spp, num_warps=4)
     return out
@@ -506,7 +587,7 @@ def qdense_tm(x, packed, tm=None):
     with t(f"f dense N={N} K={K}: dequant"):
         w16 = dequant_q8(packed)
     with t(f"f dense N={N} K={K}: mm"):
-        o = torch.mm(x2, w16.T)
+        o = torch.mm(x2, w16)
     with t(f"f dense N={N} K={K}: float"):
         out = torch.nan_to_num(o.float(), nan=0.0, posinf=F16MAX, neginf=-F16MAX)
     return out.reshape(*lead, N)

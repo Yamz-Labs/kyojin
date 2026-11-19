@@ -122,6 +122,7 @@ PF_MOE_REF = os.environ.get("HY4_PREFILL_MOE", "0") == "ref"         # ref = exa
 PF_DENSE = os.environ.get("HY4_PREFILL_DENSE", "0") in ("1", "i8")    # 1 = prefill rows of stored Q8_0 dense matrices: fused dequant fp16 GEMM; i8 = Q8 activations on int8 WMMA (prefill_kernels.py)
 PF_DENSE_I8 = os.environ.get("HY4_PREFILL_DENSE", "0") == "i8"
 PF_DIAG = os.environ.get("HY4_PREFILL_DIAG", "0") == "1"           # log fast-path vs exact error of every prefill dense matmul (debug)
+PF_IX = os.environ.get("HY4_PREFILL_IX", "0") == "1"                # 1 = k-pool indexer scores of prefill rows as an fp16 GEMM (indexer_fused scoring is fp32, 2 GB temporaries at T = 8192)
 PF_ROUTER = os.environ.get("HY4_PREFILL_ROUTER", "0") == "1"       # 1 = router logits of prefill rows as an fp16 GEMM (fp32 accumulate): fp32 matmul runs at 2.7 TFLOPS here
 
 
@@ -489,6 +490,8 @@ class Hy4Forward:
             w.update({k: load_dense(g, b + s).to(self.dev) for k, s in small.items()})
             w = {k: (v.to(self.dev) if isinstance(v, torch.Tensor) else v) for k, v in w.items()}
             fx[i] = FusedKPoolIndexer(w, self.dev, **self.ixc)
+            if PF_IX and self.dev.type == "cuda":
+                fx[i] = _pk().pf_indexer(fx[i], self.tm)
         return fx[i]
 
     # -- pieces
@@ -601,7 +604,9 @@ class Hy4Forward:
                 self.eng[i] = Hy4EngramGPU(self.g, i, self.dev, table=self.table, lin=None if os.environ.get("HY4_ENGRAM_GPU") == "2" else self._lin)    # 2 = dense fp32 kv (bit-exact vs CPU path)
             with self.tm.t("Engram"):
                 fut = getattr(self, "_eng_pf", {}).pop((i, start, x.shape[0]), None)
-                return self.eng[i](x, ids, start, pre=fut.result() if fut is not None else None)
+                with self.tm.t("f engram: wait for prefetched rows"):
+                    pre = fut.result() if fut is not None else None
+                return self.eng[i](x, ids, start, pre=pre)
         if i not in self.eng:
             self.eng[i] = Hy4Engram(self.g, i, table=self.table)
         with self.tm.t("Engram"):
