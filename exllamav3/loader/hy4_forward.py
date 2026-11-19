@@ -770,12 +770,19 @@ class Hy4Forward:
                 pre, post = self._site(x, L.hca)
                 cur = rms((x * pre[:, :, None]).sum(1), self.eps) * L.attn_norm
         mla = L.mla
+        kbase = 0
+        ring = getattr(mla, "kv_ring", 0)           # HY4_SWA_RING: window layers keep a ring of `ring` K rows instead of the full context
+        mla.ring_call = ring if gs is not None else 0
         if gs is not None and gs.T == 1 and _KVF.ENABLED and _AE.ENABLED:       # HY4_KV_FUSED: rms + rope + K-row write in ONE kernel
             kc = gs.kv_row_fused(i, mla, cur, pos)
         else:
             with tm.t("attn proj"):
                 kn = mla.kv(cur, pos)
-            kc = gs.append_kv(i, kn) if gs is not None else _ns.append_kv(self, i, kn, start) if _ns.active(self) else (torch.cat([self.kc[i], kn]) if self.kc[i] is not None else kn)
+            if ring and gs is None:       # HY4_SWA_RING: window layer, eager rows: window - 1 history rows + the new rows, relative positions
+                kc, kbase = _ns.append_kv_ring(self, i, kn, start, ring, mla.window)
+                mla.kpos_arange = T > 16      # short eager steps use the generic kpos path (absolute positions); prefill rows are relative to the scratch
+            else:
+                kc = gs.append_kv(i, kn) if gs is not None else _ns.append_kv(self, i, kn, start) if _ns.active(self) else (torch.cat([self.kc[i], kn]) if self.kc[i] is not None else kn)
         N = kc.shape[0]
         allow = None
         if L.ix:
@@ -795,7 +802,7 @@ class Hy4Forward:
                     for t, r in enumerate(sel.rows):
                         allow[t, r.long()] = True
                     allow = allow.to(self.dev)
-        kqv, gated, out = mla.attend(cur, pos, kc, gs.ar[:N] if gs is not None else _ns.kpos(self, N) if _ns.active(self) else torch.arange(N, device=self.dev), allow)
+        kqv, gated, out = mla.attend(cur, pos, kc, gs.ar[:N] if gs is not None else _ns.kpos(self, kbase + N)[kbase:] if _ns.active(self) else torch.arange(N, device=self.dev), allow)
         self.kc[i] = kc
         self._hk("attn_kqv", i, kqv)
         self._hk("attn_gated", i, gated)

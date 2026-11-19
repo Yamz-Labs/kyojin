@@ -112,7 +112,7 @@ if triton is not None:
     def _mla_kernel(QL, QP, CK, KP, QPOS, KPOS, ALLOW, SINK, O, N, scale, window,
                     s_ql_t, s_ql_h, s_qp_t, s_qp_h, s_ck, s_kp, s_al, s_o_t, s_o_h,
                     R: tl.constexpr, P: tl.constexpr, BR: tl.constexpr, BP: tl.constexpr, BN: tl.constexpr,
-                    HAS_SINK: tl.constexpr, HAS_ALLOW: tl.constexpr, HAS_WIN: tl.constexpr, ARANGE: tl.constexpr):
+                    HAS_SINK: tl.constexpr, HAS_ALLOW: tl.constexpr, HAS_WIN: tl.constexpr, ARANGE: tl.constexpr, RING: tl.constexpr = 0):
         t = tl.program_id(0)
         h = tl.program_id(1)
         offr = tl.arange(0, BR)
@@ -147,8 +147,12 @@ if triton is not None:
                 vis = vis & ((qpos - kpos) < window)
             if HAS_ALLOW:
                 vis = vis & (tl.load(ALLOW + t * s_al + offn, mask=inb, other=0) != 0)
-            ck = tl.load(CK + offn[:, None] * s_ck + offr[None, :], mask=inb[:, None] & mr[None, :], other=0.0).to(tl.float32)
-            kp = tl.load(KP + offn[:, None] * s_kp + offp[None, :], mask=inb[:, None] & mp[None, :], other=0.0).to(tl.float32)
+            if RING > 0:                                   # window layer: the K rows live in a ring buffer, absolute position j in slot j % RING
+                offs = offn % RING
+            else:
+                offs = offn
+            ck = tl.load(CK + offs[:, None] * s_ck + offr[None, :], mask=inb[:, None] & mr[None, :], other=0.0).to(tl.float32)
+            kp = tl.load(KP + offs[:, None] * s_kp + offp[None, :], mask=inb[:, None] & mp[None, :], other=0.0).to(tl.float32)
             s = (tl.sum(ck * q[None, :], axis=1) + tl.sum(kp * qp[None, :], axis=1)) * scale
             s = tl.where(vis, s, float("-inf"))
             mn = tl.maximum(m, tl.max(s, axis=0))
@@ -161,24 +165,27 @@ if triton is not None:
         tl.store(O + t * s_o_t + h * s_o_h + offr, acc / l, mask=mr)
 
 
-def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, window=0, allow=None, kpos_is_arange=False):
+def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, window=0, allow=None, kpos_is_arange=False, ring=0):
     """drop-in for mla_sink_attend: q_lat [T,H,R], q_pe [T,H,P], ckv [N,R], k_pe [N,P] (row strides free), qpos [T], kpos [N],
     sinks [H] or None -> o_lat [T,H,R] fp32. kpos_is_arange (default False = generic): the caller's kpos is torch.arange(N)
     (the Hy4 forward always passes it so), which lets causal / window bounds skip K blocks."""
+    assert not ring or (kpos_is_arange and window and allow is None and window < ring), "ring K buffers need the arange / window kernel path"
     if os.environ.get("HY4_REF_MLA", "1") == "0":   # sub-flag: MLA half off
         return mla_sink_attend_ref(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks, window, allow)
     T, H, R = q_lat.shape
     N, P = ckv.shape[0], k_pe.shape[1]
     if (not _usable(q_lat, ckv) or T > MAX_T or sinks is None or N == 0 or q_lat.dtype != torch.float32 or ckv.dtype != torch.float32
             or q_lat.stride(-1) != 1 or q_pe.stride(-1) != 1 or ckv.stride(-1) != 1 or k_pe.stride(-1) != 1):
+        if ring:
+            raise RuntimeError("ring K buffer: the fused kernel declined and the torch reference cannot read a ring")
         return mla_sink_attend_ref(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks, window, allow)
     out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
     al = allow.view(torch.uint8) if allow is not None else qpos
     BN = 16
-    _mla_kernel[(T, H)](q_lat, q_pe, ckv, k_pe, qpos, kpos, al, sinks.float().contiguous(), out, N, float(scale), int(window),
+    _mla_kernel[(T, H)](q_lat, q_pe, ckv, k_pe, qpos, kpos, al, sinks.float().contiguous(), out, (1 << 30) if ring else N, float(scale), int(window),
                         q_lat.stride(0), q_lat.stride(1), q_pe.stride(0), q_pe.stride(1), ckv.stride(0), k_pe.stride(0),
                         allow.stride(0) if allow is not None else 0, out.stride(0), out.stride(1),
                         R=R, P=P, BR=triton.next_power_of_2(R), BP=triton.next_power_of_2(P), BN=BN,
-                        HAS_SINK=True, HAS_ALLOW=allow is not None, HAS_WIN=bool(window), ARANGE=bool(kpos_is_arange),
+                        HAS_SINK=True, HAS_ALLOW=allow is not None, HAS_WIN=bool(window), ARANGE=bool(kpos_is_arange), RING=int(ring),
                         num_warps=4)
     return out

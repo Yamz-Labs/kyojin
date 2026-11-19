@@ -100,6 +100,25 @@ def append_kv(fw, i, kn, start):
     return b[:need]
 
 
+def append_kv_ring(fw, i, kn, start, ring, window):
+    """window layer, eager rows (prefill chunk / short prompt) with a ring K buffer [ring, W]: returns (scratch, base) where scratch = the window - 1 rows before
+    `start` (gathered from the ring) + kn, as one contiguous [hist + T, W] tensor holding positions base .. start + T - 1; the last min(T, ring) rows of kn go
+    into the ring (slot = position % ring). The attend then sees the same keys, in the same order, as with the full-length buffer (relative offsets only)."""
+    st = state(fw)
+    b = st.kv[i]
+    T = kn.shape[0]
+    hist = min(start, window - 1)
+    base = start - hist
+    if hist:
+        slots = (torch.arange(base, start, device=kn.device)) % ring
+        scratch = torch.cat([b.index_select(0, slots), kn])
+    else:
+        scratch = kn
+    m = min(T, ring)
+    b.index_copy_(0, (torch.arange(start + T - m, start + T, device=kn.device)) % ring, kn[T - m:])
+    return scratch, base
+
+
 def kpos(fw, N):
     st = state(fw)
     st.ensure(N)

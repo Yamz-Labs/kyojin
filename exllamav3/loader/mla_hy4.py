@@ -283,9 +283,12 @@ class Hy4MLA:
             if PF_ATTN and T > PF_ATTN_MIN and qlat.is_cuda and getattr(self, "kpos_arange", False):
                 from . import prefill_attn as _pa     # prefill rows: flash-style kernel, keys visited only inside the window / causal range
                 o = (_pa.mla_flash if PF_ATTN_FLASH else _pa.mla_banded)(qlat, qpe, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow)
+            elif allow.__class__.__name__ == "SparseSel":       # HY4_LC_SPARSE: decode rows, exact selected groups + tail only
+                from . import lc_sparse as _LS
+                o = _LS.sparse_mla_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, allow, self.scale, self.sinks)
             elif _rf.ENABLED:       # HY4_REF_FUSED=1: one online-softmax kernel (sinks / window / allow inside)
                 o = _rf.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window, allow,
-                                        kpos_is_arange=getattr(self, "kpos_arange", False))
+                                        kpos_is_arange=getattr(self, "kpos_arange", False), ring=getattr(self, "ring_call", 0))
             else:
                 o = self.S.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window, allow)
         with tm.t("attn proj"):

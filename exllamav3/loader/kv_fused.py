@@ -11,14 +11,18 @@ ENABLED = os.environ.get("HY4_KV_FUSED", "0") == "1"
 
 
 @triton.jit
-def _k_kv(c_ptr, w_ptr, tab_ptr, pos_ptr, k_ptr, sc, sk, eps, R: tl.constexpr, P: tl.constexpr, BR: tl.constexpr):
+def _k_kv(c_ptr, w_ptr, tab_ptr, pos_ptr, k_ptr, sc, sk, eps, R: tl.constexpr, P: tl.constexpr, BR: tl.constexpr, RING: tl.constexpr):
     pos = tl.load(pos_ptr)
+    if RING > 0:
+        slot = pos % RING          # window layer: ring buffer row (the rope table is still indexed by the absolute position)
+    else:
+        slot = pos
     offr = tl.arange(0, BR)
     mr = offr < R
     x = tl.load(c_ptr + offr, mask=mr, other=0.0)
     rc = tl.rsqrt(tl.sum(x * x, axis=0) / R + eps)
     w = tl.load(w_ptr + offr, mask=mr, other=0.0)
-    tl.store(k_ptr + pos * sk + offr, x * rc * w, mask=mr)
+    tl.store(k_ptr + slot * sk + offr, x * rc * w, mask=mr)
     H: tl.constexpr = P // 2
     offh = tl.arange(0, H)
     x0 = tl.load(c_ptr + R + 2 * offh)
@@ -28,13 +32,13 @@ def _k_kv(c_ptr, w_ptr, tab_ptr, pos_ptr, k_ptr, sc, sk, eps, R: tl.constexpr, P
     a1 = tl.load(tb + offh * 2 + 1)           # s
     b0 = tl.load(tb + H * 2 + offh * 2)       # -s
     b1 = tl.load(tb + H * 2 + offh * 2 + 1)   # c
-    tl.store(k_ptr + pos * sk + R + 2 * offh, x0 * a0 + x1 * b0)
-    tl.store(k_ptr + pos * sk + R + 2 * offh + 1, x0 * a1 + x1 * b1)
+    tl.store(k_ptr + slot * sk + R + 2 * offh, x0 * a0 + x1 * b0)
+    tl.store(k_ptr + slot * sk + R + 2 * offh + 1, x0 * a1 + x1 * b1)
 
 
-def write_row(c, w, tab, pos, kbuf, R, P, eps):
+def write_row(c, w, tab, pos, kbuf, R, P, eps, ring=0):
     """c [1, R+P] fp32 (unit column stride), w [R], tab [n, 2, P/2, 2], pos [1] long device, kbuf [cap, R+P] fp32"""
-    _k_kv[(1,)](c, w, tab, pos, kbuf, c.stride(0), kbuf.stride(0), eps, R=R, P=P, BR=triton.next_power_of_2(R), num_warps=4)
+    _k_kv[(1,)](c, w, tab, pos, kbuf, c.stride(0), kbuf.stride(0), eps, R=R, P=P, BR=triton.next_power_of_2(R), RING=ring, num_warps=4)
 
 
 @triton.jit

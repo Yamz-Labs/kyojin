@@ -30,6 +30,7 @@ TM = int(os.environ.get("HY4_GRAPH_TM", "8"))          # max rows of one graph s
 MASK64 = (1 << 64) - 1
 PERT = None                      # [cap, D] fp32 noise table (measurement arms only)
 _IO_W = int(os.environ.get("HY4_GRAPH_IO", "64"))
+RING_ROWS = int(os.environ.get("HY4_SWA_RING", "0"))      # >= 1: K rows of window layers in a ring buffer of this many rows (e.g. 1024) instead of cap rows
 _POOL = ThreadPoolExecutor(max_workers=_IO_W)
 SPLIT = os.environ.get("HY4_GRAPH_SPLIT", "1") == "1"      # 3 graphs per step, cut before the first two Engram layers: the rows of the later layers are staged while the GPU runs the earlier ones
 STAGE_VEC = os.environ.get("HY4_STAGE_VEC", "1") == "1"   # vectorised Engram hash + a few big read chunks (engram_stage); 0 = the per-row python path
@@ -44,6 +45,7 @@ def _rms(x, w, eps):
 
 
 from . import pool_fused as _PF
+from . import lc_sparse as _LS
 _PF.ENABLED = os.environ.get("HY4_IDX_POOLK", "0") == "1"
 
 
@@ -89,6 +91,12 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     iq = ix._rope((qr @ ix.w["q_b"].T).reshape(T, H, d), pos)
     wt = (x.float() @ ix.w["proj"].T) / math.sqrt(d * H)
     Pb = Nb // k
+    if _LS.ENABLED and ix.tail and T <= 16 and _LS._usable(iq):        # HY4_LC_SPARSE: exact top-k over the pools + sparse attend (no [T, Nb] mask, no dense key scan)
+        idx, nsel = _LS.select_groups(iq.contiguous(), wt.contiguous(), ix.pool, pos, Pb, ix.n_top, k, ix.tail)
+        sel = _LS.SparseSel(idx, nsel, k, ix.tail)
+        if _LS.CHECK and not torch.cuda.is_current_stream_capturing():
+            _LS.check_rows(iq, wt, ix.pool, pos, Pb, ix.n_top, k, sel)
+        return sel
     kq = torch.relu(torch.einsum("nhd,pd->nhp", iq, ix.pool[:Pb]))
     sc = (kq * wt[:, :, None]).sum(1)
     gend = ar[:Pb] * k + (k - 1)
@@ -167,6 +175,10 @@ class _GS:
 
     def append_kv(self, i, kn):
         b = _ns.state(self.fw).kv[i]
+        ring = getattr(self.fw._layer(i).mla, "kv_ring", 0)
+        if ring:                                  # window layer: ring buffer, slot = position % ring; attention reads the whole ring through absolute positions
+            b.index_copy_(0, self.pos % ring, kn)
+            return b
         b.index_copy_(0, self.pos, kn)
         return b[:self.Nb]
 
@@ -176,8 +188,9 @@ class _GS:
         b = _ns.state(self.fw).kv[i]
         c = mla._q(cur, "wkv_a") @ mla.wkv_a.T
         tab = AE.table(mla.rope_dim, mla.theta, self.fw.dev, pos)
-        KVF.write_row(c, mla.kv_a_norm, tab, pos, b, mla.R, mla.rope_dim, mla.eps)
-        return b[:self.Nb]
+        ring = getattr(mla, "kv_ring", 0)
+        KVF.write_row(c, mla.kv_a_norm, tab, pos, b, mla.R, mla.rope_dim, mla.eps, ring=ring)
+        return b if ring else b[:self.Nb]
 
     def indexer(self, fw, i, cur, qr, N):
         # T rows in one pass: every row writes its vg row first, then the pooled groups are computed (a group completed inside this round gets its
@@ -228,8 +241,14 @@ class GraphDecoder:
         except ImportError:
             pass
         for i in range(fw.n_layers):
-            fw._layer(i)
+            m = fw._layer(i).mla
+            if RING_ROWS and m.swa and m.window and not hasattr(m, "kv_ring") and m.window + TM + 8 <= RING_ROWS:
+                m.kv_ring = RING_ROWS                  # exact: a window-W layer never reads a key older than W - 1 positions (RING_ROWS >= W + the verify rows)
             b = st.kv.get(i)
+            if getattr(m, "kv_ring", 0):
+                if b is None or b.shape[0] != m.kv_ring:
+                    st.kv[i] = torch.zeros(m.kv_ring, 512 + 64, dtype=torch.float32, device=fw.dev)
+                continue
             if b is None or b.shape[0] < self.cap:
                 nb = torch.zeros(self.cap, 512 + 64, dtype=torch.float32, device=fw.dev) if b is None else torch.zeros(self.cap, b.shape[1], dtype=b.dtype, device=fw.dev)
                 if b is not None:
