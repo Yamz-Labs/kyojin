@@ -37,6 +37,7 @@ class Hy4Engine:
         self.ngram_ext = int(os.environ.get("HY4_NGRAM_EXT", "0"))        # extra verify rows from a prompt-lookup n-gram match (0 = off)
         self.ngram_min = int(os.environ.get("HY4_NGRAM_MIN", "4"))
         self.ngram_adapt = os.environ.get("HY4_NGRAM_ADAPT", "0") == "1"
+        self.ngram_gate = os.environ.get("HY4_NGRAM_GATE", "0") == "1"
         self.ngram_fill = os.environ.get("HY4_NGRAM_FILL", "0") == "1"
         self.ready = False
         self.meta = None
@@ -203,6 +204,7 @@ class Hy4Engine:
                 ng = NGram(self.ngram_min, self.ngram_ext)
                 ng.reset(list(ids) + [y])
             n_ext = n_hit = n_extacc = 0
+            rate, since = 0.7, 0          # recent acceptance of the extra rows; below 0.3 the proposer pauses (a probe every 8 rounds)
             while out_n < max_new and not stop and not cancel():
                 j = GR.fw.n - 1
                 ta = pc()
@@ -210,7 +212,11 @@ class Hy4Engine:
                 tb = pc()
                 ext = []
                 if ng is not None:
-                    ext, ml = ng.propose(d, min(self.ngram_ext, self.SG.TM - 1 - k))
+                    lim = min(self.ngram_ext, self.SG.TM - 1 - k)
+                    if self.ngram_gate:
+                        since += 1
+                        lim = lim if rate >= 0.5 else (2 if rate >= 0.3 else (lim if since >= 8 else 0))
+                    ext, ml = ng.propose(d, lim)
                     if self.ngram_adapt and ext:           # longer match, more rows: 2 rows at the minimum match, +2 per extra matched token
                         ext = ext[:max(1, (ml - self.ngram_min + 1) * 2)]
                 toks = [y] + d + ext
@@ -229,6 +235,9 @@ class Hy4Engine:
                 while acc < nd and toks[acc + 1] == amh[acc]:
                     acc += 1
                 n_extacc += max(0, acc - k)
+                if ext:
+                    since = 0
+                    rate = 0.75 * rate + 0.25 * (max(0, acc - k) / len(ext))
                 new = toks[1:acc + 1] + [amh[acc]]        # toks[0] = y was already emitted; the verified drafts + the trunk's own next token
                 GR.rewind(j + 2 + acc)
                 if self.ngram_fill and acc >= k:          # head rows j + k .. j + acc were never written by the draft chain: true pairs (token p + 1, trunk state h_p)
