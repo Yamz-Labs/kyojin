@@ -142,6 +142,29 @@ class Hy4Engine:
             self.precapture(spec)
         self.reset()
         print(f"warm-up {n} tokens: {time.perf_counter() - t0:.1f} s", flush=True)
+        if os.environ.get("HY4_WARMUP_TAILS", "1") == "1":
+            self.warmup_tails()
+
+    def warmup_lengths(self) -> list[int]:
+        """prompt lengths that cover every Triton specialisation class a real prompt can need (an int argument is specialised on divisible-by-16 and on == 1):
+        rows aligned / unaligned, below / above the 1024-row CK threshold, a merged last chunk (chunk + up to 25 %) aligned / unaligned, and a second chunk
+        with past rows > 0 (needs a tail above 25 % of a chunk). A class first met by a real request costs 2-3 s of JIT (measured)."""
+        c = self.chunk
+        out = [40, 100, 512, 1000, 1024, 1500, 2048 + 7, c + 1000, c + 1024]
+        if c * 3 // 8 + 5 < c:
+            out.append(c + c * 3 // 8 + 5)          # unaligned second chunk, past > 0
+            out.append(c + c // 2)                  # aligned second chunk, past > 0
+        return [n for n in out if n + 16 < self.ctx]
+
+    def warmup_tails(self):
+        t0 = time.perf_counter()
+        for n in self.warmup_lengths():
+            ids = [(i * 7919 + 13) % 50000 for i in range(n)]
+            self.reset()
+            self.prefill(ids)
+            self.torch.cuda.synchronize()
+        self.reset()
+        print(f"warm-up tails {self.warmup_lengths()}: {time.perf_counter() - t0:.1f} s", flush=True)
 
     def precapture(self, spec: str = "all", progress=print):
         """build the decode graphs now instead of inside a decode round (a build = 2 eager bodies + the capture, 0.5 - 1 s of host time): spec = "all" (every context
