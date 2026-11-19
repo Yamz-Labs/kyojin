@@ -238,9 +238,9 @@ export EXL3_DFLASH_RING="$DRAFT_RING"
 export EXL3_LOAD_DEVICE="${EXL3_LOAD_DEVICE-cuda:0}"
 [ -n "$EXL3_LOAD_DEVICE" ] && echo " -- EXL3_LOAD_DEVICE=$EXL3_LOAD_DEVICE (single-device load)"
 
-# memguard: SIGKILL the server's process group if MemAvailable or a device's free
-# memory falls below its floor, and fadvise(DONTNEED) the shards every 5 s so the
-# ~86 GiB of buffered-pread page cache never shadows the same weights in one pool.
+# memguard: SIGKILL the server's process group if host MemAvailable falls below
+# its floor, and fadvise(DONTNEED) the shards every 5 s so the ~86 GiB of
+# buffered-pread page cache never shadows the same weights in one pool.
 use_mg=0
 case "$MEMGUARD" in
     1) use_mg=1 ;;

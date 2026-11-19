@@ -90,13 +90,17 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
 ### Pre-flight guard
 
 The guard estimates each device's footprint from actual bytes: weights, KV/recurrent cache,
-the part0 load slab and, on unified-memory devices only, a prefill workspace. The device cap is
-the device itself:
+the part0 load slab and, on unified-memory devices only, a prefill workspace. The caps are:
 
 ```text
-device_cap = min(mem_get_info().free, mem_get_info().total)
-host_cap   = MemAvailable - (host_floor + preflight_margin)
+dedicated device_cap = min(mem_get_info().free, mem_get_info().total)
+unified device_cap   = min(total, max(mem_get_info().free, MemAvailable))
+host_cap             = MemAvailable - (host_floor + preflight_margin)
 ```
+
+On unified devices, `MemAvailable` covers reclaimable page cache, which some runtimes report as
+used device memory; `total` bounds the visible aperture. A component added after the target load
+may also reuse the process's cached allocator blocks; treat that part as a planning estimate.
 
 Dedicated devices plan without a workspace: `auto` refuses only a hard overcommit of
 weights+cache+slab, and does not refuse a load that merely leaves less than the workspace
@@ -115,8 +119,8 @@ table plus the chosen N/context and the largest N/context that fits. `off` disab
 check is read-only. For MTP-on, use the guard's recommendation instead of hand-picking N:
 the drafter and its cache change the memory budget.
 
-The preflight's device caps are the devices' own free/full memory; the host cap follows
-the configured floor. A load that reaches the host floor is stopped by the supervisor.
+The device caps and the host cap are checked separately; a load that reaches the host floor is
+stopped by the supervisor.
 
 ### Allocator mode
 

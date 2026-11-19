@@ -225,8 +225,84 @@ def test_unified_footprint_adds_the_workspace_and_plans_against_host(mg, monkeyp
     assert fp.workspace_bytes == 5 * GIB
 
 
-def test_supervisor_host_floor_is_env_tunable(guard_mod, monkeypatch):
+def test_unified_capacity_uses_reclaimable_host_memory(mg, monkeypatch):
+    monkeypatch.setattr(mg, "is_unified_device", lambda _i: True)
+    guard = _guard(mg)
+
+    # A runtime that reports MemFree makes page cache look like used device memory.
+    fp = guard.footprint(0, total_bytes = 118 * GIB, free_bytes = 10 * GIB,
+                         weights_bytes = 108 * GIB)
+    report = guard.check([fp], host_available = 120 * GIB)
+    assert report.ok
+    # MemAvailable is the alternative bound, clamped by the visible aperture.
+    assert report.device_results[0].capacity_bytes == 118 * GIB
+
+    # A genuine host deficit is still refused.
+    with pytest.raises(mg.OOMGuardError, match = "deficit"):
+        guard.check([fp], host_available = 110 * GIB)
+
+
+def test_guard_mode_accepts_boolean_like_values(mg, monkeypatch):
+    for value in ("0", "false", "no", "off", "disabled", " FALSE ", 0, False):
+        assert mg.GuardPolicy(mode = value).mode == "off"
+    for value in ("1", "true", "yes", "on", "auto", 1, True):
+        assert mg.GuardPolicy(mode = value).mode == "auto"
+    with pytest.raises(ValueError, match = "oom guard mode"):
+        mg.GuardPolicy(mode = "maybe")
+
+    monkeypatch.setenv("KYOJIN_OOM_GUARD", "0")
+    assert mg.GuardPolicy.from_env().mode == "off"
+
+
+def test_reusable_device_bytes_adds_cached_allocator_blocks(mg, monkeypatch):
+    monkeypatch.setattr(mg, "_torch", lambda: SimpleNamespace(cuda = SimpleNamespace(
+        mem_get_info = lambda _i: (5 * GIB, 16 * GIB),
+        memory_reserved = lambda _i: 3 * GIB,
+        memory_allocated = lambda _i: GIB)))
+    assert mg.device_reusable_bytes(0) == 7 * GIB
+
+    # Missing counters fall back to raw free; a failed probe means no opinion.
+    def boom(_i):
+        raise RuntimeError("no counters")
+
+    monkeypatch.setattr(mg, "_torch", lambda: SimpleNamespace(cuda = SimpleNamespace(
+        mem_get_info = lambda _i: (5 * GIB, 16 * GIB),
+        memory_reserved = boom,
+        memory_allocated = boom)))
+    assert mg.device_reusable_bytes(0) == 5 * GIB
+
+    monkeypatch.setattr(mg, "_torch", lambda: SimpleNamespace(cuda = SimpleNamespace(
+        mem_get_info = boom)))
+    assert mg.device_reusable_bytes(0) is None
+
+
+def test_supervisor_host_floor_is_env_tunable(guard_mod, monkeypatch, capsys):
     monkeypatch.delenv("MEMGUARD_FLOOR", raising=False)
     assert guard_mod.host_floor_from_env() == 8.0
     monkeypatch.setenv("MEMGUARD_FLOOR", "9.5")
     assert guard_mod.host_floor_from_env() == 9.5
+
+    # A safety setting must not silently fall back after a typo, and non-finite
+    # values must not disable the floor (nan) or crash the lane (inf).
+    for value in ("eight", "nan", "inf", "-inf", "1e999"):
+        monkeypatch.setenv("MEMGUARD_FLOOR", value)
+        assert guard_mod.host_floor_from_env() == 8.0
+        assert "MEMGUARD_FLOOR" in capsys.readouterr().err
+
+
+def test_supervisor_log_rotates_at_the_size_cap(guard_mod, tmp_path):
+    path = tmp_path / "memguard.log"
+    log = guard_mod.Logger(str(path), max_bytes = 200)
+    for i in range(20):
+        log(f"line {i} " + "x" * 20)
+    assert (tmp_path / "memguard.log.1").exists()
+    assert path.exists() and path.stat().st_size <= 200
+
+
+def test_supervisor_log_rotation_failure_still_caps_the_file(guard_mod, tmp_path):
+    path = tmp_path / "memguard.log"
+    (tmp_path / "memguard.log.1").mkdir()               # makes os.replace fail
+    log = guard_mod.Logger(str(path), max_bytes = 200)
+    for i in range(20):
+        log(f"line {i} " + "x" * 20)
+    assert path.exists() and path.stat().st_size <= 200

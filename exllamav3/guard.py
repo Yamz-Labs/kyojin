@@ -26,6 +26,7 @@ Options
     --interval S           poll period in seconds               (default 0.5)
     --warn-gib F           log a warning below this             (default floor + 8)
     --log PATH             also append the trace here
+    --log-max-mb F         rotate --log to PATH.1 at F MiB        (default 16; 0 off)
     --grace S              seconds to wait after SIGKILL       (default 30)
     --sample-every S       append a host-memory sample to the log every S seconds
     --fadvise-dir DIR      release DIR/*.safetensors page cache periodically
@@ -102,19 +103,61 @@ def _open_log(path: str):
 
 
 class Logger:
-    def __init__(self, path: str | None):
+    def __init__(self, path: str | None, max_bytes: int = 16 * 1024 * 1024):
+        self.path = path
+        self.max_bytes = max(0, int(max_bytes))
+        self.size = 0
         self.fh = None
         if path:
+            try:
+                self.size = os.path.getsize(path)
+            except OSError:
+                self.size = 0
             try:
                 self.fh = _open_log(path)
             except OSError as exc:
                 print(f"[guard] cannot open log {path}: {exc}", file = sys.stderr, flush = True)
 
+    def _rotate(self) -> None:
+        if not self.fh or not self.path:
+            return
+        self.fh.close()
+        try:
+            os.replace(self.path, self.path + ".1")
+        except OSError as exc:
+            # A failed rename (PATH.1 is a directory, a pinned file, ...) must not
+            # defeat the cap: truncate the log instead of growing without bound.
+            print(f"[guard] could not rotate {self.path} ({exc}); truncating log",
+                  file = sys.stderr, flush = True)
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                fd = os.open(self.path, flags, 0o600)
+                self.fh = os.fdopen(fd, "a", buffering = 1)
+                self.size = 0
+            except OSError as reopen_exc:
+                self.fh = None
+                print(f"[guard] cannot reopen log {self.path}: {reopen_exc}",
+                      file = sys.stderr, flush = True)
+            return
+        try:
+            self.fh = _open_log(self.path)
+            self.size = 0
+        except OSError as exc:
+            self.fh = None
+            print(f"[guard] cannot reopen log {self.path}: {exc}", file = sys.stderr, flush = True)
+
     def __call__(self, msg: str) -> None:
         line = f"[guard {time.strftime('%H:%M:%S')}] {msg}"
         print(line, file = sys.stderr, flush = True)
         if self.fh:
-            self.fh.write(line + "\n")
+            data = line + "\n"
+            if self.max_bytes and self.size + len(data) > self.max_bytes:
+                self._rotate()
+            if self.fh:
+                self.fh.write(data)
+                self.size += len(data)
 
 
 def kill_tree(pid: int, sig: int) -> None:
@@ -134,6 +177,8 @@ def main() -> int:
     ap.add_argument("--warn-gib", type = float, default = None)
     ap.add_argument("--interval", type = float, default = 0.5)
     ap.add_argument("--log", type = str, default = None)
+    ap.add_argument("--log-max-mb", type = float, default = 16.0,
+                    help = "rotate --log to PATH.1 when it reaches this size (0 disables)")
     ap.add_argument("--grace", type = float, default = 30.0)
     ap.add_argument("--label", type = str, default = None)
     ap.add_argument("--sample-every", type = float, default = 0.0,
@@ -153,7 +198,7 @@ def main() -> int:
     ap.add_argument("cmd", nargs = argparse.REMAINDER)
     args = ap.parse_args()
 
-    log = Logger(args.log)
+    log = Logger(args.log, max_bytes = int(max(0.0, args.log_max_mb) * 1024 ** 2))
 
     if args.selftest:
         mi = meminfo()

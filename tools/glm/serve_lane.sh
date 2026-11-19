@@ -7,7 +7,8 @@ export EXL3_ROOT="$LANE_ROOT" EXL3_REPO="$LANE_ROOT" PYTHONPATH="$LANE_ROOT" TMP
 mkdir -p "$TMPDIR"
 
 # External supervisor (exllamav3/guard.py): the reliable backstop for a unified pool.
-# auto = arm on Linux when /proc/meminfo is readable (the previous memguard behavior).
+# auto = arm on Linux when /proc/meminfo is readable. Set MEMGUARD=0 to run without
+# a supervisor (the old lane behavior); the supervisor is otherwise on by default.
 MEMGUARD="${MEMGUARD:-auto}"
 MODEL=""
 args=("$@")

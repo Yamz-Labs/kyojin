@@ -744,6 +744,8 @@ def _fake_guard_probe(dm, monkeypatch, *, mg, part0_total=16 * 1024 ** 3,
                         lambda i: part0_total if i == 1 else part1_total)
     monkeypatch.setattr(dm, "device_free_bytes",
                         lambda i: part0_total if i == 1 else part1_total)
+    monkeypatch.setattr(dm, "device_reusable_bytes",
+                        lambda i: part0_total if i == 1 else part1_total)
     monkeypatch.setattr(mg, "is_unified_device", lambda i: i == 0)
     monkeypatch.setattr(dm, "host_available_bytes", lambda: host_available)
 
@@ -789,6 +791,63 @@ def test_split_plan_guard_passes_or_refuses_before_allocation(split_modules, mon
     off.build()
     assert off.guard_report is None
 
+
+def test_preload_guard_uses_raw_free_not_allocator_cached(split_modules, monkeypatch):
+    """Before a target is resident, cached blocks do not make a load fit."""
+    dm, _bridge, _split = split_modules
+    mg = __import__("exllamav3.memory_guard", fromlist = ["OOMGuardError"])
+    gib = dm.GIB
+
+    text = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
+    text_cfg = FakeConfig({f"layer.{i}": gib // 2 for i in range(4)})
+    _fake_guard_probe(dm, monkeypatch, mg=mg)
+    monkeypatch.setattr(dm, "device_free_bytes", lambda _i: gib // 10)
+    monkeypatch.setattr(dm, "device_reusable_bytes", lambda _i: 16 * gib)
+
+    plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
+                        guard = dm.OOMGuard(dm.GuardPolicy(mode = "auto"),
+                                            logger = lambda *_a: None),
+                        logger = lambda *_a: None)
+    plan.add("text", text, config = text_cfg)
+    with pytest.raises(mg.OOMGuardError, match = "deficit"):
+        plan.build()
+
+
+def test_late_component_uses_allocator_cached_bytes(split_modules, monkeypatch):
+    """After the target load, reuse the allocator's cached blocks, not raw free."""
+    dm, _bridge, _split = split_modules
+    mg = __import__("exllamav3.memory_guard", fromlist = ["OOMGuardError"])
+    gib = dm.GIB
+
+    text = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
+    text_cfg = FakeConfig({f"layer.{i}": gib // 2 for i in range(4)})
+    mtp = FakeModel([FakeModule("mtp.block.0", layer_idx = 0), FakeModule("mtp.head")])
+    mtp_cfg = FakeConfig({"mtp.block.0": 3 * gib, "mtp.head": gib})
+
+    _fake_guard_probe(dm, monkeypatch, mg=mg)
+    plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
+                        guard = dm.OOMGuard(dm.GuardPolicy(mode = "auto"),
+                                            logger = lambda *_a: None),
+                        logger = lambda *_a: None)
+    plan.add("text", text, config = text_cfg)
+    plan.build()
+    assert plan.guard_report is not None and plan.guard_report.ok
+    plan.record_load("text", 1.0)
+
+    # Driver-free is 1 GiB, but the allocator holds 15 GiB of reusable cached blocks.
+    raw_free = 1 * gib
+    monkeypatch.setattr(dm, "device_free_bytes", lambda _i: raw_free)
+    monkeypatch.setattr(dm, "device_reusable_bytes", lambda _i: 16 * gib)
+    plan.add("mtp", mtp, config = mtp_cfg)
+    assert plan.guard_report is not None and plan.guard_report.ok
+    part0 = next(r for r in plan.guard_report.device_results if r.footprint.index == 1)
+    assert part0.footprint.need_bytes > raw_free
+    assert part0.capacity_bytes == 16 * gib
+
+    # The same component is refused when only raw free is reported.
+    monkeypatch.setattr(dm, "device_reusable_bytes", lambda _i: raw_free)
+    with pytest.raises(mg.OOMGuardError, match = "deficit"):
+        plan.check_guard()
 
 def test_guard_mode_is_normalized_from_env_style_values(split_modules):
     _dm, _bridge, split = split_modules

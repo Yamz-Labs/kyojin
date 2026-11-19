@@ -718,12 +718,14 @@ it does not add capacity. Set it in the lane profile before `import exllamav3` f
 
 Pre-flight memory guard: `auto` refuses a load whose measured weights, cache, part0 slab and
 prefill workspace do not fit before allocating anything; `off` disables the check. The guard is
-read-only and never changes allocator settings or outputs.
+read-only and never changes allocator settings or outputs. `1`/`true`/`yes`/`on` are accepted as
+`auto`, and `0`/`false`/`no`/`none` as `off`, matching the launcher-style `MEMGUARD=0/1` values.
 
-There is no per-device GTT or VRAM reserve. Each device's cap is its own reported
-`min(mem_get_info().free, mem_get_info().total)`. A dedicated-VRAM allocation failure is a
-process-level error; the host floor is what protects the unified-memory box from kernel
-starvation.
+There is no per-device GTT or VRAM reserve. Dedicated GPUs are limited by their free VRAM;
+unified-memory devices also account for reclaimable page cache and the shared host floor, so
+cached model shards do not make a fitting load look too large. A dedicated-VRAM allocation
+failure is a process-level error; the host floor is what protects the unified-memory box from
+kernel starvation.
 
 ### `MEMGUARD_FLOOR` (default: `8`)
 
@@ -731,7 +733,8 @@ The host `MemAvailable` floor, used by both the pre-flight guard and `exllamav3/
 The preflight plans against `MemAvailable - (floor + margin)`; the supervisor SIGKILLs when
 `MemAvailable < floor`. The name is the established memguard variable, so existing lanes
 keep working. Raise it for a hungrier OS or more background services; lower it only after
-measuring.
+measuring. A non-numeric value is reported on stderr and falls back to the default, rather
+than silently changing the safety floor.
 
 ### `KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB` (default: `1`)
 
@@ -744,7 +747,7 @@ exactly at the floor.
 Estimated transient prefill workspace added to unified (integrated-memory) device footprints;
 dedicated devices use 0. The default 2.0 GiB is a planning estimate, not a universal measurement.
 This is model/context dependent; raise it for a model with a larger prefill scratch area. It is
-not a reserve: the device cap remains its own reported free memory.
+not a reserve.
 
 ### `EXL3_LOAD_ARENA` (default: `1`)
 

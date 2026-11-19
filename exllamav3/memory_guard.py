@@ -32,6 +32,11 @@ except ImportError:                                      # loaded as a standalon
 GIB = 1024 ** 3
 
 MODES = ("auto", "off")
+MODE_ALIASES = {
+    "auto": "auto", "on": "auto", "1": "auto", "true": "auto", "yes": "auto",
+    "off": "off", "0": "off", "false": "off", "no": "off", "none": "off",
+    "disabled": "off",
+}
 DEFAULT_PREFLIGHT_MARGIN_GIB = 1.0
 DEFAULT_WORKSPACE_GIB = 2.0
 
@@ -55,9 +60,16 @@ class GuardPolicy:
     workspace_gib: float = DEFAULT_WORKSPACE_GIB
 
     def __post_init__(self) -> None:
-        self.mode = (self.mode or "auto").strip().lower()
-        if self.mode not in MODES:
-            raise ValueError(f"oom guard mode must be one of {MODES}, not {self.mode!r}")
+        key = str(self.mode).strip().lower() if self.mode is not None else "auto"
+        if not key:
+            key = "auto"
+        mode = MODE_ALIASES.get(key)
+        if mode is None:
+            accepted = ", ".join(sorted(MODE_ALIASES))
+            raise ValueError(
+                f"oom guard mode must be one of {MODES} "
+                f"(aliases: {accepted}), not {key!r}")
+        self.mode = mode
         self.host_floor_gib = max(0.0, float(self.host_floor_gib))
         self.preflight_margin_gib = max(0.0, float(self.preflight_margin_gib))
         self.workspace_gib = max(0.0, float(self.workspace_gib))
@@ -134,6 +146,28 @@ def device_free_bytes(index: int) -> int | None:
         return None
 
 
+def device_reusable_bytes(index: int) -> int | None:
+    """Device free bytes plus this process's cached-but-unused allocator blocks.
+
+    ``mem_get_info`` reports driver-free memory, so blocks the caching allocator
+    has reserved but not allocated look used.  A component added after the target
+    load (MTP, vision) can reuse those blocks, and raw free would refuse a load
+    that fits.  Falls back to raw free when the allocator counters are unavailable.
+    """
+    try:
+        torch = _torch()
+        free, _total = torch.cuda.mem_get_info(int(index))
+        free = int(free)
+        try:
+            reserved = int(torch.cuda.memory_reserved(int(index)))
+            allocated = int(torch.cuda.memory_allocated(int(index)))
+        except Exception:                                # noqa: BLE001 - counters are optional
+            return free
+        return free + max(0, reserved - allocated)
+    except Exception:                                    # noqa: BLE001 - unavailable probe
+        return None
+
+
 def is_unified_device(index: int) -> bool:
     """True only when the runtime reports unified/integrated memory for the device.
 
@@ -170,15 +204,25 @@ class DeviceFootprint:
         return (int(self.weights_bytes) + int(self.cache_bytes)
                 + int(self.slab_bytes) + int(self.workspace_bytes))
 
-    def capacity_bytes(self) -> int | None:
-        """The device cap is its own free/total memory; no device reserve."""
-        if self.total_bytes is None and self.free_bytes is None:
+    def capacity_bytes(self, host_available: int | None = None) -> int | None:
+        """The device cap, bounded by its aperture and (on unified) the host pool.
+
+        A unified device shares the host pool, and some runtimes report MemFree,
+        so a growing page cache looks like used device memory.  The host view is
+        an alternative bound there because those pages are reclaimable; ``total``
+        still clamps the device's visible aperture.  Dedicated devices keep the
+        raw free/total cap.
+        """
+        free = self.free_bytes
+        if self.unified and host_available is not None:
+            free = int(host_available) if free is None else max(int(free), int(host_available))
+        if self.total_bytes is None and free is None:
             return None
-        if self.free_bytes is None:
+        if free is None:
             return int(self.total_bytes)
         if self.total_bytes is None:
-            return int(self.free_bytes)
-        return min(int(self.total_bytes), int(self.free_bytes))
+            return int(free)
+        return min(int(self.total_bytes), int(free))
 
     def describe(self) -> str:
         parts = [f"cuda:{self.index}"]
@@ -305,13 +349,15 @@ class OOMGuard:
     def evaluate(self, footprints: Iterable[DeviceFootprint],
                  host_available: int | None = None) -> GuardReport:
         footprints = list(footprints)
-        results = [DeviceResult(fp, fp.capacity_bytes()) for fp in footprints]
+        unified = [fp for fp in footprints if fp.unified]
+        if unified and host_available is None:
+            host_available = host_available_bytes()
+        results = [DeviceResult(fp, fp.capacity_bytes(host_available if fp.unified else None))
+                   for fp in footprints]
         host = None
-        if any(fp.unified for fp in footprints):
-            if host_available is None:
-                host_available = host_available_bytes()
+        if unified:
             host = HostResult(available_bytes = host_available,
-                              need_bytes = sum(fp.need_bytes for fp in footprints if fp.unified),
+                              need_bytes = sum(fp.need_bytes for fp in unified),
                               floor_bytes = int(self.policy.preflight_host_floor_gib * GIB))
         return GuardReport(device_results = results, host_result = host)
 

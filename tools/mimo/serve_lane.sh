@@ -6,7 +6,8 @@ source "$LANE_ROOT/tools/strix_halo/env.sh"
 export EXL3_ROOT="$LANE_ROOT" EXL3_REPO="$LANE_ROOT" PYTHONPATH="$LANE_ROOT" TMPDIR="$LANE_ROOT/scratch/msrv-lane" TQDM_DISABLE=1
 mkdir -p "$TMPDIR"
 
-# External supervisor: unified-memory boxes do not reliably OOM-kill.
+# External supervisor: unified-memory boxes do not reliably OOM-kill. auto = arm on
+# Linux when /proc/meminfo is readable; set MEMGUARD=0 to run without a supervisor.
 MEMGUARD="${MEMGUARD:-auto}"
 MODEL=""
 mg_args=("$@")

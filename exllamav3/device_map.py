@@ -48,6 +48,7 @@ from .memory_guard import (
     OOMGuard,
     check_single_device,
     device_free_bytes,
+    device_reusable_bytes,
     device_total_bytes,
     host_available_bytes,
 )
@@ -1024,7 +1025,11 @@ class SplitPlan:
         return out
 
     def _guard_probe(self) -> dict[int, tuple[int | None, int | None]]:
-        return {index: (device_total_bytes(index), device_free_bytes(index))
+        # Before any load the raw free number is the honest cap.  Once a target is
+        # resident, a late component (MTP, vision) can reuse the allocator's cached
+        # blocks; raw free would refuse a load that fits.
+        usable = device_reusable_bytes if self.records else device_free_bytes
+        return {index: (device_total_bytes(index), usable(index))
                 for index in self._guard_device_ids()}
 
     def _largest_guard_n(self, guard: OOMGuard, probe, host_available, infos,
