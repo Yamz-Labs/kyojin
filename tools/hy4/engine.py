@@ -140,6 +140,15 @@ class Hy4Engine:
         spec = os.environ.get("HY4_PRECAPTURE", "0")
         if spec != "0":
             self.precapture(spec)
+        if os.environ.get("HY4_WARMUP_PRIME_SPARSE", "1") == "1" and os.environ.get("HY4_LC_PRIME", "0") == "1":
+            # the draft-cache fill of a long prompt (> 16K groups) runs the blocked selection + sparse gather kernels: compile them now (a request must never JIT at depth)
+            old, self.SG.PRIME_IX_BLK = self.SG.PRIME_IX_BLK, 0
+            try:
+                self.reset()
+                self.prefill(ids)
+                self.torch.cuda.synchronize()
+            finally:
+                self.SG.PRIME_IX_BLK = old
         self.reset()
         print(f"warm-up {n} tokens: {time.perf_counter() - t0:.1f} s", flush=True)
         if os.environ.get("HY4_WARMUP_TAILS", "1") == "1":

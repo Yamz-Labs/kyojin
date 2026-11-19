@@ -31,6 +31,8 @@ MASK64 = (1 << 64) - 1
 PERT = None                      # [cap, D] fp32 noise table (measurement arms only)
 _IO_W = int(os.environ.get("HY4_GRAPH_IO", "64"))
 PRIME_IX = os.environ.get("HY4_LC_PRIME", "0") == "1"      # draft-cache fill rows (T > 16) select with the prefill scorer (fp16 GEMM, exact top-k)
+PRIME_SPARSE = os.environ.get("HY4_PRIME_SPARSE", "1") == "1"      # draft-cache fill above PRIME_IX_BLK groups: the selection stays a PfSparse (gather kernel in Hy4MLA.attend), never a dense [T, N] mask
+PRIME_IX_BLK = int(os.environ.get("HY4_PRIME_IX_BLK", "16384"))           # draft-cache fill: pooled groups above this use the blocked linear-time selection
 VG_RING = 4096 if int(os.environ.get("HY4_SWA_RING", "0")) else 0      # rows of the indexer (value | gate) ring: one prime call (2048 rows) + the open group
 RING_ROWS = int(os.environ.get("HY4_SWA_RING", "0"))      # >= 1: K rows of window layers in a ring buffer of this many rows (e.g. 1024) instead of cap rows
 _POOL = ThreadPoolExecutor(max_workers=_IO_W)
@@ -101,6 +103,9 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
         off = (pos.data_ptr() - ar.data_ptr()) // ar.element_size()
         if pos.dim() == 1 and 0 <= off < ar.shape[0] and Nb == Pb * k:
             from . import prefill_kernels as _pkm
+            if Pb > PRIME_IX_BLK:       # long prompt: the unblocked ix_select keeps a pow2(P)-wide row in registers (P = 65K groups at 256K: the Triton compile alone ran > 20 min at 100 % CPU)
+                sel = _pkm.ix_select_blocked(_pkm.to_f16(iq), _pkm.to_f16(ix.pool[:Pb]), wt, int(off), k, ix.tail, ix.n_top, Nb)
+                return sel if PRIME_SPARSE else sel.to_dense()
             sc = _pkm.ix_scores_fused(_pkm.to_f16(iq), _pkm.to_f16(ix.pool[:Pb]), wt, int(off), k, ix.tail)
             return _pkm.ix_select(sc, int(off), Nb, ix.n_top, k, ix.tail, want_bias=False)
     if _LS.ENABLED and ix.tail and T <= 16 and _LS._usable(iq):        # HY4_LC_SPARSE: exact top-k over the pools + sparse attend (no [T, Nb] mask, no dense key scan)

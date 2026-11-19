@@ -14,6 +14,7 @@ from . import dense_req as _DR
 PF_ATTN = os.environ.get("HY4_PREFILL_ATTN", "0") in ("1", "flash")
 PF_ATTN_FLASH = os.environ.get("HY4_PREFILL_ATTN", "0") == "flash"       # 1 = prefill rows (T > PF_ATTN_MIN): flash-style MLA kernel (prefill_attn.py)
 PF_ATTN_MIN = 16
+PRIME_SPARSE = os.environ.get("HY4_PRIME_SPARSE", "1") == "1"      # PfSparse selections of the draft-cache fill are attended sparse (see step_graph.PRIME_SPARSE)
 def pf_wot():
     return os.environ.get("HY4_PF_WOT", "0") == "1"
 #           # HY4_PF_WOT=1: gate output written transposed [H*vd, T] so the wo GEMM reads A column-major (faster vendor kernel at K=8192-16384)
@@ -299,6 +300,18 @@ class Hy4MLA:
                     out = _hf.rmsw(out, self.post_norm, self.eps) if _hf.ENABLED else rms(out, self.eps) * self.post_norm
         return None, gated, out
 
+    def _sparse_o(self, qlat, qpe, kcache, T, sel):
+        """sparse gather attention for T consecutive rows starting at sel.start (rows of kcache beyond start + T are never visible: the draft head passes N rounded up to a
+        multiple of 4) -> o_lat [T, H, R] fp32; HIP kernel when available, else the Triton one; no kernel specialises on the context length"""
+        from . import prefill_attn as _pa
+        end = sel.start + T
+        kc = kcache[:end]
+        qcat = torch.cat([qlat.float(), qpe.float()], -1).clamp(-65504.0, 65504.0).half().transpose(0, 1).contiguous()      # [H, T, R + P]
+        o = _sp_hip_call(self, kc, T, sel, qcat)
+        if o is None:
+            o = _pa.mla_sparse(self.R, kc, end - T, self.scale, self.sinks, sel, qcat)
+        return o.transpose(0, 1).float()
+
     def attend(self, cur, pos, kcache, kpos, allow=None):
         """cur [T, n_embd] at positions pos; kcache [N, R+rope] at kpos (includes the T new rows). -> (kqv, gated, out)"""
         T, H = cur.shape[0], self.H
@@ -307,8 +320,9 @@ class Hy4MLA:
         if allow.__class__.__name__ == "PfSparse":
             if self._f16_ok(cur) and self.H % 32 == 0:
                 return self.attend16(cur, pos, kcache, allow, qa)
-            allow = allow.to_dense()
-        if self._ck_ok(cur):
+            if not (PRIME_SPARSE and cur.is_cuda):
+                allow = allow.to_dense()          # else: generic path below, sparse gather (draft-cache fill at long context: a dense [T, N] mask costs O(T x N) and compiles N-sized kernels)
+        if allow.__class__.__name__ != "PfSparse" and self._ck_ok(cur):
             r = self.attend_ck(cur, pos, kcache, allow, qa)
             if r is not None:
                 return r
@@ -320,6 +334,8 @@ class Hy4MLA:
             if self.slot_base is not None:          # multi-session step: kcache = the flat K slabs, row t reads its own slab (mu_slots)
                 from . import mu_slots as _mu
                 o = _mu.mla_attend_slots(qlat, qpe, kcache, pos, self.slot_base, kpos.shape[0], self.scale, self.sinks, self.window, allow)
+            elif allow.__class__.__name__ == "PfSparse":        # draft-cache fill (HY4_LC_PRIME) above the blocked-selection threshold: selected groups + own open group only
+                o = self._sparse_o(qlat, qpe, kcache, T, allow)
             elif PF_ATTN and T > PF_ATTN_MIN and qlat.is_cuda and getattr(self, "kpos_arange", False):
                 from . import prefill_attn as _pa     # prefill rows: flash-style kernel, keys visited only inside the window / causal range
                 o = (_pa.mla_flash if PF_ATTN_FLASH else _pa.mla_banded)(qlat, qpe, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow)
