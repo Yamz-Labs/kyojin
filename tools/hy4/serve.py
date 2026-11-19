@@ -35,6 +35,7 @@ SHIPPED_ENV = {
     "HY4_HC_FUSED": "1", "HY4_HEAD_BF16": "1", "HY4_MLA_BG": "1", "HY4_ATTN_EAGER": "2", "HY4_KV_FUSED": "1",
     "HY4_IDX_POOLK": "1", "HY4_REF_FUSED": "1", "HY4_REF_ROUTER": "1", "HY4_REF_MLA": "1", "HY4_ROUTER_GEMV": "1", "HY4_MOE_SORT": "1",   # decode set
     "HY4_MTP_FAST": "1", "HY4_MTP_HEAD": "q8",                             # draft head
+    "HY4_NGRAM_EXT": "4", "HY4_NGRAM_MIN": "4",                            # prompt-lookup rows on top of the MTP drafts (4 extra verify rows when a 4-gram of the context matches)
     "HY4_PREFILL_MOE": "1", "HY4_PREFILL_DENSE": "1", "HY4_PREFILL_ATTN": "1", "HY4_PREFILL_IX": "1", "HY4_ENGRAM_PREFETCH": "1",
     "HY4_PF_F16": "1", "HY4_MOE_NFIRST": "1", "KEEPCACHE": "1",           # prefill set
 }
