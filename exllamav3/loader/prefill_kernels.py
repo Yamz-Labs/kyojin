@@ -8,6 +8,7 @@ accumulation fp32. Formats follow ggml: Q4_K 144 B / 256, Q3_K 110 B / 256, Q8_0
 """
 from __future__ import annotations
 import contextlib
+import os
 import torch
 import triton
 import triton.language as tl
@@ -81,9 +82,9 @@ def _wtile(W, wrow, sb, FMT: tl.constexpr, BN: tl.constexpr):
 
 @triton.jit
 def _gu_kernel(X, Wg, Wu, H, sorted_pairs, block_expert, P, topk, E, ebytes, lim,
-               K: tl.constexpr, N: tl.constexpr, ROWB: tl.constexpr, FMT: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+               K: tl.constexpr, N: tl.constexpr, ROWB: tl.constexpr, FMT: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, NF: tl.constexpr):
+    pid_m = tl.program_id(1 if NF else 0)         # NF: grid (N tiles, row blocks): the N tiles of one row block (and the blocks of one expert) run back to back
+    pid_n = tl.program_id(0 if NF else 1)
     e = tl.load(block_expert + pid_m)
     if e < E:
         offs_m = pid_m * BM + tl.arange(0, BM)
@@ -107,9 +108,9 @@ def _gu_kernel(X, Wg, Wu, H, sorted_pairs, block_expert, P, topk, E, ebytes, lim
 
 @triton.jit
 def _down_kernel(Hin, Wd, Out, wts, sorted_pairs, block_expert, P, E, ebytes,
-                 K: tl.constexpr, N: tl.constexpr, ROWB: tl.constexpr, FMT: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+                 K: tl.constexpr, N: tl.constexpr, ROWB: tl.constexpr, FMT: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, NF: tl.constexpr):
+    pid_m = tl.program_id(1 if NF else 0)
+    pid_n = tl.program_id(0 if NF else 1)
     e = tl.load(block_expert + pid_m)
     if e < E:
         offs_m = pid_m * BM + tl.arange(0, BM)
@@ -432,6 +433,7 @@ def to_f16(x):
     return x.float().clamp(-F16MAX, F16MAX).half() if x.dtype != torch.float16 else x
 
 
+MOE_NF = None             # tests: force the grid order (None = env HY4_MOE_NFIRST)
 MOE_CFG = None            # None = chosen from the rows per expert (see moe_cfg)
 DENSE_CFG = {"BM": 128, "BN": 128, "warps": 8, "stages": 1}
 
@@ -466,7 +468,7 @@ def route_blocks(sel, E, BM):
     return sp, be, maxb
 
 
-def moe_prefill(z, sel, w, bufs, fmts, lim, nff, nout, rowb, ebytes, E, cfg=None):
+def moe_prefill(z, sel, w, bufs, fmts, lim, nff, nout, rowb, ebytes, E, cfg=None, tm=None):
     """z [T, K] activations (fp32 / fp16), sel [T, topk] int, w [T, topk] fp32 routing weights.
     bufs = (gate, up, down) raw uint8 expert buffers (expert-major, row-major, stored blocks), fmts = (fmt gate/up, fmt down) as FMT ids,
     rowb = (row bytes gate/up, row bytes down), ebytes = (bytes per expert gate/up, down), nff = rows of gate / up (= K of down), nout = rows of down.
@@ -476,15 +478,21 @@ def moe_prefill(z, sel, w, bufs, fmts, lim, nff, nout, rowb, ebytes, E, cfg=None
     BM, BN = c["BM"], c["BN"]
     P = T * S
     K = z.shape[1]
-    sp, be, maxb = route_blocks(sel.to(torch.int64), E, BM)
-    x = to_f16(z).contiguous()
+    t = tm.t if tm is not None and tm.on else (lambda n: contextlib.nullcontext())
+    nf = c.get("NF", MOE_NF if MOE_NF is not None else os.environ.get("HY4_MOE_NFIRST", "0") == "1")
+    with t("f moe: route + sort"):
+        sp, be, maxb = route_blocks(sel.to(torch.int64), E, BM)
+        x = to_f16(z).contiguous()
     H = torch.empty(maxb * BM, nff, dtype=torch.float16, device=z.device)
-    _gu_kernel[(maxb, nff // BN)](x, bufs[0], bufs[1], H, sp, be, P, S, E, ebytes[0], float(lim), K=K, N=nff, ROWB=rowb[0], FMT=fmts[0], BM=BM, BN=BN,
-                                  num_warps=c["warps"], num_stages=c["stages"])
+    with t("f moe: gate+up kernel"):
+        _gu_kernel[((nff // BN, maxb) if nf else (maxb, nff // BN))](x, bufs[0], bufs[1], H, sp, be, P, S, E, ebytes[0], float(lim), K=K, N=nff, ROWB=rowb[0], FMT=fmts[0], BM=BM, BN=BN,
+                                                                      NF=nf, num_warps=c["warps"], num_stages=c["stages"])
     out = torch.empty(P, nout, dtype=torch.float32, device=z.device)
-    _down_kernel[(maxb, nout // BN)](H, bufs[2], out, w.reshape(-1).float().contiguous(), sp, be, P, E, ebytes[1], K=nff, N=nout, ROWB=rowb[1], FMT=fmts[1],
-                                     BM=BM, BN=BN, num_warps=c["warps"], num_stages=c["stages"])
-    return out.view(T, S, nout).sum(1)
+    with t("f moe: down kernel"):
+        _down_kernel[((nout // BN, maxb) if nf else (maxb, nout // BN))](H, bufs[2], out, w.reshape(-1).float().contiguous(), sp, be, P, E, ebytes[1], K=nff, N=nout, ROWB=rowb[1], FMT=fmts[1],
+                                                                          BM=BM, BN=BN, NF=nf, num_warps=c["warps"], num_stages=c["stages"])
+    with t("f moe: sum over topk"):
+        return out.view(T, S, nout).sum(1)
 
 
 def qdense(x, packed, fmt, cfg=None):
@@ -532,7 +540,7 @@ def quant_k(x):
     return q, d, s
 
 
-def moe_prefill_i8(z, sel, w, bufs, fmts, lim, nff, nout, rowb, ebytes, E, cfg=None):
+def moe_prefill_i8(z, sel, w, bufs, fmts, lim, nff, nout, rowb, ebytes, E, cfg=None, tm=None):
     """same contract as moe_prefill; activations quantised to Q8_K (llama.cpp's vec_dot_type for k-quants), int8 WMMA, scales applied per superblock"""
     T, S = sel.shape
     c = cfg or I8_CFG
@@ -591,3 +599,75 @@ def qdense_tm(x, packed, tm=None):
     with t(f"f dense N={N} K={K}: float"):
         out = torch.nan_to_num(o.float(), nan=0.0, posinf=F16MAX, neginf=-F16MAX)
     return out.reshape(*lead, N)
+
+
+@triton.jit
+def _gate_kernel(KV, G, OUT, T, HV, VD: tl.constexpr, BC: tl.constexpr):
+    """OUT[t, c] = KV[h, t, d] * sigmoid(G[t, c]) with c = h * VD + d: the Hy4 output gate on fp16 operands (fp32 maths, nan_to_num on the gate logits,
+    saturating fp16 result); KV is the batch-over-heads GEMM output [H, T, VD], G / OUT are [T, H * VD]"""
+    t = tl.program_id(0)
+    c = tl.program_id(1) * BC + tl.arange(0, BC)
+    cm = c < HV
+    h = c // VD
+    d = c % VD
+    g = tl.load(G + t.to(tl.int64) * HV + c, mask=cm, other=0.0).to(tl.float32)
+    g = tl.where(g != g, 0.0, tl.minimum(tl.maximum(g, -65504.0), 65504.0))
+    kv = tl.load(KV + (h.to(tl.int64) * T + t) * VD + d, mask=cm, other=0.0).to(tl.float32)
+    o = kv * (1.0 / (1.0 + tl.exp(-g)))
+    o = tl.minimum(tl.maximum(o, -65504.0), 65504.0)
+    tl.store(OUT + t.to(tl.int64) * HV + c, o.to(tl.float16), mask=cm)
+
+
+def gate16(kv, g):
+    """kv [H, T, VD] fp16 (bmm output), g [T, H * VD] fp16 (raw gate GEMM output) -> gated [T, H * VD] fp16"""
+    H, T, VD = kv.shape
+    out = torch.empty(T, H * VD, dtype=torch.float16, device=kv.device)
+    _gate_kernel[(T, triton.cdiv(H * VD, 1024))](kv, g, out, T, H * VD, VD=VD, BC=1024, num_warps=4)
+    return out
+
+
+def qdense_raw16(x, packed, tm=None, tag=""):
+    """qdense_tm without the fp32 upcast: x [M, K] (fp16 passes through, else saturating cast) -> raw fp16 GEMM output [M, N]"""
+    N, nb, bb = packed.shape
+    t = tm.t if tm is not None and tm.on else (lambda n: contextlib.nullcontext())
+    with t(f"f dense N={N} K={nb * 32}: to_f16"):
+        x2 = to_f16(x.reshape(-1, nb * 32)).contiguous()
+    with t(f"f dense N={N} K={nb * 32}: dequant"):
+        w16 = dequant_q8(packed)
+    with t(f"f dense N={N} K={nb * 32}: mm"):
+        return torch.mm(x2, w16)
+
+
+@triton.jit
+def _qprep_kernel(Q, COS, SIN, XH, QC, T, H, HD: tl.constexpr, NOPE: tl.constexpr, NOPEP: tl.constexpr, P: tl.constexpr, D: tl.constexpr, R: tl.constexpr):
+    """one program = one (t, h) row of the wq_b output [T, H * HD] (fp16 raw GEMM output): q_nope -> XH [H, T, NOPE] fp16 (nan -> 0, saturating),
+    q_pe -> rotary (consecutive pairs, cos / sin [T, P / 2] fp32) -> QC[h, t, R:R + P] fp16 (same rounding points as rope_norm + clamp + half)"""
+    t = tl.program_id(0)
+    h = tl.program_id(1)
+    base = (t.to(tl.int64) * H + h) * HD
+    dst = (h.to(tl.int64) * T + t)
+    c = tl.arange(0, NOPEP)
+    x = tl.load(Q + base + c, mask=c < NOPE, other=0.0).to(tl.float32)
+    x = tl.where(x != x, 0.0, tl.minimum(tl.maximum(x, -65504.0), 65504.0))
+    tl.store(XH + dst * NOPE + c, x.to(tl.float16), mask=c < NOPE)
+    i = tl.arange(0, P // 2)
+    x0 = tl.load(Q + base + NOPE + 2 * i).to(tl.float32)
+    x1 = tl.load(Q + base + NOPE + 2 * i + 1).to(tl.float32)
+    x0 = tl.where(x0 != x0, 0.0, tl.minimum(tl.maximum(x0, -65504.0), 65504.0))
+    x1 = tl.where(x1 != x1, 0.0, tl.minimum(tl.maximum(x1, -65504.0), 65504.0))
+    cs = tl.load(COS + t * (P // 2) + i)
+    sn = tl.load(SIN + t * (P // 2) + i)
+    o0 = tl.minimum(tl.maximum(x0 * cs - x1 * sn, -65504.0), 65504.0)
+    o1 = tl.minimum(tl.maximum(x0 * sn + x1 * cs, -65504.0), 65504.0)
+    tl.store(QC + dst * D + R + 2 * i, o0.to(tl.float16))
+    tl.store(QC + dst * D + R + 2 * i + 1, o1.to(tl.float16))
+
+
+def qprep(q, cos, sin, H, hd, nope, P, R):
+    """q [T, H * hd] fp16 (raw wq_b GEMM output) -> (xh [H, T, nope] fp16, qc [H, T, R + P] fp16 with the rotary q_pe in columns R:). The caller's batched GEMM
+    fills qc[..., :R] (xh @ wk_b^T)."""
+    T = q.shape[0]
+    xh = torch.empty(H, T, nope, dtype=torch.float16, device=q.device)
+    qc = torch.empty(H, T, R + P, dtype=torch.float16, device=q.device)
+    _qprep_kernel[(T, H)](q, cos, sin, xh, qc, T, H, HD=hd, NOPE=nope, NOPEP=triton.next_power_of_2(nope), P=P, D=R + P, R=R, num_warps=2)
+    return xh, qc

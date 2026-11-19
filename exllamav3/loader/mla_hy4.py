@@ -11,6 +11,12 @@ from . import ref_fused as _rf
 PF_ATTN = os.environ.get("HY4_PREFILL_ATTN", "0") in ("1", "flash")
 PF_ATTN_FLASH = os.environ.get("HY4_PREFILL_ATTN", "0") == "flash"       # 1 = prefill rows (T > PF_ATTN_MIN): flash-style MLA kernel (prefill_attn.py)
 PF_ATTN_MIN = 16
+def pf_f16():
+    return os.environ.get("HY4_PF_F16", "0") == "1"
+
+
+# HY4_PF_F16=1 (read live, per call): 1 = prefill attention chain in fp16 end to end (no fp32 [T, H, R] intermediates; same values, fewer passes)
+PF_DENSE_ON = os.environ.get("HY4_PREFILL_DENSE", "0") == "1"
 
 
 def _sinks_mod():
@@ -108,12 +114,13 @@ class Hy4MLA:
             pe = rope_norm(c[:, self.R:], pos, self.theta)
             return self._h(torch.cat([lat, pe], -1))
 
-    def q(self, cur, pos):
+    def q(self, cur, pos, qa=None):
         """-> q_lat [T,H,R], q_pe [T,H,rope] (q_nope absorbed with k_b; rope on the pe part)"""
         T, H = cur.shape[0], self.H
         tm = self.tm
         with tm.t("f q: wq_a mm"):
-            qa = self._q(cur, "wq_a") @ self.wq_a.T
+            if qa is None or self.q8_act:
+                qa = self._q(cur, "wq_a") @ self.wq_a.T
         with tm.t("f q: norm"):
             qr = rms(qa, self.eps) * self.q_a_norm
         with tm.t("f q: wq_b mm"):
@@ -127,12 +134,62 @@ class Hy4MLA:
                 qlat = torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
         return self._h(qlat, "q"), self._h(qp, "q")
 
+    _qa_pre = None       # raw wq_a output of this call's rows, left by the indexer branch (same expression): reused instead of a second GEMM
+
+    def _f16_ok(self, cur):
+        T = cur.shape[0]
+        return (pf_f16() and PF_ATTN and not PF_ATTN_FLASH and T > PF_ATTN_MIN and cur.is_cuda and getattr(self, "kpos_arange", False)
+                and not self.f16_kv and not self.q8_act and os.environ.get("HY4_PREFILL_DENSE", "0") == "1" and T >= 1024
+                and all(getattr(getattr(self, n), "ty", 0) == 8 for n in ("wq_a", "wq_b", "wgate", "wo")))
+
+    def q16(self, cur, pos, qa=None):
+        """prefill rows -> qc [H, T, R + rope] fp16 (saturated): [wk_b(q_nope) | rope(q_pe)] laid out per head, the layout the banded attention (ht=True) reads"""
+        from . import prefill_kernels as _pk
+        T, H = cur.shape[0], self.H
+        tm = self.tm
+        with tm.t("f q: wq_a mm"):
+            if qa is None:
+                qa = cur @ self.wq_a.T
+        with tm.t("f q: norm"):
+            qr = rms(qa, self.eps) * self.q_a_norm
+        with tm.t("f q: wq_b mm"):
+            q = _pk.qdense_raw16(qr, self.wq_b.packed, tm)
+        with tm.t("f q: rope"):
+            P = self.rope_dim
+            th = pos.double()[:, None] * (self.theta ** (-2.0 * torch.arange(P // 2, dtype=torch.float64, device=pos.device) / P))[None, :]
+            xh, qc = _pk.qprep(q, th.cos().float().contiguous(), th.sin().float().contiguous(), H, self.hd, self.nope, P, self.R)
+        with tm.t("f q: wk_b bmm"):
+            torch.bmm(xh, self._w16("wk_b").transpose(1, 2), out=qc[..., :self.R])
+        return qc
+
+    def attend16(self, cur, pos, kcache, allow, qa):
+        from . import prefill_attn as _pa, prefill_kernels as _pk
+        T, H = cur.shape[0], self.H
+        tm = self.tm
+        with tm.t("attn proj"):
+            qcat = self.q16(cur, pos, qa)
+        with tm.t("MLA core + sinks"):
+            o = _pa.mla_banded(self.R, None, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow, qcat=qcat, o16=True, ht=True)      # [H, T, R] fp16
+        with tm.t("attn proj"):
+            with tm.t("f attend: wv_b bmm"):
+                kv = torch.bmm(o, self._w16("wv_b").transpose(1, 2))      # [H, T, vd] fp16
+            with tm.t("f gate: wgate mm + sigmoid"):
+                gated = _pk.gate16(kv, _pk.qdense_raw16(cur, self.wgate.packed, tm))
+            with tm.t("f gate: wo mm"):
+                out = _pk.qdense_tm(gated, self.wo.packed, tm)
+            with tm.t("f gate: post norm"):
+                out = rms(out, self.eps) * self.post_norm if self.post_norm is not None else out
+        return None, gated, out
+
     def attend(self, cur, pos, kcache, kpos, allow=None):
         """cur [T, n_embd] at positions pos; kcache [N, R+rope] at kpos (includes the T new rows). -> (kqv, gated, out)"""
         T, H = cur.shape[0], self.H
         tm = self.tm
+        qa, self._qa_pre = self._qa_pre, None
+        if self._f16_ok(cur):
+            return self.attend16(cur, pos, kcache, allow, qa)
         with tm.t("attn proj"):
-            qlat, qpe = self.q(cur, pos)
+            qlat, qpe = self.q(cur, pos, qa)
         with tm.t("MLA core + sinks"):
             if PF_ATTN and T > PF_ATTN_MIN and qlat.is_cuda and getattr(self, "kpos_arange", False):
                 from . import prefill_attn as _pa     # prefill rows: flash-style kernel, keys visited only inside the window / causal range

@@ -115,8 +115,8 @@ def mla_flash(q_lat, q_pe, kc, qstart, scale, sinks=None, window=0, allow=None, 
 #   2. P = softmax(S, sink)  per row (Triton row kernel, fp16 out)
 #   3. O = P V            (Triton GEMM, V = first R columns of the same K rows)
 @triton.jit
-def _qk_kernel(Q, K, S, ALLOW, M, NK, NKP, row0, t0, qstart, klo, kbase, N, H, scale_l2,
-               D: tl.constexpr, WIN: tl.constexpr, HAS_ALLOW: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _qk_kernel(Q, K, S, ALLOW, M, NK, NKP, row0, t0, qstart, klo, kbase, N, H, scale_l2, TT,
+               D: tl.constexpr, WIN: tl.constexpr, HAS_ALLOW: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, HT: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BM + tl.arange(0, BM)
@@ -124,7 +124,11 @@ def _qk_kernel(Q, K, S, ALLOW, M, NK, NKP, row0, t0, qstart, klo, kbase, N, H, s
     mm = offs_m < M
     nn = offs_n < NK
     kb = tl.arange(0, BK)
-    qrow = (row0 + offs_m).to(tl.int64) * D
+    if HT:        # Q rows laid out [H, TT, D] (row = t * H + h)
+        gq = (row0 + offs_m).to(tl.int64)
+        qrow = ((gq % H) * TT + gq // H) * D
+    else:
+        qrow = (row0 + offs_m).to(tl.int64) * D
     krow = (klo - kbase + offs_n).to(tl.int64) * D
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for d in range(0, D, BK):
@@ -161,7 +165,7 @@ def _softmax_kernel(S, Pout, SINK, NKP, H, BLOCK: tl.constexpr, HAS_SINK: tl.con
 
 
 @triton.jit
-def _pv_kernel(Pm, V, O, M, NK, NKP, row0, klo, kbase, D: tl.constexpr, R: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _pv_kernel(Pm, V, O, M, NK, NKP, row0, klo, kbase, H, TT, D: tl.constexpr, R: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, O16: tl.constexpr, HT: tl.constexpr):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     offs_m = pid_m * BM + tl.arange(0, BM)
@@ -174,7 +178,14 @@ def _pv_kernel(Pm, V, O, M, NK, NKP, row0, klo, kbase, D: tl.constexpr, R: tl.co
         a = tl.load(Pm + offs_m.to(tl.int64)[:, None] * NKP + kk[None, :], mask=mm[:, None] & (kk[None, :] < NKP), other=0.0)
         b = tl.load(V + (klo - kbase + kk).to(tl.int64)[:, None] * D + offs_n[None, :], mask=(kk[:, None] < NK), other=0.0)
         acc = tl.dot(a, b, acc)
-    tl.store(O + (row0 + offs_m).to(tl.int64)[:, None] * R + offs_n[None, :], acc, mask=mm[:, None])
+    if O16:       # saturating fp16 store (the consumer GEMM takes fp16 operands: same value as clamp + half of the fp32 result)
+        acc = tl.minimum(tl.maximum(acc, -65504.0), 65504.0).to(tl.float16)
+    go = (row0 + offs_m).to(tl.int64)
+    if HT:
+        orow = (go % H) * TT + go // H
+    else:
+        orow = go
+    tl.store(O + orow[:, None] * R + offs_n[None, :], acc, mask=mm[:, None])
 
 
 BCFG = {"BM": 128, "BN": 128, "BK": 32, "warps": 8, "PBN": 128, "PBK": 32, "pwarps": 8, "S_BYTES": 48 << 20}
@@ -185,19 +196,31 @@ BCFG_SWA = dict(BCFG, S_BYTES=8 << 20)
 BCFG_FULL = dict(BCFG, S_BYTES=16 << 20, BN=64, PBK=64)
 
 
-def mla_banded(q_lat, q_pe, kc, qstart, scale, sinks=None, window=0, allow=None, cfg=None):
-    """same contract as mla_flash: q_lat [T, H, R], q_pe [T, H, P], kc [N, R + P] (N = qstart + T) -> o_lat [T, H, R] fp32"""
+def mla_banded(q_lat, q_pe, kc, qstart, scale, sinks=None, window=0, allow=None, cfg=None, qcat=None, o16=False, ht=False):
+    """same contract as mla_flash: q_lat [T, H, R], q_pe [T, H, P], kc [N, R + P] (N = qstart + T) -> o_lat [T, H, R] fp32.
+    qcat (fp16 [T, H, R + P], already saturated; q_lat = its first R columns, q_pe is None) skips the fp32 concat; o16 returns o_lat as saturated fp16."""
     c = cfg or (BCFG_SWA if window else BCFG_FULL)
-    T, H, R = q_lat.shape
-    Pd = q_pe.shape[-1]
-    D = R + Pd
+    if qcat is not None:
+        if ht:
+            H, T, D = qcat.shape
+        else:
+            T, H, D = qcat.shape
+        R = q_lat
+        Pd = D - R
+    else:
+        T, H, R = q_lat.shape
+        Pd = q_pe.shape[-1]
+        D = R + Pd
     N = kc.shape[0]
     assert N == qstart + T
-    dev = q_lat.device
+    dev = kc.device
     klo_all = max(0, qstart - window + 1) if window else 0
     kc16 = kc[klo_all:].clamp(-65504.0, 65504.0).half().contiguous()
-    qcat = torch.cat([q_lat, q_pe], -1).clamp(-65504.0, 65504.0).half().reshape(T * H, D).contiguous()
-    o = torch.empty(T, H, R, dtype=torch.float32, device=dev)
+    if qcat is None:
+        qcat = torch.cat([q_lat, q_pe], -1).clamp(-65504.0, 65504.0).half().reshape(T * H, D).contiguous()
+    else:
+        qcat = qcat.reshape(T * H, D)
+    o = torch.empty(*((H, T, R) if ht else (T, H, R)), dtype=torch.float16 if o16 else torch.float32, device=dev)
     al = allow.to(torch.int8).contiguous() if allow is not None else qcat
     sk = sinks.float().contiguous() if sinks is not None else qcat
     nk_max = min(N, (window + 0) if window else N) + 0
@@ -227,11 +250,11 @@ def mla_banded(q_lat, q_pe, kc, qstart, scale, sinks=None, window=0, allow=None,
             sbuf = torch.empty(need, dtype=torch.float32, device=dev)
             pbuf = torch.empty(need, dtype=torch.float16, device=dev)
         row0 = t0 * H
-        _qk_kernel[(triton.cdiv(M, c["BM"]), triton.cdiv(NKP, c["BN"]))](qcat, kc16, sbuf, al, M, NK, NKP, row0, t0, qstart, lo, klo_all, N, H, float(scale) * 1.4426950408889634,
-                                                                          D=D, WIN=int(window), HAS_ALLOW=allow is not None, BM=c["BM"], BN=c["BN"], BK=c["BK"],
+        _qk_kernel[(triton.cdiv(M, c["BM"]), triton.cdiv(NKP, c["BN"]))](qcat, kc16, sbuf, al, M, NK, NKP, row0, t0, qstart, lo, klo_all, N, H, float(scale) * 1.4426950408889634, T,
+                                                                          D=D, WIN=int(window), HAS_ALLOW=allow is not None, BM=c["BM"], BN=c["BN"], BK=c["BK"], HT=ht,
                                                                           num_warps=c["warps"], num_stages=1)
         _softmax_kernel[(M,)](sbuf, pbuf, sk, NKP, H, BLOCK=triton.next_power_of_2(NKP), HAS_SINK=sinks is not None, num_warps=4)
-        _pv_kernel[(triton.cdiv(M, c["BM"]), triton.cdiv(R, c["PBN"]))](pbuf, kc16, o, M, NK, NKP, row0, lo, klo_all, D=D, R=R, BM=c["BM"], BN=c["PBN"], BK=c["PBK"],
+        _pv_kernel[(triton.cdiv(M, c["BM"]), triton.cdiv(R, c["PBN"]))](pbuf, kc16, o, M, NK, NKP, row0, lo, klo_all, H, T, D=D, R=R, BM=c["BM"], BN=c["PBN"], BK=c["PBK"], O16=o16, HT=ht,
                                                                          num_warps=c["pwarps"], num_stages=1)
         t0 += Bq
     return o

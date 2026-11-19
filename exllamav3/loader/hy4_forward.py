@@ -26,6 +26,7 @@ import torch
 
 from .engram_rows import F8Rows, Hy4Engram, load_dense, _dequant_q8_0, rms
 from .mla_hy4 import Hy4MLA
+from . import mla_hy4 as _mla_mod
 from . import ref_fused as _rf
 from . import step_nosync as _ns
 
@@ -545,7 +546,7 @@ class Hy4Forward:
             with tm.t("routed experts"):
                 k_ = _pk()
                 lat = (k_.moe_prefill_i8 if PF_MOE_I8 else k_.moe_prefill)(z, sel, w, (rsp.bufs["gate"], rsp.bufs["up"], rsp.bufs["down"]), (k_.FROM_GROUPED[rsp.fu], k_.FROM_GROUPED[rsp.fd]), lim,
-                                     rsp.nff, rsp.nout, (rsp.strides[0], rsp.strides[2]), rsp.ebytes, rsp.E)
+                                     rsp.nff, rsp.nout, (rsp.strides[0], rsp.strides[2]), rsp.ebytes, rsp.E, tm=tm)
             self.stats["prefill_moe_calls"] = self.stats.get("prefill_moe_calls", 0) + 1
             sel_l = []
         rs = self.res.get(i) if (T <= MMVQ_MAXR and dev.type == "cuda") else None
@@ -658,6 +659,8 @@ class Hy4Forward:
         if L.ix:
           with tm.t("indexer / kpool"):
             qr = mla._q(cur, "wq_a") @ mla.wq_a.T
+            if _mla_mod.pf_f16():
+                mla._qa_pre = qr
             qr = _HCF.rmsw(qr, mla.q_a_norm, mla.eps) if _HCF is not None else rms(qr, mla.eps) * mla.q_a_norm
             if os.environ.get("HY4_INDEXER_FUSED", "0") == "1" and self.dev.type == "cuda":      # flag off: the old CPU path below, untouched
                 allow = self._indexer_fused(i).forward(cur, qr, N)
