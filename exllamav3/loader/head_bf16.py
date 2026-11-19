@@ -12,7 +12,7 @@ BV = int(os.environ.get("HY4_HEAD_BV", "8"))
 BD = int(os.environ.get("HY4_HEAD_BD", "512"))
 DOT = os.environ.get("HY4_HEAD_DOT", "0") == "1"             # 1 = verify rows (T >= 2) on tl.dot: fp16 WMMA, h split hi + lo (rel ~1e-7), W bf16 -> fp16 exact above 6e-8
 DOT_BV = int(os.environ.get("HY4_HEAD_DOT_BV", "64"))
-DOT_BD = int(os.environ.get("HY4_HEAD_DOT_BD", "128"))
+DOT_BD = int(os.environ.get("HY4_HEAD_DOT_BD", "64"))
 DOT_NW = int(os.environ.get("HY4_HEAD_DOT_NW", "4"))
 ROW_TILES = os.environ.get("HY4_ROW_TILES", "0") == "1"     # 1 = verify-row tiles tuned on the Strix (T 2..4: BD 64 + 2 warps; T >= 5: BV 16, BD 32)
 
