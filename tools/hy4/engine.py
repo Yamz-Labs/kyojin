@@ -41,6 +41,7 @@ class Hy4Engine:
         self.ngram_fill = os.environ.get("HY4_NGRAM_FILL", "0") == "1"
         self.ngram_long = int(os.environ.get("HY4_NGRAM_LONG", "0"))      # >= 1: a match of at least this many tokens REPLACES the MTP draft chain (verify y + up to TM - 1 copied tokens; the draft cache is refilled from the trunk states); 0 = off
         self._tune = None           # torch.cuda.tunable module while a frozen TunableOp results file is loaded (HY4_TUNABLEOP_FILE)
+        self.pipe = os.environ.get("HY4_PIPE", "1") == "1"     # start the next round's draft before the host bookkeeping of this round (host-only reorder, same tokens)
         self.policy = None
         if os.environ.get("HY4_DRAFT_POLICY", "0") == "1":
             from draft_policy import CostPolicy
@@ -130,8 +131,21 @@ class Hy4Engine:
         ids = [(i * 7919 + 13) % 50000 for i in range(n)]
         t0 = time.perf_counter()
         self.generate(ids, 8, lambda toks: False)
+        spec = os.environ.get("HY4_PRECAPTURE", "0")
+        if spec != "0":
+            self.precapture(spec)
         self.reset()
         print(f"warm-up {n} tokens: {time.perf_counter() - t0:.1f} s", flush=True)
+
+    def precapture(self, spec: str = "all", progress=print):
+        """build the decode graphs now instead of inside a decode round (a build = 2 eager bodies + the capture, 0.5 - 1 s of host time): spec = "all" (every context
+        bucket up to the cap, T = 1 .. TM, plus every draft bucket) or "T1,T2,.." (those verify row counts; "all" buckets). Call between requests, reset() after."""
+        t0 = time.perf_counter()
+        ts = None if spec in ("all", "1") else [int(x) for x in spec.split(",") if x]
+        built = self.GR.precapture(ts=ts)
+        nb = self.MG.precapture()
+        free = self.torch.cuda.mem_get_info()[0] / 2 ** 30
+        progress(f"precapture: {len(built)} verify graphs ({sum(x[2] for x in built) / 1000:.1f} s), {nb} draft graphs, {time.perf_counter() - t0:.1f} s, {free:.1f} GiB free")
 
     # ------------------------------------------------------------------------------------------ request state
     def reset(self):
@@ -238,18 +252,40 @@ class Hy4Engine:
                 self.policy.reset_stats()
             n_ext = n_hit = n_extacc = n_long = 0
             rate, since = 0.7, 0          # recent acceptance of the extra rows; below 0.4 the proposer pauses (a probe every 8 rounds)
+            stage_ov = self.MH._STAGE_OV[0]
+            cap0, caps0 = GR.stats["captures"], GR.stats["capture_s"]
+            lt = [0.0]                    # time of the last draft launch (set by plan)
+            td_prev = None
+            gap = [0.0, 0.0]              # host time with the GPU idle: verify result known -> next draft launched, draft tokens known -> verify launched
+
+            def plan(y_, hcur_, j_):
+                """the next round's draft, started BEFORE the host bookkeeping of this round: the n-gram long-match test (a long match replaces the chain) or the draft
+                launch (async: its tokens are read at the top of the round) + the Engram reads of verify row 0 (they do not depend on the drafts)"""
+                skip_, cl_, dd_ = False, [], None
+                if ng is not None and self.ngram_long > 0:
+                    cl_, ml_ = ng.propose([], self.SG.TM - 1)
+                    skip_ = bool(cl_) and ml_ >= self.ngram_long
+                if not skip_:
+                    dd_ = MG.run(y_, hcur_, j_)
+                    lt[0] = pc()
+                    if stage_ov:
+                        GR.prestage(y_)
+                return skip_, cl_, dd_
+
+            planned = False
             while out_n < max_new and not stop and not cancel():
                 j = GR.fw.n - 1
                 ta = pc()
-                skip = False
-                if ng is not None and self.ngram_long > 0:
-                    cl, ml = ng.propose([], self.SG.TM - 1)
-                    skip = bool(cl) and ml >= self.ngram_long
+                if not planned:
+                    skip, cl, dd = plan(y, hcur, j)
+                planned = False
+                if td_prev is not None and not skip:
+                    gap[0] += lt[0] - td_prev
                 if skip:
                     d, ext = [], cl
                     tb = pc()
                 else:
-                    d = MG.run(y, hcur, j).tolist()
+                    d = dd.tolist()
                     confs = None
                     if self.MH.CONF:                      # the draft graph appended the k confidences (fixed point 2^-20)
                         confs = [c / 1048576.0 for c in d[k:]]
@@ -280,6 +316,7 @@ class Hy4Engine:
                 tm[0] += tb - ta
                 tm[1] += tc - tb
                 tm[2] += td - tc
+                gap[1] += tc - tb
                 acc = 0
                 nd = len(toks) - 1
                 while acc < nd and toks[acc + 1] == amh[acc]:
@@ -308,14 +345,21 @@ class Hy4Engine:
                 if ng is not None:
                     ng.add(new)
                 y, hcur = amh[acc], hv[acc:acc + 1]
-                hist[acc] += 1
-                rounds += 1
                 room = max_new - out_n
                 if len(new) > room:
                     new = new[:room]
+                if self.pipe and out_n + len(new) < max_new:
+                    skip, cl, dd = plan(y, hcur, GR.fw.n - 1)
+                    planned = True
+                td_prev = td
+                hist[acc] += 1
+                rounds += 1
                 out_n += len(new)
                 stop = on_tokens(new)
             st["round_ms"] = [x / max(rounds, 1) * 1000 for x in tm]
+            st["gap_ms"] = [x / max(rounds, 1) * 1000 for x in gap]       # host time per round with the GPU idle: [after verify, before verify]
+            st["captures"] = GR.stats["captures"] - cap0
+            st["capture_s"] = GR.stats["capture_s"] - caps0
             if self.policy is not None:
                 st["policy"] = self.policy.stats()
             st["ngram"] = {"ext": self.ngram_ext, "min": self.ngram_min, "fill": self.ngram_fill, "hit_rounds": n_hit, "ext_rows": n_ext, "ext_accepted": n_extacc, "long": self.ngram_long, "long_rounds": n_long}

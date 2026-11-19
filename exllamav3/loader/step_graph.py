@@ -22,6 +22,7 @@ import torch
 from . import step_nosync as _ns
 from .engram_rows import QB, E4M3, E8M0
 from . import attn_eager as _ae
+from .engram_stage import EngramStager
 
 BUCKET = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
 TM = int(os.environ.get("HY4_GRAPH_TM", "8"))          # max rows of one graph step (verify rows)
@@ -29,6 +30,7 @@ MASK64 = (1 << 64) - 1
 PERT = None                      # [cap, D] fp32 noise table (measurement arms only)
 _IO_W = int(os.environ.get("HY4_GRAPH_IO", "64"))
 _POOL = ThreadPoolExecutor(max_workers=_IO_W)
+STAGE_VEC = os.environ.get("HY4_STAGE_VEC", "1") == "1"   # vectorised Engram hash + a few big read chunks (engram_stage); 0 = the per-row python path
 
 
 # ---------------------------------------------------------------------------------------------------- static indexer
@@ -202,7 +204,10 @@ class GraphDecoder:
         self.prepared = False
         self.expect_n = None
         self.hin = torch.zeros(2, TM, dtype=torch.long).pin_memory()
-        self.stats = {"captures": 0, "replays": 0}
+        self.hnp = self.hin.numpy()
+        self.stager = None
+        self._pre = None
+        self.stats = {"captures": 0, "replays": 0, "capture_s": 0.0}
         self.ev = torch.cuda.Event()
         self.ev_set = False
 
@@ -240,6 +245,8 @@ class GraphDecoder:
         self.vpin = torch.zeros(nE, TM, nc, dtype=torch.float32).pin_memory()
         self.rnp = self.rpin.numpy()
         self._rmv = None
+        if STAGE_VEC:
+            self.stager = EngramStager([fw.eng[i] for i in sorted(fw.ple)], fw.table, self.rnp, self.vpin.numpy(), pool=_POOL)
         for i in range(fw.n_layers):
             if fw._layer(i).ix:
                 indexer_static_init(fw._indexer_fused(i), self.cap)
@@ -257,6 +264,7 @@ class GraphDecoder:
         """new sequence: zero the static state (buffers keep their addresses so captured graphs stay valid)"""
         fw = self.fw
         self.expect_n = None
+        self._drain_pre()
         for b in self.st.kv.values():
             b.zero_()
         for ix in getattr(fw, "ixf", {}).values():
@@ -281,10 +289,44 @@ class GraphDecoder:
             fw._ns_dev = False
         return lg, torch.argmax(lg, -1), x, fw._h
 
+    def bucket(self, start, T=1):
+        """context bucket Nb of a step of T rows at positions start .. start + T - 1 (rows past the last position are masked inside the graph)"""
+        return min(self.cap, ((start + T - 1) // BUCKET + 1) * BUCKET)
+
+    def graph(self, Nb, T=1):
+        """the captured (graph, outputs) of a T-row step at context bucket Nb (captured now if not yet). Row-generic: T = rows of ONE sequence (verify) or any
+        batch of rows that the body maps onto positions (inp[1, :T])."""
+        return self._graph(Nb, T)
+
+    def precapture(self, nbs=None, ts=None, progress=None):
+        """capture every (Nb, T) graph now (a capture inside a decode round costs 2 eager bodies + the capture: 0.5 - 1 s of host time that lands in one round).
+        nbs: iterable of buckets (default every bucket up to the cap), ts: row counts (default 1 .. TM). Returns [(Nb, T, ms)] of the graphs built. The static
+        inputs keep their last values: call it between requests (the K / indexer rows it rewrites are the same ones the last step wrote) and reset() after."""
+        import time
+        nbs = sorted(set(nbs)) if nbs is not None else list(range(BUCKET, self.cap + 1, BUCKET))
+        ts = sorted(set(ts)) if ts is not None else list(range(1, TM + 1))
+        if not self.prepared:
+            self.prepare()
+        out = []
+        for T in ts:
+            assert 1 <= T <= TM
+            for Nb in nbs:
+                assert Nb % BUCKET == 0 and Nb <= self.cap
+                if (Nb, T) in self.graphs:
+                    continue
+                t = time.perf_counter()
+                self._graph(Nb, T)
+                out.append((Nb, T, round((time.perf_counter() - t) * 1000)))
+                if progress:
+                    progress(f"graph Nb={Nb} T={T} {out[-1][2]} ms")
+        return out
+
     def _graph(self, Nb, T=1):
         g = self.graphs.get((Nb, T))
         if g is not None:
             return g
+        import time
+        t_cap = time.perf_counter()
         fw, gs = self.fw, self.gs
         gs.Nb, gs.T = Nb, T
         fw._gs = gs
@@ -303,6 +345,7 @@ class GraphDecoder:
             fw._gs = None
         g = self.graphs[(Nb, T)] = (cg, out)
         self.stats["captures"] += 1
+        self.stats["capture_s"] += time.perf_counter() - t_cap
         return g
 
     def _jobs(self, start, t0, t1, toks):
@@ -337,23 +380,41 @@ class GraphDecoder:
         per = max(1, -(-len(jobs) // _IO_W))
         return [_POOL.submit(rd, jobs[a:a + per]) for a in range(0, len(jobs), per)]
 
+    def _drain_pre(self):
+        """wait for the reads of a staged row that was never used (they write into the shared pinned staging)"""
+        pre, self._pre = self._pre, None
+        if pre is not None:
+            for f in pre[2]:
+                f.result()
+
     def prestage(self, tok):
         """HY4_STAGE_OV: row 0 of the next verify (token tok at position fw.n) does not depend on the drafts: start its Engram reads now, while the draft chain runs on the GPU"""
         fw = self.fw
+        self._drain_pre()
         if self.ev_set:
             self.ev.synchronize()           # the previous replay has finished reading the pinned staging rows
         start = fw.n
-        jobs = self._jobs(start, 0, 1, fw.tokens + [int(tok)])
-        self._pre = (start, int(tok), self._submit(jobs))
+        if self.stager is not None:
+            futs = self.stager.stage(fw.tokens, start, 0, 1, extra=[int(tok)])
+        else:
+            futs = self._submit(self._jobs(start, 0, 1, fw.tokens + [int(tok)]))
+        self._pre = (start, int(tok), futs)
 
     def stage(self, start, T=1):
         """host side of T tokens: Engram hash + threaded pread of their rows into pinned staging, one H2D each (fw.tokens holds them at start .. start + T - 1)"""
         fw = self.fw
-        pre, self._pre = getattr(self, "_pre", None), None
+        pre, self._pre = self._pre, None
         t0 = 0
         if pre is not None and pre[0] == start and pre[1] == fw.tokens[start]:
             t0 = 1
-        futs = self._submit(self._jobs(start, t0, T, fw.tokens)) if T > t0 else []
+        elif pre is not None:
+            for f in pre[2]:                # stale staged row: its reads still write into the staging rows below
+                f.result()
+            pre = None
+        if self.stager is not None:
+            futs = self.stager.stage(fw.tokens, start, t0, T) if T > t0 else []
+        else:
+            futs = self._submit(self._jobs(start, t0, T, fw.tokens)) if T > t0 else []
         if t0:
             futs += pre[2]
         for f in futs:
@@ -383,10 +444,10 @@ class GraphDecoder:
         if self.ev_set:
             self.ev.synchronize()           # the previous replay has read the pinned staging buffers: safe to overwrite them
         fw.tokens.extend(int(t) for t in toks)
-        Nb = min(self.cap, ((start + T - 1) // BUCKET + 1) * BUCKET)
+        Nb = self.bucket(start, T)
         self.gs.Nb = Nb
-        self.hin[0, :T] = torch.tensor([int(t) for t in toks])
-        self.hin[1, :T] = torch.arange(start, start + T)
+        self.hnp[0, :T] = toks
+        self.hnp[1, :T] = np.arange(start, start + T)
         self.gs.inp.copy_(self.hin, non_blocking=True)
         self.stage(start, T)
         cg, _out = self._graph(Nb, T)

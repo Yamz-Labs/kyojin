@@ -248,6 +248,17 @@ class MTPGraph:
         g = self.graphs[N] = (cg, out)
         return g
 
+    def precapture(self, ns=None):
+        """capture the draft graph of every context bucket now (default: every bucket up to the cap); -> number built"""
+        mt = self.mt
+        ns = sorted(set(ns)) if ns is not None else list(range(self.BUCKET, mt.cap + 1, self.BUCKET))
+        built = 0
+        for N in ns:
+            if N not in self.graphs:
+                self._graph(N)
+                built += 1
+        return built
+
     def run(self, tok, h, j):
         """tok: host int (the token of the pair, x_{j+1}), h: device [1, D] trunk state h_j, j: head position -> device tensor [k] of drafts"""
         mt = self.mt
