@@ -18,7 +18,9 @@ import triton
 import triton.language as tl
 
 ENABLED = os.environ.get("HY4_HC_FUSED", "0") == "1"
+ONEPASS = os.environ.get("HY4_PF_FUSE", "0") == "1"      # one program per row: [optional residual add], mix dots, sigmoid, collapse, norm in ONE read of the stream (replaces K1 + K2)
 BK = int(os.environ.get("HY4_HC_BK", "512"))      # K1 chunk (elements of the flattened H*D row)
+EMIT16 = [os.environ.get("HY4_PF_FUSE", "0") == "1"]     # the one-pass kernel also writes the saturating fp16 copy of cur (registered with to_f16)
 MAX_D = 16384                                       # K2/K3 keep one row of D in registers
 
 
@@ -84,6 +86,41 @@ def _k2_collapse(x_ptr, part_ptr, sq_ptr, base_ptr, scale_ptr, w_ptr, post_ptr, 
 
 
 @triton.jit
+def _k12_row(x_ptr, y_ptr, post_ptr, s_ptr, fn_ptr, base_ptr, scale_ptr, w_ptr, postout_ptr, cur_ptr, cur16_ptr,
+             D, K, eps, hc_eps, mag,
+             H: tl.constexpr, HP: tl.constexpr, NO: tl.constexpr, HAS_RES: tl.constexpr, EMIT16: tl.constexpr, BD: tl.constexpr):
+    """K1 + K2 in one program per row: the whole [H, D] row is held in registers (read once, residual written once)"""
+    r = tl.program_id(0)
+    hv = tl.arange(0, HP)
+    d = tl.arange(0, BD)
+    off = hv[:, None] * D + d[None, :]
+    xm = (hv[:, None] < H) & (d[None, :] < D)
+    x = tl.load(x_ptr + r * K + off, mask=xm, other=0.0)
+    if HAS_RES:
+        yv = tl.load(y_ptr + r * D + d, mask=d < D, other=0.0)
+        pv = tl.load(post_ptr + r * H + hv, mask=hv < H, other=0.0)
+        x = x + pv[:, None] * yv[None, :]
+        tl.store(s_ptr + r * K + off, x, mask=xm)
+    rr = tl.math.rsqrt(tl.sum(tl.sum(x * x, axis=1), axis=0) / K + eps)
+    s0 = tl.load(scale_ptr)
+    pre_v = tl.zeros([HP], dtype=tl.float32)
+    for o in tl.static_range(NO):
+        fnt = tl.load(fn_ptr + o * K + off, mask=xm, other=0.0)
+        m = tl.sum(tl.sum(fnt * x, axis=1), axis=0)
+        if o < H:
+            val = tl.sigmoid(m * rr * s0 + tl.load(base_ptr + o)) + hc_eps
+            pre_v = tl.where(hv == o, val, pre_v)
+        else:
+            tl.store(postout_ptr + r * H + (o - H), mag * tl.sigmoid(m * rr * tl.load(scale_ptr + 1) + tl.load(base_ptr + o)) + hc_eps)
+    col = tl.sum(x * pre_v[:, None], axis=0)
+    rc = tl.math.rsqrt(tl.sum(col * col, axis=0) / D + eps)
+    c = col * rc * tl.load(w_ptr + d, mask=d < D, other=0.0)
+    tl.store(cur_ptr + r * D + d, c, mask=d < D)
+    if EMIT16:
+        tl.store(cur16_ptr + r * D + d, tl.minimum(tl.maximum(c, -65504.0), 65504.0).to(tl.float16), mask=d < D)
+
+
+@triton.jit
 def _k3_resid(s_ptr, f_ptr, post_ptr, w_ptr, o_ptr, D, eps,
               H: tl.constexpr, BD: tl.constexpr):
     r = tl.program_id(0)
@@ -99,13 +136,16 @@ def _k3_resid(s_ptr, f_ptr, post_ptr, w_ptr, o_ptr, D, eps,
 
 
 @triton.jit
-def _k4_rmsw(x_ptr, w_ptr, o_ptr, D, eps, BD: tl.constexpr):
+def _k4_rmsw(x_ptr, w_ptr, o_ptr, o16_ptr, D, eps, EMIT16: tl.constexpr, BD: tl.constexpr):
     r = tl.program_id(0)
     d = tl.arange(0, BD)
     dm = d < D
     x = tl.load(x_ptr + r * D + d, mask=dm, other=0.0)
     rc = tl.math.rsqrt(tl.sum(x * x, axis=0) / D + eps)
-    tl.store(o_ptr + r * D + d, x * rc * tl.load(w_ptr + d, mask=dm, other=0.0), mask=dm)
+    o = x * rc * tl.load(w_ptr + d, mask=dm, other=0.0)
+    tl.store(o_ptr + r * D + d, o, mask=dm)
+    if EMIT16:
+        tl.store(o16_ptr + r * D + d, tl.minimum(tl.maximum(o, -65504.0), 65504.0).to(tl.float16), mask=dm)
 
 
 def ok(x, hw, H):
@@ -126,6 +166,18 @@ def _mix(x, y, post_prev, hw, w, eps, hc_eps, mag):
     NOP = _p2(NO)
     NCH = triton.cdiv(K, BK)
     dev = x.device
+    if ONEPASS and H <= 8:
+        has_res = y is not None
+        s = torch.empty_like(x) if has_res else x
+        post = torch.empty(T, H, dtype=torch.float32, device=dev) if NO == 2 * H else None
+        cur = torch.empty(T, D, dtype=torch.float32, device=dev)
+        cur16 = torch.empty(T, D, dtype=torch.float16, device=dev) if EMIT16[0] else cur
+        _k12_row[(T,)](x, y if has_res else x, post_prev if has_res else x, s, fn, base, scale, w, post if post is not None else cur, cur, cur16,
+                       D, K, eps, hc_eps, mag, H=H, HP=_p2(H), NO=NO, HAS_RES=has_res, EMIT16=EMIT16[0], BD=_p2(D), num_warps=8)
+        if EMIT16[0]:
+            from . import prefill_kernels as _pk
+            _pk.register_f16(cur, cur16)
+        return s, post, cur
     part = torch.empty(T, NCH, NOP, dtype=torch.float32, device=dev)
     sq = torch.empty(T, NCH, dtype=torch.float32, device=dev)
     has_res = y is not None
@@ -160,9 +212,13 @@ def resid(s, f, post, w_post, eps):
     return o
 
 
-def rmsw(x, w, eps):
-    """rms(x, eps) * w over the last dim, fp32 [R, D] (one launch instead of 5)"""
+def rmsw(x, w, eps, emit16=False):
+    """rms(x, eps) * w over the last dim, fp32 [R, D] (one launch instead of 5). emit16: also writes the saturating fp16 copy and registers it with to_f16"""
     x = x.float().contiguous()
     o = torch.empty_like(x)
-    _k4_rmsw[(x.shape[0],)](x, w.contiguous(), o, x.shape[1], eps, BD=_p2(x.shape[1]), num_warps=8)
+    o16 = torch.empty(x.shape, dtype=torch.float16, device=x.device) if emit16 else o
+    _k4_rmsw[(x.shape[0],)](x, w.contiguous(), o, o16, x.shape[1], eps, EMIT16=bool(emit16), BD=_p2(x.shape[1]), num_warps=8)
+    if emit16:
+        from . import prefill_kernels as _pk
+        _pk.register_f16(o, o16)
     return o

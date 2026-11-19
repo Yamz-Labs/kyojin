@@ -146,6 +146,7 @@ class Hy4MLA:
                 qlat = torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
         return self._h(qlat, "q"), self._h(qp, "q")
 
+    _qr_n = None        # normalised q_a of this call's rows (indexer branch, HY4_PF_FUSE=1), consumed by attend_ck
     _qa_pre = None       # raw wq_a output of this call's rows, left by the indexer branch (same expression): reused instead of a second GEMM
 
     def _f16_ok(self, cur):
@@ -222,7 +223,10 @@ class Hy4MLA:
                 if qa is None:
                     qa = cur @ self.wq_a.T
             with tm.t("f q: norm"):
-                qr = rms(qa, self.eps) * self.q_a_norm
+                from . import hc_fused as _hcf
+                qr, self._qr_n = self._qr_n, None
+                if qr is None or qr.shape[0] != qa.shape[0]:
+                    qr = _hcf.rmsw(qa, self.q_a_norm, self.eps, emit16=True) if (_pk.PF_FUSE and _hcf.ENABLED) else rms(qa, self.eps) * self.q_a_norm
             with tm.t("f q: wq_b mm"):
                 q = _pk.qdense_raw16(qr, self.wq_b.packed, tm)
             with tm.t("f q: rope"):
@@ -237,8 +241,8 @@ class Hy4MLA:
                 lat16 = kc[:, :R].clamp(-65504.0, 65504.0).half().contiguous()
                 pe16 = kc[:, R:].clamp(-65504.0, 65504.0).half().contiguous()
                 kk, vv = _pu.kv_decompress(lat16, pe16, self._kvw(), H)
-            bias = None
-            if allow is not None:
+            bias = getattr(allow, "_ck_bias", None) if klo == 0 else None
+            if allow is not None and bias is None:
                 with tm.t("f ck: allow bias"):
                     Nk = N - klo
                     bias = torch.empty(T, (Nk + 7) // 8 * 8, dtype=torch.float16, device=cur.device)

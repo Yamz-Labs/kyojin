@@ -130,6 +130,7 @@ PF_DENSE = os.environ.get("HY4_PREFILL_DENSE", "0") in ("1", "i8")    # 1 = pref
 PF_DENSE_I8 = os.environ.get("HY4_PREFILL_DENSE", "0") == "i8"
 PF_DIAG = os.environ.get("HY4_PREFILL_DIAG", "0") == "1"           # log fast-path vs exact error of every prefill dense matmul (debug)
 PF_IX = os.environ.get("HY4_PREFILL_IX", "0") == "1"                # 1 = k-pool indexer scores of prefill rows as an fp16 GEMM (indexer_fused scoring is fp32, 2 GB temporaries at T = 8192)
+PF_ROUTER2 = os.environ.get("HY4_PREFILL_ROUTER", "0") == "2"       # 2 = router logits of prefill rows from the split-fp16 kernel (hi + lo parts, near-fp32 accuracy)
 PF_ROUTER = os.environ.get("HY4_PREFILL_ROUTER", "0") == "1"       # 1 = router logits of prefill rows as an fp16 GEMM (fp32 accumulate): fp32 matmul runs at 2.7 TFLOPS here
 
 
@@ -761,7 +762,9 @@ class Hy4Forward:
             qr = mla._q(cur, "wq_a") @ mla.wq_a.T
             if _mla_mod.pf_f16():
                 mla._qa_pre = qr
-            qr = _HCF.rmsw(qr, mla.q_a_norm, mla.eps) if _HCF is not None else rms(qr, mla.eps) * mla.q_a_norm
+            qr = _HCF.rmsw(qr, mla.q_a_norm, mla.eps, emit16=_pk().PF_FUSE) if _HCF is not None else rms(qr, mla.eps) * mla.q_a_norm
+            if _pk().PF_FUSE:
+                mla._qr_n = qr          # attend_ck reuses the normalised q_a (and its fp16 copy) instead of a second norm
             if os.environ.get("HY4_INDEXER_FUSED", "0") == "1" and self.dev.type == "cuda":      # flag off: the old CPU path below, untouched
                 allow = gs.indexer(self, i, cur, qr, N) if gs is not None else self._indexer_fused(i).forward(cur, qr, N)
             else:

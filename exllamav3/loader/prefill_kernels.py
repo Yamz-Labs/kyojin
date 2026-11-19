@@ -346,6 +346,7 @@ def _deq_q8_kernel(W, OUT, N, K: tl.constexpr, ROWB: tl.constexpr, BN: tl.conste
 
 # ------------------------------------------------------------------------------------------------ k-pool indexer scoring (prefill rows)
 IX_ALLOW_CPU = [False]      # tests only
+CK_BIAS = [os.environ.get("HY4_PF_CK", "0") == "1"]      # ix_select also writes the CK attention bias
 
 
 def ix_scores(iq, pk, wt):
@@ -392,16 +393,22 @@ def _pf_indexer_forward(self, x, qr, n_keys=None):
         wt = (x.float() @ self.w["proj"].T) / math.sqrt(d * H)
     P = self.P
     with t("f ix: scores"):
-        sc = ix_scores(iq, self.pool[:P], wt)
-        gend = torch.arange(P, device=self.dev) * k + (k - 1)
-        vis = (gend[None] < pos[:, None]) if self.tail else (gend[None] <= pos[:, None])
-        sc = torch.where(vis, sc, torch.full_like(sc, -math.inf))
+        if PF_FUSE:
+            sc = ix_scores_fused(to_f16(iq), to_f16(self.pool[:P]), wt, start, k, self.tail)
+        else:
+            sc = ix_scores(iq, self.pool[:P], wt)
+            gend = torch.arange(P, device=self.dev) * k + (k - 1)
+            vis = (gend[None] < pos[:, None]) if self.tail else (gend[None] <= pos[:, None])
+            sc = torch.where(vis, sc, torch.full_like(sc, -math.inf))
         self.last_scores = sc
     last = start + T - 1
     nvis_max = last // k if self.tail else (last + 1) // k
     if nvis_max <= self.n_top:
         return None
     N = self.n if n_keys is None else n_keys
+    if PF_FUSE and N >= P * k:
+        with t("f ix: select + allow + bias"):
+            return ix_select(sc, start, N, self.n_top, k, self.tail, want_bias=CK_BIAS[0])
     with t("f ix: topk"):
         idx = torch.topk(sc, min(self.n_top, P), dim=1).indices
     with t("f ix: allow mask"):
@@ -454,6 +461,173 @@ def to_f16(x):
     _sat_half_kernel[(triton.cdiv(n, 4096),)](x, o, n, BLK=4096, num_warps=4)
     _F16_MEMO[0], _F16_MEMO[1] = (x, o), key
     return o
+
+
+# ------------------------------------------------------------------------------------------------ fused cast helpers (HY4_PF_FUSE=1)
+PF_FUSE = os.environ.get("HY4_PF_FUSE", "0") == "1"
+
+
+@triton.jit
+def _f32_sat_kernel(X, O, n, BLK: tl.constexpr):
+    i = tl.program_id(0).to(tl.int64) * BLK + tl.arange(0, BLK)
+    m = i < n
+    x = tl.load(X + i, mask=m, other=0.0).to(tl.float32)
+    x = tl.where(x != x, 0.0, tl.minimum(tl.maximum(x, -65504.0), 65504.0))
+    tl.store(O + i, x, mask=m)
+
+
+def f32_sat(o):
+    """fp16 GEMM output -> fp32 with nan -> 0 and +-inf -> +-65504: torch.nan_to_num(o.float(), ...) in ONE pass instead of three"""
+    if not PF_FUSE or o.dtype != torch.float16 or not o.is_cuda or not o.is_contiguous():
+        return torch.nan_to_num(o.float(), nan=0.0, posinf=F16MAX, neginf=-F16MAX)
+    out = torch.empty(o.shape, dtype=torch.float32, device=o.device)
+    n = o.numel()
+    _f32_sat_kernel[(triton.cdiv(n, 4096),)](o, out, n, BLK=4096, num_warps=4)
+    return out
+
+
+def register_f16(x, x16):
+    """tell to_f16 that x16 is the saturating fp16 copy of the fp32 tensor x (a producer kernel wrote both)"""
+    if x.dtype == torch.float32 and x.is_contiguous() and x.numel() >= (1 << 20):
+        _F16_MEMO[0], _F16_MEMO[1] = (x, x16), (x.data_ptr(), x.shape, x._version)
+
+
+# ------------------------------------------------------------------------------------------------ router logits, split fp16 (HY4_PREFILL_ROUTER=2)
+@triton.jit
+def _rt_split_kernel(X, W, O, T, E, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """O[t, e] = sum_k X[t, k] * W[e, k] with both operands split into fp16 hi + lo parts: hi*hi + hi*lo + lo*hi, fp32 accumulation (error ~ 2^-21 relative)"""
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros([BM, BN], dtype=tl.float32)
+    for k0 in range(0, K, BK):
+        kk = k0 + rk
+        x = tl.load(X + rm[:, None].to(tl.int64) * K + kk[None, :], mask=(rm[:, None] < T) & (kk[None, :] < K), other=0.0)
+        w = tl.load(W + rn[None, :].to(tl.int64) * K + kk[:, None], mask=(rn[None, :] < E) & (kk[:, None] < K), other=0.0)       # [BK, BN]
+        x = tl.minimum(tl.maximum(x, -65504.0), 65504.0)
+        xh = x.to(tl.float16)
+        xl = (x - xh.to(tl.float32)).to(tl.float16)
+        wh = w.to(tl.float16)
+        wl = (w - wh.to(tl.float32)).to(tl.float16)
+        acc = tl.dot(xh, wh, acc)
+        acc = tl.dot(xh, wl, acc)
+        acc = tl.dot(xl, wh, acc)
+    tl.store(O + rm[:, None].to(tl.int64) * E + rn[None, :], acc, mask=(rm[:, None] < T) & (rn[None, :] < E))
+
+
+RT_CFG = (64, 64, 32, 4)
+
+
+def router_logits(x, w, cfg=None):
+    """x [T, K] fp32 @ w[E, K].T -> [T, E] fp32 with near-fp32 accuracy at fp16 tensor-core speed (fp32 matmul runs at 2.7 TFLOPS here)"""
+    T, K = x.shape
+    E = w.shape[0]
+    x = x.contiguous()
+    w = w.contiguous()
+    o = torch.empty(T, E, dtype=torch.float32, device=x.device)
+    bm, bn, bk, nw = cfg or RT_CFG
+    _rt_split_kernel[(triton.cdiv(T, bm), triton.cdiv(E, bn))](x, w, o, T, E, K, BM=bm, BN=bn, BK=bk, num_warps=nw)
+    return o
+
+
+# ------------------------------------------------------------------------------------------------ fused indexer scorer + exact top-k selection (HY4_PF_FUSE=1)
+@triton.jit
+def _ix_score_kernel(IQ, PK, WT, SC, T, P, start, H: tl.constexpr, D: tl.constexpr, KP: tl.constexpr, TAIL: tl.constexpr, BT: tl.constexpr, BP: tl.constexpr):
+    """SC[t, p] = sum_h WT[t, h] * relu(IQ[t, h, :] . PK[p, :]) for the groups visible to row t (group end < pos with TAIL, <= pos without), -inf elsewhere.
+    IQ [T, H, D] fp16, PK [P, D] fp16, WT [T, H] fp32, SC [T, P] fp32. Tiles that no row of the block can see are skipped."""
+    pt = tl.program_id(0)
+    pp = tl.program_id(1)
+    t = pt * BT + tl.arange(0, BT)
+    p = pp * BP + tl.arange(0, BP)
+    pos = start + t
+    gend = p * KP + (KP - 1)
+    if TAIL:
+        vis = gend[None, :] < pos[:, None]
+    else:
+        vis = gend[None, :] <= pos[:, None]
+    tm = t < T
+    out = SC + t[:, None].to(tl.int64) * P + p[None, :]
+    om = tm[:, None] & (p[None, :] < P)
+    pmax = start + tl.minimum(pt * BT + BT - 1, T - 1)
+    first_end = pp * BP * KP + (KP - 1)
+    skip = (first_end >= pmax) if TAIL else (first_end > pmax)
+    if skip:
+        tl.store(out, tl.full([BT, BP], float("-inf"), dtype=tl.float32), mask=om)
+    else:
+        dd = tl.arange(0, D)
+        pk = tl.load(PK + p[None, :].to(tl.int64) * D + dd[:, None], mask=(p[None, :] < P), other=0.0)      # [D, BP]
+        acc = tl.zeros([BT, BP], dtype=tl.float32)
+        for h in range(H):
+            q = tl.load(IQ + (t[:, None].to(tl.int64) * H + h) * D + dd[None, :], mask=tm[:, None], other=0.0)      # [BT, D]
+            w = tl.load(WT + t * H + h, mask=tm, other=0.0)
+            s = tl.dot(q, pk)
+            acc += tl.maximum(s, 0.0) * w[:, None]
+        tl.store(out, tl.where(vis, acc, float("-inf")), mask=om)
+
+
+def ix_scores_fused(iq16, pk16, wt, start, kpool, tail):
+    """iq16 [T, H, d] fp16, pk16 [P, d] fp16, wt [T, H] fp32 -> sc [T, P] fp32 (invisible groups = -inf); fp32 accumulation, no [T*H, P] temporaries"""
+    T, H, d = iq16.shape
+    P = pk16.shape[0]
+    sc = torch.empty(T, P, dtype=torch.float32, device=iq16.device)
+    _ix_score_kernel[(triton.cdiv(T, 64), triton.cdiv(P, 64))](iq16.contiguous(), pk16.contiguous(), wt.contiguous(), sc, T, P, start, H=H, D=d, KP=kpool,
+                                                                 TAIL=int(bool(tail)), BT=64, BP=64, num_warps=4)
+    return sc
+
+
+@triton.jit
+def _ix_select_kernel(SC, ALLOW, BIAS, P, N, NP, start, n_top, PP: tl.constexpr, KP: tl.constexpr, TAIL: tl.constexpr, WRITE_BIAS: tl.constexpr):
+    """one row per program: the n_top highest scores (ties: lowest group index first; invisible groups never selected) -> group mask expanded to keys,
+    OR the row's own open group (tail); writes allow [T, N] (int8) and optionally the CK bias [T, NP] fp16 (0 / -30000)"""
+    r = tl.program_id(0)
+    pos = start + r
+    g = tl.arange(0, PP)
+    gm = g < P
+    sc = tl.load(SC + r.to(tl.int64) * P + g, mask=gm, other=float("-inf"))
+    gend = g * KP + (KP - 1)
+    vis = gm & ((gend < pos) if TAIL else (gend <= pos))
+    b = (sc + 0.0).to(tl.int32, bitcast=True)      # + 0.0: -0.0 becomes +0.0 (equal floats must give equal keys)
+    key = tl.where(b < 0, b ^ 0x7FFFFFFF, b).to(tl.int64)
+    lo = tl.full([1], -2147483648, dtype=tl.int64)
+    hi = tl.full([1], 2147483647, dtype=tl.int64)
+    for _ in range(32):
+        mid = lo + (hi - lo + 1) // 2
+        cnt = tl.sum((key >= mid).to(tl.int32), axis=0)
+        ge = cnt >= n_top
+        lo = tl.where(ge, mid, lo)
+        hi = tl.where(ge, hi, mid - 1)
+    gt = key > lo
+    eq = key == lo
+    need = n_top - tl.sum(gt.to(tl.int32), axis=0)
+    rank = tl.cumsum(eq.to(tl.int32), axis=0)
+    sel = (gt | (eq & (rank <= need))) & vis
+    selx = tl.reshape(tl.broadcast_to(sel.to(tl.int8)[:, None], [PP, KP]), [PP * KP])
+    j = tl.arange(0, PP * KP)
+    if TAIL:
+        lo_t = pos - (pos % KP)
+    else:
+        lo_t = pos - ((pos + 1) % KP) + 1
+    al = (selx != 0) | ((j >= lo_t) & (j <= pos))
+    tl.store(ALLOW + r.to(tl.int64) * N + j, al.to(tl.int8), mask=j < N)
+    if WRITE_BIAS:
+        tl.store(BIAS + r.to(tl.int64) * NP + j, tl.where(al, 0.0, -30000.0).to(tl.float16), mask=j < NP)
+        j2 = PP * KP + tl.arange(0, 8)
+        tl.store(BIAS + r.to(tl.int64) * NP + j2, tl.full([8], -30000.0, dtype=tl.float16), mask=j2 < NP)
+
+
+def ix_select(sc, start, N, n_top, kpool, tail, want_bias=True):
+    """sc [T, P] fp32 (-inf = invisible) -> allow [T, N] bool (+ its CK bias [T, ceil8(N)] fp16 attached as allow._ck_bias when want_bias)"""
+    T, P = sc.shape
+    PP = 1 << max(1, int(P).bit_length())          # strictly above P: PP * kpool >= N + 1
+    NP = (N + 7) // 8 * 8
+    allow = torch.empty(T, N, dtype=torch.bool, device=sc.device)
+    bias = torch.empty(T, NP, dtype=torch.float16, device=sc.device) if want_bias else allow
+    _ix_select_kernel[(T,)](sc, allow.view(torch.int8), bias, P, N, NP, start, n_top, PP=PP, KP=kpool, TAIL=int(bool(tail)), WRITE_BIAS=bool(want_bias), num_warps=8)
+    if want_bias:
+        allow._ck_bias = bias
+    return allow
 
 
 MOE_NF = None             # tests: force the grid order (None = env HY4_MOE_NFIRST)
@@ -609,7 +783,7 @@ DENSE_TM_MIN_M = 1024        # rows from which dequantise-to-fp16 + vendor GEMM 
 def mm_f32(a, b):
     """a [M, K] fp16 @ b [K, N] fp16 -> fp32 [M, N]. fp16 GEMM output (fp32 accumulation inside) upcast with the saturating clamp: the out_dtype=float32
     variant of torch.mm falls off the fast kernel on this box (measured: attention projections 1.7 TFLOPS instead of 15-35)."""
-    return torch.nan_to_num(torch.mm(a, b).float(), nan=0.0, posinf=F16MAX, neginf=-F16MAX)
+    return f32_sat(torch.mm(a, b))
 
 
 def dequant_q8(packed):
@@ -635,7 +809,7 @@ def qdense_tm(x, packed, tm=None):
     with t(f"f dense N={N} K={K}: mm"):
         o = torch.mm(x2, w16)
     with t(f"f dense N={N} K={K}: float"):
-        out = torch.nan_to_num(o.float(), nan=0.0, posinf=F16MAX, neginf=-F16MAX)
+        out = f32_sat(o)
     return out.reshape(*lead, N)
 
 
