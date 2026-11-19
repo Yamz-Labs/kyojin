@@ -31,10 +31,11 @@ hf download yamz-labs/GLM-5.3-Flash-EXL3-Yamz --local-dir ./glm-pack
 python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
 ```
 
-Hy4-flash (GGUF Q3_K, 128K context, one Strix Halo machine): download the publisher's GGUF and run `tools/hy4/serve.py` ([doc/hy4.md](doc/hy4.md)):
+Hy4-flash (GGUF Q3_K, 128K context, one Strix Halo machine): after the install of [doc/install.md](doc/install.md), download the publisher's GGUF, build the kernels once and run `tools/hy4/serve.py` ([doc/hy4.md](doc/hy4.md)):
 
 ```bash
 hf download AngelSlim/Hy4-flash-GGUF --include "Hy4-flash-Q3_K-*.gguf" --local-dir ./hy4
+bash tools/hy4/install_strix.sh        # once: builds the Hy4 kernels, prints "install_strix: OK"
 python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 131072
 ```
 

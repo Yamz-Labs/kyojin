@@ -6,8 +6,8 @@
 
 Prefill runs the prefill fast path; decode runs the HIP-graph step with MTP speculative decoding (greedy; the stream equals plain greedy decoding of the
 trunk). Sampling parameters are accepted and ignored. One request is served at a time (one resident model); others queue.
-The shipped kernel flag set is SHIPPED_ENV below; every entry can be overridden from the environment. Run it inside the strix env wrapper
-(tools/strix_halo/env.sh) and a GPU lock / memory cap of your choice: the server takes neither.
+The shipped kernel flag set is SHIPPED_ENV below; every entry can be overridden from the environment. The server sources tools/strix_halo/env.sh itself
+and needs the kernels of tools/hy4/install_strix.sh (once). It takes no GPU lock and no memory cap: add your own.
 """
 from __future__ import annotations
 
@@ -24,6 +24,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TREE = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))
+
+
+def _env_reexec():
+    """torch needs the ROCm 7 HSA runtime preloaded on gfx1151 (tools/strix_halo/env.sh): when the shell did not source it, re-run this command under it."""
+    env_sh = os.path.join(TREE, "tools", "strix_halo", "env.sh")
+    if "libhsa-runtime64" in os.environ.get("LD_PRELOAD", "") or os.environ.get("KYOJIN_ENV_SOURCED") or not os.path.isfile(env_sh):
+        return
+    os.environ["KYOJIN_ENV_SOURCED"] = "1"
+    os.execvp("bash", ["bash", "-c", 'source "$1" >/dev/null && shift && exec "$@"', "_", env_sh, sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    _env_reexec()
 
 import serve_core as C  # noqa: E402
 import serve_compat  # noqa: E402
@@ -42,6 +55,20 @@ SHIPPED_ENV = {
     "HY4_PF_SPARSE": "1", "HY4_PF_SPARSE_MINN": "16384",            # sparse prefill attention (HIP kernel via SP_SO, Triton fallback) from 16K keys: 33K prefill 60.6 -> 42 s, 128K flat ~790 tok/s; NLL 32K 4.5226 vs dense 4.5231 (nulls 4.511-4.515); below 16K dense CK (KL at 4096 with sparse 0.1089 vs nulls 0.0988-0.1054)
     "HY4_PF_WOT": "0", "HY4_MOE_HIP": "2", "HY4_PF_CK": "1", "HY4_PF_FUSE": "1",      # prefill set 2: shared gm_ext WMMA experts (HY4_GM_EXT), CK MLA core (EXL3_CKMLA_SO), one-pass hc / norm / indexer kernels
 }
+
+
+def check_kernels() -> None:
+    """The built kernels (tools/hy4/install_strix.sh) are part of the shipped speed. A missing MoE extension stops the start with the install step
+    (HY4_ALLOW_SLOW=1 starts anyway on the slow path); a missing attention library prints a warning."""
+    home_cache = os.path.expanduser("~/.cache")
+    gm = os.environ.get("HY4_GM_EXT", os.path.join(home_cache, "exl3_gm_ext", "exl3_gm_ext.so"))
+    sp = os.environ.get("SP_SO", os.path.join(TREE, "hipsp", "libspmla.so"))
+    ck = os.environ.get("EXL3_CKMLA_SO") or os.path.join(os.environ.get("XDG_CACHE_HOME", home_cache), "kyojin", "ck-fmha", "libckmla.so")
+    if os.environ.get("HY4_MOE_HIP", "0") in ("1", "2") and not os.path.isfile(gm) and os.environ.get("HY4_ALLOW_SLOW") != "1":
+        sys.exit(f"hy4 serve: the MoE kernel extension is missing ({gm}).\nBuild the kernels once: bash tools/hy4/install_strix.sh (HY4_ALLOW_SLOW=1 starts on the slow path anyway).")
+    for flag, path, what in (("HY4_PF_SPARSE", sp, "sparse prefill attention (Triton fallback)"), ("HY4_PF_CK", ck, "CK latent attention (slower fallback)")):
+        if os.environ.get(flag, "0") == "1" and not os.path.isfile(path):
+            print(f"hy4 serve: WARNING {path} is missing: {what}. Build it with: bash tools/hy4/install_strix.sh", file=sys.stderr, flush=True)
 
 
 def apply_env(ctx: int) -> None:
@@ -355,6 +382,7 @@ def main(argv=None):
     ap.add_argument("--sched-chunk", type=int, default=1024, help="prefill rows per scheduler turn with --slots > 1 (a decode round of the other sessions runs between chunks)")
     args = ap.parse_args(argv)
     apply_env(args.max_ctx)
+    check_kernels()
     st = State(args)
     app = build_app(st)
 

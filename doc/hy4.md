@@ -16,31 +16,37 @@ The GGUF is published by AngelSlim: [AngelSlim/Hy4-flash-GGUF](https://huggingfa
 hf download AngelSlim/Hy4-flash-GGUF --include "Hy4-flash-Q3_K-*.gguf" --local-dir ./hy4
 ```
 
-## Build the optional kernels (once)
-
-The server runs without them and falls back to slower paths. Build them for the full speed:
+## Build the kernels (once)
 
 ```bash
-source tools/strix_halo/env.sh build
-bash hipsp/build.sh hipsp/sp_mla.cu hipsp/libspmla.so       # sparse prefill attention (HIP); without it the Triton kernel runs
-bash tools/strix_halo/ck_fmha/build_mla.sh                   # CK latent-attention core, written to ~/.cache/kyojin/ck-fmha/libckmla.so (EXL3_CKMLA_SO overrides)
-python tools/hy4/make_head_bin.py ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf ./hy4/head_q5_k.bin
-export HY4_MTP_HEAD_BIN=$PWD/hy4/head_q5_k.bin               # Q5_K copy of the output head for the MTP drafts (smaller than the Q8_0 default)
+bash tools/hy4/install_strix.sh
 ```
 
-`hipsp/libspmla.so` is found next to `hipsp/sp_hip.py`; `SP_SO` points to another build. The expert kernels (`exl3_gm_ext`) build on first use and are cached in `~/.cache/exl3_gm_ext`.
+The script uses the repository venv (`EXL3_VENV`, default `.venv`), builds three libraries and prints `install_strix: OK`:
+
+- `hipsp/libspmla.so`: sparse prefill attention (`SP_SO` points to another build).
+- `~/.cache/exl3_gm_ext/exl3_gm_ext.so`: the MoE expert kernels (`EXL3_GM_BUILD_DIR` moves the build, `HY4_GM_EXT` points the server to it).
+- `~/.cache/kyojin/ck-fmha/libckmla.so`: CK latent attention (`EXL3_CKMLA_OUT` moves the build, `EXL3_CKMLA_SO` points the server to it). The script fetches composable_kernel at the pinned commit once into `~/.cache/kyojin/ck-src`; `CK_SRC` names your own checkout.
+
+The server stops at start when the MoE extension is missing and names this script (`HY4_ALLOW_SLOW=1` starts on the slow path anyway). A missing attention library prints a warning.
+
+Optional: a Q5_K copy of the output head for the MTP drafts (smaller than the Q8_0 default):
+
+```bash
+python tools/hy4/make_head_bin.py ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf ./hy4/head_q5_k.bin
+export HY4_MTP_HEAD_BIN=$PWD/hy4/head_q5_k.bin
+```
 
 ## Run
 
 ```bash
-source tools/strix_halo/env.sh
 python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 131072 --num-draft 3
 curl http://127.0.0.1:8300/v1/chat/completions -H 'content-type: application/json' \
      -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
 The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, both with streaming; `/v1/models`, `/health`, `/tokenize`, `/apply-template`).
-`tools/hy4/serve.py` sets the shipped kernel flags (`SHIPPED_ENV` in the file); every one can be overridden from the environment. The main ones:
+`tools/hy4/serve.py` runs itself under `tools/strix_halo/env.sh` (the HSA runtime torch needs on gfx1151) and sets the shipped kernel flags (`SHIPPED_ENV` in the file); every one can be overridden from the environment. The main ones:
 
 | variable | shipped | effect |
 |---|---|---|
