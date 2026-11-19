@@ -12,19 +12,35 @@ GGUF = "/path/to/models/hy4-flash-gguf/Hy4-flash-Q3_K-00001-of-00002.gguf"
 e = Hy4Engine(tree, GGUF, ctx=16384, k=3)
 e.load(print)
 GR = e.GR
-rf = sys.modules[type(GR.fw).__module__]._rf
+fwm = sys.modules[type(GR.fw).__module__]
+rf, hbm, bgm, rgm = fwm._rf, fwm._HB, fwm._BGM, fwm._RG
+FL = os.environ.get("ARMB", "hb,head,bg,rg").split(",")      # levers switched on in arm B
+rg_orig = {}
+def arm(b):
+    rf.HB = b and "hb" in FL
+    hbm.DOT = b and "head" in FL
+    bgm.DOT = b and "bg" in FL
+    if "rg" in FL:
+        for i in range(GR.fw.n_layers):
+            L = GR.fw._layer(i)
+            if getattr(L, "router", None) is None:
+                continue
+            if b and L.router.dtype == torch.float32:
+                rg_orig[i] = L.router; L.router = L.router.half().contiguous()
+            elif not b and i in rg_orig:
+                L.router = rg_orig.pop(i)
 wiki = json.load(open("/path/to/wiki_ids.json"))
 pc = time.perf_counter
 sync = torch.cuda.synchronize
-print("REF_FUSED", rf.ENABLED, "HB_BN", rf.HB_BN, "HB_NW", rf.HB_NW, flush=True)
+print("REF_FUSED", rf.ENABLED, "HB_BN", rf.HB_BN, "HB_NW", rf.HB_NW, "ARMB", FL, "RG", rgm.ENABLED, "BG", bgm.ENABLED, "HEAD", hbm.ENABLED, flush=True)
 ctxs = [int(x) for x in os.environ.get("PCTXS", "1000,4000").split(",")]
 Ts = [int(x) for x in os.environ.get("PTS", "1,2,6").split(",")]
 res = {}
 logit = {}
 for ctxn in ctxs:
     e._t0 = pc(); e.reset(); e.prefill(wiki[:ctxn]); e.phase("decode")
-    for arm in ("A", "B", "B", "A"):
-        rf.HB = arm == "B"
+    for a_ in ("A", "B", "B", "A"):
+        arm(a_ == "B")
         GR.graphs.clear()
         for T in Ts:
             toks = wiki[ctxn:ctxn + T]
@@ -33,9 +49,9 @@ for ctxn in ctxs:
             ts = []
             for _ in range(20):
                 t = pc(); out = GR.step_rows(toks); sync(); ts.append((pc() - t) * 1000); GR.rewind(ctxn)
-            res.setdefault((ctxn, T, arm), []).append(statistics.median(ts))
-            if (ctxn, T, arm) not in logit:
-                logit[(ctxn, T, arm)] = out[0].float().reshape(T, -1).clone()
+            res.setdefault((ctxn, T, a_), []).append(statistics.median(ts))
+            if (ctxn, T, a_) not in logit:
+                logit[(ctxn, T, a_)] = out[0].float().reshape(T, -1).clone()
 for ctxn in ctxs:
     for T in Ts:
         a, b = res[(ctxn, T, "A")], res[(ctxn, T, "B")]
