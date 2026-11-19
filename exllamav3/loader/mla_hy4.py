@@ -149,6 +149,7 @@ class Hy4MLA:
                 qlat = torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
         return self._h(qlat, "q"), self._h(qp, "q")
 
+    slot_base = None    # [T] long device (slot * cap per row) during a multi-session step, else None
     _qr_n = None        # normalised q_a of this call's rows (indexer branch, HY4_PF_FUSE=1), consumed by attend_ck
     _qa_pre = None       # raw wq_a output of this call's rows, left by the indexer branch (same expression): reused instead of a second GEMM
 
@@ -280,7 +281,10 @@ class Hy4MLA:
         with tm.t("attn proj"):
             qlat, qpe = self.q(cur, pos, qa)
         with tm.t("MLA core + sinks"):
-            if PF_ATTN and T > PF_ATTN_MIN and qlat.is_cuda and getattr(self, "kpos_arange", False):
+            if self.slot_base is not None:          # multi-session step: kcache = the flat K slabs, row t reads its own slab (mu_slots)
+                from . import mu_slots as _mu
+                o = _mu.mla_attend_slots(qlat, qpe, kcache, pos, self.slot_base, kpos.shape[0], self.scale, self.sinks, self.window, allow)
+            elif PF_ATTN and T > PF_ATTN_MIN and qlat.is_cuda and getattr(self, "kpos_arange", False):
                 from . import prefill_attn as _pa     # prefill rows: flash-style kernel, keys visited only inside the window / causal range
                 o = (_pa.mla_flash if PF_ATTN_FLASH else _pa.mla_banded)(qlat, qpe, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow)
             elif allow.__class__.__name__ == "SparseSel":       # HY4_LC_SPARSE: decode rows, exact selected groups + tail only

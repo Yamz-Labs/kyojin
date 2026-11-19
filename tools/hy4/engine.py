@@ -93,15 +93,21 @@ class Hy4Engine:
         torch.cuda.synchronize()
         self.M = M
         progress("graph decoder + draft head")
-        self.GR = SG.GraphDecoder(M)
+        self.GR = self._decoder(M)
         self.GR.prepare()                          # static K / indexer / Engram buffers at the full context size: addresses never change after this
         self.MT = MH.Hy4MTP(M)
-        self.MG = MH.MTPGraph(self.MT, self.k)
+        self.MG = self._mtp_graph()
         MH._STAGE_OV[0] = os.environ.get("HY4_SERVE_STAGE_OV", "1") == "1"     # Engram row 0 of the next verify staged during the draft chain
         torch.cuda.synchronize()
         self.load_s = time.time() - t0
         self.ready = True
         progress(f"ready: {M.n_layers} layers, {M.stats.get('resident_gib')} GiB resident experts, {self.load_s:.0f} s")
+
+    def _decoder(self, M):                 # hooks of the multi-session engine (mu_engine.py)
+        return self.SG.GraphDecoder(M)
+
+    def _mtp_graph(self):
+        return self.MH.MTPGraph(self.MT, self.k)
 
     def _decode_flags(self):
         """remember the decode-set switches the environment selected at import"""
