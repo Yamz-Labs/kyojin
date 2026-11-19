@@ -479,7 +479,7 @@ def moe_prefill(z, sel, w, bufs, fmts, lim, nff, nout, rowb, ebytes, E, cfg=None
     P = T * S
     K = z.shape[1]
     t = tm.t if tm is not None and tm.on else (lambda n: contextlib.nullcontext())
-    nf = c.get("NF", MOE_NF if MOE_NF is not None else os.environ.get("HY4_MOE_NFIRST", "0") == "1")
+    nf = c.get("NF", MOE_NF if MOE_NF is not None else os.environ.get("HY4_MOE_NFIRST", "1") == "1")
     with t("f moe: route + sort"):
         sp, be, maxb = route_blocks(sel.to(torch.int64), E, BM)
         x = to_f16(z).contiguous()

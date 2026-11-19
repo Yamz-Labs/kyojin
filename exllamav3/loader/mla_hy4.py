@@ -156,8 +156,11 @@ class Hy4MLA:
             q = _pk.qdense_raw16(qr, self.wq_b.packed, tm)
         with tm.t("f q: rope"):
             P = self.rope_dim
-            th = pos.double()[:, None] * (self.theta ** (-2.0 * torch.arange(P // 2, dtype=torch.float64, device=pos.device) / P))[None, :]
-            xh, qc = _pk.qprep(q, th.cos().float().contiguous(), th.sin().float().contiguous(), H, self.hd, self.nope, P, self.R)
+            rc = pos.__dict__.setdefault("_rope_tabs", {})      # the tables depend only on (positions, theta): one fp64 evaluation per step, not per layer
+            if self.theta not in rc:
+                th = pos.double()[:, None] * (self.theta ** (-2.0 * torch.arange(P // 2, dtype=torch.float64, device=pos.device) / P))[None, :]
+                rc[self.theta] = (th.cos().float().contiguous(), th.sin().float().contiguous())
+            xh, qc = _pk.qprep(q, rc[self.theta][0], rc[self.theta][1], H, self.hd, self.nope, P, self.R)
         with tm.t("f q: wk_b bmm"):
             torch.bmm(xh, self._w16("wk_b").transpose(1, 2), out=qc[..., :self.R])
         return qc
