@@ -588,6 +588,10 @@ class Hy4Forward:
         tm = self.tm
         if i < self.n_dense:
             gt, up, dn = L.dense
+            if PF_DENSE and not PF_DENSE_I8 and os.environ.get("HY4_PF_G_SWIGLU", "0") == "1" and self.hook is None and x.is_cuda and x.dim() == 2 and x.shape[0] >= _pk().DENSE_TM_MIN_M \
+                    and all(isinstance(q, QLinear) and q.ty == 8 for q in (gt, up, dn)):
+                with tm.t("other"):
+                    return _pk().dense_ffn_fused(x, gt.packed, up.packed, dn.packed, _TM_HOLD[0]), None
             with tm.t("other"):
                 return self._mm(torch.nn.functional.silu(self._mm(x, gt)) * self._mm(x, up), dn), None
         T, dev = x.shape[0], self.dev
@@ -684,6 +688,10 @@ class Hy4Forward:
                 h = torch.nn.functional.silu(ga.clamp(max=lim)) * upv.clamp(-lim, lim)
                 dn_o = mv(h, "down")
                 lat.index_add_(0, rows, dn_o * w[rows, slot].unsqueeze(-1))
+        if pf and PF_DENSE and not PF_DENSE_I8 and self.hook is None and lat.is_cuda and lat.dim() == 2 and x.dim() == 2 and T >= _pk().DENSE_TM_MIN_M \
+                and any(os.environ.get(f, "0") == "1" for f in ("HY4_PF_G_SWIGLU", "HY4_PF_G_ADD")) and all(isinstance(q, QLinear) and q.ty == 8 for q in (L.rup, *L.shexp)):
+            with tm.t("shared expert"):
+                return _pk().ffn_tail_fused(lat, x, L.rup.packed, L.shexp[0].packed, L.shexp[1].packed, L.shexp[2].packed, _TM_HOLD[0]), lat
         with tm.t("other"):
             y = self._mm(lat, L.rup)
         gt, up, dn = L.shexp

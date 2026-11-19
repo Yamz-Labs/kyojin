@@ -507,6 +507,72 @@ def register_f16(x, x16):
         _F16_MEMO[0], _F16_MEMO[1] = (x, x16), (x.data_ptr(), x.shape, x._version)
 
 
+# ------------------------------------------------------------------------------------------------ glue fusions (each behind its own env flag, default OFF; read per call so one boot can A/B arms; a fused topk-sum + fp16 copy was measured: not bit-equal, -0.2 ms per layer, dropped)
+def _flag(name):
+    return os.environ.get(name, "0") == "1"
+
+
+@triton.jit
+def _swiglu16_kernel(G, U, O, n, BLK: tl.constexpr):
+    i = tl.program_id(0).to(tl.int64) * BLK + tl.arange(0, BLK)
+    m = i < n
+    g = tl.load(G + i, mask=m, other=0.0).to(tl.float32)
+    u = tl.load(U + i, mask=m, other=0.0).to(tl.float32)
+    g = tl.where(g != g, 0.0, tl.minimum(tl.maximum(g, -65504.0), 65504.0))
+    u = tl.where(u != u, 0.0, tl.minimum(tl.maximum(u, -65504.0), 65504.0))
+    h = g / (1.0 + tl.exp(-g)) * u
+    tl.store(O + i, tl.minimum(tl.maximum(h, -65504.0), 65504.0).to(tl.float16), mask=m)
+
+
+def swiglu16(g16, u16):
+    """silu(f32_sat(g)) * f32_sat(u) -> saturating fp16, from the two raw fp16 GEMM outputs in ONE pass (was: 2 x f32_sat, silu, mul, sat_half = 5 passes over fp32)"""
+    o = torch.empty(g16.shape, dtype=torch.float16, device=g16.device)
+    n = o.numel()
+    _swiglu16_kernel[(triton.cdiv(n, 4096),)](g16, u16, o, n, BLK=4096, num_warps=4)
+    return o
+
+
+@triton.jit
+def _add_sat2_kernel(A, B, O, n, BLK: tl.constexpr):
+    i = tl.program_id(0).to(tl.int64) * BLK + tl.arange(0, BLK)
+    m = i < n
+    a = tl.load(A + i, mask=m, other=0.0).to(tl.float32)
+    b = tl.load(B + i, mask=m, other=0.0).to(tl.float32)
+    a = tl.where(a != a, 0.0, tl.minimum(tl.maximum(a, -65504.0), 65504.0))
+    b = tl.where(b != b, 0.0, tl.minimum(tl.maximum(b, -65504.0), 65504.0))
+    tl.store(O + i, a + b, mask=m)
+
+
+def add_sat2(a16, b16):
+    """f32_sat(a) + f32_sat(b) -> fp32 in one pass (same values as the two casts and the fp32 add)"""
+    o = torch.empty(a16.shape, dtype=torch.float32, device=a16.device)
+    n = o.numel()
+    _add_sat2_kernel[(triton.cdiv(n, 4096),)](a16, b16, o, n, BLK=4096, num_warps=4)
+    return o
+
+
+def ffn_tail_fused(lat, x, rup_p, gate_p, up_p, down_p, tm=None):
+    """MoE layer tail on stored Q8_0 matrices: rup(lat) + shared_down(silu(shared_gate(x)) * shared_up(x)) as fp32 [T, D], from raw fp16 GEMM outputs.
+    HY4_PF_G_SWIGLU=1: silu * mul + casts in one kernel; HY4_PF_G_ADD=1: both saturating casts and the add in one kernel."""
+    y16 = qdense_raw16(lat, rup_p, tm)
+    g16 = qdense_raw16(x, gate_p, tm)
+    u16 = qdense_raw16(x, up_p, tm)
+    if _flag("HY4_PF_G_SWIGLU"):
+        h = swiglu16(g16, u16)
+    else:
+        h = torch.nn.functional.silu(f32_sat(g16)) * f32_sat(u16)
+    s16 = qdense_raw16(h, down_p, tm)
+    if _flag("HY4_PF_G_ADD"):
+        return add_sat2(y16, s16)
+    return f32_sat(y16) + f32_sat(s16)
+
+
+def dense_ffn_fused(x, gate_p, up_p, down_p, tm=None):
+    """dense-layer MLP (stored Q8_0): down(silu(gate(x)) * up(x)) -> fp32 [T, D] with the SwiGLU glue in one kernel (HY4_PF_G_SWIGLU=1)"""
+    h = swiglu16(qdense_raw16(x, gate_p, tm), qdense_raw16(x, up_p, tm))
+    return qdense_tm(h, down_p, tm)
+
+
 # ------------------------------------------------------------------------------------------------ fused indexer scorer + exact top-k selection (HY4_PF_FUSE=1)
 @triton.jit
 def _ix_score_kernel(IQ, PK, WT, SC, T, P, start, H: tl.constexpr, D: tl.constexpr, KP: tl.constexpr, TAIL: tl.constexpr, BT: tl.constexpr, BP: tl.constexpr):
@@ -967,11 +1033,18 @@ def mm_rows(x2, w):
     tail chunk (8192 + up to 2048 rows) fell back to the default GEMM solution (35 TF instead of 42, wo K = 16384 24 instead of 34): the first 8192 rows take the tuned entry"""
     M = x2.shape[0]
     S = int(os.environ.get("HY4_PF_MM_SPLIT", "8192"))
-    if S <= 0 or M <= S:
+    if S <= 0:
+        return torch.mm(x2, w)
+    fine = os.environ.get("HY4_PF_MM_FINE", "0") == "1" and S >= 8192       # 1: after the 8192-row pieces, 4096-row pieces too (the other tuned M): chunks of 4096 * k rows and of 4096..8192 rows hit tuned entries
+    if M <= S and not (fine and M > 4096):
         return torch.mm(x2, w)
     out = torch.empty(M, w.shape[1], dtype=x2.dtype, device=x2.device)
-    for a in range(0, M, S):
-        torch.mm(x2[a:a + S], w, out=out[a:a + S])
+    a = 0
+    while a < M:
+        r = M - a
+        n = S if r > S else (4096 if (fine and r > 4096) else r)
+        torch.mm(x2[a:a + n], w, out=out[a:a + n])
+        a += n
     return out
 
 
