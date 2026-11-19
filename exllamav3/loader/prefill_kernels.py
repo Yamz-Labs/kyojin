@@ -434,6 +434,8 @@ def to_f16(x):
 
 
 MOE_NF = None             # tests: force the grid order (None = env HY4_MOE_NFIRST)
+LAST_PATH = ""           # path the last moe_prefill call ran (triton / hip_wmma / gm_pfmoe_shared); gmmq is not called from this module
+MOE_HIP = None            # tests: force (None = env HY4_MOE_HIP=1); HIP / WMMA expert kernels (moe_hip.cu, 128-row blocks, Q4_K / Q3_K); off = Triton
 MOE_CFG = None            # None = chosen from the rows per expert (see moe_cfg)
 DENSE_CFG = {"BM": 128, "BN": 128, "warps": 8, "stages": 1}
 
@@ -483,6 +485,19 @@ def moe_prefill(z, sel, w, bufs, fmts, lim, nff, nout, rowb, ebytes, E, cfg=None
     with t("f moe: route + sort"):
         sp, be, maxb = route_blocks(sel.to(torch.int64), E, BM)
         x = to_f16(z).contiguous()
+    use_hip = BM == 128 and nf and (MOE_HIP if MOE_HIP is not None else os.environ.get("HY4_MOE_HIP", "0") in ("1", "2")) and K % 64 == 0 and nff % 128 == 0 and nout % 128 == 0 and fmts[0] in (FMT_Q4K, FMT_Q3K) and fmts[1] == FMT_Q4K
+    global LAST_PATH
+    LAST_PATH = "triton"
+    if use_hip:
+        from . import kq_moe_hip as KH
+        sh = os.environ.get("HY4_MOE_HIP", "0") == "2"
+        LAST_PATH = "gm_pfmoe_shared" if sh else "hip_wmma"       # 2 = the shared gguf-moe gm_ext kernel (same source family), 1 = the local code object
+        with t("f moe: gate+up kernel"):
+            H = (KH.gate_up_shared if sh else KH.gate_up)(x, bufs[0], bufs[1], sp, be, P, S, E, ebytes[0], float(lim), K, nff, rowb[0], 0 if fmts[0] == FMT_Q4K else 1, maxb)
+        with t("f moe: down kernel"):
+            out = (KH.down_shared if sh else KH.down)(H, bufs[2], w.reshape(-1).float().contiguous(), sp, be, P, E, ebytes[1], nff, nout, rowb[1], maxb)
+        with t("f moe: sum over topk"):
+            return out.view(T, S, nout).sum(1)
     H = torch.empty(maxb * BM, nff, dtype=torch.float16, device=z.device)
     with t("f moe: gate+up kernel"):
         _gu_kernel[((nff // BN, maxb) if nf else (maxb, nff // BN))](x, bufs[0], bufs[1], H, sp, be, P, S, E, ebytes[0], float(lim), K=K, N=nff, ROWB=rowb[0], FMT=fmts[0], BM=BM, BN=BN,

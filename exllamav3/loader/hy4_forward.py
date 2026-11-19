@@ -570,6 +570,7 @@ class Hy4Forward:
                 lat = (k_.moe_prefill_i8 if PF_MOE_I8 else k_.moe_prefill)(z, sel, w, (rsp.bufs["gate"], rsp.bufs["up"], rsp.bufs["down"]), (k_.FROM_GROUPED[rsp.fu], k_.FROM_GROUPED[rsp.fd]), lim,
                                      rsp.nff, rsp.nout, (rsp.strides[0], rsp.strides[2]), rsp.ebytes, rsp.E, tm=tm)
             self.stats["prefill_moe_calls"] = self.stats.get("prefill_moe_calls", 0) + 1
+            self.stats["moe_path_" + getattr(k_, "LAST_PATH", "?")] = self.stats.get("moe_path_" + getattr(k_, "LAST_PATH", "?"), 0) + 1
             sel_l = []
         rs = self.res.get(i) if (T <= MMVQ_MAXR and dev.type == "cuda") else None
         if rs is not None:
