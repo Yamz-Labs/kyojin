@@ -38,6 +38,7 @@ SHIPPED_ENV = {
     "HY4_NGRAM_EXT": "4", "HY4_NGRAM_MIN": "8", "HY4_NGRAM_GATE": "1", "HY4_NGRAM_LONG": "12",   # prompt-lookup rows on top of the MTP drafts: up to 4 extra verify rows when the last 8 tokens occurred earlier; paused while their acceptance is low
     "HY4_PREFILL_MOE": "1", "HY4_PREFILL_DENSE": "1", "HY4_PREFILL_ATTN": "1", "HY4_PREFILL_IX": "1", "HY4_ENGRAM_PREFETCH": "1",
     "HY4_PF_F16": "1", "HY4_MOE_NFIRST": "1", "KEEPCACHE": "1",           # prefill set
+    "HY4_LC_SPARSE": "1", "HY4_LC_PRIME": "1",                             # long context: exact top-k sparse decode attend (NLL inside the dense-vs-null band at 8K / 16K), draft-cache fill selects with the prefill scorer
     "HY4_PF_WOT": "0", "HY4_MOE_HIP": "2", "HY4_PF_CK": "1", "HY4_PF_FUSE": "1",      # prefill set 2: shared gm_ext WMMA experts (HY4_GM_EXT), CK MLA core (EXL3_CKMLA_SO), one-pass hc / norm / indexer kernels
 }
 
