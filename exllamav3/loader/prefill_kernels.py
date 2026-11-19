@@ -7,6 +7,7 @@ Generic by stored format (FMT constexpr) and shape; nothing keyed on a model nam
 accumulation fp32. Formats follow ggml: Q4_K 144 B / 256, Q3_K 110 B / 256, Q8_0 34 B / 32.
 """
 from __future__ import annotations
+import contextlib
 import torch
 import triton
 import triton.language as tl
@@ -494,11 +495,18 @@ def dequant_q8(packed):
     return out
 
 
-def qdense_tm(x, packed):
-    """x [.., K] -> [.., N] fp32 = x @ W.T: dequantise the stored Q8_0 weight to fp16 once per call, then the vendor fp16 GEMM"""
+def qdense_tm(x, packed, tm=None):
+    """x [.., K] -> [.., N] fp32 = x @ W.T: dequantise the stored Q8_0 weight to fp16 once per call, then the vendor fp16 GEMM (tm = optional stage timers)"""
     N, nb, bb = packed.shape
     K = nb * 32
     lead = x.shape[:-1]
-    x2 = to_f16(x.reshape(-1, K)).contiguous()
-    out = mm_f32(x2, dequant_q8(packed).T)
+    t = tm.t if tm is not None and tm.on else (lambda n: contextlib.nullcontext())
+    with t(f"f dense N={N} K={K}: to_f16"):
+        x2 = to_f16(x.reshape(-1, K)).contiguous()
+    with t(f"f dense N={N} K={K}: dequant"):
+        w16 = dequant_q8(packed)
+    with t(f"f dense N={N} K={K}: mm"):
+        o = torch.mm(x2, w16.T)
+    with t(f"f dense N={N} K={K}: float"):
+        out = torch.nan_to_num(o.float(), nan=0.0, posinf=F16MAX, neginf=-F16MAX)
     return out.reshape(*lead, N)

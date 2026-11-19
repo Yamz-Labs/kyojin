@@ -91,6 +91,13 @@ class Hy4MLA:
     def _f16(x):
         return x.clamp(-65504.0, 65504.0).half()
 
+    @staticmethod
+    def _bmm_th(w16, x16):
+        """w16 [H, Nout, K] fp16, x16 [T, H, K] fp16 -> [T, H, Nout] fp32 ROW-major: the batch-over-heads GEMM writes [H, T, Nout]; the permute-back copy keeps Nout contiguous.
+        (Writing the result as a permuted view [T, H, Nout] with T fastest made every later elementwise / cat / clamp on it a stride-T gather: 10-30x slower.)"""
+        o = torch.bmm(x16.permute(1, 0, 2), w16.transpose(1, 2))
+        return o.permute(1, 0, 2).contiguous().float()
+
     def kv(self, cur, pos):
         """cur [T, n_embd], pos [T] -> K cache rows [T, R + rope] = [rms(kv_a)*w | rope(k_pe)] (V is the first R columns)"""
         tm = self.tm
@@ -115,7 +122,7 @@ class Hy4MLA:
             qn, qp = q[..., :self.nope], rope_norm(q[..., self.nope:].contiguous(), pos, self.theta)
         with tm.t("f q: wk_b bmm"):
             if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:       # prefill rows: fp16 batched GEMM over heads (fp32 einsum is ~3x slower)
-                qlat = torch.bmm(self._w16("wk_b"), self._f16(qn).permute(1, 2, 0)).permute(2, 0, 1).float()
+                qlat = self._bmm_th(self._w16("wk_b"), self._f16(qn))
             else:
                 qlat = torch.einsum("hrk,thk->thr", self.wk_b, self._q(qn, "kb"))
         return self._h(qlat, "q"), self._h(qp, "q")
@@ -138,7 +145,7 @@ class Hy4MLA:
         with tm.t("attn proj"):
             with tm.t("f attend: wv_b bmm"):
                 if PF_ATTN and T > PF_ATTN_MIN and cur.is_cuda:
-                    kqv = torch.bmm(self._w16("wv_b"), self._f16(o).permute(1, 2, 0)).permute(2, 0, 1).float().reshape(T, H * self.vd)
+                    kqv = self._bmm_th(self._w16("wv_b"), self._f16(o)).reshape(T, H * self.vd)
                 else:
                     kqv = torch.einsum("hdr,thr->thd", self.wv_b, self._q(o, "vb")).reshape(T, H * self.vd)
             gated, out = self.gate_out(cur, kqv)

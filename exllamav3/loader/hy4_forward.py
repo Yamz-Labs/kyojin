@@ -216,6 +216,9 @@ def dense_fn(ty, K):
     return spec, (getattr(e, spec[2], None) if e is not None else None)
 
 
+_TM_HOLD = [None]          # the live _Tm (stage timers inside prefill dense calls)
+
+
 class QLinear:
     """a dense [N, K] matrix kept as STORED bytes on the device; `x @ q.T` / q(x) = x [.., K] -> [.., N]"""
 
@@ -242,7 +245,7 @@ class QLinear:
                 self.stats["dense_gemv"] = self.stats.get("dense_gemv", 0) + 1
         elif PF_DENSE and self.ty == 8 and x2.is_cuda:
             k_ = _pk()
-            out = k_.qdense_i8(x2, self.packed) if PF_DENSE_I8 else (k_.qdense_tm(x2, self.packed) if x2.shape[0] >= k_.DENSE_TM_MIN_M else k_.qdense(x2, self.packed, k_.FMT_Q8))
+            out = k_.qdense_i8(x2, self.packed) if PF_DENSE_I8 else (k_.qdense_tm(x2, self.packed, _TM_HOLD[0]) if x2.shape[0] >= k_.DENSE_TM_MIN_M else k_.qdense(x2, self.packed, k_.FMT_Q8))
             if PF_DIAG:
                 ex = x2.float() @ self.dense().T
                 df = out.float() - ex
@@ -351,6 +354,7 @@ class Hy4Forward:
                         rope_base=float(m[p + "rope.freq_base"]), eps=self.eps)
         self.use_indexer, self.q8_act = use_indexer, q8_act
         self.tm = _Tm()
+        _TM_HOLD[0] = self.tm
         self.expert_dq = os.environ.get("HY4_EXPERT_DQ", "0") == "1"       # 1 = old path (torch dequant) for decode rows too
         self.dense_dq = DENSE_DQ
         self.head_cpu = os.environ.get("HY4_HEAD_CPU", "0") == "1" or self.dev.type != "cuda"     # 1 = old path: head on the CPU, last position only
@@ -521,7 +525,7 @@ class Hy4Forward:
                     p = torch.sigmoid(_pk().mm_f32(_pk().to_f16(x), L.router16.T))
                 else:
                     p = torch.sigmoid(x @ L.router.T)
-                sel = torch.topk(p + L.rbias, self.topk, dim=-1).indices
+                sel = torch.sort(p + L.rbias, dim=-1, descending=True, stable=True).indices[:, :self.topk]      # stable: tied experts resolve to the lowest id every call (torch.topk tie order varies between calls on gfx1151)
                 w = torch.gather(p, 1, sel)
                 w = w / w.sum(-1, keepdim=True).clamp(min=6.103515625e-5) * self.w_scale
                 sel_l = [] if (pf or _ns.skip_host_ids(self, i, T, MMVQ_MAXR)) else sorted(set(sel.flatten().tolist()))
