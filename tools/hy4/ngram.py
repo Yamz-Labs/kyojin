@@ -7,17 +7,21 @@ class NGram:
         self.nmin, self.ext = nmin, ext
         self.seq: list[int] = []
         self.idx: dict[tuple, int] = {}      # n-gram -> index of its LAST token (latest occurrence)
+        self.prev: dict[tuple, int] = {}     # n-gram -> index of its occurrence before the latest one (the lookup of the sequence's own suffix, no drafts)
 
     def reset(self, ids):
-        self.seq, self.idx = [], {}
+        self.seq, self.idx, self.prev = [], {}, {}
         self.add(ids)
 
     def add(self, toks):
-        n, s, ix = self.nmin, self.seq, self.idx
+        n, s, ix, pv = self.nmin, self.seq, self.idx, self.prev
         for t in toks:
             s.append(int(t))
             if len(s) >= n:
-                ix[tuple(s[-n:])] = len(s) - 1
+                k = tuple(s[-n:])
+                if k in ix:
+                    pv[k] = ix[k]
+                ix[k] = len(s) - 1
 
     def propose(self, d, ext=None):
         """d: the MTP drafts (host ints) that follow self.seq. Returns (extra tokens, match length) with extra = [] when there is no usable match."""
@@ -30,7 +34,10 @@ class NGram:
             return [], 0
         end = len(ss) - 1
         # the draft region ends at `end`; the index holds only positions < len(s), so a hit is always an earlier occurrence
-        i = self.idx.get(tuple(ss[-n:]))
+        key = tuple(ss[-n:])
+        i = self.idx.get(key)
+        if i is not None and i >= end:           # no drafts: the suffix of the sequence is its own latest occurrence, use the one before it
+            i = self.prev.get(key)
         if i is None or i >= end:
             return [], 0
         m = n                                    # extend the match backwards
