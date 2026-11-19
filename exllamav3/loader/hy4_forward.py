@@ -366,6 +366,20 @@ def _mv(o, dev, dtype=None):
 
 
 # ------------------------------------------------------------------------------------------------ the model
+def chunk_plan(start, total, chunk):
+    """prefill chunk boundaries [(s, e)] for rows start..total: full chunks of `chunk` rows; a tail of at most HY4_PF_TAIL_MERGE * chunk rows (default 0.25)
+    is merged into the last chunk instead of becoming its own small chunk (8K measured: a 408-row tail chunk costs 1.8 s, merging it costs 1.5 s less)"""
+    merge = float(os.environ.get("HY4_PF_TAIL_MERGE", "0.25"))
+    out, s = [], start
+    while s < total:
+        e = min(total, s + chunk)
+        if total - e <= merge * chunk:
+            e = total
+        out.append((s, e))
+        s = e
+    return out
+
+
 class Hy4Forward:
     _gs = None            # step_graph._GS while a decode graph is warmed up / captured (static buffers), else None
 
@@ -743,8 +757,8 @@ class Hy4Forward:
         toks = [int(t) for t in ids_all]
         self._eng_pf = {}
         ex = ThreadPoolExecutor(max_workers=2)
-        for s in range(self.n, len(toks), chunk):
-            n = min(chunk, len(toks) - s)
+        for s, e in chunk_plan(self.n, len(toks), chunk):
+            n = e - s
             for i in layers:
                 self._eng_pf[(i, s, n)] = ex.submit(self.eng[i].host_rows, toks, s, n)
         ex.shutdown(wait=False)

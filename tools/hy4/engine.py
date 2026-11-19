@@ -173,8 +173,7 @@ class Hy4Engine:
         self.phase("prefill")
         M.prefetch_engram(ids, self.chunk)
         states, lg = [], None
-        for s in range(0, n, self.chunk):
-            e = min(n, s + self.chunk)
+        for s, e in self.hf.chunk_plan(0, n, self.chunk):
             lg = M.step(ids[s:e])
             states.append(M.head_state(M._x))
             M._x = None
