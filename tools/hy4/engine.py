@@ -34,6 +34,9 @@ class Hy4Engine:
         self.tree, self.gguf, self.k, self.chunk = tree, gguf, k, chunk
         self.ctx = ctx
         self.prime_rows = prime_rows              # 0 = fill the draft cache for the whole prompt; N = the last N rows only (cheaper, lower acceptance)
+        self.ngram_ext = int(os.environ.get("HY4_NGRAM_EXT", "0"))        # extra verify rows from a prompt-lookup n-gram match (0 = off)
+        self.ngram_min = int(os.environ.get("HY4_NGRAM_MIN", "4"))
+        self.ngram_fill = os.environ.get("HY4_NGRAM_FILL", "0") == "1"
         self.ready = False
         self.meta = None
         self.last_stats: dict = {}
@@ -193,12 +196,22 @@ class Hy4Engine:
             k = self.k
             pc = time.perf_counter
             tm = [0.0, 0.0, 0.0]
+            ng = None
+            if self.ngram_ext > 0:
+                from ngram import NGram
+                ng = NGram(self.ngram_min, self.ngram_ext)
+                ng.reset(list(ids) + [y])
+            n_ext = n_hit = n_extacc = 0
             while out_n < max_new and not stop and not cancel():
                 j = GR.fw.n - 1
                 ta = pc()
                 d = MG.run(y, hcur, j).tolist()
                 tb = pc()
-                toks = [y] + d
+                ext = ng.propose(d, min(self.ngram_ext, self.SG.TM - 1 - k))[0] if ng is not None else []
+                toks = [y] + d + ext
+                if ext:
+                    n_hit += 1
+                    n_ext += len(ext)
                 _lg, amv, _x, hv = GR.step_rows(toks)
                 tc = pc()
                 amh = amv.tolist()
@@ -207,10 +220,18 @@ class Hy4Engine:
                 tm[1] += tc - tb
                 tm[2] += td - tc
                 acc = 0
-                while acc < k and d[acc] == amh[acc]:
+                nd = len(toks) - 1
+                while acc < nd and toks[acc + 1] == amh[acc]:
                     acc += 1
+                n_extacc += max(0, acc - k)
                 new = toks[1:acc + 1] + [amh[acc]]        # toks[0] = y was already emitted; the verified drafts + the trunk's own next token
                 GR.rewind(j + 2 + acc)
+                if self.ngram_fill and acc >= k:          # head rows j + k .. j + acc were never written by the draft chain: true pairs (token p + 1, trunk state h_p)
+                    MT = self.MT
+                    N = ((j + acc + 1 + 3) // 4) * 4
+                    MT.step(torch.tensor(toks[k:acc + 1], dtype=torch.long, device=self.dev), hv[k - 1:acc], MT.ar[j + k:j + acc + 1], N)
+                if ng is not None:
+                    ng.add(new)
                 y, hcur = amh[acc], hv[acc:acc + 1]
                 hist[acc] += 1
                 rounds += 1
@@ -220,6 +241,7 @@ class Hy4Engine:
                 out_n += len(new)
                 stop = on_tokens(new)
             st["round_ms"] = [x / max(rounds, 1) * 1000 for x in tm]
+            st["ngram"] = {"ext": self.ngram_ext, "min": self.ngram_min, "fill": self.ngram_fill, "hit_rounds": n_hit, "ext_rows": n_ext, "ext_accepted": n_extacc}
         else:
             while out_n < max_new and not stop and not cancel():
                 lg = GR.step(y)
