@@ -476,7 +476,7 @@ class Hy4Forward:
                 sel_l = [] if (self.res.get(i) is not None and T <= MMVQ_MAXR and dev.type == "cuda") else sorted(set(sel.flatten().tolist()))
             else:
                 p = torch.sigmoid(x @ L.router.T)
-                sel = torch.topk(p + L.rbias, self.topk, dim=-1).indices
+                sel = torch.sort(p + L.rbias, dim=-1, descending=True, stable=True).indices[:, :self.topk]      # stable: near-tied experts resolve to the lowest id every call
                 w = torch.gather(p, 1, sel)
                 w = w / w.sum(-1, keepdim=True).clamp(min=6.103515625e-5) * self.w_scale
                 sel_l = [] if _ns.skip_host_ids(self, i, T, MMVQ_MAXR) else sorted(set(sel.flatten().tolist()))

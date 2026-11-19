@@ -35,7 +35,7 @@ def _usable(*ts):
 def router_ref(logits, bias, k, w_scale):
     """the old code (hy4_forward._ffn), verbatim maths: logits [T, E] = x @ router.T -> sel [T, k] int64, w [T, k] fp32"""
     p = torch.sigmoid(logits)
-    sel = torch.topk(p + bias, k, dim=-1).indices
+    sel = torch.sort(p + bias, dim=-1, descending=True, stable=True).indices[:, :k]
     w = torch.gather(p, 1, sel)
     w = w / w.sum(-1, keepdim=True).clamp(min=CLAMP_MIN) * w_scale
     return sel, w
