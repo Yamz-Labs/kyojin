@@ -38,13 +38,19 @@ class FusedKPoolIndexer:
         self._cs = None                                             # (cos, sin) [Lpos, rope_dim/2] fp32
         self.last_scores = None
 
+    _TABS = {}      # (base, rope_dim, device) -> (cos, sin): one fp64 evaluation per process, not one per indexer layer (13 x 34 ms at 8K)
+
     # -- rope table, built like the reference (float64 angle, then fp32 cos / sin)
     def _table(self, upto):
         if self._cs is None or self._cs[0].shape[0] < upto:
-            L = max(upto, 2 * (self._cs[0].shape[0] if self._cs else 0), 4096)
-            inv = self.base ** (-torch.arange(0, self.rope_dim, 2, dtype=torch.float64) / self.rope_dim)
-            ang = torch.arange(L, dtype=torch.float64)[:, None] * inv[None]
-            self._cs = (ang.cos().float().to(self.dev), ang.sin().float().to(self.dev))
+            key = (self.base, self.rope_dim, str(self.dev))
+            cs = self._TABS.get(key)
+            if cs is None or cs[0].shape[0] < upto:
+                L = max(upto, 2 * (cs[0].shape[0] if cs else 0), 4096)
+                inv = self.base ** (-torch.arange(0, self.rope_dim, 2, dtype=torch.float64) / self.rope_dim)
+                ang = torch.arange(L, dtype=torch.float64)[:, None] * inv[None]
+                cs = self._TABS[key] = (ang.cos().float().to(self.dev), ang.sin().float().to(self.dev))
+            self._cs = cs
         return self._cs
 
     def _rope(self, x, pos):
