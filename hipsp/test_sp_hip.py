@@ -10,7 +10,7 @@ import sp_hip
 dev = "cuda"
 H, R, Pd, KP, NTOP = 64, 512, 64, 4, 511
 scale = 1 / 16.0
-def make(N, T, tail, ntop, seed, sc_scale=1.0, sink=True):
+def make(N, T, tail, ntop, seed, sc_scale=1.0, sink=True, qmul=1.0):
     g = torch.Generator(device=dev); g.manual_seed(seed)
     qstart = N - T; P = (N + KP - 1) // KP
     sc = torch.randn(T, P, device=dev, generator=g) * sc_scale
@@ -18,7 +18,7 @@ def make(N, T, tail, ntop, seed, sc_scale=1.0, sink=True):
     gend = torch.arange(P, device=dev) * KP + KP - 1
     sc = sc.masked_fill(~(gend[None] < pos[:, None]), float("-inf"))
     sp = PK.ix_select(sc, qstart, N, ntop, KP, tail, want_bias=False, sparse=True)
-    qc = (torch.randn(H, T, R + Pd, device=dev, generator=g) * 0.3).half()
+    qc = (torch.randn(H, T, R + Pd, device=dev, generator=g) * 0.3 * qmul).half()
     kc = torch.randn(N, R + Pd, device=dev, generator=g) * 0.3
     sinks = torch.randn(H, device=dev, generator=g) if sink else None
     return qstart, sp, qc, kc, sinks
@@ -40,6 +40,7 @@ def ref64(qstart, sp, qc, kc, sinks):
 ok = True
 cases = [(3000, 256, True, 511), (3000, 256, False, 511), (2999, 129, True, 511), (2998, 64, False, 40), (41, 41, True, 511), (41, 41, False, 511), (7, 7, True, 511), (1, 1, False, 511), (130, 64, True, 3),
          (33001, 48, True, 511), (33000, 48, False, 511), (4100, 32, True, 5)]
+peaky = [(3000, 128, True, 511), (3001, 128, False, 100), (700, 64, True, 20)]
 for (N, T, tail, ntop) in cases:
     for sink in (True, False):
         qstart, sp, qc, kc, sinks = make(N, T, tail, ntop, N + T, sink=sink)
@@ -56,4 +57,13 @@ for (N, T, tail, ntop) in cases:
         good = err < 1.5e-3 and bool(torch.isfinite(o).all())
         ok &= good
         print(f"N {N} T {T} tail {int(tail)} ntop {ntop} sink {int(sink)} nsel mean {float(sp.nsel.float().mean()):.0f}: err vs fp64 {err:.2e} (max {mx:.1e}) | triton vs fp64 {etr0:.2e} | hip vs triton {etr:.2e} {'OK' if good else 'FAIL'}", flush=True)
+for (N, T, tail, ntop) in peaky:
+    for qmul in (6.0, 30.0):
+        for sink in (True, False):
+            qstart, sp, qc, kc, sinks = make(N, T, tail, ntop, N + T + 7, sink=sink, qmul=qmul)
+            kc16 = kc.clamp(-65504.0, 65504.0).half().contiguous()
+            o = sp_hip.mla_sparse_hip(R, kc16, qstart, scale, sinks, sp, qc).double(); torch.cuda.synchronize()
+            ref = ref64(qstart, sp, qc, kc, sinks)
+            err = float((o - ref).norm() / ref.norm().clamp_min(1e-30)); good = err < 2e-3 and bool(torch.isfinite(o).all()); ok &= good
+            print(f"PEAKY N {N} T {T} tail {int(tail)} ntop {ntop} qmul {qmul} sink {int(sink)}: err vs fp64 {err:.2e} {'OK' if good else 'FAIL'}", flush=True)
 print("ALL OK" if ok else "FAILURES")

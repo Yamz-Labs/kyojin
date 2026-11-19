@@ -14,6 +14,14 @@ typedef __attribute__((__vector_size__(8 * sizeof(float)))) float f8;
 #define KPITCH 1168   // bytes per K row in LDS (73 * 16: conflict free b128 rows)
 #define VPITCH 48     // bytes per V^T row (16 keys * 2 + 16 pad)
 #define LAZY 8.0f
+#ifdef NO_SYNC
+#define SYNC() ((void)0)
+#else
+#define SYNC() __syncthreads()
+#endif
+#ifndef HALFK
+#define HALFK 0
+#endif
 
 __device__ __forceinline__ uint32_t perm16(uint32_t x) { return __builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xfedcba98, false, false); }
 __device__ __forceinline__ float permf(float x) { return __builtin_bit_cast(float, perm16(__builtin_bit_cast(uint32_t, x))); }
@@ -29,7 +37,7 @@ __device__ __forceinline__ uint32_t pk2s(float a, float b)
 }
 
 template <int KP, bool SINK>
-__global__ __launch_bounds__(512, 1) void sp_mla(const _Float16* __restrict__ Q, const _Float16* __restrict__ KC, const float* __restrict__ sink, const int* __restrict__ gidx,
+__global__ __launch_bounds__(512) void sp_mla(const _Float16* __restrict__ Q, const _Float16* __restrict__ KC, const float* __restrict__ sink, const int* __restrict__ gidx,
     const int* __restrict__ nsel, _Float16* __restrict__ O, int T, int qstart, int H, int GS, int N, float scale, int tail, int fixed_tiles)
 {
     __shared__ __attribute__((aligned(16))) char Kn[16 * KPITCH];
@@ -93,31 +101,62 @@ __global__ __launch_bounds__(512, 1) void sp_mla(const _Float16* __restrict__ Q,
         }
     };
     __syncthreads();
-    if (ntiles > 0) { gload(0); wK(); wV(); }
+    if (ntiles > 0) { gload(0); wK(); }
     __syncthreads();
     const char* kb = Kn + n * KPITCH + 2 * 144 * qq;
     float* spw = Sp + ((mt * 4 + qq) * 16 + hh) * 16 + n;
     for (int tau = 0; tau < ntiles; tau++) {
         const bool more = tau + 1 < ntiles;
+#ifndef NO_GATHER
+        wV();
+#endif
+        //  Vt_tau (free: every wave passed the end barrier of tau-1)
+#ifndef NO_GATHER
         if (more) gload(tau + 1);
+#endif
         f8 s = (f8){0, 0, 0, 0, 0, 0, 0, 0};
+#ifndef NO_QK
+        f8 s1 = s, s2 = s;
 #pragma unroll
         for (int k = 0; k < 9; k++) {
             const uint4* kp = (const uint4*)(kb + 32 * k);
-            s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(mk16(kp[0], kp[1]), qf[k], s);
+            #ifdef NO_LDSRD
+            const h16 af = qf[(k + 1) % 9];
+#else
+            const h16 af = mk16(kp[0], HALFK ? kp[0] : kp[1]);
+#endif
+            if (k % 3 == 0) s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, qf[k], s);
+            else if (k % 3 == 1) s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, qf[k], s1);
+            else s2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, qf[k], s2);
         }
 #pragma unroll
+        for (int i = 0; i < 8; i++) s[i] = (s[i] + s1[i]) + s2[i];
+#endif
+#pragma unroll
+#ifndef NO_SP
         for (int i = 0; i < 8; i++) spw[2 * i * 16] = s[i];
-        __syncthreads();
+#endif
+        SYNC();
+#ifndef NO_GATHER
         if (more) wK();
+#endif
+        //  Kn_{tau+1}: every wave finished QK(tau)
         float sv[8];
 #pragma unroll
         for (int i = 0; i < 8; i++) {
             float p[4];
 #pragma unroll
+#ifdef NO_SP
+            for (int q2 = 0; q2 < 4; q2++) p[q2] = s[i];
+#else
             for (int q2 = 0; q2 < 4; q2++) p[q2] = (q2 == qq) ? s[i] : Sp[(((mt * 4 + q2) * 16 + 2 * i + hh) * 16) + n];
+#endif
             sv[i] = (((p[0] + p[1]) + p[2]) + p[3]) * c;
         }
+#ifdef NO_SOFT
+        uint32_t pw[4]; const float alpha = 1.f; const bool upd = false;
+        for (int i = 0; i < 8; i += 2) pw[i >> 1] = pk2(sv[i], sv[i + 1]);
+#else
         float mx = -INFINITY;
 #pragma unroll
         for (int i = 0; i < 8; i++) {
@@ -145,18 +184,28 @@ __global__ __launch_bounds__(512, 1) void sp_mla(const _Float16* __restrict__ Q,
 #pragma unroll
                 for (int j = 0; j < 8; j++) acc[i][j] *= alpha;
         }
+#endif
+        #ifdef DEPFREE
+        for (int i = 0; i < 8; i++) ls += s[i];
+        const h16 pb = mk16(make_uint4(tau, n, hh, 7), make_uint4(3, 4, tau, 5));
+#else
         const h16 pb = mk16(make_uint4(pw[0], pw[1], pw[2], pw[3]), make_uint4(perm16(pw[0]), perm16(pw[1]), perm16(pw[2]), perm16(pw[3])));
+#endif
+#ifndef NO_PV
 #pragma unroll
         for (int tt = 0; tt < 8; tt++) {
             const int d = (16 * (8 * qq + tt) + n);
             const int pd = d ^ ((d >> 3) & 3);
             const char* vp = Vt + pd * VPITCH;
-            const uint4 a0 = *(const uint4*)(vp + 16 * hh), a1 = *(const uint4*)(vp + 16 * (hh ^ 1));
+            #ifdef NO_LDSRD
+            const uint4 a0 = make_uint4(pw[0] + tt, pw[1], pw[2], pw[3] ^ tt), a1 = make_uint4(pw[1], pw[2] + tt, pw[3], pw[0]);
+#else
+            const uint4 a0 = *(const uint4*)(vp + 16 * hh), a1 = HALFK ? a0 : *(const uint4*)(vp + 16 * (hh ^ 1));
+#endif
             acc[tt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(mk16(a0, a1), pb, acc[tt]);
         }
-        __syncthreads();
-        if (more) wV();
-        __syncthreads();
+#endif
+        SYNC();
     }
     ls += permf(ls);
     const float inv = 1.f / fmaxf(ls, 1e-30f);
