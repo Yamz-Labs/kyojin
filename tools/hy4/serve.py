@@ -71,10 +71,18 @@ def check_kernels() -> None:
             print(f"hy4 serve: WARNING {path} is missing: {what}. Build it with: bash tools/hy4/install_strix.sh", file=sys.stderr, flush=True)
 
 
-def apply_env(ctx: int) -> None:
+def apply_env(ctx: int, model: str = "") -> None:
     for k, v in SHIPPED_ENV.items():
         os.environ.setdefault(k, v)
     os.environ.setdefault("HY4_NOSYNC_CAP", str(((ctx + 64 + 511) // 512) * 512))   # K buffers / token history: fixed for the life of the process
+    # the measured line also runs with frozen TunableOp results for the prefill GEMMs and a start-up request that compiles the prefill kernels and captures the decode graphs
+    tune = os.path.join(TREE, "tools", "hy4", "tunableop_gfx1151.csv")
+    if os.path.isfile(tune):
+        os.environ.setdefault("HY4_TUNABLEOP_FILE", tune)
+    os.environ.setdefault("HY4_WARMUP_TOKENS", str(min(8493, max(ctx - 128, 0))))
+    head = os.path.join(os.path.dirname(os.path.abspath(model)), "head_q5_k.bin") if model else ""
+    if os.path.isfile(head):                                  # Q5_K draft head made by tools/hy4/make_head_bin.py, kept next to the GGUF
+        os.environ.setdefault("HY4_MTP_HEAD_BIN", head)
 
 
 class State:
@@ -381,7 +389,7 @@ def main(argv=None):
     ap.add_argument("--slots", type=int, default=1, help="concurrent sessions decoded in ONE batched step (1 = the single-request engine behind the lock)")
     ap.add_argument("--sched-chunk", type=int, default=1024, help="prefill rows per scheduler turn with --slots > 1 (a decode round of the other sessions runs between chunks)")
     args = ap.parse_args(argv)
-    apply_env(args.max_ctx)
+    apply_env(args.max_ctx, args.model)
     check_kernels()
     st = State(args)
     app = build_app(st)

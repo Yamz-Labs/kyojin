@@ -34,8 +34,9 @@ Optional: a Q5_K copy of the output head for the MTP drafts (0.255 GB instead of
 
 ```bash
 GGML_LIB=/path/to/libggml-base.so python tools/hy4/make_head_bin.py ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf ./hy4/head_q5_k.bin
-export HY4_MTP_HEAD_BIN=$PWD/hy4/head_q5_k.bin
 ```
+
+The server finds `head_q5_k.bin` by itself when it sits next to the GGUF (`HY4_MTP_HEAD_BIN` names another place). The measured line uses this head: without the file the drafts run on the Q8_0 head, a little slower.
 
 ## Run
 

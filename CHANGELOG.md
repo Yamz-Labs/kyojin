@@ -9,5 +9,6 @@ Hy4-flash (GGUF Q3_K) on one Strix Halo machine. Numbers: see the benchmark tabl
 - Long-context decode: exact top-k sparse attend (`HY4_LC_SPARSE`), draft-cache fill with the same selection.
 - Prefill: fused dequant GEMMs, WMMA expert kernels shared with the GGUF MoE path, CK latent-attention core, dense GEMMs split in pieces of 8192 rows above 8192 rows.
 - Decode: static-buffer graph step, MTP head from a Q5_K copy of the output head, n-gram rows on top of the drafts, Engram rows prefetched by row.
+- The server applies the frozen TunableOp results (`tools/hy4/tunableop_gfx1151.csv`) and a start-up warm-up request by default (`HY4_TUNABLEOP_FILE`, `HY4_WARMUP_TOKENS=0` to skip it), and picks up `head_q5_k.bin` next to the GGUF.
 - Generic GGUF loader (`EXL3_GGUF_GENERIC=1`, off by default) and its CPU tests.
 - Context: 128K tokens. Single user (`--slots` is experimental). Greedy decoding only.
