@@ -14,6 +14,9 @@ typedef __attribute__((__vector_size__(8 * sizeof(float)))) float f8;
 #define KPITCH 1168   // bytes per K row in LDS (73 * 16: conflict free b128 rows)
 #define VPITCH 48     // bytes per V^T row (16 keys * 2 + 16 pad)
 #define LAZY 8.0f
+#ifndef WPEMAX
+#define WPEMAX 4
+#endif
 #ifdef NO_SYNC
 #define SYNC() ((void)0)
 #else
@@ -36,23 +39,24 @@ __device__ __forceinline__ uint32_t pk2s(float a, float b)
     return (uint32_t)__builtin_bit_cast(uint16_t, satf(a)) | ((uint32_t)__builtin_bit_cast(uint16_t, satf(b)) << 16);
 }
 
-template <int KP, bool SINK>
-__global__ __launch_bounds__(512) void sp_mla(const _Float16* __restrict__ Q, const _Float16* __restrict__ KC, const float* __restrict__ sink, const int* __restrict__ gidx,
+template <int KP, bool SINK, int NH>
+__global__ __launch_bounds__(NH * 8) __attribute__((amdgpu_waves_per_eu(1, WPEMAX))) void sp_mla(const _Float16* __restrict__ Q, const _Float16* __restrict__ KC, const float* __restrict__ sink, const int* __restrict__ gidx,
     const int* __restrict__ nsel, _Float16* __restrict__ O, int T, int qstart, int H, int GS, int N, float scale, int tail, int fixed_tiles)
 {
     __shared__ __attribute__((aligned(16))) char Kn[16 * KPITCH];
     __shared__ __attribute__((aligned(16))) char Vt[512 * VPITCH];
     __shared__ __attribute__((aligned(16))) float Sp[4 * 4 * 16 * 16];
     __shared__ int gi[512];
-    const int tid = threadIdx.x, w = tid >> 5, l = tid & 31, n = l & 15, hh = l >> 4, mt = w & 3, qq = w >> 2;
-    const int t = blockIdx.x, hg = blockIdx.y * 64;
+    const int tid = threadIdx.x, w = tid >> 5, l = tid & 31, n = l & 15, hh = l >> 4, mt = w % (NH / 16), qq = w / (NH / 16);
+    constexpr int NT = NH * 8, NR = 512 / NT;
+    const int t = blockIdx.x, hg = blockIdx.y * NH;
     const int pos = qstart + t;
     const int ns = fixed_tiles ? 0 : min(nsel[t], min(GS, 512));
     const int lo_t = sp_lo_t(pos, KP, tail);
     const int ntail = pos - lo_t + 1;
     const int nv = fixed_tiles ? fixed_tiles * 16 : ns * KP + ntail;
     const int ntiles = (nv + 15) >> 4;
-    if (tid < ns) gi[tid] = gidx[(long)t * GS + tid];
+    for (int i = tid; i < ns; i += NT) gi[i] = gidx[(long)t * GS + i];
     const int head = hg + mt * 16 + n;
     const long qrow = ((long)head * T + t) * D_;
     // resident Q B fragments (both lane halves hold the full 16 dims)
@@ -69,16 +73,19 @@ __global__ __launch_bounds__(512) void sp_mla(const _Float16* __restrict__ Q, co
     float ls = SINK ? (hh == 0 ? 1.f : 0.f) : 0.f;
     const float c = scale * LOG2E;
     // gather task: V part (dim chunk cT, group g, parity e) = 2 keys x 8 dims; rope part for tid < 128
-    const int cT = tid >> 3, tg = (tid >> 1) & 3, te = tid & 1;
+    const int cT0 = tid >> 3, tg = (tid >> 1) & 3, te = tid & 1;
     const int rk = tid >> 3, rc = tid & 7;
-    uint4 ga, gb, gr;
+    uint4 ga[NR], gb[NR], gr;
     auto gload = [&](int tau) {
         const int v0 = tau * 16 + 4 * tg + te;
         int r0, r1;
         if (fixed_tiles) { r0 = v0 & 15; r1 = (v0 + 2) & 15; }
         else { r0 = sp_row<KP>(v0, nv, ns, lo_t, gi, N); r1 = sp_row<KP>(v0 + 2, nv, ns, lo_t, gi, N); }
-        ga = *(const uint4*)(KC + (long)r0 * D_ + 8 * cT);
-        gb = *(const uint4*)(KC + (long)r1 * D_ + 8 * cT);
+#pragma unroll
+        for (int r = 0; r < NR; r++) {
+            ga[r] = *(const uint4*)(KC + (long)r0 * D_ + 8 * (cT0 + (NT / 8) * r));
+            gb[r] = *(const uint4*)(KC + (long)r1 * D_ + 8 * (cT0 + (NT / 8) * r));
+        }
         if (tid < 128) {
             const int rr = fixed_tiles ? ((tau * 16 + rk) & 15) : sp_row<KP>(tau * 16 + rk, nv, ns, lo_t, gi, N);
             gr = *(const uint4*)(KC + (long)rr * D_ + R_ + 8 * rc);
@@ -86,18 +93,26 @@ __global__ __launch_bounds__(512) void sp_mla(const _Float16* __restrict__ Q, co
     };
     auto wK = [&]() {
         const int k0 = 4 * tg + te;
-        *(uint4*)(Kn + k0 * KPITCH + 16 * cT) = ga;
-        *(uint4*)(Kn + (k0 + 2) * KPITCH + 16 * cT) = gb;
+#pragma unroll
+        for (int r = 0; r < NR; r++) {
+            const int cT = cT0 + (NT / 8) * r;
+            *(uint4*)(Kn + k0 * KPITCH + 16 * cT) = ga[r];
+            *(uint4*)(Kn + (k0 + 2) * KPITCH + 16 * cT) = gb[r];
+        }
         if (tid < 128) *(uint4*)(Kn + rk * KPITCH + 2 * (R_ + 8 * rc)) = gr;
     };
     auto wV = [&]() {
-        const uint32_t av[4] = {ga.x, ga.y, ga.z, ga.w}, bv[4] = {gb.x, gb.y, gb.z, gb.w};
 #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            const uint32_t a = av[j >> 1], b = bv[j >> 1];
-            const uint32_t pr = (j & 1) ? ((a >> 16) | (b & 0xffff0000u)) : ((a & 0xffffu) | (b << 16));
-            const int d = (8 * cT + j) ^ (cT & 3);
-            *(uint32_t*)(Vt + d * VPITCH + 16 * te + 4 * tg) = pr;
+        for (int r = 0; r < NR; r++) {
+            const int cT = cT0 + (NT / 8) * r;
+            const uint32_t av[4] = {ga[r].x, ga[r].y, ga[r].z, ga[r].w}, bv[4] = {gb[r].x, gb[r].y, gb[r].z, gb[r].w};
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const uint32_t a = av[j >> 1], b = bv[j >> 1];
+                const uint32_t pr = (j & 1) ? ((a >> 16) | (b & 0xffff0000u)) : ((a & 0xffffu) | (b << 16));
+                const int d = (8 * cT + j) ^ (cT & 3);
+                *(uint32_t*)(Vt + d * VPITCH + 16 * te + 4 * tg) = pr;
+            }
         }
     };
     __syncthreads();
@@ -120,11 +135,7 @@ __global__ __launch_bounds__(512) void sp_mla(const _Float16* __restrict__ Q, co
 #pragma unroll
         for (int k = 0; k < 9; k++) {
             const uint4* kp = (const uint4*)(kb + 32 * k);
-            #ifdef NO_LDSRD
-            const h16 af = qf[(k + 1) % 9];
-#else
             const h16 af = mk16(kp[0], HALFK ? kp[0] : kp[1]);
-#endif
             if (k % 3 == 0) s = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, qf[k], s);
             else if (k % 3 == 1) s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, qf[k], s1);
             else s2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, qf[k], s2);
@@ -192,17 +203,20 @@ __global__ __launch_bounds__(512) void sp_mla(const _Float16* __restrict__ Q, co
         const h16 pb = mk16(make_uint4(pw[0], pw[1], pw[2], pw[3]), make_uint4(perm16(pw[0]), perm16(pw[1]), perm16(pw[2]), perm16(pw[3])));
 #endif
 #ifndef NO_PV
+        {
+            uint4 fv[3][2];
+            const char* vpb[8];
 #pragma unroll
-        for (int tt = 0; tt < 8; tt++) {
-            const int d = (16 * (8 * qq + tt) + n);
-            const int pd = d ^ ((d >> 3) & 3);
-            const char* vp = Vt + pd * VPITCH;
-            #ifdef NO_LDSRD
-            const uint4 a0 = make_uint4(pw[0] + tt, pw[1], pw[2], pw[3] ^ tt), a1 = make_uint4(pw[1], pw[2] + tt, pw[3], pw[0]);
-#else
-            const uint4 a0 = *(const uint4*)(vp + 16 * hh), a1 = HALFK ? a0 : *(const uint4*)(vp + 16 * (hh ^ 1));
-#endif
-            acc[tt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(mk16(a0, a1), pb, acc[tt]);
+            for (int tt = 0; tt < 8; tt++) { const int d = 16 * (8 * qq + tt) + n; vpb[tt] = Vt + (d ^ ((d >> 3) & 3)) * VPITCH; }
+#pragma unroll
+            for (int tt = 0; tt < 2; tt++) { fv[tt][0] = *(const uint4*)(vpb[tt] + 16 * hh); fv[tt][1] = *(const uint4*)(vpb[tt] + 16 * (hh ^ 1)); }
+#pragma unroll
+            for (int tt = 0; tt < 8; tt++) {
+                if (tt + 2 < 8) { fv[(tt + 2) % 3][0] = *(const uint4*)(vpb[tt + 2] + 16 * hh); fv[(tt + 2) % 3][1] = *(const uint4*)(vpb[tt + 2] + 16 * (hh ^ 1)); }
+                __builtin_amdgcn_sched_barrier(0);
+                acc[tt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(mk16(fv[tt % 3][0], fv[tt % 3][1]), pb, acc[tt]);
+                __builtin_amdgcn_sched_barrier(0);
+            }
         }
 #endif
         SYNC();
@@ -226,12 +240,14 @@ extern "C" int sp_launch(const void* Q, const void* KC, const void* sink, const 
     int KP, int fixed_tiles, void* stream)
 {
     hipStream_t st = (hipStream_t)stream;
-    if (GS > 512 || H % 64) return -2;
-    dim3 g(T, H / 64);
-#define L(KPV, SK) sp_mla<KPV, SK><<<g, 512, 0, st>>>((const _Float16*)Q, (const _Float16*)KC, (const float*)sink, (const int*)gidx, (const int*)nsel, (_Float16*)O, T, qstart, H, GS, N, scale, tail, fixed_tiles)
-    if (KP == 4) { if (sink) L(4, true); else L(4, false); }
-    else if (KP == 2) { if (sink) L(2, true); else L(2, false); }
-    else if (KP == 8) { if (sink) L(8, true); else L(8, false); }
+    if (GS > 512 || H % 32) return -2;
+    const int NHv = (H % 64 == 0) ? 64 : 32;
+    dim3 g(T, H / NHv);
+#define L(KPV, SK) { if (NHv == 64) sp_mla<KPV, SK, 64><<<g, 512, 0, st>>>((const _Float16*)Q, (const _Float16*)KC, (const float*)sink, (const int*)gidx, (const int*)nsel, (_Float16*)O, T, qstart, H, GS, N, scale, tail, fixed_tiles); \
+                     else sp_mla<KPV, SK, 32><<<g, 256, 0, st>>>((const _Float16*)Q, (const _Float16*)KC, (const float*)sink, (const int*)gidx, (const int*)nsel, (_Float16*)O, T, qstart, H, GS, N, scale, tail, fixed_tiles); }
+    if (KP == 4) { if (sink) L(4, true) else L(4, false) }
+    else if (KP == 2) { if (sink) L(2, true) else L(2, false) }
+    else if (KP == 8) { if (sink) L(8, true) else L(8, false) }
     else return -1;
     return (int)hipGetLastError();
 }

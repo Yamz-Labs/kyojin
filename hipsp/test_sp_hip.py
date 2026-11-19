@@ -8,7 +8,7 @@ from exllamav3.loader import prefill_kernels as PK, prefill_attn as PA
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_hip
 dev = "cuda"
-H, R, Pd, KP, NTOP = 64, 512, 64, 4, 511
+H, R, Pd, KP, NTOP = int(os.environ.get('HH', 64)), 512, 64, 4, 511
 scale = 1 / 16.0
 def make(N, T, tail, ntop, seed, sc_scale=1.0, sink=True, qmul=1.0):
     g = torch.Generator(device=dev); g.manual_seed(seed)

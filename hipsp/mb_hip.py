@@ -8,7 +8,7 @@ from exllamav3.loader import prefill_kernels as PK, prefill_attn as PA
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sp_hip
 dev = "cuda"
-H, R, Pd, KP, NTOP = 64, 512, 64, 4, 511
+H, R, Pd, KP, NTOP = int(os.environ.get('HH', 64)), 512, 64, 4, 511
 scale = 1 / 16.0
 Ns = [int(x) for x in sys.argv[2].split(",")] if len(sys.argv) > 2 else [8192, 33000, 131072]
 def tm(f, reps=3):
