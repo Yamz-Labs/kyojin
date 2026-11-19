@@ -77,7 +77,13 @@ class Hy4MTP:
         # draft head: "" = the trunk's bf16 head (Triton mat-vec), "q8" = Q8_0 copy (half the bytes), "sub<N>" = the first N vocabulary rows only (draft picks among them)
         hm = os.environ.get("HY4_MTP_HEAD", "")
         self.head_q8 = self.head_sub = self.ids = None
-        if hm == "q8":
+        if hm == "q5k":          # Q5_K bytes of the bf16 head from a file (make_head_bin.py): 0.255 GB instead of 0.394 GB (Q8_0); falls back to Q8_0 when the file is missing
+            from . import dense_req as _DR
+            self.head_q8 = _DR.head_from_file(self, os.environ.get("HY4_MTP_HEAD_BIN", "/path/to/head_q5_k.bin"))
+            if self.head_q8 is None:
+                print("mtp_head: HY4_MTP_HEAD=q5k but no matching head file, using Q8_0", flush=True)
+                self.head_q8 = q8_linear(fw.out_w.float())
+        elif hm == "q8":
             self.head_q8 = q8_linear(fw.out_w.float())
         elif hm.startswith("sub"):
             n = int(hm[3:])

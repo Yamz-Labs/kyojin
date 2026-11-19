@@ -231,3 +231,15 @@ def set_head(mt, mg, mode):
     import gc
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def head_from_file(mt, path, kind="q5_k"):
+    """HY4_MTP_HEAD=q5k: the draft head as a K-quant QLinear read from `path` (tools/hy4/make_head_bin.py); returns None when the file does not match the head"""
+    from .hy4_forward import QLinear
+    W = mt.fw.out_w
+    V, D = W.shape
+    n = V * (D // 256) * KQ[kind]["bb"]
+    if not os.path.exists(path) or os.path.getsize(path) != n:
+        return None
+    arr = np.fromfile(path, dtype=np.uint8).reshape(V, D // 256, KQ[kind]["bb"])
+    return QLinear(torch.from_numpy(arr).to(W.device), _KIND_TY[kind], (256, KQ[kind]["bb"], "fq_gemv_" + kind, _dq_fn(kind)), _gemv(kind, "gemv"), None)
