@@ -33,31 +33,42 @@ class MuEngine(Hy4Engine):
         return self.GR.new_session(slot)
 
     def prefill_begin(self, s, ids, chunk):
-        s.ids, s.pf_pos, s.H, s.chunk = list(ids), 0, [], chunk
+        s.ids, s.pf_pos, s.H, s.chunk = list(ids), 0, [], min(chunk, PRIME_ROWS)
 
     def prefill_step(self, s):
-        """one chunk of the prompt of s (eager prefill set). -> True when the prompt is done: s.y = first token, s.hcur, draft cache primed"""
-        torch, M, GR = self.torch, self.M, self.GR
+        """one chunk of the prompt of s (eager prefill set) + the draft-head cache rows of that chunk (so no single long stall at the end of the prompt).
+        -> True when the prompt is done: s.y = first token, s.hcur = trunk state of the last prompt row"""
+        torch, M, GR, MT = self.torch, self.M, self.GR, self.MT
         a = s.pf_pos
-        b = min(len(s.ids), a + s.chunk)
+        n = len(s.ids)
+        b = min(n, a + s.chunk)
         self.phase("prefill")
         GR.bind(s)
         if a == 0:
             M.prefetch_engram(s.ids, s.chunk)      # the row prefetch list is global: one prefill is in flight at a time, it starts with its first chunk
+            s.tok_dev = torch.tensor(s.ids, dtype=torch.long, device=self.dev)
         lg = M.step(s.ids[a:b])
-        s.H.append(M.head_state(M._x))
+        hs = M.head_state(M._x)
         M._x = None
+        e_end = min(b, n - 1)                       # head pairs (token j + 1, trunk state h_j) for j = a .. min(b, n - 1) - 1
+        if e_end > a:
+            f16 = os.environ.get("HY4_PF_F16")
+            os.environ["HY4_PF_F16"] = "0"          # the fp16 attention chain is tuned for the trunk's matrices; the draft layer takes the generic prefill path
+            try:
+                MT.step(s.tok_dev[a + 1:e_end + 1], hs[:e_end - a], MT.ar[a:e_end], ((e_end + 3) // 4) * 4)
+            finally:
+                if f16 is None:
+                    os.environ.pop("HY4_PF_F16", None)
+                else:
+                    os.environ["HY4_PF_F16"] = f16
         torch.cuda.synchronize()
         GR.save(s)
         s.pf_pos = b
-        if b < len(s.ids):
+        if b < n:
             return False
-        H = torch.cat(s.H) if len(s.H) > 1 else s.H[0]
-        s.H = []
         s.y = int(torch.argmax(lg))
-        s.hcur = H[-1:].clone()
-        self._prime_draft(s.ids, H)               # MT is bound to s
-        torch.cuda.synchronize()
+        s.hcur = hs[-1:].clone()
+        s.tok_dev = None
         GR.start_graph_state(s)
         self.phase("decode")
         return True

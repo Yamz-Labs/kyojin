@@ -283,6 +283,10 @@ if "pf" in PH:
         for spec in (False,):
             sch = MuScheduler(e, chunk=chunk, spec=spec)
             sch.start()
+            w = Request(wiki[:pfl], 4, speculative=spec)          # warm-up: Triton / CK shapes of this chunk size compile here, not in the measured prefill
+            sch.submit(w)
+            w.done.wait(300)
+            sch.pf.clear()
             runners = [Request(ids_of[i], 200, speculative=spec) for i in range(3)]
             for r in runners:
                 sch.submit(r)
