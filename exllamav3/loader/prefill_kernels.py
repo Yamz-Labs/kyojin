@@ -454,7 +454,7 @@ def to_f16(x):
     if x.dtype != torch.float32 or not x.is_cuda or not x.is_contiguous() or x.numel() < (1 << 20):
         return x.float().clamp(-F16MAX, F16MAX).half()
     key = (x.data_ptr(), x.shape, x._version)
-    if _F16_MEMO[0] is not None and _F16_MEMO[1] == key and _F16_MEMO[0][0] is x:
+    if _F16_MEMO[0] is not None and _F16_MEMO[1] == key:      # same storage address + shape + in-place version; the memo holds the source, so the storage cannot be reused
         return _F16_MEMO[0][1]
     o = torch.empty(x.shape, dtype=torch.float16, device=x.device)
     n = x.numel()
