@@ -25,6 +25,7 @@ from .engram_rows import QB, E4M3, E8M0
 BUCKET = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
 TM = int(os.environ.get("HY4_GRAPH_TM", "8"))          # max rows of one graph step (verify rows)
 MASK64 = (1 << 64) - 1
+PERT = None                      # [cap, D] fp32 noise table (measurement arms only)
 _POOL = ThreadPoolExecutor(max_workers=int(os.environ.get("HY4_GRAPH_IO", "16")))
 
 
@@ -256,6 +257,8 @@ class GraphDecoder:
     def body(self):
         fw, gs = self.fw, self.gs
         e = _ns.gather_dequant_q8_0(self.st.table, gs.tok)
+        if PERT is not None:                      # noise-ensemble null arm: 1e-6 fixed-seed perturbation of the embedding output (quality gate, never in production)
+            e = e + PERT[gs.pos]
         x = e[:, None, :].expand(-1, fw.hc, -1).contiguous()
         for i in range(fw.n_layers):
             x = fw.layer(i, x, gs.pos, None, 0)
