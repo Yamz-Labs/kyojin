@@ -185,7 +185,7 @@ class Hy4Engine:
         self.phase("decode")
         t1 = time.perf_counter()
         st["prefill_s"] = t1 - t0
-        out_n, rounds, hist = 0, 0, [0] * (self.k + 1)
+        out_n, rounds, hist = 0, 0, [0] * (self.SG.TM + 1)
         stop = False
         # first token: it comes from the prefill logits
         stop = on_tokens([y])
