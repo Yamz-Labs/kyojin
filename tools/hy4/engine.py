@@ -36,6 +36,7 @@ class Hy4Engine:
         self.prime_rows = prime_rows              # 0 = fill the draft cache for the whole prompt; N = the last N rows only (cheaper, lower acceptance)
         self.ngram_ext = int(os.environ.get("HY4_NGRAM_EXT", "0"))        # extra verify rows from a prompt-lookup n-gram match (0 = off)
         self.ngram_min = int(os.environ.get("HY4_NGRAM_MIN", "4"))
+        self.ngram_adapt = os.environ.get("HY4_NGRAM_ADAPT", "0") == "1"
         self.ngram_fill = os.environ.get("HY4_NGRAM_FILL", "0") == "1"
         self.ready = False
         self.meta = None
@@ -207,7 +208,11 @@ class Hy4Engine:
                 ta = pc()
                 d = MG.run(y, hcur, j).tolist()
                 tb = pc()
-                ext = ng.propose(d, min(self.ngram_ext, self.SG.TM - 1 - k))[0] if ng is not None else []
+                ext = []
+                if ng is not None:
+                    ext, ml = ng.propose(d, min(self.ngram_ext, self.SG.TM - 1 - k))
+                    if self.ngram_adapt and ext:           # longer match, more rows: 2 rows at the minimum match, +2 per extra matched token
+                        ext = ext[:max(1, (ml - self.ngram_min + 1) * 2)]
                 toks = [y] + d + ext
                 if ext:
                     n_hit += 1
