@@ -184,7 +184,7 @@ class MultiDecoder(SG.GraphDecoder):
             ps += list(range(s.n, s.n + len(toks)))
             bs += [s.slot * self.cap] * len(toks)
             top = max(top, s.n + len(toks))
-        Nb = min(self.cap, ((top - 1) // SG.BUCKET + 1) * SG.BUCKET)
+        Nb = SG._gb.bucket(top, self.cap)
         gs.Nb = Nb
         self.hin[0, :T] = torch.tensor(tk)
         self.hin[1, :T] = torch.tensor(ps)
