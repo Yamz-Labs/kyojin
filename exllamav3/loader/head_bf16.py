@@ -10,6 +10,10 @@ import triton.language as tl
 ENABLED = os.environ.get("HY4_HEAD_BF16", "0") == "1"
 BV = int(os.environ.get("HY4_HEAD_BV", "8"))
 BD = int(os.environ.get("HY4_HEAD_BD", "512"))
+DOT = os.environ.get("HY4_HEAD_DOT", "0") == "1"             # 1 = verify rows (T >= 2) on tl.dot: fp16 WMMA, h split hi + lo (rel ~1e-7), W bf16 -> fp16 exact above 6e-8
+DOT_BV = int(os.environ.get("HY4_HEAD_DOT_BV", "64"))
+DOT_BD = int(os.environ.get("HY4_HEAD_DOT_BD", "128"))
+DOT_NW = int(os.environ.get("HY4_HEAD_DOT_NW", "4"))
 ROW_TILES = os.environ.get("HY4_ROW_TILES", "0") == "1"     # 1 = verify-row tiles tuned on the Strix (T 2..4: BD 64 + 2 warps; T >= 5: BV 16, BD 32)
 
 
@@ -44,6 +48,26 @@ def _k_headt(w_ptr, h_ptr, o_ptr, V, D, T, BT: tl.constexpr, BV: tl.constexpr, B
     tl.store(o_ptr + tt[:, None] * V + rows[None, :], acc, mask=tm[:, None] & rm[None, :])
 
 
+@triton.jit
+def _k_headd(w_ptr, h_ptr, o_ptr, V, D, T, BT: tl.constexpr, BV: tl.constexpr, BD: tl.constexpr):
+    """T rows on the matrix units: out[t, v] = sum_d h[t, d] * W[v, d]. Each W tile is read once; h (fp32) = hi + lo fp16 pieces, two fp16 dots with fp32 accumulation."""
+    rows = tl.program_id(0) * BV + tl.arange(0, BV)
+    rm = rows < V
+    tt = tl.arange(0, BT)
+    tm = tt < T
+    acc = tl.zeros([BT, BV], dtype=tl.float32)
+    for d0 in range(0, D, BD):
+        cols = d0 + tl.arange(0, BD)
+        cm = cols < D
+        w = tl.load(w_ptr + rows[:, None] * D + cols[None, :], mask=rm[:, None] & cm[None, :], other=0.0).to(tl.float16)
+        hv = tl.load(h_ptr + tt[:, None] * D + cols[None, :], mask=tm[:, None] & cm[None, :], other=0.0)
+        hh = hv.to(tl.float16)
+        hl = (hv - hh.to(tl.float32)).to(tl.float16)
+        wt = tl.trans(w)
+        acc += tl.dot(hh, wt) + tl.dot(hl, wt)
+    tl.store(o_ptr + tt[:, None] * V + rows[None, :], acc, mask=tm[:, None] & rm[None, :])
+
+
 def usable(h, W):
     return ENABLED and 1 <= h.shape[0] <= 16 and W.dim() == 2 and W.is_contiguous() and h.dtype == torch.float32 and W.dtype in (torch.bfloat16, torch.float16, torch.float32) \
         and (W.is_cuda or os.environ.get("TRITON_INTERPRET", "0") == "1")
@@ -55,6 +79,9 @@ def gemv(h, W):
     T = h.shape[0]
     if T > 1:
         out = torch.empty(T, V, dtype=torch.float32, device=W.device)
+        if DOT and D % DOT_BD == 0 and W.dtype in (torch.bfloat16, torch.float16):
+            _k_headd[(triton.cdiv(V, DOT_BV),)](W, h.contiguous(), out, V, D, T, BT=16, BV=DOT_BV, BD=DOT_BD, num_warps=DOT_NW)
+            return out
         bv, bd, nw = BV, min(BD, 128), 4
         if ROW_TILES:
             bv, bd, nw = (BV, 64, 2) if T <= 4 else (16, 32, 4)
