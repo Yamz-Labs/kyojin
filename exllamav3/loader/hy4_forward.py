@@ -212,6 +212,9 @@ def _dq_q8_0_t(packed):
 # rows <= DENSE_MAXR run the extension GEMV (activation quantised to q8_1 inside, like llama.cpp), more rows dequantise per call (no resident fp32 copy).
 GG_DENSE = {8: (32, 34, "fq_gemv_q8_0", _dq_q8_0_t)}
 DENSE_MAXR = 16
+GM_MOE = os.environ.get("HY4_GM_MOE", "0") == "1"       # 1 = verify rows (2..8) of the grouped MoE through gm_moe_kq_decode (expert-major: each distinct expert read once per tile for all rows); everything else stays stock
+GM_MOE_Q4MINR = int(os.environ.get("HY4_GM_MOE_Q4MINR", "2"))     # fewest rows for Q4_K gate/up layers (measured: gm = stock at 2 rows, -7 % at 3, -15 % at 4, -29 % at 8)
+GM_MOE_Q3MINR = int(os.environ.get("HY4_GM_MOE_Q3MINR", "4"))     # fewest rows for Q3_K gate/up layers (box microbench 19/11: gm 5 % faster at 4 rows, stock 8 % faster at 2-3)
 GM_FFN = os.environ.get("HY4_GM_FFN", "0") == "1"       # 1 = decode FFN (<= 8 rows) through the shared gm_ext ops: gm_route + one Q8_0 launch (rdown, shared gate, shared up) + gm_moe_kq_decode + rup / shared swiglu-down in one buffer
 _GMX = []
 
@@ -598,7 +601,20 @@ class Hy4Forward:
             self.stats["moe_path_" + getattr(k_, "LAST_PATH", "?")] = self.stats.get("moe_path_" + getattr(k_, "LAST_PATH", "?"), 0) + 1
             sel_l = []
         rs = self.res.get(i) if (T <= MMVQ_MAXR and dev.type == "cuda") else None
-        if rs is not None:
+        if rs is not None and GM_MOE and 2 <= T <= 8 and self.hook is None and self._gm_moe_ok(rs, T, N):
+            with tm.t("routed experts"):
+                S = sel.shape[1]
+                st = getattr(self, "_gmm", None)
+                if st is None or st.act.shape[1] != N:
+                    st = self._gmm = SimpleNamespace(act=torch.empty(8 * S, N, dtype=torch.float16, device=dev), qb=torch.empty(8 * N // 32 * 36, dtype=torch.uint8, device=dev),
+                                                     part=torch.empty(8 * S, N, dtype=torch.float32, device=dev), lat=torch.empty(8, N, dtype=torch.float32, device=dev),
+                                                     meta=torch.zeros(8 * S * 9, dtype=torch.int32, device=dev), nores=torch.empty(0, dtype=torch.float32, device=dev))
+                _gm().gm_moe_kq_decode(z.half().contiguous(), sel.reshape(-1).contiguous(), w.half().reshape(-1).contiguous(), *rs.ptrs, *rs.strides[:3], rs.fd,
+                                       st.act, st.qb, st.part, st.lat[:T], st.nores, rs.fu, lim, st.meta)
+                lat = st.lat[:T]
+            self.stats["gm_moe_calls"] = self.stats.get("gm_moe_calls", 0) + 1
+            sel_l = []
+        elif rs is not None:
             with tm.t("routed experts"):
                 ext, S = _ext(), sel.shape[1]
                 if getattr(self, "_gpart", None) is None or self._gpart.shape[1] != N:
@@ -647,6 +663,12 @@ class Hy4Forward:
         with tm.t("shared expert"):
             sh = self._mm(torch.nn.functional.silu(self._mm(x, gt)) * self._mm(x, up), dn)
         return y + sh, lat
+
+    def _gm_moe_ok(self, rs, T, N):
+        """the resident experts of this layer run on gm_moe_kq_decode at T rows: gate/up Q4_K (>= GM_MOE_Q4MINR rows) or Q3_K (>= GM_MOE_Q3MINR rows), down Q4_K / Q6_K, 256-multiples"""
+        if _gm() is None or rs.fd not in (0, 2) or N % 256 != 0 or N > 4096:
+            return False
+        return T >= (GM_MOE_Q4MINR if rs.fu == 0 else GM_MOE_Q3MINR) if rs.fu in (0, 8) else False
 
     def _gm_ok(self, i, L, x):
         """layer i FFN can run on the gm_ext ops: resident experts in a gm format, Q8_0 latent / shared matrices, 1..8 rows, no hooks"""

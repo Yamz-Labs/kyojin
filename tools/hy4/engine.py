@@ -41,6 +41,11 @@ class Hy4Engine:
         self.ngram_fill = os.environ.get("HY4_NGRAM_FILL", "0") == "1"
         self.ngram_long = int(os.environ.get("HY4_NGRAM_LONG", "0"))      # >= 1: a match of at least this many tokens REPLACES the MTP draft chain (verify y + up to TM - 1 copied tokens; the draft cache is refilled from the trunk states); 0 = off
         self._tune = None           # torch.cuda.tunable module while a frozen TunableOp results file is loaded (HY4_TUNABLEOP_FILE)
+        self.policy = None
+        if os.environ.get("HY4_DRAFT_POLICY", "0") == "1":
+            from draft_policy import CostPolicy
+            os.environ["HY4_DRAFT_CONF"] = "1"        # the draft graph appends the confidences (read at the import of mtp_head, i.e. in load())
+            self.policy = CostPolicy.from_env()
         self.ready = False
         self.meta = None
         self.last_stats: dict = {}
@@ -229,6 +234,8 @@ class Hy4Engine:
                 from ngram import NGram
                 ng = NGram(self.ngram_min, self.ngram_ext)
                 ng.reset(list(ids) + [y])
+            if self.policy is not None:
+                self.policy.reset_stats()
             n_ext = n_hit = n_extacc = n_long = 0
             rate, since = 0.7, 0          # recent acceptance of the extra rows; below 0.4 the proposer pauses (a probe every 8 rounds)
             while out_n < max_new and not stop and not cancel():
@@ -243,6 +250,12 @@ class Hy4Engine:
                     tb = pc()
                 else:
                     d = MG.run(y, hcur, j).tolist()
+                    confs = None
+                    if self.MH.CONF:                      # the draft graph appended the k confidences (fixed point 2^-20)
+                        confs = [c / 1048576.0 for c in d[k:]]
+                        d = d[:k]
+                    if self.policy is not None:
+                        d = d[:self.policy.choose(confs, 1 if ng is not None else 0)]
                     tb = pc()
                     ext = []
                 if ng is not None and not skip:
@@ -271,11 +284,16 @@ class Hy4Engine:
                 nd = len(toks) - 1
                 while acc < nd and toks[acc + 1] == amh[acc]:
                     acc += 1
+                kk = len(toks) - 1 - len(ext)             # drafted rows of this round (the policy may cut the chain below k)
+                if skip:
+                    pass
+                elif self.policy is not None and confs is not None:
+                    self.policy.update(confs, kk, acc)
                 if not skip:
-                    n_extacc += max(0, acc - k)
+                    n_extacc += max(0, acc - kk)
                 if ext and not skip:
                     since = 0
-                    rate = 0.75 * rate + 0.25 * (max(0, acc - k) / len(ext))
+                    rate = 0.75 * rate + 0.25 * (max(0, acc - len(d)) / len(ext))
                 new = toks[1:acc + 1] + [amh[acc]]        # toks[0] = y was already emitted; the verified drafts + the trunk's own next token
                 GR.rewind(j + 2 + acc)
                 if skip:                                  # the chain wrote no head rows: pairs (token m, state before it) for head positions j .. j + acc
@@ -283,10 +301,10 @@ class Hy4Engine:
                     N = ((j + acc + 1 + 3) // 4) * 4
                     sts = torch.cat([hc0, hv[:acc]]) if acc > 0 else hc0
                     MT.step(torch.tensor(toks[:acc + 1], dtype=torch.long, device=self.dev), sts, MT.ar[j:j + acc + 1], N)
-                elif self.ngram_fill and acc >= k:          # head rows j + k .. j + acc were never written by the draft chain: true pairs (token p + 1, trunk state h_p)
+                elif self.ngram_fill and acc >= len(d) and len(d) >= 1:          # head rows j + k .. j + acc were never written by the draft chain: true pairs (token p + 1, trunk state h_p)
                     MT = self.MT
                     N = ((j + acc + 1 + 3) // 4) * 4
-                    MT.step(torch.tensor(toks[k:acc + 1], dtype=torch.long, device=self.dev), hv[k - 1:acc], MT.ar[j + k:j + acc + 1], N)
+                    MT.step(torch.tensor(toks[len(d):acc + 1], dtype=torch.long, device=self.dev), hv[len(d) - 1:acc], MT.ar[j + len(d):j + acc + 1], N)
                 if ng is not None:
                     ng.add(new)
                 y, hcur = amh[acc], hv[acc:acc + 1]
@@ -298,6 +316,8 @@ class Hy4Engine:
                 out_n += len(new)
                 stop = on_tokens(new)
             st["round_ms"] = [x / max(rounds, 1) * 1000 for x in tm]
+            if self.policy is not None:
+                st["policy"] = self.policy.stats()
             st["ngram"] = {"ext": self.ngram_ext, "min": self.ngram_min, "fill": self.ngram_fill, "hit_rounds": n_hit, "ext_rows": n_ext, "ext_accepted": n_extacc, "long": self.ngram_long, "long_rounds": n_long}
         else:
             while out_n < max_new and not stop and not cancel():

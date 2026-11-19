@@ -14,6 +14,7 @@ import triton.language as tl
 ENABLED = os.environ.get("HY4_MLA_BG", "0") == "1"
 BN = int(os.environ.get("HY4_BG_BN", "16"))
 BK = int(os.environ.get("HY4_BG_BK", "128"))
+ROW_TILES = os.environ.get("HY4_ROW_TILES", "0") == "1"     # 1 = tile sizes tuned on the Strix for verify rows (T >= 4: BN 32, BK 32; box microbench 19/11)
 MAXT = 8                                   # rows served by the batched kernels (verify rows)
 
 
@@ -71,8 +72,9 @@ class Q8Batched:
         if x.dim() == 3 and x.shape[0] > 1 and x.stride(-1) == 1:
             T = x.shape[0]
             out = torch.empty(T, self.H, self.N, dtype=torch.float32, device=x.device)
-            _k_bgt[(self.H, triton.cdiv(self.N, BN))](self.q, self.d, x, out, self.N, self.K, self.K // 32, x.stride(0), x.stride(1), T,
-                                                      BT=triton.next_power_of_2(T), BN=BN, BK=min(BK, 64), num_warps=4)
+            bn, bk = (32, 32) if (ROW_TILES and T >= 4) else (BN, min(BK, 64))
+            _k_bgt[(self.H, triton.cdiv(self.N, bn))](self.q, self.d, x, out, self.N, self.K, self.K // 32, x.stride(0), x.stride(1), T,
+                                                      BT=triton.next_power_of_2(T), BN=bn, BK=bk, num_warps=4)
             return out
         out = torch.empty(self.H, self.N, dtype=torch.float32, device=x.device)
         if x.dim() == 3 and x.shape[0] == 1 and x.stride(-1) == 1:       # [1, H, K] view with a head stride (e.g. the nope part of q): no copy

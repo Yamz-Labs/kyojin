@@ -10,6 +10,7 @@ import triton.language as tl
 ENABLED = os.environ.get("HY4_HEAD_BF16", "0") == "1"
 BV = int(os.environ.get("HY4_HEAD_BV", "8"))
 BD = int(os.environ.get("HY4_HEAD_BD", "512"))
+ROW_TILES = os.environ.get("HY4_ROW_TILES", "0") == "1"     # 1 = verify-row tiles tuned on the Strix (T 2..4: BD 64 + 2 warps; T >= 5: BV 16, BD 32)
 
 
 @triton.jit
@@ -54,7 +55,10 @@ def gemv(h, W):
     T = h.shape[0]
     if T > 1:
         out = torch.empty(T, V, dtype=torch.float32, device=W.device)
-        _k_headt[(triton.cdiv(V, BV),)](W, h.contiguous(), out, V, D, T, BT=triton.next_power_of_2(T), BV=BV, BD=min(BD, 128), num_warps=4)
+        bv, bd, nw = BV, min(BD, 128), 4
+        if ROW_TILES:
+            bv, bd, nw = (BV, 64, 2) if T <= 4 else (16, 32, 4)
+        _k_headt[(triton.cdiv(V, bv),)](W, h.contiguous(), out, V, D, T, BT=triton.next_power_of_2(T), BV=bv, BD=bd, num_warps=nw)
         return out
     out = torch.empty(1, V, dtype=torch.float32, device=W.device)
     _k_head[(triton.cdiv(V, BV),)](W, h.contiguous(), out, V, D, BV=BV, BD=BD, num_warps=4)

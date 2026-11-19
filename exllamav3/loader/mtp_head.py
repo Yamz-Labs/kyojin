@@ -194,6 +194,10 @@ class Hy4MTP:
         return outs
 
 
+CONF = os.environ.get("HY4_DRAFT_CONF", "0") == "1"
+CONF_ONE = float(1 << 20)
+
+
 class MTPGraph:
     """the draft chain of k head steps as ONE HIP graph per context bucket: static inputs (token, trunk state, head position), greedy argmax feeds the next
     step on the device, output = the k drafted tokens [k] (device). No host work between the steps."""
@@ -216,12 +220,16 @@ class MTPGraph:
         mt = self.mt
         outs, tok, h = [], self.inp[0:1], self.h0
         pos = self.inp[1:2]
+        confs = []
         for i in range(self.k):
             y, lg = mt.step(tok, h, pos + i if i else pos, N)
             tok = mt.pick(lg)
             outs.append(tok)
+            if CONF:          # max softmax probability of the draft head, fixed point 2^-20, appended after the k tokens (cost-aware draft length)
+                l32 = lg.float()
+                confs.append((torch.exp(l32.max() - torch.logsumexp(l32, 0)) * CONF_ONE).long().reshape(1))
             h = y
-        return torch.cat(outs)
+        return torch.cat(outs + confs)
 
     def _graph(self, N):
         g = self.graphs.get(N)
