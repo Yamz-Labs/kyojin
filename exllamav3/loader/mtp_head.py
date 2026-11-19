@@ -68,15 +68,15 @@ class Hy4MTP:
         w = torch.gather(p, 1, sel)
         w = w / w.sum(-1, keepdim=True).clamp(min=6.103515625e-5) * fw.w_scale
         z = x @ self.rdown.T
-        lat = MI.experts_forward(self.ex[0], self.ex[1], self.ex[2], z[0].contiguous(), sel[0].contiguous(), w[0].contiguous(), self.lim)
+        lat = torch.stack([MI.experts_forward(self.ex[0], self.ex[1], self.ex[2], z[r].contiguous(), sel[r].contiguous(), w[r].contiguous(), self.lim) for r in range(x.shape[0])])
         gt, up, dn = self.shexp
         sh = (torch.nn.functional.silu(x @ gt.T) * (x @ up.T)) @ dn.T
-        return lat[None] @ self.rup.T + sh
+        return lat @ self.rup.T + sh
 
     @torch.no_grad()
     def step(self, tok, h, pos, N):
-        """tok device long [1] (token j+1), h [1, D] (trunk state h_j, or the previous y of the chain), pos device long [1] (= j), N rows attended (multiple of 4,
-        > j) -> y [1, D], logits [V]"""
+        """tok device long [T] (tokens j+1 ..), h [T, D] (trunk states h_j .., or the previous y of the chain), pos device long [T] (= j .., ascending), N rows
+        attended (multiple of 4, > last position) -> y [T, D], logits of the LAST row [V]"""
         fw, mla, eps = self.fw, self.mla, self.eps
         e = _ns.embed(fw, tok)
         x = torch.cat([rms(e, eps) * self.enorm, rms(h, eps) * self.hnorm], -1) @ self.eh.T
@@ -89,7 +89,7 @@ class Hy4MTP:
         f = self.ffn(rms(s1, eps) * self.ffn_norm)
         s2 = s1 + rms(f, eps) * self.post_ffw
         y = rms(s2, eps) * self.shn
-        return y, head_gemm(y.float(), fw.out_w)[0]
+        return y, head_gemm(y[-1:].float(), fw.out_w)[0]
 
     def chain(self, tok_next, h, j, k):
         """greedy chain of k drafts from the pair (token j+1 = tok_next [device long [1]], trunk state h at position j): head rows j .. j+k-1 are written
@@ -163,5 +163,66 @@ class MTPGraph:
         self.ev.record()
         self.ev_set = True
         cg, out = self._graph(N)
+        cg.replay()
+        return out
+
+
+class MTPGraphCU(MTPGraph):
+    """draft chain WITH catch-up: after a verify round that accepted `a` drafts, the head rows of the accepted positions are rewritten with their TRUE pairs
+    (draft token, trunk hidden of that position) and the new pair is appended, all in the first head step (a + 1 rows); then k - 1 single-row chain steps.
+    One graph per (bucket, a)."""
+
+    def __init__(self, mt, k):
+        super().__init__(mt, k)
+        dev = mt.dev
+        self.hs = torch.zeros(k + 1, mt.fw.D, device=dev)
+        self.hin = torch.zeros(k + 2, dtype=torch.long).pin_memory()
+        self.inp = torch.zeros(k + 2, dtype=torch.long, device=dev)         # [tokens (k + 1), first position]
+        self.arr = torch.arange(k + 1, device=dev)
+
+    def body(self, N, a):
+        mt, k = self.mt, self.k
+        tok, pos0 = self.inp[:a + 1], self.inp[k + 1:k + 2]
+        y, lg = mt.step(tok, self.hs[:a + 1], pos0 + self.arr[:a + 1], N)
+        t = torch.argmax(lg).reshape(1)
+        outs, h = [t], y[-1:]
+        for i in range(1, k):
+            y, lg = mt.step(t, h, pos0 + (a + i), N)
+            t = torch.argmax(lg).reshape(1)
+            outs.append(t)
+            h = y
+        return torch.cat(outs)
+
+    def _graph(self, N, a):
+        g = self.graphs.get((N, a))
+        if g is not None:
+            return g
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                self.body(N, a)
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        cg = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cg, pool=self.pool):
+            out = self.body(N, a)
+        g = self.graphs[(N, a)] = (cg, out)
+        return g
+
+    def run(self, toks, h_rows, pos0):
+        """toks: host ints [a + 1] (accepted drafts then the new token), h_rows [a + 1, D] device (trunk hidden of the positions pos0 .. pos0 + a),
+        pos0: first head position -> device [k] drafts"""
+        mt, a = self.mt, len(toks) - 1
+        N = min(mt.cap, ((pos0 + a + self.k) // self.BUCKET + 1) * self.BUCKET)
+        if self.ev_set:
+            self.ev.synchronize()
+        self.hin[:a + 1] = torch.tensor([int(t) for t in toks])
+        self.hin[self.k + 1] = int(pos0)
+        self.inp.copy_(self.hin, non_blocking=True)
+        self.hs[:a + 1].copy_(h_rows)
+        self.ev.record()
+        self.ev_set = True
+        cg, out = self._graph(N, a)
         cg.replay()
         return out
