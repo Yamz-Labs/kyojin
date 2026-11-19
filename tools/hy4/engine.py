@@ -125,6 +125,7 @@ class Hy4Engine:
             torch.cuda.synchronize()
         y = int(torch.argmax(lg))
         H = torch.cat(states) if len(states) > 1 else states[0]
+        self._H = H
         hcur = H[-1:].clone()
         t = time.perf_counter()
         self.last_stats["prefill_trunk_s"] = t - self._t0
