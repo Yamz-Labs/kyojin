@@ -30,10 +30,10 @@ The script uses the repository venv (`EXL3_VENV`, default `.venv`), builds three
 
 The server stops at start when the MoE extension is missing and names this script (`HY4_ALLOW_SLOW=1` starts on the slow path anyway). A missing attention library prints a warning.
 
-Optional: a Q5_K copy of the output head for the MTP drafts (smaller than the Q8_0 default):
+Optional: a Q5_K copy of the output head for the MTP drafts (0.255 GB instead of 0.394 GB for Q8_0, which the server uses when no file is given). It needs the `libggml-base.so` of a llama.cpp build:
 
 ```bash
-python tools/hy4/make_head_bin.py ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf ./hy4/head_q5_k.bin
+GGML_LIB=/path/to/libggml-base.so python tools/hy4/make_head_bin.py ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf ./hy4/head_q5_k.bin
 export HY4_MTP_HEAD_BIN=$PWD/hy4/head_q5_k.bin
 ```
 

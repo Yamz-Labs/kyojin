@@ -712,6 +712,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
           py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
           py::arg("partial"), py::arg("out"));
+    m.def("fq_moe_kq_set_swiglu_limit", &fq_moe_kq_set_swiglu_limit, "fq_moe_kq_set_swiglu_limit", py::arg("lim"));
     m.def("fq_moe_kq_grouped_mixed_q8", &fq_moe_kq_grouped_mixed_q8, "fq_moe_kq_grouped_mixed_q8",
           py::arg("h"), py::arg("sel"), py::arg("wts"),
           py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),

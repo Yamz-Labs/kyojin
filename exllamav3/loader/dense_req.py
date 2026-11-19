@@ -32,6 +32,8 @@ def quantize_rows(w, kind, nth=12, rows_per=64):
     import ctypes
     from concurrent.futures import ThreadPoolExecutor
     if not _LIB:
+        if not os.path.isfile(GGML_LIB):
+            raise RuntimeError(f"ggml library not found ({GGML_LIB}): set GGML_LIB to the libggml-base.so of a llama.cpp build")
         lib = ctypes.CDLL(GGML_LIB)
         lib.ggml_quantize_chunk.restype = ctypes.c_size_t
         lib.ggml_quantize_chunk.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
