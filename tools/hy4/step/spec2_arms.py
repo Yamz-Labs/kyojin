@@ -32,15 +32,27 @@ def chat(body):
     r = json.load(urllib.request.urlopen(req, timeout=900)); tm = r.get("timings") or {}; txt = r["choices"][0]["message"].get("content") or ""
     return {"tps": tm.get("predicted_per_second"), "tau": tm.get("tau"), "n": tm.get("predicted_n"), "prompt_n": tm.get("prompt_n"), "md5": hashlib.md5(txt.encode()).hexdigest()[:12]}
 
+def row_ms_env(levers):
+    """HY4_ROW_MS for the gate from the phase-0 replay medians (4K): 'T:ms,...'; None when phase 0 gave nothing (the gate keeps its built-in table)"""
+    if not levers: return None
+    t = {int(k.split("_T")[1]): v["median"] for k, v in levers["round_ms"].items() if k.startswith("4096_T")}
+    return ",".join(f"{T}:{t[T]:.2f}" for T in sorted(t)) if len(t) >= 3 else None
+
 def gate_lines(path):
-    """per request (server log line 'req N: ...'): rounds, tau, ext rounds of the gate when present"""
-    out = []
+    """per request (server log line 'req N: ...'): rounds, tau, ext rounds of the gate when present (the gate stats are cumulative over the server's life: differenced per request)"""
+    out, prev = [], (0, 0)
     for l in open(path, errors="replace"):
         m = re.search(r"^req (\d+): .*rounds (\d+) tau ([0-9.]+) hist (\[[^\]]*\])", l)
         if m:
             g = re.search(r"gate \{'rounds': (\d+), 'ext_rounds': (\d+)", l)
-            out.append({"req": int(m.group(1)), "rounds": int(m.group(2)), "tau": float(m.group(3)), "hist": json.loads(m.group(4)), "gate_rounds": g and int(g.group(1)), "ext_rounds": g and int(g.group(2))})
+            cur = (int(g.group(1)), int(g.group(2))) if g else None
+            out.append({"req": int(m.group(1)), "rounds": int(m.group(2)), "tau": float(m.group(3)), "hist": json.loads(m.group(4)),
+                        "gate_rounds": cur and cur[0] - prev[0], "ext_rounds": cur and cur[1] - prev[1]})
+            prev = cur or prev
     return out
+
+def precapture_line(path):
+    return next((l.strip() for l in open(path, errors="replace") if l.startswith("precapture:")), None)
 
 def class_means(pts):
     r = {}
@@ -73,6 +85,9 @@ def main():
         if time.time() - t0 > tmax - 600: log("SP2 skipped (deadline)", key); continue
         extra, nd = ARMS[letter]
         env = {**E, **COMMON, **ARM_C, **extra, "HY4_PRECAPTURE": "all"}
+        rm = row_ms_env(res["levers"])
+        if rm: env["HY4_ROW_MS"] = rm                                      # measured T1..T6 replay table (T7 / T8 extrapolated) instead of the built-in one
+        log("SP2 HY4_ROW_MS", rm or "built-in table")
         sl = f"{OUT}/{name}.arm_{key}.server.log"
         srv = subprocess.Popen([sys.executable, "-u", f"{tree}/tools/hy4/serve.py", "--model", GGUF, "--port", port, "-c", "12288", "--model-id", "Hy4-Kyojin", "--num-draft", nd], env=env,
                                stdout=open(sl, "w"), stderr=subprocess.STDOUT, start_new_session=True)
@@ -96,7 +111,11 @@ def main():
                 res["arms"][key] = {"letter": letter, "num_draft": nd, "env": extra, "points": pts, "classes": class_means(pts)}
         finally:
             stop(srv)
-        res["arms"].get(key, {})["reqs"] = gate_lines(sl)
+        if key in res["arms"]:
+            res["arms"][key]["reqs"] = gate_lines(sl)
+            res["arms"][key]["precapture"] = precapture_line(sl)
+            for q, c in zip(res["arms"][key]["reqs"][1:], [p["cls"] for p in res["arms"][key]["points"].values()]):      # request 1 = the discarded warm-up
+                q["cls"] = c
         save()
     # ---- table
     arms = res["arms"]
@@ -107,9 +126,12 @@ def main():
         for k, a in arms.items():
             c = a["classes"].get(cls)
             if c:
-                ext = [q["ext_rounds"] / q["gate_rounds"] for q in a.get("reqs", []) if q.get("gate_rounds")]
+                qs = [q for q in a.get("reqs", []) if q.get("cls") == cls and q.get("gate_rounds")]
+                ext = [sum(q["ext_rounds"] for q in qs) / sum(q["gate_rounds"] for q in qs)] if qs else []
                 print(f"{cls:<6} arm {k:<3} (num-draft {a['num_draft']}{' gate' if a['env'] else ''}): {c['tps']:.2f} tok/s tau {c['tau']:.3f} round {c['round_ms']:.1f} ms"
                       + (f" | d vs A {100 * (c['tps'] / base - 1):+.1f} %" if base else "") + (f" | gate ext rate {statistics.mean(ext):.2f}" if ext else ""))
+    for k, a in arms.items():
+        if a.get("precapture"): print(f"arm {k} {a['precapture']}")
     if res["levers"]:
         print("\nSPEC2 replay ms per verify round (4K, arm C flags):", {k: v["median"] for k, v in res["levers"]["round_ms"].items()})
     def mean_cls(letter, cls):
