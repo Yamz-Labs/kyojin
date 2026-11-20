@@ -20,6 +20,11 @@ DOT_BN = int(os.environ.get("HY4_BG_DOT_BN", "64"))
 DOT_MINT = int(os.environ.get("HY4_BG_DOT_MINT", "5"))        # fewest rows on the dot path (box A/B: T 3-4 +-0.2 ms, T 6 -5 ms, T 2 +0.9 ms)
 DOT_NW = int(os.environ.get("HY4_BG_DOT_NW", "4"))
 MAXT = 8                                   # rows served by the batched kernels (verify rows)
+V2 = os.environ.get("HY4_BG_V2", "0") == "1"                # 1 = block-wise kernels: one scale load / multiply per 32-weight block (the v1 kernels load the scale once per WEIGHT), same products
+V2_BN = int(os.environ.get("HY4_BG_V2_BN", "8"))
+V2_BKB = int(os.environ.get("HY4_BG_V2_BKB", "4"))          # 32-weight blocks per loop step
+V2_NW = int(os.environ.get("HY4_BG_V2_NW", "4"))
+V2_MAXT = int(os.environ.get("HY4_BG_V2_MAXT", "4"))        # rows T on the v2 multi-row kernel (T above it keeps the v1 / dot path)
 
 
 @triton.jit
@@ -87,6 +92,49 @@ def _k_bgd(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, sxt, sxh, T, BT: tl.constexpr, 
     tl.store(o_ptr + (tt[:, None] * (tl.num_programs(0) * N)) + h * N + rows[None, :], acc, mask=tm[:, None] & rm[None, :])
 
 
+@triton.jit
+def _k_bg2(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, sxh, BN: tl.constexpr, BKB: tl.constexpr):
+    """HY4_BG_V2, one row: out[h, n] = sum_blocks d[h, n, b] * sum_{j < 32} q[h, n, 32 b + j] * x[h, 32 b + j]. q tile [BN, BKB, 32] (contiguous 32 B per block), scale tile [BN, BKB]."""
+    h = tl.program_id(0)
+    rows = tl.program_id(1) * BN + tl.arange(0, BN)
+    rm = rows < N
+    c32 = tl.arange(0, 32)
+    acc = tl.zeros([BN], dtype=tl.float32)
+    rb = (h * N + rows)
+    for kb0 in range(0, NB, BKB):
+        kb = kb0 + tl.arange(0, BKB)
+        kbm = kb < NB
+        cols = kb[:, None] * 32 + c32[None, :]
+        q = tl.load(q_ptr + rb[:, None, None] * K + cols[None, :, :], mask=rm[:, None, None] & kbm[None, :, None], other=0).to(tl.float32)
+        d = tl.load(d_ptr + rb[:, None] * NB + kb[None, :], mask=rm[:, None] & kbm[None, :], other=0.0).to(tl.float32)
+        xv = tl.load(x_ptr + h * sxh + cols, mask=kbm[:, None], other=0.0)
+        acc += tl.sum(tl.sum(q * xv[None, :, :], axis=2) * d, axis=1)
+    tl.store(o_ptr + h * N + rows, acc, mask=rm)
+
+
+@triton.jit
+def _k_bgt2(q_ptr, d_ptr, x_ptr, o_ptr, N, K, NB, sxt, sxh, T, BT: tl.constexpr, BN: tl.constexpr, BKB: tl.constexpr):
+    """HY4_BG_V2, T rows (T <= BT): each weight tile is read once; the rows are applied one after the other to the same tile."""
+    h = tl.program_id(0)
+    rows = tl.program_id(1) * BN + tl.arange(0, BN)
+    rm = rows < N
+    c32 = tl.arange(0, 32)
+    tt = tl.arange(0, BT)
+    acc = tl.zeros([BT, BN], dtype=tl.float32)
+    rb = (h * N + rows)
+    for kb0 in range(0, NB, BKB):
+        kb = kb0 + tl.arange(0, BKB)
+        kbm = kb < NB
+        cols = kb[:, None] * 32 + c32[None, :]
+        q = tl.load(q_ptr + rb[:, None, None] * K + cols[None, :, :], mask=rm[:, None, None] & kbm[None, :, None], other=0).to(tl.float32)
+        d = tl.load(d_ptr + rb[:, None] * NB + kb[None, :], mask=rm[:, None] & kbm[None, :], other=0.0).to(tl.float32)
+        for t in tl.static_range(BT):
+            xv = tl.load(x_ptr + t * sxt + h * sxh + cols, mask=kbm[:, None] & (t < T), other=0.0)
+            part = tl.sum(tl.sum(q * xv[None, :, :], axis=2) * d, axis=1)
+            acc += tl.where(tt[:, None] == t, part[None, :], 0.0)
+    tl.store(o_ptr + (tt[:, None] * (tl.num_programs(0) * N)) + h * N + rows[None, :], acc, mask=(tt[:, None] < T) & rm[None, :])
+
+
 class Q8Batched:
     """[H, N, K] Q8_0 matrix as int8 + fp16 scales on a device"""
 
@@ -101,6 +149,10 @@ class Q8Batched:
         if x.dim() == 3 and x.shape[0] > 1 and x.stride(-1) == 1:
             T = x.shape[0]
             out = torch.empty(T, self.H, self.N, dtype=torch.float32, device=x.device)
+            if V2 and T <= V2_MAXT and self.K % 32 == 0:
+                _k_bgt2[(self.H, triton.cdiv(self.N, V2_BN))](self.q, self.d, x, out, self.N, self.K, self.K // 32, x.stride(0), x.stride(1), T,
+                                                              BT=triton.next_power_of_2(T), BN=V2_BN, BKB=V2_BKB, num_warps=V2_NW)
+                return out
             if DOT and DOT_MINT <= T <= 16 and self.K % 32 == 0:
                 _k_bgd[(self.H, triton.cdiv(self.N, DOT_BN))](self.q, self.d, x, out, self.N, self.K, self.K // 32, x.stride(0), x.stride(1), T, BT=16, BN=DOT_BN, num_warps=DOT_NW)
                 return out
@@ -113,6 +165,9 @@ class Q8Batched:
             xv, sxh = x, x.stride(1)
         else:
             xv, sxh = x.reshape(self.H, self.K).contiguous(), self.K
+        if V2 and self.K % 32 == 0:
+            _k_bg2[(self.H, triton.cdiv(self.N, V2_BN))](self.q, self.d, xv, out, self.N, self.K, self.K // 32, sxh, BN=V2_BN, BKB=V2_BKB, num_warps=V2_NW)
+            return out.reshape(1, self.H, self.N)
         _k_bg[(self.H, triton.cdiv(self.N, BN))](self.q, self.d, xv, out, self.N, self.K, self.K // 32, sxh, BN=BN, BK=BK, num_warps=4)
         return out.reshape(1, self.H, self.N)
 

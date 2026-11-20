@@ -243,6 +243,15 @@ def _gm():
 
 
 NO_ALIAS_LAT = os.environ.get("HY4_LAT_CLONE", "0") == "1"     # 1 = copy the grouped MoE output before the rup matmul (old behaviour)
+
+GRAPH_FORK = int(os.environ.get("HY4_GRAPH_FORK", "0"))       # decode graph fork / join: 1 = the shared-expert branch of the FFN runs on a second capture stream (fork at the FFN entry, join before the residual add); 2 = also the latent down-projection (rdown) on a third stream beside the router; same math, own q8_1 scratch
+_SIDE = []
+
+
+def _side_stream(dev, k=0):
+    while len(_SIDE) <= k:
+        _SIDE.append(torch.cuda.Stream(device=dev))
+    return _SIDE[k]
 DENSE_DQ = os.environ.get("HY4_DENSE_DQ", "0") == "1"       # 1 = old path: dense matrices dequantised once to fp32 and kept resident
 
 
@@ -305,6 +314,23 @@ class QLinear:
         return out.to(x.dtype).reshape(*lead, N)
 
 
+    def call_own(self, x):
+        """__call__ for the decode GEMV with a PRIVATE q8_1 scratch (the cached global scratch is shared by every launch on the stream: two concurrent branches must not use it). Same kernels, same math."""
+        K, N = self.shape[1], self.shape[0]
+        lead = x.shape[:-1]
+        xf = x.reshape(-1, K).float().contiguous()
+        qb = torch.empty(xf.shape[0], K // 32 * 36, dtype=torch.uint8, device=x.device)
+        out = torch.empty(xf.shape[0], N, dtype=torch.float32, device=x.device)
+        e = _ext()
+        e.fq_quant_q8_1_rows(xf, qb)
+        e.fq_gemv_q8_0_q8(qb, self.packed, out)
+        return out.to(x.dtype).reshape(*lead, N)
+
+    def own_ok(self):
+        return self.ty == 8 and self.gemv is not None and os.environ.get("BOLT_FQ_Q8Q8", "1") != "0" \
+            and _ext() is not None and hasattr(_ext(), "fq_gemv_q8_0_q8") and hasattr(_ext(), "fq_quant_q8_1_rows")
+
+
 class _QT:
     def __init__(self, q):
         self.q = q
@@ -330,6 +356,8 @@ def load_linear(g, name, dev, stats=None):
 
 
 HEAD_CHUNK = 8192
+HEAD_Q8 = os.environ.get("HY4_HEAD_Q8", "0") == "1"           # 1 = the trunk output head as Q8_0 bytes (quantised once at load from the stored bf16, read by the dense Q8 GEMV); the bf16 copy is freed
+HEAD_Q8_KEEP = os.environ.get("HY4_HEAD_Q8_KEEP", "0") == "1"  # A/B drivers: keep the bf16 head too, so HEAD_Q8 can be flipped at run time (graphs re-captured)
 
 
 def head_gemm(h, W, chunk=HEAD_CHUNK):
@@ -437,7 +465,31 @@ class Hy4Forward:
         assert tuple(self.out_w.shape) == (m[p + "vocab_size"], self.D), self.out_w.shape
         if not self.head_cpu:
             self.out_w = self.out_w.to(self.dev)         # resident in its stored dtype (bf16: 0.74 GB)
+        self.out_q8 = self._quantize_head() if (HEAD_Q8 and self.out_w.is_cuda) else None
         self._load_resident()
+
+    def _quantize_head(self):
+        """HY4_HEAD_Q8=1: Q8_0 bytes of the bf16 output head, same block layout and scale rule (fp16 d = amax / 127) as the stored dense Q8_0 tensors, so the dense Q8 GEMV
+        (rows 1..16) reads it; chunked so no fp32 copy of the whole head exists"""
+        from .mtp_head import q8_0_pack
+        W = self.out_w
+        if W.shape[1] % 32 != 0:
+            return None
+        raw = torch.cat([q8_0_pack(W[a:a + HEAD_CHUNK].float()) for a in range(0, W.shape[0], HEAD_CHUNK)], 0)
+        f = dense_fn(8, W.shape[1])
+        q = QLinear(raw, 8, GG_DENSE[8], f[1] if f is not None else None)
+        q.gname = "output.weight.q8"
+        return q
+
+    def free_bf16_head(self):
+        """HY4_HEAD_Q8=1 without _KEEP: drop the bf16 head (0.74 GB) once nothing needs its values (the draft head is built from it first); idempotent. out_w stays as a meta tensor (shape only)"""
+        if self.out_q8 is not None and not HEAD_Q8_KEEP and self.out_w.device.type != "meta":
+            m0 = torch.cuda.memory_allocated()
+            self.out_w = torch.empty_like(self.out_w, device="meta")
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            print(f"HEAD_Q8: bf16 head freed, device allocation {m0 / 2**30:.3f} -> {torch.cuda.memory_allocated() / 2**30:.3f} GiB; Q8_0 head {self.out_q8.packed.numel() / 2**30:.3f} GiB", flush=True)
 
     def _load_resident(self):
         '''routed experts of every MoE layer (while the byte budget lasts) resident on the GPU in their STORED bytes; decode rows then go through
@@ -599,6 +651,23 @@ class Hy4Forward:
             return self._ffn_gm(i, L, x), None
         rsp = self.res.get(i)
         pf = bool(PF_MOE and T > MMVQ_MAXR and dev.type == "cuda" and rsp is not None and rsp.fu in _pk().FROM_GROUPED and rsp.fd in _pk().FROM_GROUPED)
+        fork = fork_z = None
+        if GRAPH_FORK and T <= min(MMVQ_MAXR, DENSE_MAXR) and not pf and dev.type == "cuda" and self.hook is None and all(isinstance(q, QLinear) and q.own_ok() for q in L.shexp):
+            fork = _side_stream(dev)            # created in the eager warm-up too, so the capture never creates a stream
+            if GRAPH_FORK >= 2 and isinstance(L.rdown, QLinear) and L.rdown.own_ok():
+                fork_z = _side_stream(dev, 1)
+            if not torch.cuda.is_current_stream_capturing():
+                fork = fork_z = None
+        if fork is not None:
+            fork.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(fork):
+                g_, u_, d_ = L.shexp
+                sh_side = d_.call_own((torch.nn.functional.silu(g_.call_own(x).float()) * u_.call_own(x).float()))
+                sh_side = sh_side.float()
+        if fork_z is not None:
+            fork_z.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(fork_z):
+                z_side = L.rdown.call_own(x).float()
         with tm.t("router"):
             if _rf.ENABLED:       # HY4_REF_FUSED=1: one router kernel; the host sync (tolist) only where the pread loop needs it
                 sel, w = _rf.router_select(_RG.mm(x, L.router), L.rbias, self.topk, self.w_scale)
@@ -619,7 +688,11 @@ class Hy4Forward:
                 w = w / w.sum(-1, keepdim=True).clamp(min=6.103515625e-5) * self.w_scale
                 sel_l = [] if (pf or _ns.skip_host_ids(self, i, T, MMVQ_MAXR)) else sorted(set(sel.flatten().tolist()))
         with tm.t("other"):
-            z = self._mm(x, L.rdown)
+            if fork_z is not None:
+                z = z_side
+                torch.cuda.current_stream().wait_stream(fork_z)
+            else:
+                z = self._mm(x, L.rdown)
             lat = None          # allocated (zeros) only by the paths that accumulate into it: the grouped / prefill paths overwrite it
         lim, N = float(self.clamp[i]), z.shape[1]
         b = f"blk.{i}."
@@ -699,6 +772,9 @@ class Hy4Forward:
         with tm.t("other"):
             y = self._mm(lat, L.rup)
         gt, up, dn = L.shexp
+        if fork is not None:
+            torch.cuda.current_stream().wait_stream(fork)
+            return y + sh_side, lat
         with tm.t("shared expert"):
             sh = self._mm(torch.nn.functional.silu(self._mm(x, gt)) * self._mm(x, up), dn)
         return y + sh, lat
@@ -908,7 +984,10 @@ class Hy4Forward:
         self._h = h           # the trunk state the output head reads (MTP draft input)
         if self.head_cpu:
             h = h.cpu()
-        out = head_gemm(h.float(), self.out_w)
+        if HEAD_Q8 and self.out_q8 is not None:
+            out = self.out_q8(h.float())
+        else:
+            out = head_gemm(h.float(), self.out_w)
         return out if all_pos else (out[0] if getattr(self, "_ns_dev", False) else out[0].cpu())
 
     def step(self, ids, all_pos=False):
