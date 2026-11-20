@@ -41,25 +41,35 @@
 #   the Trap 1 segfault. Build-time only, hence the `build` guard below.
 # ===========================================================================
 
-# Needs a ROCm 7 libhsa-runtime64.so.1 (HSA 1.18 or newer). Ubuntu 24.04's own libhsa-runtime64-1 is ROCm 5.7 (1.11)
-# and is too old: torch then fails with "undefined symbol: hsa_amd_enable_logging". Install ROCm 7 from AMD's apt
-# repository (it provides /opt/rocm/lib/libhsa-runtime64.so.1), or point EXL3_HSA_LIB at your copy. The rocm-sdk-devel wheel ships one too (EXL3_ROCM_SDK/lib). It is tried first because it matches the ROCm torch wheel: a system /opt/rocm with an older HSA fails with "undefined symbol: hsa_ext_image_create_v2".
-_HSA=""
-for _c in "${EXL3_HSA_LIB:-}" "${EXL3_ROCM_SDK:-/nonexistent}/lib/libhsa-runtime64.so.1" /opt/rocm/lib/libhsa-runtime64.so.1 /usr/lib/x86_64-linux-gnu/libhsa-runtime64.so.1; do
-    if [ -n "$_c" ] && [ -e "$_c" ]; then _HSA="$_c"; break; fi
-done
-if [ -n "$_HSA" ]; then
-    export LD_PRELOAD="$_HSA"
-else
-    echo "[env.sh] WARNING: no libhsa-runtime64.so.1 found. Install ROCm 7, set EXL3_ROCM_SDK or set EXL3_HSA_LIB, or torch will segfault on gfx1151 (Trap 1)." >&2
-fi
-
 # Repository root = two levels above this file (works for any clone location).
 _SELF="${BASH_SOURCE[0]:-$0}"
 EXL3_ROOT="${EXL3_ROOT:-$(cd "$(dirname "$_SELF")/../.." && pwd)}"
 EXL3_VENV="${EXL3_VENV:-$EXL3_ROOT/.venv}"
 export PATH="$EXL3_VENV/bin:$HOME/.local/bin:$PATH"
 export PYTHONPATH="$EXL3_ROOT:${PYTHONPATH:-}"   # exllamav3 and the built exllamav3_ext*.so live in the repo root
+
+# Needs a ROCm 7 libhsa-runtime64.so.1 (HSA 1.18 or newer). Ubuntu 24.04's own libhsa-runtime64-1 is ROCm 5.7 (1.11)
+# and is too old: torch then fails with "undefined symbol: hsa_amd_enable_logging". Looked for, in this order: EXL3_HSA_LIB; the rocm-sdk wheel
+# (EXL3_ROCM_SDK/lib, else the root `rocm-sdk path --root` of the venv prints; it matches the torch wheel, so it is tried first); the system ROCm 7
+# (EXL3_HSA_SYSTEM_DIRS, default /opt/rocm/lib /usr/lib/x86_64-linux-gnu: install ROCm 7 from AMD's apt repository).
+# When none exists this stops with an error: torch would segfault on the first GPU allocation (Trap 1). EXL3_ALLOW_NO_HSA=1 only warns (CPU-only use).
+_SDK_ROOT="${EXL3_ROCM_SDK:-}"
+if [ -z "$_SDK_ROOT" ] && command -v rocm-sdk >/dev/null 2>&1; then
+    _SDK_ROOT="$(rocm-sdk path --root 2>/dev/null || true)"
+fi
+_HSA=""
+for _c in "${EXL3_HSA_LIB:-}" "${_SDK_ROOT:-/nonexistent}/lib/libhsa-runtime64.so.1" $(for _d in ${EXL3_HSA_SYSTEM_DIRS:-/opt/rocm/lib /usr/lib/x86_64-linux-gnu}; do echo "$_d/libhsa-runtime64.so.1"; done); do
+    if [ -n "$_c" ] && [ -e "$_c" ]; then _HSA="$_c"; break; fi
+done
+if [ -n "$_HSA" ]; then
+    export LD_PRELOAD="$_HSA"
+elif [ "${EXL3_ALLOW_NO_HSA:-0}" = "1" ]; then
+    echo "[env.sh] WARNING: no libhsa-runtime64.so.1 found (EXL3_ALLOW_NO_HSA=1): any GPU use of torch will segfault on gfx1151 (Trap 1)." >&2
+else
+    echo "[env.sh] ERROR: no libhsa-runtime64.so.1 (ROCm 7) found: torch would segfault on the first GPU allocation on gfx1151 (Trap 1). Install ROCm 7 (/opt/rocm), activate the venv that holds the rocm-sdk wheel (rocm-sdk path --root), or set EXL3_ROCM_SDK or EXL3_HSA_LIB. Set EXL3_ALLOW_NO_HSA=1 for CPU-only use." >&2
+    return 1 2>/dev/null || exit 1
+fi
+unset _SDK_ROOT _HSA _c _d
 
 # Uncomment to force reconstruct+hgemm instead of HIP GEMV (debugging):
 # export EXL3_GEMV=0
