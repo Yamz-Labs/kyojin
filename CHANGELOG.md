@@ -1,8 +1,8 @@
 # Changelog
 
-## Hy4-flash v1 (draft)
+## 1.9.0: Hy4-flash v1
 
-Hy4-flash (GGUF Q3_K) on one Strix Halo machine. Numbers: see the benchmark table.
+Hy4-flash (GGUF Q3_K) on one Strix Halo machine. Numbers: see the benchmark table in the release notes.
 
 - New `tools/hy4/serve.py`: OpenAI-compatible server for Hy4-flash with prefill fast path, HIP-graph decode, MTP drafts and prompt-lookup rows. Guide: `doc/hy4.md`.
 - Sparse-attention prefill: per-query gather MLA kernel in HIP/WMMA (`hipsp/`, H = 32 and H = 64), Triton fallback; blocked indexer score with linear-time exact top-k; sparse path from 2048 keys.
