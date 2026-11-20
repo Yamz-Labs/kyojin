@@ -3,12 +3,12 @@ position, so a bucket only costs the masked rows it adds.
 
 Fixed 512-row buckets mean one graph build (2 eager bodies + the capture, 0.5 - 1 s of host time) every 512 decoded tokens and a new build for every (bucket, rows) a fresh
 prompt lands in: at 256K that is 512 buckets, the first request of a process captured its own bucket inside a 47-token decode (256K spec: 11 tok/s, the same checkpoint
-decoded warm: 16). Above HY4_GRAPH_BUCKET_FROM rows the bucket grows with the context: 1 / HY4_GRAPH_BUCKET_REL of its power-of-two octave (default 32: at most 3 % masked
+decoded warm: 16). Above HY4_GRAPH_BUCKET_FROM rows the bucket grows with the context: 1 / HY4_GRAPH_BUCKET_REL of its power-of-two octave (shipped default 0 = off; 32: at most 3 % masked
 rows, 32 buckets per octave: 8192 rows at 256K, 16384 at 512K, 32768 at 1M). HY4_GRAPH_BUCKET_REL=0 keeps the fixed bucket."""
 import os
 
 BASE = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
-REL = int(os.environ.get("HY4_GRAPH_BUCKET_REL", "32"))
+REL = int(os.environ.get("HY4_GRAPH_BUCKET_REL", "0"))
 FROM = int(os.environ.get("HY4_GRAPH_BUCKET_FROM", "16384"))
 
 
