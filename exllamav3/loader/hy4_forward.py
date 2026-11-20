@@ -268,6 +268,23 @@ def dense_fn(ty, K):
 _TM_HOLD = [None]          # the live _Tm (stage timers inside prefill dense calls)
 
 
+DENSE_V2 = [os.environ.get("HY4_DENSE_V2", "0") == "1"]          # 1 = 2..16 decode rows with K <= 8192 through gm_ext gm_dense_q8 (column-tiled Q8_0 GEMV, activations in registers; bit-identical to fq_gemv_q8_0); read at call time (graph re-capture flips it)
+DENSE_V2_KMAX = 8192                                             # above this (wo K=16384, layer-0 FFN down) the stock launch is as fast (opbench / dend_test 20/11)
+
+
+def dense_gemv(gemv, xf, packed, out):
+    """out = Q8_0 GEMV of the [R, K] float rows xf: the stock launch, or (HY4_DENSE_V2, R >= 2) quantise once + the column-tiled kernel (1 / 2 / 3 columns per block at R <= 4 / <= 8 / more: measured best)"""
+    if DENSE_V2[0] and xf.shape[0] >= 2 and xf.shape[1] <= DENSE_V2_KMAX and getattr(gemv, "__name__", "") == "fq_gemv_q8_0":
+        g, e = _gm(), _ext()
+        if g is not None and e is not None and hasattr(g, "gm_dense_q8"):
+            R, K = xf.shape
+            qb = e.fq_q8_scratch(xf.device.index, R, K)
+            e.fq_quant_q8_1_rows(xf, qb)
+            if g.gm_dense_q8(qb, packed, out, 1 if R <= 4 else (2 if R <= 8 else 3)):
+                return
+    gemv(xf, packed, out)
+
+
 class QLinear:
     """a dense [N, K] matrix kept as STORED bytes on the device; `x @ q.T` / q(x) = x [.., K] -> [.., N]"""
 
@@ -291,7 +308,7 @@ class QLinear:
         if x2.shape[0] <= DENSE_MAXR and self.gemv is not None:
             xf = x2.float().contiguous()
             out = torch.empty(xf.shape[0], N, dtype=torch.float32, device=x.device)
-            self.gemv(xf, self.packed, out)
+            dense_gemv(self.gemv, xf, self.packed, out)
             if self.stats is not None:
                 self.stats["dense_gemv"] = self.stats.get("dense_gemv", 0) + 1
         elif PF_DENSE and self.ty in (13, 14) and x2.is_cuda:       # requantised dense (HY4_DENSE_REQ_ARMS): fp16 dequant + fp16 GEMM, like the Q8_0 prefill path
