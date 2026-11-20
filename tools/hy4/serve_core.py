@@ -229,15 +229,20 @@ def _common(body: dict, default_max: int) -> dict:
     if not isinstance(body, dict):
         raise RequestError("the body must be a JSON object")
     if _as_int(body, "n", 1, 1) != 1:
-        raise RequestError("n must be 1")
-    mt = body.get("max_completion_tokens", body.get("max_tokens"))
+        raise RequestError("n must be 1: this server returns one choice per request")
+    mt = body.get("max_completion_tokens")          # the newer name wins; an explicit null falls back to max_tokens
+    if mt is None:
+        mt = body.get("max_tokens")
     max_tokens = default_max if mt is None else _as_int({"max_tokens": mt}, "max_tokens", default_max, 1)
     for k in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
         v = body.get(k)
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
             raise RequestError(f"{k} must be a number")
+    opts = body.get("stream_options")
+    if opts is not None and not isinstance(opts, dict):
+        raise RequestError("stream_options must be an object")
     return {"max_tokens": max_tokens, "stream": bool(body.get("stream", False)), "stop": _stops(body),
-            "include_usage": bool((body.get("stream_options") or {}).get("include_usage", False)),
+            "include_usage": bool((opts or {}).get("include_usage", False)),
             # the speculative decoder is greedy: sampling parameters are accepted and ignored; reported back in the reply
             "sampling_ignored": body.get("temperature") not in (None, 0, 0.0),
             "speculative": body.get("speculative", True) is not False}
@@ -257,8 +262,11 @@ def parse_effort(body: dict) -> str:
     return EFFORT_MAP[v]
 
 
+TEXT_PARTS = ("text", "input_text", "output_text")
+
+
 def _content_text(c: Any) -> str:
-    """OpenAI content (string, or a list of {type: text} parts) -> text"""
+    """OpenAI content (a string, null, or a list of {type: text} parts) -> text. Null parts and null / empty text are empty text."""
     if c is None:
         return ""
     if isinstance(c, str):
@@ -266,10 +274,12 @@ def _content_text(c: Any) -> str:
     if isinstance(c, list):
         out = []
         for p in c:
+            if p is None:
+                continue
             if isinstance(p, str):
                 out.append(p)
-            elif isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str):
-                out.append(p["text"])
+            elif isinstance(p, dict) and (p.get("type") in TEXT_PARTS or (p.get("type") is None and "text" in p)) and (p.get("text") is None or isinstance(p["text"], str)):
+                out.append(p.get("text") or "")
             else:
                 raise RequestError("only text content parts are supported (no images / audio)")
         return "".join(out)
@@ -290,6 +300,27 @@ def _function_tool(t: Any, where: str) -> dict:
     if fn.get("parameters") is not None and not isinstance(fn["parameters"], dict):
         raise RequestError(f"{where}: parameters must be a JSON schema object")
     return {"type": "function", "function": {k: v for k, v in fn.items() if k != "type" and v is not None}}
+
+
+JSON_HINT = "Respond with a single valid JSON object and nothing else (no code fences, no commentary)."
+JSON_SCHEMA_HINT = "Respond with a single valid JSON object that matches this JSON schema, and nothing else (no code fences, no commentary): "
+
+
+def response_format_hint(body: dict) -> str:
+    """`response_format` -> the instruction line it adds to the system message. The decoder has no grammar: json_object and json_schema are best effort
+    (the model is told to answer with JSON), text is the default."""
+    rf = body.get("response_format")
+    if rf is None:
+        return ""
+    kind = rf.get("type") if isinstance(rf, dict) else None
+    if kind not in ("text", "json_object", "json_schema"):
+        raise RequestError("response_format.type must be text, json_object or json_schema")
+    if kind == "json_schema":
+        schema = (rf.get("json_schema") or {}).get("schema") if isinstance(rf.get("json_schema"), dict) else None
+        if not isinstance(schema, dict):
+            raise RequestError("response_format.json_schema.schema must be a JSON schema object")
+        return JSON_SCHEMA_HINT + json.dumps(schema, ensure_ascii=False)
+    return JSON_HINT if kind == "json_object" else ""
 
 
 TOOL_HINTS = {"required": "You must answer by calling one or more of the provided functions.",
@@ -387,9 +418,7 @@ def parse_chat(body: dict, default_max: int = 1024) -> dict:
     for i, m in enumerate(msgs):
         if not isinstance(m, dict) or m.get("role") not in CHAT_ROLES:
             raise RequestError(f"messages[{i}]: role must be system, user, assistant or tool")
-        role = CHAT_ROLES[m["role"]]
-        if role == "system" and i != 0:
-            raise RequestError(f"messages[{i}]: a system message is only allowed first")
+        role = CHAT_ROLES[m["role"]]          # developer = system; the template renders a system message wherever it stands
         item = {"role": role, "content": _content_text(m.get("content"))}
         rc = m.get("reasoning_content", m.get("reasoning"))
         if role == "assistant":
@@ -407,11 +436,12 @@ def parse_chat(body: dict, default_max: int = 1024) -> dict:
         out.append(item)
     if out[-1]["role"] == "assistant":
         raise RequestError("the last message must come from the user")
-    if req["tool_hint"]:
+    hint = "\n\n".join(h for h in (req.pop("tool_hint"), response_format_hint(body)) if h)
+    if hint:                                  # instructions the template has no switch for: one block at the end of the leading system message
         if out[0]["role"] == "system":
-            out[0] = dict(out[0], content=(out[0]["content"] + "\n\n" if out[0]["content"] else "") + req["tool_hint"])
+            out[0] = dict(out[0], content=(out[0]["content"] + "\n\n" if out[0]["content"] else "") + hint)
         else:
-            out.insert(0, {"role": "system", "content": req["tool_hint"]})
+            out.insert(0, {"role": "system", "content": hint})
     req.update(messages=out, effort=parse_effort(body))
     return req
 

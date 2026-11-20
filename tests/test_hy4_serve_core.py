@@ -85,8 +85,7 @@ class Core(unittest.TestCase):
                {"messages": [{"role": "user", "content": "x"}], "tools": [{"type": "function"}]},
                {"messages": [{"role": "user", "content": "x"}], "max_tokens": 0},
                {"messages": [{"role": "user", "content": "x"}], "stop": ["a"] * 9},
-               {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]},
-               {"messages": [{"role": "user", "content": "x"}, {"role": "system", "content": "late"}]}]
+               {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]}]
         for b in bad:
             with self.assertRaises(C.RequestError, msg=str(b)):
                 C.parse_chat(b)
