@@ -104,7 +104,7 @@ It prints a Markdown block. Paste it in a [benchmark report](https://github.com/
 - Hy4-flash (public GGUF, Q3_K) on one Strix Halo machine: sparse-attention prefill, graph decode with MTP drafts, 64K context, 128K opt-in ([doc/hy4.md](doc/hy4.md), [changelog](CHANGELOG.md)).
 - Long context: up to 983K tokens (DeepSeek V4.1 Flash on a Mac Studio), 500K on GLM-5.3-Flash.
 - Image input on Qwen3.8-27B.
-- Optional uncensored mode: a small run-time preset on the normal packs, off by default; it edits no weights. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).
+- Optional uncensored mode: a small run-time preset on the normal packs, off by default; it edits no weights. How it works: [doc/refusal_hook.md](doc/refusal_hook.md). A preset for Hy4-flash ships in [presets/hy4-uncensor](presets/hy4-uncensor/README.md) (`HY4_ABLIT_SPEC`).
 
 ## Made with our models
 

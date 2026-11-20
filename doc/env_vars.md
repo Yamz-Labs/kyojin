@@ -1055,6 +1055,13 @@ edits no weights. `off`, `0`, `false`, `no` and `none` force it off. An explicit
 `uncensor_spec.json` that a model directory may carry, and a path that does not exist stops the
 load with an error naming the file. See [refusal_hook.md](refusal_hook.md).
 
+#### `HY4_ABLIT_SPEC` (default: unset, the hook is off)
+
+Hy4-flash server only. Path of an `edit_spec.json` (with `edit_spec.safetensors` next to it) that
+projects a per-layer direction out of the attention and MLP / MoE outputs at run time. It edits no
+weights. `off`, `0`, `false`, `no` and `none` force it off. A malformed spec or a missing file stops
+the load. The preset is in `presets/hy4-uncensor/`. See [hy4.md](hy4.md).
+
 #### `EXL3_ABLIT_TORCH` (default: `0`)
 
 `1` uses the PyTorch projection instead of the Triton kernel. It has no effect when Triton is not

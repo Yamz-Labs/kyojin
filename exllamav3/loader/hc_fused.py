@@ -137,14 +137,19 @@ def _k12_row(x_ptr, y_ptr, post_ptr, s_ptr, fn_ptr, base_ptr, scale_ptr, w_ptr, 
 
 
 @triton.jit
-def _k3_resid(s_ptr, f_ptr, post_ptr, w_ptr, o_ptr, D, eps,
-              H: tl.constexpr, BD: tl.constexpr):
+def _k3_resid(s_ptr, f_ptr, post_ptr, w_ptr, o_ptr, D, eps, er_ptr, ew_ptr, emu_ptr,
+              H: tl.constexpr, BD: tl.constexpr, HAS_EDIT: tl.constexpr):
     r = tl.program_id(0)
     d = tl.arange(0, BD)
     dm = d < D
     f = tl.load(f_ptr + r * D + d, mask=dm, other=0.0)
     rc = tl.math.rsqrt(tl.sum(f * f, axis=0) / D + eps)
     fn = f * rc * tl.load(w_ptr + d, mask=dm, other=0.0)
+    if HAS_EDIT:        # decensor hook (ablit_hy4): fn' = fn - w * ((er . fn) - mu) * er, fn itself when w == 0
+        er = tl.load(er_ptr + d, mask=dm, other=0.0)
+        ew = tl.load(ew_ptr)
+        fe = fn - ew * (tl.sum(fn * er, axis=0) - tl.load(emu_ptr)) * er
+        fn = tl.where(ew == 0.0, fn, fe)
     for h in tl.static_range(H):
         ph = tl.load(post_ptr + r * H + h)
         sv = tl.load(s_ptr + (r * H + h) * D + d, mask=dm, other=0.0)
@@ -239,14 +244,17 @@ class Pend:
         self.s, self.f, self.post, self.w_post, self.eps, self.edit = s, f.float().contiguous(), post.float().contiguous(), w_post.contiguous(), eps, edit
 
     def materialize(self):
-        return resid(self.s, self.f, self.post, self.w_post, self.eps)
+        return resid(self.s, self.f, self.post, self.w_post, self.eps, edit=self.edit)
 
 
-def resid(s, f, post, w_post, eps):
-    """s + post[:, :, None] * (rms(f) * w_post)[:, None, :]  -> new [T,H,D]"""
+def resid(s, f, post, w_post, eps, edit=None):
+    """s + post[:, :, None] * (rms(f) * w_post)[:, None, :]  -> new [T,H,D]
+    edit = (r [D], w [1+], mu [1+]) fp32 device tensors: the decensor edit is applied to rms(f) * w_post inside the same kernel"""
     T, H, D = s.shape
     o = torch.empty_like(s)
-    _k3_resid[(T,)](s, f.float().contiguous(), post.float().contiguous(), w_post.contiguous(), o, D, eps, H=H, BD=_p2(D), num_warps=8)
+    f = f.float().contiguous()
+    er, ew, emu = edit if edit is not None else (f, f, f)
+    _k3_resid[(T,)](s, f, post.float().contiguous(), w_post.contiguous(), o, D, eps, er, ew, emu, H=H, BD=_p2(D), HAS_EDIT=edit is not None, num_warps=8)
     return o
 
 

@@ -65,6 +65,7 @@ The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, bot
 | `HY4_ENGRAM_NPHASH`, `HY4_ENGRAM_PF_WORKERS` | 1, 1 | Engram hash in numpy; one prefetch worker |
 | `HY4_ENGRAM_NATIVE_IO` | 1 | Engram row reads in C threads (`pread`, no GIL) |
 | `HY4_ENGRAM_FUSED` | 0 | two-launch fused Engram block in decode (opt-in) |
+| `HY4_ABLIT_SPEC` | unset (off) | path of `edit_spec.json` (tensor file next to it): run-time decensor edit of the attention and MLP / MoE outputs; the shipped preset is `presets/hy4-uncensor/`; `off` disables |
 
 Native Engram IO: `exllamav3/loader/engram_io.c` is compiled with `gcc` at first use into `~/.cache/kyojin/engram_io` (`XDG_CACHE_HOME` moves it). When `gcc` is missing or the build fails, the server prints one line and uses the Python reader, which does the same reads more slowly (`HY4_ENGRAM_NATIVE_IO=0` selects it directly).
 

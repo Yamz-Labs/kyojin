@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Optional decensor preset for Hy4-flash (`HY4_ABLIT_SPEC`, off by default): a per-layer run-time edit of the attention and MLP / MoE outputs, no weight change. Files in `presets/hy4-uncensor/`, code in `exllamav3/loader/ablit_hy4.py`.
+
 ## 1.9.0: Hy4-flash v1
 
 Hy4-flash (GGUF Q3_K) on one Strix Halo machine. Numbers: see the benchmark table in the release notes.

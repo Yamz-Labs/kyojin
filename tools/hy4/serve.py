@@ -367,6 +367,11 @@ def load_in_background(st: State):
                 st.stage = s
                 print("load:", s, flush=True)
             eng.load(progress)
+            sp = os.environ.get("HY4_ABLIT_SPEC", "").strip()    # optional decensor spec (edit_spec.json + edit_spec.safetensors next to it); unset or off = the unmodified forward
+            if sp and sp.lower() not in ("off", "0", "false", "no", "none"):
+                eng.hf._AB.load_spec(sp, "cuda", D=eng.M.D, pin=True)   # all sites pinned so the graphs capture them; weights live in static buffers
+                eng.GR.clear()
+                print("decensor spec armed:", sp, flush=True)
             if a.slots > 1:
                 import mu_engine
                 st.sched = mu_engine.MuScheduler(eng, chunk=a.sched_chunk)

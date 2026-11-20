@@ -35,6 +35,7 @@ from . import attn_eager as _AE
 from . import router_gemv as _RG
 from . import mla_hy4 as _mla_mod
 from . import dense_req as _DR
+from . import ablit_hy4 as _AB       # decensor edit hook (inert while _AB.ST is None)
 
 _HCF = None
 if os.environ.get("HY4_HC_FUSED", "0") == "1":      # fused hyper-connection sites (loader/hc_fused.py)
@@ -931,6 +932,9 @@ class Hy4Forward:
         self._hk("attn_kqv", i, kqv)
         self._hk("attn_gated", i, gated)
         self._hk("attn_out", i, out)
+        ab = _AB.ST
+        if ab is not None and i < ab.n and ab.sites[i][0]:
+            out = ab.edit(out, i, 0)
         with tm.t("hc / norms"):
             if _HCF is not None and _HCF.ok(x, L.hcf, self.hc) and out.shape == (T, self.D):
                 s1, post2, cur2 = _HCF.res_site(x, out, post, L.hcf, L.ffn_norm, self.eps, self.hc_eps, self.magnitude, pend)
@@ -944,13 +948,16 @@ class Hy4Forward:
         if lat is not None:
             self._hk("ffn_moe_out", i, lat)
         with tm.t("hc / norms"):
-            if _HCF is not None and _HCF.ok(s1, L.hcf, self.hc) and f.shape == (T, self.D):
+            ed = ab is not None and i < ab.n and ab.sites[i][1]
+            if _HCF is not None and _HCF.ok(s1, L.hcf, self.hc) and f.shape == (T, self.D) and not (ed and not _AB._usable(f)):
                 if (_HCF.lazy() and T > _HCF.PF_MIN_ROWS and self.hook is None and self._gs is None and i + 1 < self.n_layers
-                        and i + 1 not in self.ple and self.hc <= 8):       # HY4_PF_HC2: hand (s1, f, post) to the next layer instead of writing x
-                    return _HCF.Pend(s1, f, post2, L.post_ffw, self.eps)
-                s2 = _HCF.resid(s1, f, post2, L.post_ffw, self.eps)
+                        and i + 1 not in self.ple and self.hc <= 8):       # HY4_PF_HC2: hand (s1, f, post) to the next layer instead of writing x (the decensor edit rides along in the Pend)
+                    return _HCF.Pend(s1, f, post2, L.post_ffw, self.eps, edit=ab.args(i, 1) if ed else None)
+                s2 = _HCF.resid(s1, f, post2, L.post_ffw, self.eps, edit=ab.args(i, 1) if ed else None)
             else:
                 f = rms(f, self.eps) * L.post_ffw
+                if ed:
+                    f = ab.edit(f, i, 1)
                 s2 = s1 + post2[:, :, None] * f[:, None, :]
         self._hk("l_out", i, s2)
         return s2
