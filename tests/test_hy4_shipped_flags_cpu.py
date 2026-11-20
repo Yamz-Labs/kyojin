@@ -4,6 +4,8 @@ import ast
 import os
 import re
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 TREE = os.path.dirname(HERE)
 
@@ -46,11 +48,54 @@ def test_every_flag_has_an_env_off_switch():
         assert re.search(r'environ\.get\("%s", "0"\)' % flag, src), f"{flag}: {path} must read it from the environment with the 1.9.0 behaviour (0) as code default"
 
 
-def test_apply_env_keeps_user_values():
+@pytest.fixture
+def env(monkeypatch):
+    """apply_env() sets many HY4_* variables: it runs on a private copy of the environment, nothing leaks into the other tests"""
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+
+
+def _apply_env():
+    """apply_env() and the constants it reads, cut out of serve.py (importing the module would pull the server stack in)"""
     src = open(os.path.join(TREE, "tools", "hy4", "serve.py")).read()
-    body = src[src.index("def apply_env"):]
-    body = body[:body.index("\ndef ", 10)]
-    assert "os.environ.setdefault(k, v)" in body
+    keep = {"SHIPPED_ENV", "SLOTS_OFF"}
+    nodes = []
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id in keep for t in node.targets):
+            nodes.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name == "apply_env":
+            nodes.append(node)
+    assert len(nodes) == 3, "SHIPPED_ENV, SLOTS_OFF and apply_env must all be found in tools/hy4/serve.py"
+    ns = {"os": os, "TREE": TREE}
+    exec(compile(ast.Module(body = nodes, type_ignores = []), "serve.py", "exec"), ns)
+    return ns
+
+
+def test_apply_env_keeps_user_values(env):
+    ns = _apply_env()
+    for flag in FLAGS:
+        os.environ.pop(flag, None)
+    os.environ["HY4_PF_HC2"] = "0"             # the rollback to 1.9.0: an explicit value always wins, with one slot or several
+    for slots in (1, 4):
+        os.environ["HY4_PF_HC2"] = "0"
+        ns["apply_env"](4096, slots = slots)
+        assert os.environ["HY4_PF_HC2"] == "0"
+        assert os.environ["HY4_PF_ROUTER16"] == "1"    # an unset flag takes its shipped value
+        os.environ.pop("HY4_PF_ROUTER16")
+
+
+def test_apply_env_turns_slot_unsafe_levers_off_with_slots(env):
+    ns = _apply_env()
+    for flag in ns["SLOTS_OFF"]:
+        assert ns["SHIPPED_ENV"].get(flag) == "1", flag
+        os.environ.pop(flag, None)
+        ns["apply_env"](4096, slots = 1)
+        assert os.environ[flag] == "1"
+        os.environ.pop(flag)
+        ns["apply_env"](4096, slots = 2)
+        assert os.environ[flag] == "0"
+        os.environ[flag] = "1"                  # explicit value still wins (MuEngine then refuses it)
+        ns["apply_env"](4096, slots = 2)
+        assert os.environ[flag] == "1"
 
 
 # ---- 1.9.2: opt-in fp8 KV (long context) and the head-blocked attend that reads it
