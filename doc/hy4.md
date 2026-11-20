@@ -65,7 +65,7 @@ The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, bot
 | `HY4_ENGRAM_NPHASH`, `HY4_ENGRAM_PF_WORKERS` | 1, 1 | Engram hash in numpy; one prefetch worker |
 | `HY4_ENGRAM_NATIVE_IO` | 1 | Engram row reads in C threads (`pread`, no GIL) |
 | `HY4_ENGRAM_FUSED` | 0 | two-launch fused Engram block in decode (opt-in) |
-| `HY4_ABLIT_SPEC` | unset (off) | path of `edit_spec.json` (tensor file next to it): run-time decensor edit of the attention and MLP / MoE outputs; the shipped preset is `presets/hy4-uncensor/`; `off` disables |
+| `HY4_ABLIT_SPEC` | bundled `presets/hy4-uncensor/edit_spec.json` (on) | path of `edit_spec.json` (tensor file next to it): run-time decensor edit of the attention and MLP / MoE outputs; an explicit path wins; `0`, empty or `off` disables |
 
 Native Engram IO: `exllamav3/loader/engram_io.c` is compiled with `gcc` at first use into `~/.cache/kyojin/engram_io` (`XDG_CACHE_HOME` moves it). When `gcc` is missing or the build fails, the server prints one line and uses the Python reader, which does the same reads more slowly (`HY4_ENGRAM_NATIVE_IO=0` selects it directly).
 
@@ -87,15 +87,17 @@ The free memory is steady, not a load transient: at the default `-c 65536` it st
 
 128K (`-c 131072`) is opt-in. At load, fp32 KV, the server reached 110.4 GiB of GTT and the free memory fell to 7.8 GiB. It was not measured under a 128K prefill on the release build; if memory runs out, use a smaller `-c`.
 
-## Uncensor preset (optional)
+## Uncensor preset (on by default)
 
-Off by default. One env line turns it on; the spec is a run-time edit of the attention and MLP / MoE outputs and changes no weights:
+The server loads the preset bundled in `presets/hy4-uncensor/` (found from the repository, any working directory). It is a run-time edit of the attention and MLP / MoE outputs and changes no weights. The start-up log prints `decensor preset on (HY4_ABLIT_SPEC=...)`.
+
+Switch it off:
 
 ```bash
-HY4_ABLIT_SPEC=<repo>/presets/hy4-uncensor/edit_spec.json python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 65536 --num-draft 3
+HY4_ABLIT_SPEC=0 python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 65536 --num-draft 3
 ```
 
-`off` or an unset variable runs the unmodified forward. Details and files: [presets/hy4-uncensor](../presets/hy4-uncensor/README.md).
+`0`, an empty value or `off` installs no edit: the forward is the unmodified one. `HY4_ABLIT_SPEC=<other path>/edit_spec.json` loads another spec. Details and files: [presets/hy4-uncensor](../presets/hy4-uncensor/README.md).
 
 ## Known limits
 

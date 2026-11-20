@@ -1,12 +1,12 @@
-# Hy4-flash: decensor preset (opt-in)
+# Hy4-flash: decensor preset (on by default)
 
-A run-time edit of the Hy4 forward. It edits no weights and no quantised data. Off unless `HY4_ABLIT_SPEC` points at the spec.
+A run-time edit of the Hy4 forward. It edits no weights and no quantised data. The server loads it by default; `HY4_ABLIT_SPEC=0` switches it off.
 
 ```
-HY4_ABLIT_SPEC=/path/to/presets/hy4-uncensor/edit_spec.json python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf ...
+HY4_ABLIT_SPEC=0 python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf ...
 ```
 
-`edit_spec.safetensors` must sit next to the JSON. `HY4_ABLIT_SPEC=off` (or unset) runs the unmodified forward.
+`edit_spec.safetensors` must sit next to the JSON. `HY4_ABLIT_SPEC=0`, an empty value or `off` runs the unmodified forward and installs no edit; `HY4_ABLIT_SPEC=<path>/edit_spec.json` loads another spec.
 
 What it does: after the attention output projection and after the post-norm MLP / MoE output of the 42 trunk layers, the output `y` becomes `y - w * ((r . y) - mu) * r`, with a per-layer unit direction `r` and per-layer weights `w`, `mu`. Layers with `w = 0` are not touched. The MTP draft block is never edited. Code: `exllamav3/loader/ablit_hy4.py`; the post-norm MLP site is fused into the residual kernel (`exllamav3/loader/hc_fused.py`).
 
