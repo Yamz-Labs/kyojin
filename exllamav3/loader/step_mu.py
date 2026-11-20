@@ -10,7 +10,9 @@ head runs on a session unchanged, on the slab views. Graphs are keyed (bucket, r
 from __future__ import annotations
 
 import os
+import time
 
+import numpy as np
 import torch
 
 from . import mu_debug as DBG
@@ -20,6 +22,20 @@ from . import step_nosync as _ns
 from .engram_rows import QB  # noqa: F401  (re-export for callers)
 
 TM = SG.TM
+
+# HY4_MU_HOSTFAST=1: the Engram rows of a step are hashed with the numpy EngramStager (one pass per session), read with the cached-row fast path, and each layer group is staged
+# right before its own graph segment so the reads overlap the GPU (the solo step_rows pipeline); the step inputs are written through a numpy view of the pinned buffer.
+# HY4_MU_HOSTPROF=1: perf_counter splits per step (HT, seconds) for the server log line of mu_engine.
+FIRES = {"stage_vec": 0, "stage_ov": 0, "inp_np": 0, "rows_gt8": 0, "steps": 0}      # path counters (FIRES-CHECK): a flagged arm with 0 stage_ov FAILS
+HT = {"stage": 0.0, "launch": 0.0, "inputs": 0.0}
+
+
+def hostfast() -> bool:
+    return os.environ.get("HY4_MU_HOSTFAST", "0") not in ("", "0")
+
+
+def hostprof() -> bool:
+    return os.environ.get("HY4_MU_HOSTPROF", "0") not in ("", "0")
 
 
 class _GSMU(SG._GS):
@@ -70,6 +86,7 @@ class MultiDecoder(SG.GraphDecoder):
         self.S = nslots
         self.gs = _GSMU(fw, self.cap)
         self.hin = torch.zeros(3, TM, dtype=torch.long).pin_memory()
+        self.hnp = self.hin.numpy()
         self.mt = None
 
     # -- one-time setup: flat slabs, then the solo prepare on slot 0's views
@@ -192,6 +209,25 @@ class MultiDecoder(SG.GraphDecoder):
         self.gs.eng_raw.copy_(self.rpin, non_blocking=True)
         self.gs.eng_valid.copy_(self.vpin, non_blocking=True)
 
+    # -- HY4_MU_HOSTFAST: vectorised staging of the Engram rows (numpy hash per session, rows concatenated along T), group by group
+    def _hash_rows(self, rows):
+        """ids int64 [nE, T, nc] and valid float32 [T] of every row of the step, rows in step order (EngramStager.hash per session: same integer maths as engram_row_ids)"""
+        parts = [self.stager.hash(s.tokens, s.n, 0, len(toks)) for s, toks in rows]
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate([p[0] for p in parts], axis=1), np.concatenate([p[1] for p in parts])
+
+    def _stage_group_mu(self, hs, a, b):
+        """read the rows of the Engram modules a .. b - 1 into the pinned staging, then ONE H2D of those layers (stream-ordered before the next replay)"""
+        for f in self.stager.submit(hs[0], hs[1], 0, es=range(a, b)):
+            f.result()
+        if a == 0 and b == self.rpin.shape[0]:
+            self.gs.eng_raw.copy_(self.rpin, non_blocking=True)
+            self.gs.eng_valid.copy_(self.vpin, non_blocking=True)
+        else:
+            self.gs.eng_raw[a:b].copy_(self.rpin[a:b], non_blocking=True)
+            self.gs.eng_valid[a:b].copy_(self.vpin[a:b], non_blocking=True)
+
     def step_slots(self, rows):
         """rows = [(session, [tokens])]: append each token list at that session's next positions, ONE graph replay for all rows. Returns DEVICE (logits, argmax, x, h)
         with the rows concatenated in order (single row: logits [V], argmax scalar). session.n and session.tokens advance; a verifier that rejects rows calls `rewind`."""
@@ -200,6 +236,10 @@ class MultiDecoder(SG.GraphDecoder):
         assert 1 <= T <= TM
         if not self.prepared:
             self.prepare()
+        fast = hostfast() and self.stager is not None
+        prof = hostprof()
+        pc = time.perf_counter
+        t0 = pc() if prof else 0.0
         if self.ev_set:
             self.ev.synchronize()
         tk, ps, bs, top = [], [], [], 0
@@ -212,27 +252,65 @@ class MultiDecoder(SG.GraphDecoder):
             top = max(top, s.n + len(toks))
         Nb = min(self.cap, ((top - 1) // SG.BUCKET + 1) * SG.BUCKET)
         gs.Nb = Nb
-        what = f"step_slots T={T} Nb={Nb} rows={[(s.slot, s.n, len(t)) for s, t in rows]}"
+        what = f"step_slots T={T} Nb={Nb} rows={[(s.slot, s.n, len(t)) for s, t in rows]}" if (not fast or DBG.enabled()) else "step_slots"
+        bnds = self.bounds() if fast else None
+        ov = fast and (Nb, T, len(bnds)) in self.graphs        # graph already captured: stage group by group while the earlier segments run
+        hs = None
         with DBG.stage(what + " inputs + Engram rows"):
-            self.hin[0, :T] = torch.tensor(tk)
-            self.hin[1, :T] = torch.tensor(ps)
-            self.hin[2, :T] = torch.tensor(bs)
+            if fast:
+                self.hnp[0, :T] = tk
+                self.hnp[1, :T] = ps
+                self.hnp[2, :T] = bs
+                FIRES["inp_np"] += 1
+            else:
+                self.hin[0, :T] = torch.tensor(tk)
+                self.hin[1, :T] = torch.tensor(ps)
+                self.hin[2, :T] = torch.tensor(bs)
             gs.inp.copy_(self.hin, non_blocking=True)
-            self._stage_rows(rows)
+            if prof:
+                t1 = pc()
+                HT["inputs"] += t1 - t0
+                t0 = t1
+            if fast:
+                hs = self._hash_rows(rows)
+                FIRES["stage_vec"] += 1
+                if not ov:                                   # first use of this (bucket, rows): stage everything, the capture's warm-up bodies read the rows
+                    self._stage_group_mu(hs, 0, self.rpin.shape[0])
+            else:
+                self._stage_rows(rows)
+            if prof:
+                t1 = pc()
+                HT["stage"] += t1 - t0
+                t0 = t1
         if DBG.probe_enabled():
             self._probe(Nb, T, rows)
         with DBG.stage(what + " graph (capture if new)"):
             cgs, _out = self._graph(Nb, T)       # the solo capture: a LIST of graph segments (Engram split), replayed in order like step_rows
         self.x_out = _out[2]
         fw._h = _out[3]
-        for si, cg in enumerate(cgs):        # every Engram row of the step is already staged by _stage_rows: no per-segment staging, only the order
+        grp = self.groups(bnds) if ov else None
+        for si, cg in enumerate(cgs):        # staged up front (_stage_rows / first use); with `ov` each group is read just before its own segment
+            if ov and grp[si] is not None:
+                t2 = pc() if prof else 0.0
+                self._stage_group_mu(hs, *grp[si])
+                if prof:
+                    dt = pc() - t2
+                    HT["stage"] += dt
+                    t0 += dt                                 # launch = the replay calls only
             with DBG.stage(f"{what} replay segment {si}/{len(cgs)}"):
                 cg.replay()
+        if ov:
+            FIRES["stage_ov"] += 1
+        if T > 8:
+            FIRES["rows_gt8"] += 1
+        FIRES["steps"] += 1
         self.ev.record()
         self.ev_set = True
         for s, toks in rows:
             s.n += len(toks)
         self.stats["replays"] += 1
+        if prof:
+            HT["launch"] += pc() - t0
         return _out[0], _out[1], _out[2], _out[3]
 
     @staticmethod
@@ -248,6 +326,10 @@ from . import mtp_head as _MH
 class MTPGraphMU(_MH.MTPGraph):
     """the draft chain graph per (slot, bucket): the captured graph holds the addresses of the slot's K buffer / indexer slab views (set `slot` and bind the session first)"""
     slot = 0
+
+    def captured(self, slot, j):
+        """True when the draft graph of (slot, the bucket of head position j) exists: run() then needs no `bind` (a replay touches no eager state)"""
+        return (slot, min(self.mt.cap, ((j + self.k) // self.BUCKET + 1) * self.BUCKET)) in self.graphs
 
     def run(self, tok, h, j):
         """drafts of the bound session as a PRIVATE device tensor. The (slot, N) graphs share one memory pool and a graph's output can live in a block that an
