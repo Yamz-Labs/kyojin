@@ -52,10 +52,13 @@ Served numbers, one Strix Halo machine, shipped settings, seeded prompts, tok/s 
 
 | depth | prefill 1.9.0 | prefill 1.9.1 | decode spec 1.9.0 | decode spec 1.9.1 | tau 1.9.1 | decode plain 1.9.0 | decode plain 1.9.1 |
 |---|---|---|---|---|---|---|---|
-| 4K | 785 | {{PF4K}} | 22.5 | {{DEC4K}} | {{TAU4K}} | 14.6 | {{PLAIN4K}} |
-| 16K | 869 | {{PF16K}} | 23.7 | {{DEC16K}} | {{TAU16K}} | - | - |
-| 32K | 859 | {{PF32K}} | 22.7 | {{DEC32K}} | {{TAU32K}} | 14.5 | {{PLAIN32K}} |
-| 64K | 842 | {{PF64K}} | 23.9 | {{DEC64K}} | {{TAU64K}} | - | - |
+| 4K | 785 | 925 | 22.5 | 23.0 | 2.60 | 14.6 | 15.8 |
+| 16K | 869 | 1000 | 23.7 | 24.6 | 2.83 | - | - |
+| 32K | 859 | 996 | 22.7 | 23.3 | 2.68 | 14.5 | 15.6 |
+| 64K | 842 | 962 | 23.9 | 24.0 | 2.87 | - | - |
+
+
+Decode depends on the generated text through tau (accepted tokens per round), so one served point moves by a few tok/s between prompts. On the same prompt the decode changes of this release give +7 % speculative decode at 4K and a 5 % shorter verify round (paired A/B in one run). Rows 4K to 32K: one Strix Halo machine; 64K: a second identical machine (cross-check within 3 %).
 
 RTX 3090 (NVIDIA): build for CUDA once ([tools/cuda/README.md](tools/cuda/README.md)), then Qwen3.8-27B with 245K of context (the served settings, one session), with turboderp's 4.0 bpw pack:
 
