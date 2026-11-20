@@ -7,7 +7,7 @@ HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 from depth_gate import DepthGate
 passes = sys.argv[1]; order = os.environ.get("SP2_ORDER", "AONN")
 tmp = tempfile.mkdtemp(prefix="sp2chk_")
-os.environ.update(OD_NAME="chk", OD_PORT="8999", N1119=tmp, B2_H=tmp, B2_DIR=tmp, B2_PASSES=passes, SP2_LEVERS="0", SP2_ORDER=order, OD_TMAX="3300", GGUF="x.gguf")
+os.environ.update(OD_NAME="chk", OD_PORT="8999", SP2_WORK=tmp, B2_H=tmp, B2_DIR=tmp, B2_PASSES=passes, SP2_LEVERS="0", SP2_ORDER=order, OD_TMAX="3300", GGUF="x.gguf")
 import subprocess, urllib.request, time
 state = {}
 class FakeProc:

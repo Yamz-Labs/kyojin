@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased 1.9.3
+
+- Hy4-flash: online speculative draft-depth gate, `HY4_SPEC2_GATE=1` (default off), mode `HY4_SPEC2_MODE=learn` (default, the measured S7 arm O), KB 2, THETA 0.6 for the `static` mode.
+  Base draft graph of 2 steps plus a confidence-gated third step. Fires counter per request: depth chosen per round and rounds where the gate changed the depth.
+  Also: context-bucket graphs (`HY4_GRAPH_BUCKET_REL`, default 0, the gate's tail graph uses the same bucket helper). See `doc/env_vars.md`.
+
 ## 1.9.2
 
 Hy4-flash server hotfix: tool calling, a quiet exit when the client leaves, request-parser fixes, Strix install fixes, docs.

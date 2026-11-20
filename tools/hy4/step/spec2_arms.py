@@ -5,11 +5,11 @@ Question: tau and ms per round on the 6 head_tau prompts (code / prose / chat x 
 order SP2_ORDER (default AONN: N twice = the reproducibility proof; reported as N and N2). FIRES gate_det <n> per gate arm = prompts whose two reps (or the warm-up) differ in text md5 / gate digest; must be 0 for O, N; N vs N2 must match on every point. Phase 0: graph-replay ms per verify round at T = 1..6 (4K, arm C flags) = the missing T3 / T5 / T6 of the cost model.
 Metric per class: tok/s, tau, ms per round = 1000 * tau / tok/s, paired delta vs A (mean of both A runs). Gate rule (s7_model.py): C ships when it is >= B on code by 2 % and not below B on chat / prose by more than 1 %;
 B ships alone when C does not beat it; neither when both lose to A on code by more than 2 %.
-env: OD_PORT OD_NAME GGUF N1119 B2_H B2_DIR B2_GM B2_CO B2_PASSES SP2_ORDER SP2_REPS (default 2) SP2_LEVERS (default 1)
-Output: table on stdout + <N1119>/out/<OD_NAME>.spec2.json. ~50 min GPU: TMAX 3300."""
+env: OD_PORT OD_NAME GGUF SP2_WORK B2_H B2_DIR B2_GM B2_CO B2_PASSES SP2_ORDER SP2_REPS (default 2) SP2_LEVERS (default 1)
+Output: table on stdout + <SP2_WORK>/out/<OD_NAME>.spec2.json. ~50 min GPU: TMAX 3300."""
 import ast, hashlib, json, os, re, signal, statistics, subprocess, sys, time, urllib.request
 E = os.environ; tree = os.getcwd(); t0 = time.time()
-H = E.get("B2_H", "/home/kamel"); N = E.get("N1119", f"{H}/scratch/n1119")
+H = E.get("B2_H", os.path.expanduser("~")); N = E.get("SP2_WORK", f"{H}/spec2_work")
 name, port = E["OD_NAME"], E["OD_PORT"]; tmax = int(E.get("OD_TMAX", "3300"))
 GGUF = E.get("GGUF", f"{H}/models/hy4-flash-gguf/Hy4-flash-Q3_K-00001-of-00002.gguf")
 B2 = E.get("B2_DIR", f"{H}/scratch/b2"); OUT = f"{N}/out"; os.makedirs(OUT, exist_ok=True)

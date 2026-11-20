@@ -21,6 +21,7 @@ import zlib
 
 NBIN = 10
 THETA = 0.6
+MODE_DEFAULT = "learn"      # S7 arm O: the online rule with a reset at every request. static (a pure threshold, no state) and carry (no reset, negative control) are the other modes
 
 
 def _table(s):
@@ -38,6 +39,8 @@ class DepthGate:
         self.prior_n, self.prior_q, self.probe, self.alpha, self.tok0 = prior_n, prior_q, probe, alpha, tok0
         self.mode, self.theta = mode, theta
         self.life_rounds = self.life_ext = 0                # lifetime counters (never reset): the server log differences them per request
+        self.life_hist = {}                                 # lifetime histogram of the chosen draft depth {depth: rounds}
+        self.life_changed = 0                               # lifetime rounds where the gate CHANGED the depth: it cut the chain below the shipped depth kb + ext
         self.reset(force=True)
 
     def reset(self, force=False):
@@ -49,13 +52,15 @@ class DepthGate:
         self.tok_m = self.tok0                              # running mean tokens per round / ms per round (the rate is their ratio)
         self.ms_m = self.round_ms(False)
         self.dig = 0
+        self.req_hist = {}                                  # same two counters, this request only
+        self.req_changed = 0
 
     @classmethod
     def from_env(cls, kb, ext):
         t = _table(os.environ.get("HY4_ROW_MS", "1:61.8,2:76.7,3:90.3,4:104.0,5:117.3,6:130.6,7:143.8,8:157.0"))       # b2 arm C 4K graph replay, T3 / T5+ interpolated (spec2 job measures them)
         return cls(t, float(os.environ.get("HY4_SPEC2_STEP_MS", "3.0")), float(os.environ.get("HY4_SPEC2_GAP_MS", "0.3")), kb, ext,
                    float(os.environ.get("HY4_SPEC2_PRIOR_N", "6")), float(os.environ.get("HY4_SPEC2_PRIOR_Q", "0.5")), int(os.environ.get("HY4_SPEC2_PROBE", "16")),
-                   mode=os.environ.get("HY4_SPEC2_MODE", "static"), theta=float(os.environ.get("HY4_SPEC2_THETA", str(THETA))))
+                   mode=os.environ.get("HY4_SPEC2_MODE", MODE_DEFAULT), theta=float(os.environ.get("HY4_SPEC2_THETA", str(THETA))))
 
     def verify_ms(self, T):
         if T in self.vt:
@@ -100,6 +105,12 @@ class DepthGate:
             if self.probe and self.n_round % self.probe == 0:
                 go = True
         self.life_ext += go
+        depth = self.kb + (self.ext if go else 0)
+        self.life_hist[depth] = self.life_hist.get(depth, 0) + 1
+        self.req_hist[depth] = self.req_hist.get(depth, 0) + 1
+        if not go:                                          # the shipped depth is kb + ext: a cut round is a round where the gate changed the depth
+            self.life_changed += 1
+            self.req_changed += 1
         self.dig = zlib.crc32(b"\x01" if go else b"\x00", self.dig)
         return go, b
 
@@ -118,8 +129,13 @@ class DepthGate:
         self.ms_m += self.alpha * (self.round_ms(extended) - self.ms_m)
 
     def stats(self):
-        return {"rounds": self.life_rounds, "ext_rounds": self.life_ext, "req_rounds": self.n_round, "req_ext": self.n_ext, "mode": self.mode, "digest": f"{self.dig:08x}", "rate_tok_s": round(1000 * self.tok_m / self.ms_m, 2),
+        return {"rounds": self.life_rounds, "ext_rounds": self.life_ext, "req_rounds": self.n_round, "req_ext": self.n_ext, "mode": self.mode, "digest": f"{self.dig:08x}", "depth_hist": dict(sorted(self.life_hist.items())), "changed": self.life_changed, "req_depth_hist": dict(sorted(self.req_hist.items())), "req_changed": self.req_changed, "rate_tok_s": round(1000 * self.tok_m / self.ms_m, 2),
                 "bins": [[round(a, 1), round(n, 1)] for a, n in self.hits]}
+
+    def fires_line(self):
+        """one line for the server log / an A/B driver: depth chosen per round (lifetime and this request) and the rounds where the gate changed the depth. changed = 0 means the arm did not fire."""
+        return (f"FIRES gate mode={self.mode} depth_hist={dict(sorted(self.life_hist.items()))} changed={self.life_changed}/{self.life_rounds} "
+                f"req_depth_hist={dict(sorted(self.req_hist.items()))} req_changed={self.req_changed}/{self.n_round}")
 
 
 def draft_with_gate(gate, mg, out, kb, j):
