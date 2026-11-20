@@ -1021,6 +1021,32 @@ def mm_f32(a, b):
     return f32_sat(torch.mm(a, b))
 
 
+@triton.jit
+def _mm16_f32_kernel(A, B, C, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    rn = tl.program_id(1) * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros([BM, BN], dtype=tl.float32)
+    for k in range(0, K, BK):
+        a = tl.load(A + rm[:, None] * K + (k + rk)[None, :], mask=(rm[:, None] < M) & ((k + rk)[None, :] < K), other=0.0)
+        b = tl.load(B + rn[None, :] * K + (k + rk)[:, None], mask=(rn[None, :] < N) & ((k + rk)[:, None] < K), other=0.0)
+        acc += tl.dot(a, b)
+    tl.store(C + rm[:, None] * N + rn[None, :], acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+MM16_CFG = (64, 128, 64, 4)
+
+
+def mm16_f32(a, b):
+    """a [M, K] fp16 @ b [N, K] fp16 (row-major weight) -> fp32 [M, N], fp32 accumulation AND fp32 output (torch.mm rounds the product to fp16; the out_dtype=float32 variant is slow here)"""
+    M, K = a.shape
+    N = b.shape[0]
+    BM, BN, BK, w = MM16_CFG
+    c = torch.empty(M, N, dtype=torch.float32, device=a.device)
+    _mm16_f32_kernel[(triton.cdiv(M, BM), triton.cdiv(N, BN))](a, b, c, M, N, K, BM=BM, BN=BN, BK=BK, num_warps=w)
+    return c
+
+
 def dequant_q8(packed):
     """stored Q8_0 [N, K/32, 34] uint8 -> fp16 W^T [K, N] (contiguous)"""
     N, nb, bb = packed.shape

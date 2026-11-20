@@ -242,9 +242,10 @@ class Hy4MLA:
         return self.hd == 256 and self.vd == 256 and self.R == 512 and self.rope_dim == 64 and ck_mla.available()
 
     def _kvw(self):
+        from . import prefill_unabs as _pu
         w = self.__dict__.get("_kvw_c")
-        if w is None:
-            from . import prefill_unabs as _pu
+        if w is None or (w.dim() == 3) != _pu.kv_head_major():      # the layout follows HY4_PF_KV_HM (one resident copy: the other layout is dropped)
+            self._kvw_c = None
             w = self._kvw_c = _pu.kv_weight(self._w16("wk_b"), self._w16("wv_b"))
         return w
 
@@ -271,7 +272,10 @@ class Hy4MLA:
                 if self.theta not in rc:
                     th = pos.double()[:, None] * (self.theta ** (-2.0 * torch.arange(P // 2, dtype=torch.float64, device=pos.device) / P))[None, :]
                     rc[self.theta] = (th.cos().float().contiguous(), th.sin().float().contiguous())
-                _pu.qrope_inplace(q, rc[self.theta][0], rc[self.theta][1], H, self.hd, self.hd - P, P)
+                if _pu.qo_head_major():
+                    q = _pu.qrope_hm(q, rc[self.theta][0], rc[self.theta][1], H, self.hd, self.hd - P, P)
+                else:
+                    _pu.qrope_inplace(q, rc[self.theta][0], rc[self.theta][1], H, self.hd, self.hd - P, P)
             with tm.t("f ck: kv decompress"):
                 klo = max(0, N - T - self.window + 1) if self.window else 0
                 kc = kcache[klo:]
@@ -285,13 +289,15 @@ class Hy4MLA:
                     bias = torch.empty(T, (Nk + 7) // 8 * 8, dtype=torch.float16, device=cur.device)
                     bias[:, :Nk] = torch.where(allow[:, klo:], 0.0, -30000.0).half()
         with tm.t("MLA core + sinks"):
-            o = ck_mla.fmha(q.view(T, H, self.hd), kk, vv, self.scale, self.sinks, bias, self.window)
+            hm = _pu.qo_head_major()
+            o = ck_mla.fmha(q if hm else q.view(T, H, self.hd), kk, vv, self.scale, self.sinks, bias, self.window,
+                            out=torch.empty(H, T, self.vd, dtype=torch.float16, device=cur.device).permute(1, 0, 2) if hm else None)
         if o is None:
             return None
         with tm.t("attn proj"):
             with tm.t("f gate: wgate mm + sigmoid"):
                 g = _pk.qdense_raw16(cur, self.wgate.packed, tm)
-                gated = _pk.gate16t(o.view(T, H * self.vd), g)
+                gated = _pu.gate16_hm(o, g, H, self.vd) if hm else _pk.gate16t(o.view(T, H * self.vd), g)
             with tm.t("f gate: wo mm"):
                 out = _pk.qdense_tm(gated, self.wo.packed, tm)
             with tm.t("f gate: post norm"):

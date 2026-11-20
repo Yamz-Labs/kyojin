@@ -608,6 +608,10 @@ class Hy4Forward:
                     if getattr(L, "router16", None) is None:
                         L.router16 = L.router.half().contiguous()
                     p = torch.sigmoid(_pk().mm_f32(_pk().to_f16(x), L.router16.T))
+                elif T > MMVQ_MAXR and dev.type == "cuda" and x.dtype == torch.float32 and os.environ.get("HY4_PF_ROUTER16", "0") == "1":       # fp16 operands, fp32 accumulate AND fp32 logits (the fp32 GEMM runs at ~5 TFLOPS)
+                    if getattr(L, "router16", None) is None:
+                        L.router16 = L.router.half().contiguous()
+                    p = torch.sigmoid(_pk().mm16_f32(_pk().to_f16(x), L.router16))
                 else:
                     p = torch.sigmoid(_RG.mm(x, L.router))
                 sel = torch.sort(p + L.rbias, dim=-1, descending=True, stable=True).indices[:, :self.topk]      # stable: tied experts resolve to the lowest id every call (torch.topk tie order varies between calls on gfx1151)
@@ -790,6 +794,12 @@ class Hy4Forward:
 
     def layer(self, i, x, pos, ids, start):
         L = self._layer(i)
+        pend = None
+        if _HCF is not None and isinstance(x, _HCF.Pend):      # HY4_PF_HC2: the previous layer's residual is applied inside this layer's two site kernels
+            pend = x
+            x = pend.s
+            if i in self.ple or not _HCF.ok(x, L.hca, self.hc):
+                x, pend = pend.materialize(), None
         T = x.shape[0]
         if _AE.ENABLED:       # HY4_ATTN_EAGER: host bound for the rope tables (no sync)
             _AE.ensure(start + T)
@@ -800,8 +810,9 @@ class Hy4Forward:
         tm = self.tm
         with tm.t("hc / norms"):
             if _HCF is not None and _HCF.ok(x, L.hca, self.hc):
-                post, cur = _HCF.site(x, L.hca, L.attn_norm, self.eps, self.hc_eps, self.magnitude)
+                post, cur = _HCF.site(x, L.hca, L.attn_norm, self.eps, self.hc_eps, self.magnitude, pend)
             else:
+                assert pend is None
                 pre, post = self._site(x, L.hca)
                 cur = rms((x * pre[:, :, None]).sum(1), self.eps) * L.attn_norm
         mla = L.mla
@@ -846,8 +857,10 @@ class Hy4Forward:
         self._hk("attn_out", i, out)
         with tm.t("hc / norms"):
             if _HCF is not None and _HCF.ok(x, L.hcf, self.hc) and out.shape == (T, self.D):
-                s1, post2, cur2 = _HCF.res_site(x, out, post, L.hcf, L.ffn_norm, self.eps, self.hc_eps, self.magnitude)
+                s1, post2, cur2 = _HCF.res_site(x, out, post, L.hcf, L.ffn_norm, self.eps, self.hc_eps, self.magnitude, pend)
             else:
+                if pend is not None:
+                    x, pend = pend.materialize(), None
                 s1 = x + post[:, :, None] * out[:, None, :]
                 pre2, post2 = self._site(s1, L.hcf)
                 cur2 = rms((s1 * pre2[:, :, None]).sum(1), self.eps) * L.ffn_norm
@@ -856,6 +869,9 @@ class Hy4Forward:
             self._hk("ffn_moe_out", i, lat)
         with tm.t("hc / norms"):
             if _HCF is not None and _HCF.ok(s1, L.hcf, self.hc) and f.shape == (T, self.D):
+                if (_HCF.lazy() and T > _HCF.PF_MIN_ROWS and self.hook is None and self._gs is None and i + 1 < self.n_layers
+                        and i + 1 not in self.ple and self.hc <= 8):       # HY4_PF_HC2: hand (s1, f, post) to the next layer instead of writing x
+                    return _HCF.Pend(s1, f, post2, L.post_ffw, self.eps)
                 s2 = _HCF.resid(s1, f, post2, L.post_ffw, self.eps)
             else:
                 f = rms(f, self.eps) * L.post_ffw

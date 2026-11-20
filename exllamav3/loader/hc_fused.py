@@ -89,14 +89,29 @@ def _k2_collapse(x_ptr, part_ptr, sq_ptr, base_ptr, scale_ptr, w_ptr, post_ptr, 
 @triton.jit
 def _k12_row(x_ptr, y_ptr, post_ptr, s_ptr, fn_ptr, base_ptr, scale_ptr, w_ptr, postout_ptr, cur_ptr, cur16_ptr,
              D, K, eps, hc_eps, mag,
-             H: tl.constexpr, HP: tl.constexpr, NO: tl.constexpr, HAS_RES: tl.constexpr, EMIT16: tl.constexpr, BD: tl.constexpr):
-    """K1 + K2 in one program per row: the whole [H, D] row is held in registers (read once, residual written once)"""
+             pf_ptr, ppost_ptr, pw_ptr, er_ptr, ew_ptr, emu_ptr, peps,
+             H: tl.constexpr, HP: tl.constexpr, NO: tl.constexpr, HAS_RES: tl.constexpr, EMIT16: tl.constexpr, BD: tl.constexpr,
+             PEND: tl.constexpr = False, HAS_EDIT: tl.constexpr = False):
+    """K1 + K2 in one program per row: the whole [H, D] row is held in registers (read once, residual written once)
+    PEND: x_ptr holds the PREVIOUS layer's s1 and the previous residual (K3) is applied here, in registers: x = s1 + ppost * (rms(f) * pw)
+    (the previous layer's output x is never written to memory; K3's arithmetic, expression for expression)"""
     r = tl.program_id(0)
     hv = tl.arange(0, HP)
     d = tl.arange(0, BD)
     off = hv[:, None] * D + d[None, :]
     xm = (hv[:, None] < H) & (d[None, :] < D)
     x = tl.load(x_ptr + r * K + off, mask=xm, other=0.0)
+    if PEND:
+        f = tl.load(pf_ptr + r * D + d, mask=d < D, other=0.0)
+        frc = tl.math.rsqrt(tl.sum(f * f, axis=0) / D + peps)
+        fnv = f * frc * tl.load(pw_ptr + d, mask=d < D, other=0.0)
+        if HAS_EDIT:
+            er = tl.load(er_ptr + d, mask=d < D, other=0.0)
+            ew = tl.load(ew_ptr)
+            fe = fnv - ew * (tl.sum(fnv * er, axis=0) - tl.load(emu_ptr)) * er
+            fnv = tl.where(ew == 0.0, fnv, fe)
+        pp = tl.load(ppost_ptr + r * H + hv, mask=hv < H, other=0.0)
+        x = x + pp[:, None] * fnv[None, :]
     if HAS_RES:
         yv = tl.load(y_ptr + r * D + d, mask=d < D, other=0.0)
         pv = tl.load(post_ptr + r * H + hv, mask=hv < H, other=0.0)
@@ -159,7 +174,7 @@ def ok(x, hw, H):
     return fn.dtype == torch.float32 and fn.shape[1] == H * x.shape[2] and fn.shape[0] in (H, 2 * H) and x.shape[2] <= MAX_D
 
 
-def _mix(x, y, post_prev, hw, w, eps, hc_eps, mag):
+def _mix(x, y, post_prev, hw, w, eps, hc_eps, mag, pend=None):
     T, H, D = x.shape
     fn, base, scale = hw
     NO = fn.shape[0]
@@ -173,12 +188,19 @@ def _mix(x, y, post_prev, hw, w, eps, hc_eps, mag):
         post = torch.empty(T, H, dtype=torch.float32, device=dev) if NO == 2 * H else None
         cur = torch.empty(T, D, dtype=torch.float32, device=dev)
         cur16 = torch.empty(T, D, dtype=torch.float16, device=dev) if EMIT16[0] else cur
+        if pend is None:
+            pa = (x, x, x, x, x, x, 0.0)
+        else:
+            er, ew, emu = pend.edit if pend.edit is not None else (x, x, x)
+            pa = (pend.f, pend.post, pend.w_post, er, ew, emu, pend.eps)
         _k12_row[(T,)](x, y if has_res else x, post_prev if has_res else x, s, fn, base, scale, w, post if post is not None else cur, cur, cur16,
-                       D, K, eps, hc_eps, mag, H=H, HP=_p2(H), NO=NO, HAS_RES=has_res, EMIT16=EMIT16[0], BD=_p2(D), num_warps=8)
+                       D, K, eps, hc_eps, mag, *pa, H=H, HP=_p2(H), NO=NO, HAS_RES=has_res, EMIT16=EMIT16[0], BD=_p2(D),
+                       PEND=pend is not None, HAS_EDIT=pend is not None and pend.edit is not None, num_warps=8)
         if EMIT16[0]:
             from . import prefill_kernels as _pk
             _pk.register_f16(cur, cur16)
         return s, post, cur
+    assert pend is None
     part = torch.empty(T, NCH, NOP, dtype=torch.float32, device=dev)
     sq = torch.empty(T, NCH, dtype=torch.float32, device=dev)
     has_res = y is not None
@@ -194,15 +216,30 @@ def _mix(x, y, post_prev, hw, w, eps, hc_eps, mag):
     return s, post, cur
 
 
-def site(x, hw, w_norm, eps, hc_eps, mag):
+def site(x, hw, w_norm, eps, hc_eps, mag, pend=None):
     """site A / head: x [T,H,D] -> (post [T,H] or None for a pre-only head fn, cur [T,D] = rms(sum_h pre_h x_h) * w_norm)"""
-    _, post, cur = _mix(x, None, None, hw, w_norm.contiguous(), eps, hc_eps, mag)
+    _, post, cur = _mix(x, None, None, hw, w_norm.contiguous(), eps, hc_eps, mag, pend)
     return post, cur
 
 
-def res_site(x, y, post_prev, hw, w_norm, eps, hc_eps, mag):
+def res_site(x, y, post_prev, hw, w_norm, eps, hc_eps, mag, pend=None):
     """s = x + post_prev[:, :, None] * y[:, None, :]; then the site on s -> (s, post, cur)"""
-    return _mix(x, y.float().contiguous(), post_prev.float().contiguous(), hw, w_norm.contiguous(), eps, hc_eps, mag)
+    return _mix(x, y.float().contiguous(), post_prev.float().contiguous(), hw, w_norm.contiguous(), eps, hc_eps, mag, pend)
+
+
+def lazy():       # read live (arm switching in one process)
+    return ONEPASS and os.environ.get("HY4_PF_HC2", "0") == "1"      # layer output left as (s1, f, post): K3 runs inside the next layer's two site kernels (3 stream passes per layer instead of 5)
+
+
+class Pend:
+    """the previous layer's residual K3 not yet applied: its output x = s + post[:, :, None] * (rms(f) * w_post)[:, None, :] (edit: optional edit of the layer output)"""
+    __slots__ = ("s", "f", "post", "w_post", "eps", "edit")
+
+    def __init__(self, s, f, post, w_post, eps, edit=None):
+        self.s, self.f, self.post, self.w_post, self.eps, self.edit = s, f.float().contiguous(), post.float().contiguous(), w_post.contiguous(), eps, edit
+
+    def materialize(self):
+        return resid(self.s, self.f, self.post, self.w_post, self.eps)
 
 
 def resid(s, f, post, w_post, eps):
