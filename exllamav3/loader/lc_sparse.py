@@ -263,7 +263,7 @@ def sparse_mla_attend(q_lat, q_pe, ckv, k_pe, qpos, sel, scale, sinks, scl=None)
     out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
     if qf and HB_ON and HB_SPLIT != 0 and H % HB == 0 and R == triton.next_power_of_2(R) and R <= 1024:
         from . import ref_fused as _rf
-        ng, S = H // HB, (HB_SPLIT if HB_SPLIT > 0 else (16 if T <= 3 else 8))      # -1 = auto: the micro sweep (84_00_2a_mla_micro) best split per row count
+        ng, S = H // HB, (HB_SPLIT if HB_SPLIT > 0 else (16 if T <= 3 else 8))      # -1 = auto: the micro sweep (tools/hy4/step/mla_micro.py) best split per row count
         wa = torch.empty(T * ng * S * HB * R, dtype=torch.float32, device=q_lat.device)
         wm = torch.empty(T * ng * S * HB, dtype=torch.float32, device=q_lat.device)
         wl = torch.empty(T * ng * S * HB, dtype=torch.float32, device=q_lat.device)

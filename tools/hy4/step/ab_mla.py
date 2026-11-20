@@ -10,7 +10,7 @@ CAP = max(ctxs) + 2048
 serve.apply_env(CAP)
 import torch
 from engine import Hy4Engine
-GGUF = os.environ.get("GGUF", "/home/kamel/models/hy4-flash-gguf/Hy4-flash-Q3_K-00001-of-00002.gguf")
+GGUF = os.environ.get("GGUF", "/path/to/models/hy4-flash-gguf/Hy4-flash-Q3_K-00001-of-00002.gguf")
 e = Hy4Engine(tree, GGUF, ctx=CAP, k=3)
 e.load(print)
 GR = e.GR
@@ -27,7 +27,7 @@ def arm(fl):
     for k, f in LEV.items():
         f(k in fl)
     GR.clear()
-wiki = json.load(open(os.environ.get("WIKI", "/home/kamel/scratch_w5/wiki_ids.json")))
+wiki = json.load(open(os.environ.get("WIKI", "/path/to/wiki_ids.json")))
 pc, sync = time.perf_counter, torch.cuda.synchronize
 print("ARMB", FL, "KV_FP8", os.environ.get("HY4_KV_FP8"), "LC_SPARSE", LS.ENABLED, "HB", rf.HB, flush=True)
 Ts = [int(x) for x in os.environ.get("PTS", "1,2,3,4,5,6").split(",")]
