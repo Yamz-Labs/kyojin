@@ -144,6 +144,17 @@ class Q8Batched:
         self.q = b[:, :, 2:].contiguous().view(torch.int8).reshape(H, N, K).contiguous()
         self.H, self.N, self.K = H, N, K
 
+    @classmethod
+    def from_float(cls, w):
+        """[H, N, K] float tensor (K % 32 == 0) -> Q8_0-style int8 + fp16 block scales (the draft layer's GGUF tensors are bf16: no stored Q8_0 bytes to read)"""
+        H, N, K = w.shape
+        blk = w.float().reshape(H * N, K // 32, 32)
+        d = (blk.abs().amax(-1) / 127.0).clamp_min(1e-30).half()
+        q = torch.round(blk / d.float()[..., None]).clamp(-127, 127).to(torch.int8)
+        o = cls.__new__(cls)
+        o.d, o.q, o.H, o.N, o.K = d.reshape(H, N, K // 32).contiguous(), q.reshape(H, N, K).contiguous(), H, N, K
+        return o
+
     def mv(self, x):
         """x [T, H, K] fp32 -> [T, H, N] fp32 (T == 1: the single-row kernel; T > 1: one kernel, weights read once)"""
         if x.dim() == 3 and x.shape[0] > 1 and x.stride(-1) == 1:

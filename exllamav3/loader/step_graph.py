@@ -23,6 +23,7 @@ import torch
 from . import step_nosync as _ns
 from .engram_rows import QB, E4M3, E8M0
 from . import attn_eager as _ae
+from . import router_gemv as _RG
 from .engram_stage import EngramStager
 
 BUCKET = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
@@ -73,11 +74,17 @@ def indexer_static_init(ix, cap):
 
 
 @torch.no_grad()
+def _mmw(ix, a, name):
+    """a @ ix.w[name].T; the draft layer's indexer (ix.gv, HY4_DRAFT_IX_GV=1) runs its small fp32 matrices through the router mat-vec (rocBLAS SGEMM at M = 1 runs these at 12-60 GB/s)"""
+    w = ix.w[name]
+    return _RG.logits(a, w) if (getattr(ix, "gv", False) and _RG.usable(a, w)) else a @ w.T
+
+
 def indexer_keys_static(ix, x, pos, ar):
     """key side of indexer_forward_static: the per-position (value | gate) rows and the pool groups they complete (x [T, E], pos [T] long device, ascending). Needs no query and no selection."""
     k, d = ix.k, ix.d
-    ik = _rms(x @ ix.w["attn_k"].T, ix.w["k_norm"], ix.eps)
-    vg_new = torch.cat([ik @ ix.w["value"].T, ik @ ix.w["gate"].T], -1)
+    ik = _rms(_mmw(ix, x, "attn_k"), ix.w["k_norm"], ix.eps)
+    vg_new = torch.cat([_mmw(ix, ik, "value"), _mmw(ix, ik, "gate")], -1)
     vr = getattr(ix, "vg_ring", 0)
     assert not vr or x.shape[0] + k <= vr, "vg ring smaller than one call"
     ix.vgb.index_copy_(0, pos % vr if vr else pos, vg_new)
@@ -103,8 +110,8 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     if Nb <= (ix.n_top + 1) * k:        # every position of this bucket sees <= n_top groups: the selection is all-causal (the eager path returns None)
         return None
     T = x.shape[0]
-    iq = ix._rope((qr @ ix.w["q_b"].T).reshape(T, H, d), pos)
-    wt = (x.float() @ ix.w["proj"].T) / math.sqrt(d * H)
+    iq = ix._rope(_mmw(ix, qr, "q_b").reshape(T, H, d), pos)
+    wt = _mmw(ix, x.float(), "proj") / math.sqrt(d * H)
     Pb = Nb // k
     if PRIME_IX and T > 16 and ix.tail and iq.is_cuda:       # draft-cache fill of a long prompt (T up to 2048 rows): fused fp16 scorer + exact select instead of the fp32 [T, 16, Pb] einsum
         off = (pos.data_ptr() - ar.data_ptr()) // ar.element_size()
