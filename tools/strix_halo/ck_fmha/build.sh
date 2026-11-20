@@ -19,7 +19,7 @@ for c in "${EXL3_ROCM_SDK:-/nonexistent}/lib/llvm/bin/amdclang++" "${EXL3_ROCM_S
     if [ -z "$CXX" ] && [ -x "$c" ]; then CXX=$c; fi
 done
 : "${CXX:?no amdclang++ found: set ROCM_CLANG}"
-GCC_DIR=${GCC_DIR:-/usr/lib/gcc/x86_64-linux-gnu/13}
+GCC_DIR=${GCC_DIR:-$(dirname "$(gcc -print-libgcc-file-name)")}
 F=$CK_SRC/example/ck_tile/01_fmha
 B=$(mktemp -d); trap 'rm -rf "$B" "${FETCHED:-}"' EXIT
 mkdir -p "$B/gen" "$B/obj" "$(dirname "$OUT")"
