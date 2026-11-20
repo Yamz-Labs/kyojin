@@ -65,6 +65,8 @@ def indexer_static_init(ix, cap):
     if vgb is None:
         ix.vg_ring = VG_RING if (VG_RING and VG_RING < cap) else 0       # HY4_SWA_RING: only the open group (+ the rows of one batch call) is ever read: slot = position % VG_RING
         vgb = ix.vgb = torch.zeros(ix.vg_ring or cap, 2 * d, device=ix.dev)
+    elif not hasattr(ix, "vg_ring"):
+        ix.vg_ring = 0                         # a buffer bound from outside (multi-session slab view [cap, 2d]) is full length: positions index it directly, never a ring
     if ix.vg is not None:                      # open group of an eager prefill (< k rows)
         m = ix.vg.shape[0]
         vgb[(torch.arange(ix.n - m, ix.n, device=ix.dev) % ix.vg_ring) if ix.vg_ring else slice(ix.n - m, ix.n)] = ix.vg
