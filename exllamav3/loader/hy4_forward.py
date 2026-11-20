@@ -201,6 +201,32 @@ def _ext():
     return _EXT[0]
 
 
+MOE_V2 = os.environ.get("HY4_MOE_V2", "0") == "1"      # routed experts through loader/moe_dec_hip.py (HIP code object, bit-equal to the shipped grouped kernels, fewer waits per row); default off
+_MD = []
+
+
+def _moe_v2(rs, T, K):
+    """the MoeDec scratch holder for this layer shape, or None (flag off / code object missing / shape or alignment outside the kernels' contract)"""
+    if not MOE_V2 or T > MMVQ_MAXR:
+        return None
+    if not _MD:
+        try:
+            from . import moe_dec_hip as md
+            _MD.append(md if os.path.exists(md.CO) else None)
+            _MD.append({})
+        except Exception as ex:            # noqa: BLE001
+            print("hy4_forward: HY4_MOE_V2 unavailable:", repr(ex)[:160], flush=True)
+            _MD.extend([None, {}])
+    md, cache = _MD[0], _MD[1]
+    fmt = {0: "q4_k", 8: "q3_k"}.get(rs.fu)
+    if md is None or fmt is None or rs.fd != 0 or rs.nout != K or K % 256 or rs.nff % 256 or K != 1536 or rs.nff != 1536 or any(st % 16 for st in rs.strides) or (rs.bufs["gate"].data_ptr() % 16):
+        return None
+    key = (T, fmt, K, rs.nff)
+    if key not in cache:
+        cache[key] = md.MoeDec(rs.bufs["gate"].device, T, 16, K, rs.nff, fmt, rs.E)
+    return cache[key] if cache[key].topk == 16 else None
+
+
 def mmvq_fn(ty, K):
     """kernel for stored ggml type `ty` with row length K, or None (-> torch dequant path)"""
     f = GG_MMVQ.get(int(ty))
@@ -746,10 +772,15 @@ class Hy4Forward:
                 if getattr(self, "_gpart", None) is None or self._gpart.shape[1] != N:
                     self._gpart = torch.empty(MMVQ_MAXR * S, N, dtype=torch.float32, device=dev)
                     self._gout = torch.empty(MMVQ_MAXR, N, dtype=torch.float32, device=dev)
-                ext.fq_moe_kq_set_swiglu_limit(lim)
-                ext.fq_moe_kq_grouped_mixed_q8(z.half().contiguous(), sel.contiguous(), w.half().contiguous(), *rs.ptrs, *rs.strides, rs.fu, rs.fd,
-                                               self._gpart[:T * S], self._gout[:T])
-                lat = self._gout[:T] if (self.hook is None and not NO_ALIAS_LAT) else self._gout[:T].clone()       # rup reads it before the next layer's grouped call overwrites _gout (one stream); hooks keep a copy
+                mv2 = _moe_v2(rs, T, z.shape[1]) if S == 16 else None
+                if mv2 is not None:
+                    out2 = mv2.run(z.half().contiguous(), sel.reshape(-1).contiguous(), w.half().reshape(-1).contiguous(), rs.ptrs, rs.strides, lim, "v3", "v3")
+                    lat = out2 if (self.hook is None and not NO_ALIAS_LAT) else out2.clone()
+                else:
+                    ext.fq_moe_kq_set_swiglu_limit(lim)
+                    ext.fq_moe_kq_grouped_mixed_q8(z.half().contiguous(), sel.contiguous(), w.half().contiguous(), *rs.ptrs, *rs.strides, rs.fu, rs.fd,
+                                                   self._gpart[:T * S], self._gout[:T])
+                    lat = self._gout[:T] if (self.hook is None and not NO_ALIAS_LAT) else self._gout[:T].clone()       # rup reads it before the next layer's grouped call overwrites _gout (one stream); hooks keep a copy
             self.stats["grouped_calls"] = self.stats.get("grouped_calls", 0) + 1
             sel_l = []          # the per-expert pread loop below runs zero times
         if lat is None:

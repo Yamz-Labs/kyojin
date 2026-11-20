@@ -416,6 +416,81 @@ def op_experts(c):
         torch.cuda.empty_cache()
 
 
+# ---------------------------------------------------------------------------------------------------------------- experts_v2
+def op_experts_v2(c):
+    """A/B of the HIP stage kernels (loader/moe_dec_hip.py): copies of the shipped kernels (ref) vs the rewrites (v3), bit-equality checked"""
+    from exllamav3.loader import moe_dec_hip as MD
+    g = c.gguf()
+    ext = HF._ext()
+    m, p = g.meta, c.p
+    clamp = list(m[p + "swiglu_clamp_exp"])
+    w_scale = float(m[p + "expert_weights_scale"])
+    S = c.topk
+    first, types = {}, {}
+    for i in moe_layers(c):
+        ty = int(g.infos[f"blk.{i}.ffn_gate_exps.weight"][0])
+        types[ty] = types.get(ty, 0) + 1
+        first.setdefault(ty, i)
+    E0 = g.infos[f"blk.{c.n_dense}.ffn_gate_exps.weight"][1][2]
+    pk = calib_overlap(S, E0)
+    rng = np.random.default_rng(1)
+    for ty, i in first.items():
+        rs = load_experts(c, i)
+        assert rs.fd == 0, "down is not Q4_K"
+        per_exp = 2 * rs.ebytes[0] + rs.ebytes[1]
+        lim = float(clamp[i])
+        for T in tlist(c.a):
+            sels = [sample_sel(T, S, rs.E, pk, rng) for _ in range(c.a.variants)]
+            dis = [len(set(s.flatten().tolist())) for s in sels]
+            md = sum(dis) / len(dis)
+            z = (torch.randn(T, rs.K, device=dev) * 0.5).half()
+            ws = [(torch.rand(T, S, device=dev) + 0.1) for _ in sels]
+            ws = [(w / w.sum(-1, keepdim=True) * w_scale).half().reshape(-1).contiguous() for w in ws]
+            seltt = [torch.from_numpy(s).to(dev).reshape(-1).contiguous() for s in sels]
+            M = MD.MoeDec(dev, T, S, rs.K, rs.nff, rs.fmt, rs.E)
+            perms = []
+            for s_ in seltt:
+                pm = torch.empty(T * S, dtype=torch.int32, device=dev)
+                if M.sort:
+                    MD._launch("moe_sort", 1, 128, [s_, pm, T * S, rs.E])
+                perms.append(pm if M.sort else None)
+            gpart = torch.empty(HF.MMVQ_MAXR * S, rs.nout, dtype=torch.float32, device=dev)
+            gout = torch.empty(HF.MMVQ_MAXR, rs.nout, dtype=torch.float32, device=dev)
+            ext.fq_moe_kq_set_swiglu_limit(lim)
+            ext.fq_moe_kq_grouped_mixed_q8(z, seltt[0], ws[0], *rs.ptrs, *rs.strides, rs.fu, rs.fd, gpart[:T * S], gout[:T])
+            ref = gout[:T].clone()
+            o_ref = M.run(z, seltt[0], ws[0], rs.ptrs, rs.strides, lim, "ref", "ref").clone()
+            a_ref = M.act.clone()
+            o_v3 = M.run(z, seltt[0], ws[0], rs.ptrs, rs.strides, lim, "v3", "v3").clone()
+            a_v3 = M.act.clone()
+            torch.cuda.synchronize()
+            eq = dict(ext_vs_ref=float((ref - o_ref).abs().max()), ref_vs_v3=float((o_ref - o_v3).abs().max()), act_ref_vs_v3=float((a_ref.float() - a_v3.float()).abs().max()))
+            print(f"experts_v2 {rs.fmt} T {T}: max abs diff {eq}", flush=True)
+            def mk(arm_ug, arm_dn, stage):
+                def f(s, w, pm=None):
+                    M.perm = pm if stage != "full" else M.perm
+                    if stage == "full":
+                        M.run(z, s, w, rs.ptrs, rs.strides, lim, arm_ug, arm_dn)
+                    elif stage == "ug":
+                        M.ug(arm_ug, s, rs.ptrs, rs.strides, lim)
+                    else:
+                        M.dn(arm_dn, s, rs.ptrs, rs.strides)
+                return [(lambda s=s, w=w, pm=pm: f(s, w, pm)) for s, w, pm in zip(seltt, ws, perms)]
+            def prime(s, w):
+                M.prep(z, s); M.ug("ref", s, rs.ptrs, rs.strides, lim); M.qact()
+            prime(seltt[0], ws[0])
+            for arm, stage, bytes_ in (("ext", "ext", per_exp), ("ref", "full", per_exp), ("v3", "full", per_exp), ("ref", "ug", 2 * rs.ebytes[0]), ("v3", "ug", 2 * rs.ebytes[0]),
+                                       ("ref", "dn", rs.ebytes[1]), ("v3", "dn", rs.ebytes[1])):
+                if stage == "ext":
+                    fns = [(lambda s=s, w=w: ext.fq_moe_kq_grouped_mixed_q8(z, s, w, *rs.ptrs, *rs.strides, rs.fu, rs.fd, gpart[:T * S], gout[:T])) for s, w in zip(seltt, ws)]
+                else:
+                    fns = mk(arm, arm, stage)
+                # stage arms reuse the activations of variant 0 (timing only depends on the expert bytes)
+                point(c, "experts_v2", T, 0, f"{rs.fmt}_layer{i}_{stage}_{arm}", fns, md * bytes_, rs.fmt, types[ty], None, dict(distinct_mean=md, bit=eq))
+        del rs
+        torch.cuda.empty_cache()
+
+
 # ---------------------------------------------------------------------------------------------------------------- router
 def op_router(c):
     g = c.gguf()
@@ -563,7 +638,7 @@ def op_info(c):
     print("n_dense", c.n_dense, "n_trunk", c.n_trunk, "topk", c.topk, "ext", HF._ext() is not None, "sha", SHA, "flags", FLAGHASH)
 
 
-OPS = dict(roofs=op_roofs, dense_q8=op_dense_q8, experts=op_experts, router=op_router, absorb=op_absorb, mla_rows=op_mla_rows, head=op_head, draft_head=op_draft_head, info=op_info)
+OPS = dict(roofs=op_roofs, dense_q8=op_dense_q8, experts=op_experts, experts_v2=op_experts_v2, router=op_router, absorb=op_absorb, mla_rows=op_mla_rows, head=op_head, draft_head=op_draft_head, info=op_info)
 ALL = ["roofs", "experts", "mla_rows", "dense_q8", "absorb", "router", "head", "draft_head"]
 
 
