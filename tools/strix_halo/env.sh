@@ -100,7 +100,7 @@ fi
 
 if [ "${1:-}" = "--check" ]; then
     if [ ! -x "$EXL3_VENV/bin/python" ]; then
-        echo "[env.sh] no venv at $EXL3_VENV. Create it (python3 -m venv .venv) or set EXL3_VENV." >&2
+        echo "[env.sh] no venv at $EXL3_VENV. Create it (python3.12 -m venv .venv) or set EXL3_VENV." >&2
         exit 1
     fi
     "$EXL3_VENV/bin/python" - <<'PY'

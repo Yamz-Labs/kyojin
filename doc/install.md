@@ -4,7 +4,7 @@ Requirements: Linux (Ubuntu/Debian tested), a gfx1151 machine with 128 GB, Pytho
 
 ```bash
 git clone https://github.com/Yamz-Labs/kyojin && cd kyojin
-python3 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate
 # 1. ROCm torch + SDK first (AMD gfx1151 wheels; plain `pip install torch` gives a CUDA/CPU build that cannot run here):
 pip install --pre torch rocm-sdk-devel --index-url https://rocm.nightlies.amd.com/v2/gfx1151/
 pip install -r requirements.txt

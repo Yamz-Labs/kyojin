@@ -43,8 +43,12 @@ The server finds `head_q5_k.bin` by itself when it sits next to the GGUF (`HY4_M
 ```bash
 python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 65536 --num-draft 3
 curl http://127.0.0.1:8300/v1/chat/completions -H 'content-type: application/json' \
-     -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
+     -d '{"messages":[{"role":"user","content":"Hello"}],"reasoning_effort":"no_think","max_tokens":64}'
 ```
+
+Hy4-flash thinks first by default (`reasoning_effort` high): the reasoning is returned in `reasoning_content`, the answer in `content`, and a small `max_tokens` can end inside the reasoning with `content` empty. `"reasoning_effort": "no_think"` (or `"chat_template_kwargs": {"reasoning_effort": "no_think"}`) answers directly; otherwise leave room, for example `max_tokens` 1024.
+
+Tool calling (1.9.2): `tools` / `tool_choice` / `tool_calls` / `tool` messages work as in the OpenAI API, streamed or not (README "Tool calling"). `python tools/hy4/tool_smoke.py --base http://127.0.0.1:8300` runs the served check. A client that closes a stream stops the generation. Not supported: `n` > 1, `response_format` `json_object` / `json_schema` (400, no constrained decoding), images and audio.
 
 The 1.9.1 levers are listed with their rollback switches in the [env_vars.md](env_vars.md) table "Hy4-flash 1.9.1 levers". After updating from 1.9.0 run `bash tools/hy4/install_strix.sh` again (the Q3_K V2 kernel needs the rebuilt MoE extension; without it the old kernel runs).
 

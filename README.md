@@ -19,7 +19,7 @@
 <tr><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/GLM-5.3-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-glm-dark.svg"><img src="doc/img/home/card-glm-light.svg" alt="GLM-5.3-Flash on Strix Halo: 32 tok/s decode, 633 tok/s prefill" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/Qwen3.8-Flash-Next-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-flash-next-dark.svg"><img src="doc/img/home/card-flash-next-light.svg" alt="Qwen3.8-Flash-Next on Strix Halo: 53 tok/s decode, 1,576 tok/s prefill" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/turboderp/Qwen3.8-27B-exl3/tree/SC_4.00bpw_H5_V6"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-qwen27-dark.svg"><img src="doc/img/home/card-qwen27-light.svg" alt="Qwen3.8-27B on RTX 3090: 75 tok/s decode, 1,621 tok/s prefill" width="100%"></picture></a></td><td align="center" width="25%"><a href="https://huggingface.co/yamz-labs/DeepSeek-V4.1-Flash-EXL3-Yamz"><picture><source media="(prefers-color-scheme: dark)" srcset="doc/img/home/card-ds41-dark.svg"><img src="doc/img/home/card-ds41-light.svg" alt="DeepSeek V4.1 Flash on Mac Studio M5 Ultra: 62 tok/s decode, 3,001 tok/s prefill" width="100%"></picture></a></td></tr>
 </table>
 
-<p align="center"><sub>Decode and prefill tok/s at 8K (RTX: 5K), served. Kyojin 1.8.10 on Strix Halo, 1.8.9 on RTX and Mac.</sub></p>
+<p align="center"><sub>Decode and prefill tok/s at 8K (RTX: 5K), served. Measured on Kyojin 1.8.10 (Strix Halo) and 1.8.9 (RTX, Mac); the Hy4-flash numbers in the table below are 1.9.1.</sub></p>
 
 ## Quick start
 
@@ -78,12 +78,33 @@ Every server speaks the OpenAI API. More commands: [doc/models.md](doc/models.md
 
 ### Test it
 
-With a server running on port 8000 (the Mac command above uses 8080):
+With a server running, use its port: GLM on 8000 (the command above), Hy4-flash on 8300, the Mac command above on 8080.
 
 ```bash
 curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "Say hello in five words."}]}'
 ```
+
+Hy4-flash thinks before it answers: the reasoning comes back in `reasoning_content` and the answer in `content`, so a small `max_tokens` can end inside the reasoning and leave `content` empty. For a direct answer add `"reasoning_effort": "no_think"` (or `"chat_template_kwargs": {"reasoning_effort": "no_think"}`), or leave room for the reasoning with a larger `max_tokens`:
+
+```bash
+curl http://localhost:8300/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Say hello in five words."}], "reasoning_effort": "no_think", "max_tokens": 64}'
+```
+
+### Tool calling
+
+The Hy4-flash server speaks the OpenAI tool-calling API: `tools` (and the legacy `functions`), `tool_choice` (`none`, `auto`, `required` or a named function; the model template has no switch for it, so `required` and a named function add one instruction line to the system message and the model decides), assistant messages with `tool_calls`, and `tool` messages with the result. A reply that calls a function has `finish_reason` `"tool_calls"` and `message.tool_calls`; streamed, the calls arrive as `delta.tool_calls`. The reasoning stays in `reasoning_content`.
+
+```bash
+curl http://localhost:8300/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+  "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Current weather of a city.",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
+  "reasoning_effort": "low", "max_tokens": 1024}'
+```
+
+Send the result back with the call: add the assistant message with its `tool_calls` and a `{"role": "tool", "tool_call_id": "<id of the call>", "content": "<result>"}` message, and the model answers in text. `python tools/hy4/tool_smoke.py --base http://localhost:8300` checks a running server end to end (tool call, stream, round trip, a client that closes the stream). `response_format` `json_object` / `json_schema` is not supported yet (a 400); several system messages are merged into one, and a last assistant message is continued (prefill).
 
 ## Speed by context
 
