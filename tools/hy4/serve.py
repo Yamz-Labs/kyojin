@@ -85,9 +85,12 @@ def check_kernels() -> None:
         print(f"hy4 serve: WARNING {m}: slow path (HY4_ALLOW_SLOW=1)", file=sys.stderr, flush=True)
 
 
-def apply_env(ctx: int, model: str = "") -> None:
+SLOTS_OFF = ("HY4_LC_SPARSE",)     # shipped long-context levers that act on the single-session K / indexer buffers: mu_engine.MuEngine refuses them with --slots > 1
+
+
+def apply_env(ctx: int, model: str = "", slots: int = 1) -> None:
     for k, v in SHIPPED_ENV.items():
-        os.environ.setdefault(k, v)
+        os.environ.setdefault(k, "0" if slots > 1 and k in SLOTS_OFF else v)      # an explicit value still wins (and MuEngine refuses it)
     os.environ.setdefault("HY4_NOSYNC_CAP", str(((ctx + 64 + 511) // 512) * 512))   # K buffers / token history: fixed for the life of the process
     # the measured line also runs with frozen TunableOp results for the prefill GEMMs and a start-up request that compiles the prefill kernels and captures the decode graphs
     tune = os.path.join(TREE, "tools", "hy4", "tunableop_gfx1151.csv")
@@ -410,7 +413,7 @@ def main(argv=None):
     ap.add_argument("--slots", type=int, default=1, help="concurrent sessions decoded in ONE batched step (1 = the single-request engine behind the lock)")
     ap.add_argument("--sched-chunk", type=int, default=1024, help="prefill rows per scheduler turn with --slots > 1 (a decode round of the other sessions runs between chunks)")
     args = ap.parse_args(argv)
-    apply_env(args.max_ctx, args.model)
+    apply_env(args.max_ctx, args.model, args.slots)
     check_kernels()
     st = State(args)
     app = build_app(st)
