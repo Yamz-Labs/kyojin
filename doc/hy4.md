@@ -68,13 +68,15 @@ The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, bot
 
 Native Engram IO: `exllamav3/loader/engram_io.c` is compiled with `gcc` at first use into `~/.cache/kyojin/engram_io` (`XDG_CACHE_HOME` moves it). When `gcc` is missing or the build fails, the server prints one line and uses the Python reader, which does the same reads more slowly (`HY4_ENGRAM_NATIVE_IO=0` selects it directly).
 
-`--num-draft` is the number of MTP drafts per round (3 by default). Memory: the K buffers are sized by `-c` (about 0.1 MB per position).
+`--num-draft` is the number of MTP drafts per round (3 by default). Memory: the K buffers are sized by `-c` (about 0.1 MB per position); see Supported context for the measured totals.
 
 ## Supported context
 
 64K tokens (`-c 65536`, the command above). Speed and passkey retrieval are measured on the release build at 4K, 16K, 32K and 64K. Longer prompts are refused with a context-length error.
 
-128K (`-c 131072`) is opt-in and not measured on the release build. Memory: the K buffers grow with `-c`, and at `-c 131072` (fp32 KV) the loaded server already reached 110.4 GiB of GTT and a minimum of 0.9 GiB of available memory on a 128 GB machine. Close other large processes first; if memory runs out, use a smaller `-c`.
+Memory at the default `-c 65536`, measured through a full run (4K to 64K spec, passkey, plain): GTT peak 102.7 GiB, minimum available memory 0.9 GiB, no GPU fault. The model itself (weights and buffers) fills a 128 GB machine, so the margin is about 1 GiB at any `-c`: run it on a 128 GB Strix Halo machine with nothing else large resident, and close other GPU or memory-heavy apps first.
+
+128K (`-c 131072`) is opt-in. At load, fp32 KV, the server reached 110.4 GiB of GTT (7.7 GiB more than the 64K peak). It was not measured under a 128K prefill on the release build; if memory runs out, use a smaller `-c`.
 
 ## Known limits
 
