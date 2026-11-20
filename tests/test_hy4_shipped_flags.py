@@ -46,3 +46,25 @@ def test_apply_env_keeps_user_values():
     body = src[src.index("def apply_env"):]
     body = body[:body.index("\ndef ", 10)]
     assert "os.environ.setdefault(k, v)" in body
+
+
+# ---- 1.9.2: opt-in fp8 KV (long context) and the head-blocked attend that reads it
+
+
+def _read(path):
+    return open(os.path.join(TREE, path)).read()
+
+
+def test_kv_fp8_is_off_by_default_and_not_shipped():
+    """-c 65536 keeps the fp32 cache: HY4_KV_FP8 is not in SHIPPED_ENV and its code default is 0 (the long-context option is the user's env)"""
+    assert "HY4_KV_FP8" not in _shipped_env()
+    assert re.search(r'environ\.get\("HY4_KV_FP8", "0"\) == "1"', _read("exllamav3/loader/step_graph.py"))
+
+
+def test_head_blocked_attend_defaults_and_switches():
+    """HY4_LC_HB defaults on and HY4_LC_HB=0 switches it off; it can only run on the fp8 cache (qf), so it is on by default only when HY4_KV_FP8 is on"""
+    src = _read("exllamav3/loader/lc_sparse.py")
+    assert re.search(r'HB_ON = os\.environ\.get\("HY4_LC_HB", "1"\) == "1"', src)
+    assert re.search(r'HB_SPLIT = int\(os\.environ\.get\("HY4_LC_HB_SPLIT", "-1"\)\)', src)
+    assert "HY4_LC_HB" not in _shipped_env() and "HY4_LC_HB_SPLIT" not in _shipped_env()
+    assert len(re.findall(r"if qf and HB_ON", src)) == 2, "both head-blocked launches must be gated by the fp8 cache flag qf"

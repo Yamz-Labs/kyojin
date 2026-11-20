@@ -22,8 +22,8 @@ except Exception:
 
 CHECK = os.environ.get("HY4_LC_CHECK", "0") == "1"          # eager (non-captured) calls also run the dense torch selection and count differing row sets (debug / gate)
 STATS = {"rows": 0, "diff_rows": 0, "diff_groups": 0, "max_gap": 0.0}
-HB_ON = os.environ.get("HY4_LC_HB", "0") == "1"            # fp8 cache: head-blocked sparse attend (one key decode for HB heads); 0 = the one-head kernel
-HB_SPLIT = int(os.environ.get("HY4_LC_HB_SPLIT", "0"))      # with HY4_LC_HB: key splits of the head-blocked kernel (flash-decoding combine); n >= 1 fixed, -1 auto (16 rows <= 3, else 8), 0 = one program per (row, head block)
+HB_ON = os.environ.get("HY4_LC_HB", "1") == "1"            # fp8 cache only (HY4_KV_FP8=1; the fp32 cache never reaches it): head-blocked sparse attend (one key decode for HB heads); HY4_LC_HB=0 = the one-head kernel
+HB_SPLIT = int(os.environ.get("HY4_LC_HB_SPLIT", "-1"))      # with HY4_LC_HB: key splits of the head-blocked kernel (flash-decoding combine); n >= 1 fixed, -1 auto (16 rows <= 3, else 8), 0 = one program per (row, head block)
 HB = 16
 HB_BN = int(os.environ.get("HY4_LC_HB_BN", "16"))
 ENABLED = os.environ.get("HY4_LC_SPARSE", "0") == "1"      # decode: indexer layers use select_groups + sparse_mla_attend instead of the dense allow mask

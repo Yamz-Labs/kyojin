@@ -63,6 +63,7 @@ The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, bot
 | `HY4_NGRAM_EXT`, `HY4_NGRAM_MIN` | 4, 8 | prompt-lookup rows added to the MTP drafts when the last 8 tokens occurred before |
 | `HY4_MTP_HEAD` | q5k | head of the MTP drafts |
 | `HY4_MLA_HB` | 1 | decode attention: one kernel reads each K tile once for 16 heads (fp16 `tl.dot`); `HY4_MLA_HB_SPLIT` adds a key-split path for few-row steps |
+| `HY4_KV_FP8` | 0 | opt-in fp8 e4m3 latent K cache of the full-attention layers for `-c 131072` / `-c 262144` (see "Long context option"); `HY4_LC_HB` (1) and `HY4_LC_HB_SPLIT` (-1) select the head-blocked sparse attend that reads it |
 | `HY4_BG_DOT`, `HY4_HEAD_DOT` | 1 | k_b / v_b and output-head products of the verify rows on `tl.dot` (used from 5 rows for k_b / v_b, from 3 rows for the head) |
 | `HY4_RG_F16` | 1 | fp16 resident router weights for the router mat-vec, fp32 accumulate |
 | `HY4_KV_FUSED_MAXT` | 16 | the fused K-row / q-rope kernels take verify rows up to this count (was 1 row) |
@@ -97,6 +98,20 @@ Memory, measured on a 128 GB Strix Halo machine with nothing else large resident
 The free memory is steady, not a load transient: at the default `-c 65536` it stays at about 16 GiB, and 15 GiB during a 64K prefill (the page cache holds 8 to 10 GiB at ready). A smaller `-c` leaves more. Close other GPU or memory-heavy apps first.
 
 128K (`-c 131072`) is opt-in. At load, fp32 KV, the server reached 110.4 GiB of GTT and the free memory fell to 7.8 GiB. It was not measured under a 128K prefill on the release build; if memory runs out, use a smaller `-c`.
+
+### Long context option: fp8 KV (`HY4_KV_FP8=1`, off by default)
+
+Default (`-c 65536`): fp32 latent K cache, the measured quality. For `-c 131072` and `-c 262144`, switch the fp8 cache on: `HY4_KV_FP8=1 python tools/hy4/serve.py ... -c 131072`. The 12 trunk full-attention layers keep their latent K in e4m3 (512 bytes) + one fp32 scale per token + bf16 rope dims: 644 bytes per token and layer instead of 2304. The MTP layer and the 30 window layers stay fp32. The sparse decode kernel decodes e4m3 itself; prefill and the other paths read a dequantised copy of the keys of the call. With the fp8 cache the head-blocked sparse attend (`HY4_LC_HB`, default 1: one key decode shared by 16 heads, split-K with `HY4_LC_HB_SPLIT=-1` auto) is on; it never runs on the fp32 cache. `HY4_LC_HB=0` returns to the one-head kernel; `HY4_KV_FP8=0` (or unset) returns to the fp32 cache.
+
+Latent K cache, analytic (12 trunk full-attention layers in fp8 or fp32, the MTP layer in fp32, 30 window layers at 1024 rows; the 84.3 GiB of weights and 3 GiB of graph pools and activations are not included):
+
+| `-c` | fp32 KV | fp8 KV |
+|---|---|---|
+| 65536 | 1.9 GiB | 0.7 GiB |
+| 131072 | 3.7 GiB | 1.3 GiB |
+| 262144 | 7.4 GiB | 2.5 GiB |
+
+Estimated total memory with sparse prefill (chunk 8192 at 128K and 256K, fp32 indexer pool, full draft states): about 92 GiB at `-c 131072` and 97 GiB at `-c 262144` with fp8 KV. With fp32 KV and dense prefill the same model gives 101 and 114 GiB, and it read 100.9 GiB for the 128K row that measured 110.4 GiB of GTT: read the estimates as a lower bound. Quality, measured on the lane tree: fp8 KV + head-blocked attend, long-text NLL change -0.0025 +- 0.019 against a noise null of 0.0263. Not yet measured on this build: served speed, memory peak and passkey at 128K and 256K.
 
 ## Uncensor preset (opt-in)
 

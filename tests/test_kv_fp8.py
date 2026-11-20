@@ -55,5 +55,59 @@ def test_kernel_matches_dequant():
     c = LS.sparse_mla_attend(ql, qp, kn[:, :R].contiguous(), kn[:, R:].contiguous(), pos, sel, 1 / 16, sinks)
     print("fp8 vs exact attend max abs diff", (a - c).abs().max().item(), "out scale", c.abs().mean().item())
 
+def test_head_blocked_matches_one_head():
+    """HY4_LC_HB kernels (single pass and split-K with the combine) vs the one-head fp8 kernel on the same cache (Triton interpreter on CPU)"""
+    if DEV == "cpu" and os.environ.get("TRITON_INTERPRET") != "1":
+        return
+    pkg = types.ModuleType("kvhb_pkg"); pkg.__path__ = [os.path.join(here, "..", "exllamav3", "loader")]; sys.modules["kvhb_pkg"] = pkg      # package context for the relative import of ref_fused (combine kernel)
+    import importlib
+    LS = importlib.import_module("kvhb_pkg.lc_sparse")
+    g = torch.Generator().manual_seed(2)
+    T, H, R, P, N, kp, nt = 3, 16, 512, 64, 400, 4, 24
+    kn = (torch.randn(N, R + P, generator=g) * 1.5).to(DEV)
+    kv = KV.Fp8KV(N, R, P, DEV); kv.write(0, kn)
+    ql = torch.randn(T, H, R, generator=g).to(DEV); qp = torch.randn(T, H, P, generator=g).to(DEV); sinks = torch.randn(H, generator=g).to(DEV)
+    pos = torch.tensor([300, 301, 350], device=DEV)
+    idx = torch.stack([torch.randperm(N // kp - 3, generator=g)[:nt].sort().values for _ in range(T)]).to(torch.int32).to(DEV)
+    sel = LS.SparseSel(idx, torch.full((T,), nt, dtype=torch.int32, device=DEV), kp, True)
+    old = (LS.HB_ON, LS.HB_SPLIT)
+    try:
+        LS.HB_ON = False
+        ref = LS.sparse_mla_attend(ql, qp, kv.lat, kv.pe, pos, sel, 1 / 16, sinks, scl=kv.sc)
+        for split in (0, -1, 3):
+            LS.HB_ON, LS.HB_SPLIT = True, split
+            out = LS.sparse_mla_attend(ql, qp, kv.lat, kv.pe, pos, sel, 1 / 16, sinks, scl=kv.sc)
+            err = (out - ref).abs().max().item()
+            assert err < 5e-3, (split, err)      # fp16 operands of tl.dot vs the fp32 one-head kernel
+    finally:
+        LS.HB_ON, LS.HB_SPLIT = old
+
+G = 2 ** 30
+
+def kv_plan_gib(n, fp8, full=13, swa=30, ring=1024, lat=576):
+    """latent K cache of Hy4-flash in GiB: `full` full-attention layers (12 trunk + the MTP layer, which stays fp32), `swa` window layers on a `ring` rows ring (fp32)"""
+    k = (12 * n * KV.Fp8KV(1, 512, 64, "cpu").nbytes() + n * lat * 4) if fp8 else full * n * lat * 4
+    return (k + swa * ring * lat * 4) / G
+
+def test_sizing_math():
+    assert KV.Fp8KV(1, 512, 64, "cpu").nbytes() == 644            # bytes per token and layer, fp32 is 2304
+    got = {n: (round(kv_plan_gib(n, False), 1), round(kv_plan_gib(n, True), 1)) for n in (131072, 262144)}
+    assert got == {131072: (3.7, 1.3), 262144: (7.4, 2.5)}, got      # the doc table of doc/hy4.md
+    assert kv_plan_gib(65536, True) < kv_plan_gib(65536, False) / 2.5
+    for n in (65536, 131072, 262144):                                # -c 262144 with fp8 stays under the 128 GB machine with room for weights (84.3) + pools / activations (3)
+        assert 84.3 + 3.0 + kv_plan_gib(n, True) < 100.0
+
+def test_roundtrip_cpu_rows_and_scale():
+    """quantise on write, per-row scale: a row of 1e-3 magnitudes and a row of 1e3 magnitudes both keep ~2^-4 relative accuracy; an all-zero row stays zero"""
+    kn = torch.zeros(3, 576)
+    g = torch.Generator().manual_seed(3)
+    kn[0, :512] = torch.randn(512, generator=g) * 1e-3
+    kn[1, :512] = torch.randn(512, generator=g) * 1e3
+    kv = KV.Fp8KV(3, 512, 64, "cpu"); kv.write(0, kn)
+    back = kv.dequant32()
+    for r in (0, 1):
+        assert ((back[r, :512] - kn[r, :512]).abs().max() / kn[r, :512].abs().max()) < 0.07
+    assert torch.count_nonzero(back[2]) == 0
+
 if __name__ == "__main__":
-    test_dq8_matches_torch(); test_roundtrip(); test_dequant16_cat(); test_kernel_matches_dequant(); print("kv_fp8 ok")
+    test_dq8_matches_torch(); test_roundtrip(); test_dequant16_cat(); test_kernel_matches_dequant(); test_head_blocked_matches_one_head(); test_sizing_math(); test_roundtrip_cpu_rows_and_scale(); print("kv_fp8 ok")
