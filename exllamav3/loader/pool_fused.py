@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+from . import rope_rows as _RR
+
 ENABLED = False
 
 
@@ -36,7 +38,7 @@ def _pooled(vgb, ape, g0, offs, k: tl.constexpr, d: tl.constexpr, VR: tl.constex
 
 
 @triton.jit
-def _pool_kernel(vgb, pos, ape, pnw, cosb, sinb, pool, eps, k: tl.constexpr, d: tl.constexpr, rd: tl.constexpr, VR: tl.constexpr):
+def _pool_kernel(vgb, pos, ape, pnw, cosb, sinb, pool, eps, k: tl.constexpr, d: tl.constexpr, rd: tl.constexpr, VR: tl.constexpr, TROW: tl.constexpr = 0):
     t = tl.program_id(0)
     p0 = tl.load(pos + t)
     gi = p0 // k
@@ -54,14 +56,21 @@ def _pool_kernel(vgb, pos, ape, pnw, cosb, sinb, pool, eps, k: tl.constexpr, d: 
     ob = oa + 1
     na = _pooled(vgb, ape, g0, oa, k, d, VR) * r * tl.load(pnw + oa)
     nb = _pooled(vgb, ape, g0, ob, k, d, VR) * r * tl.load(pnw + ob)
-    c = tl.load(cosb + g0 * h + ii)
-    s = tl.load(sinb + g0 * h + ii)
+    if TROW:                                  # HY4_ROPE_POS: cos / sin rows of the group start of each row [T, h]
+        c = tl.load(cosb + t * h + ii)
+        s = tl.load(sinb + t * h + ii)
+    else:
+        c = tl.load(cosb + g0 * h + ii)
+        s = tl.load(sinb + g0 * h + ii)
     tl.store(pool + gi * d + oa, na * c - nb * s)
     tl.store(pool + gi * d + ob, na * s + nb * c)
 
 
 def pool_update(ix, pos):
     """pos [T] long (device): update the pool row of each position's group from ix.vgb (the new rows are already in place)"""
-    cs, sn = ix._table(ix._max_pos)
+    if _RR.ENABLED:
+        cs, sn = _RR.ix_rows(ix.base, ix.rope_dim, pos, ix.k)
+    else:
+        cs, sn = ix._table(ix._max_pos)
     ape = ix.w["ape"]
-    _pool_kernel[(pos.shape[0],)](ix.vgb, pos, ape, ix.w["pool_norm"], cs, sn, ix.pool, ix.eps, k=ix.k, d=ix.d, rd=ix.rope_dim, VR=getattr(ix, "vg_ring", 0))
+    _pool_kernel[(pos.shape[0],)](ix.vgb, pos, ape, ix.w["pool_norm"], cs, sn, ix.pool, ix.eps, k=ix.k, d=ix.d, rd=ix.rope_dim, VR=getattr(ix, "vg_ring", 0), TROW=int(_RR.ENABLED))

@@ -385,7 +385,7 @@ def _pf_indexer_forward(self, x, qr, n_keys=None):
         m = buf.shape[0] // k
         if m:
             if self.P + m > self.pool.shape[0]:
-                big = torch.empty(max(2 * self.pool.shape[0], self.P + m), d, device=self.dev)
+                big = torch.empty(max(2 * self.pool.shape[0], self.P + m), d, device=self.dev, dtype=self.pool.dtype)
                 big[:self.P] = self.pool[:self.P]
                 self.pool = big
             with t("f ixk: pool groups"):

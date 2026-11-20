@@ -53,6 +53,10 @@ def _rms(x, w, eps):
 from . import pool_fused as _PF
 from . import lc_sparse as _LS
 _PF.ENABLED = os.environ.get("HY4_IDX_POOLK", "0") == "1"
+from . import kv_fp8 as _KV8
+from . import rope_rows as _RR
+POOL16 = os.environ.get("HY4_IX_POOL16", "0") == "1"      # indexer pooled keys stored in fp16 (half the bytes; the prefill scorer already scores with the fp16 copy; selection reads fp16, top-k set overlap gate in tests/test_kv10.py)
+KV_FP8 = os.environ.get("HY4_KV_FP8", "0") == "1"      # latent K cache of the full-attention layers in fp8 e4m3 + per-token scale (+ bf16 rope dims)
 
 
 def indexer_static_init(ix, cap):
@@ -60,9 +64,11 @@ def indexer_static_init(ix, cap):
     k, d = ix.k, ix.d
     rows = cap // k
     if ix.pool.shape[0] < rows:
-        big = torch.zeros(rows, d, device=ix.dev)
+        big = torch.zeros(rows, d, device=ix.dev, dtype=torch.float16 if POOL16 else ix.pool.dtype)
         big[:ix.P] = ix.pool[:ix.P]
         ix.pool = big
+    elif POOL16 and ix.pool.dtype != torch.float16:
+        ix.pool = ix.pool.half()
     vgb = getattr(ix, "vgb", None)             # per-position (value | gate) rows [cap, 2d]: a rejected / re-run position just overwrites its row
     if vgb is None:
         ix.vg_ring = VG_RING if (VG_RING and VG_RING < cap) else 0       # HY4_SWA_RING: only the open group (+ the rows of one batch call) is ever read: slot = position % VG_RING
@@ -71,7 +77,8 @@ def indexer_static_init(ix, cap):
         m = ix.vg.shape[0]
         vgb[(torch.arange(ix.n - m, ix.n, device=ix.dev) % ix.vg_ring) if ix.vg_ring else slice(ix.n - m, ix.n)] = ix.vg
     ix._max_pos = cap
-    ix._table(cap)
+    if not _RR.ENABLED:             # HY4_ROPE_POS: the rope rows of a call come from its positions, no table to the full context
+        ix._table(cap)
 
 
 IX_GV_FIRES = _LVF.Fires("draft_ix_gv", hit="gv", miss="gemm")      # draft indexer matrices (ix has the gv attribute): gv = mat-vec calls, gemm = {reason: n} of the calls that kept the GEMM (the trunk's indexer has no gv attribute and is not counted)
@@ -108,7 +115,7 @@ def indexer_keys_static(ix, x, pos, ar):
         v, g = rows[..., :d].reshape(-1, k, d), rows[..., d:].reshape(-1, k, d)
         p = (torch.softmax(g + ix.w["ape"][None], dim=1) * v).sum(1)
         pooled = ix._rope(_rms(p, ix.w["pool_norm"], ix.eps), g0)
-        ix.pool.index_copy_(0, pos // k, pooled)            # a group still open holds partial data here; it stays masked until it is complete
+        ix.pool.index_copy_(0, pos // k, pooled.to(ix.pool.dtype))            # a group still open holds partial data here; it stays masked until it is complete
 
 
 @torch.no_grad()
@@ -139,7 +146,7 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
         if _LS.CHECK and not torch.cuda.is_current_stream_capturing():
             _LS.check_rows(iq, wt, ix.pool, pos, Pb, ix.n_top, k, sel)
         return sel
-    kq = torch.relu(torch.einsum("nhd,pd->nhp", iq, ix.pool[:Pb]))
+    kq = torch.relu(torch.einsum("nhd,pd->nhp", iq, ix.pool[:Pb].to(iq.dtype)))
     sc = (kq * wt[:, :, None]).sum(1)
     gend = ar[:Pb] * k + (k - 1)
     vis = (gend[None] < pos[:, None]) if ix.tail else (gend[None] <= pos[:, None])
@@ -192,6 +199,7 @@ class _GS:
         self.inp = torch.zeros(2, TM, dtype=torch.long, device=dev)     # row 0 tokens, row 1 positions (first T columns used)
         self.ar = torch.arange(cap, device=dev)
         self.eng_raw = self.eng_valid = None
+        self._pv = None
 
     @property
     def tok(self):
@@ -199,7 +207,14 @@ class _GS:
 
     @property
     def pos(self):
-        return self.inp[1, :self.T]
+        """the position row of this step: ONE view object per segment body (new_pos() starts a new one), so the rope rows computed from it (HY4_ROPE_POS, memo on the object) are shared by the layers"""
+        if self._pv is None or self._pv.shape[0] != self.T:
+            self._pv = self.inp[1, :self.T]
+            self._pv._rope_ok = True
+        return self._pv
+
+    def new_pos(self):
+        self._pv = None
 
     # -- Engram: rows are staged on the host before the replay, decoded + applied inside the graph
     def engram(self, fw, i, x):
@@ -221,6 +236,9 @@ class _GS:
         if ring:                                  # window layer: ring buffer, slot = position % ring; attention reads the whole ring through absolute positions
             b.index_copy_(0, self.pos % ring, kn)
             return b
+        if b.__class__.__name__ == "Fp8KV":           # HY4_KV_FP8: quantise + scatter the rows
+            b.write_pos(self.pos, kn)
+            return b[:self.Nb]
         b.index_copy_(0, self.pos, kn)
         return b[:self.Nb]
 
@@ -229,9 +247,9 @@ class _GS:
         from . import attn_eager as AE, kv_fused as KVF
         b = _ns.state(self.fw).kv[i]
         c = mla._q(cur, "wkv_a") @ mla.wkv_a.T
-        tab = AE.table(mla.rope_dim, mla.theta, self.fw.dev, pos)
+        tab, per_row = AE.table_rows(mla.rope_dim, mla.theta, self.fw.dev, pos)
         ring = getattr(mla, "kv_ring", 0)
-        KVF.write_row(c, mla.kv_a_norm, tab, pos, b, mla.R, mla.rope_dim, mla.eps, ring=ring)
+        KVF.write_row(c, mla.kv_a_norm, tab, pos, b, mla.R, mla.rope_dim, mla.eps, ring=ring, per_row=per_row)
         return b if ring else b[:self.Nb]
 
     def indexer(self, fw, i, cur, qr, N):
@@ -290,6 +308,12 @@ class GraphDecoder:
             if getattr(m, "kv_ring", 0):
                 if b is None or b.shape[0] != m.kv_ring:
                     st.kv[i] = torch.zeros(m.kv_ring, 512 + 64, dtype=torch.float32, device=fw.dev)
+                continue
+            if KV_FP8 and not m.swa and fw._layer(i).ix and not isinstance(b, _KV8.Fp8KV):          # full-attention layer: fp8 latent cache
+                nb = _KV8.Fp8KV(self.cap, 512, 64, fw.dev)
+                if b is not None:
+                    nb.write(0, b[:min(b.shape[0], self.cap)])
+                st.kv[i] = nb
                 continue
             if b is None or b.shape[0] < self.cap:
                 nb = torch.zeros(self.cap, 512 + 64, dtype=torch.float32, device=fw.dev) if b is None else torch.zeros(self.cap, b.shape[1], dtype=b.dtype, device=fw.dev)
@@ -361,6 +385,7 @@ class GraphDecoder:
     def body_seg(self, si, x, bnds):
         fw, gs = self.fw, self.gs
         lo, hi = bnds[si]
+        gs.new_pos()                  # every segment body (eager warm-up, graph capture) starts its own position view: no rope rows memo outlives a capture
         if si == 0:
             e = _ns.gather_dequant_q8_0(self.st.table, gs.tok)
             if PERT is not None:                      # noise-ensemble null arm: 1e-6 fixed-seed perturbation of the embedding output (quality gate, never in production)
@@ -443,6 +468,7 @@ class GraphDecoder:
                 cgs.append(cg)
         finally:
             fw._gs = None
+            gs.new_pos()
         g = self.graphs[key] = (cgs, x)
         self.stats["captures"] += 1
         self.stats["capture_s"] += time.perf_counter() - t_cap

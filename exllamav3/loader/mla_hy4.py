@@ -5,6 +5,7 @@ Only relative import: loader/engram_rows.py (tests load both by path)."""
 from __future__ import annotations
 import importlib.util, os
 import torch
+from . import kv_fp8 as _KV8
 from .engram_rows import load_dense, _dequant_q8_0, q8_0_roundtrip, rms
 from . import ref_fused as _rf
 from . import mla_bgemv as _BG
@@ -279,8 +280,11 @@ class Hy4MLA:
             with tm.t("f ck: kv decompress"):
                 klo = max(0, N - T - self.window + 1) if self.window else 0
                 kc = kcache[klo:]
-                lat16 = kc[:, :R].clamp(-65504.0, 65504.0).half().contiguous()
-                pe16 = kc[:, R:].clamp(-65504.0, 65504.0).half().contiguous()
+                if isinstance(kc, _KV8.Fp8KV):
+                    lat16, pe16 = kc.dequant16()
+                else:
+                    lat16 = kc[:, :R].clamp(-65504.0, 65504.0).half().contiguous()
+                    pe16 = kc[:, R:].clamp(-65504.0, 65504.0).half().contiguous()
                 kk, vv = _pu.kv_decompress(lat16, pe16, self._kvw(), H)
             bias = getattr(allow, "_ck_bias", None) if klo == 0 else None
             if allow is not None and bias is None:
@@ -325,6 +329,8 @@ class Hy4MLA:
         qa, self._qa_pre = self._qa_pre, None
         if allow.__class__.__name__ == "PfSparse":
             if self._f16_ok(cur) and self.H % 32 == 0:
+                if isinstance(kcache, _KV8.Fp8KV):      # HY4_KV_FP8: the sparse prefill kernel reads fp16 rows
+                    kcache = kcache.dequant16_cat()
                 return self.attend16(cur, pos, kcache, allow, qa)
             if not (PRIME_SPARSE and cur.is_cuda):
                 allow = allow.to_dense()          # else: generic path below, sparse gather (draft-cache fill at long context: a dense [T, N] mask costs O(T x N) and compiles N-sized kernels)
@@ -332,6 +338,9 @@ class Hy4MLA:
             r = self.attend_ck(cur, pos, kcache, allow, qa)
             if r is not None:
                 return r
+        kv8 = isinstance(kcache, _KV8.Fp8KV)
+        if kv8 and allow.__class__.__name__ != "SparseSel":      # fp8 latent cache: everything but the sparse decode kernel works on a dequantised copy
+            kcache, kv8 = kcache.dequant32(), False
         if self._f16_ok(cur):
             return self.attend16(cur, pos, kcache, allow, qa)
         with tm.t("attn proj"):
@@ -347,7 +356,8 @@ class Hy4MLA:
                 o = (_pa.mla_flash if PF_ATTN_FLASH else _pa.mla_banded)(qlat, qpe, kcache, kcache.shape[0] - T, self.scale, self.sinks, self.window, allow)
             elif allow.__class__.__name__ == "SparseSel":       # HY4_LC_SPARSE: decode rows, exact selected groups + tail only
                 from . import lc_sparse as _LS
-                o = _LS.sparse_mla_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, allow, self.scale, self.sinks)
+                o = _LS.sparse_mla_attend(qlat, qpe, kcache.lat, kcache.pe, pos, allow, self.scale, self.sinks, scl=kcache.sc) if kv8 else \
+                    _LS.sparse_mla_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, allow, self.scale, self.sinks)
             elif _rf.ENABLED:       # HY4_REF_FUSED=1: one online-softmax kernel (sinks / window / allow inside)
                 o = _rf.mla_sink_attend(qlat, qpe, kcache[:, :self.R], kcache[:, self.R:], pos, kpos, self.scale, self.sinks, self.window, allow,
                                         kpos_is_arange=getattr(self, "kpos_arange", False), ring=getattr(self, "ring_call", 0))

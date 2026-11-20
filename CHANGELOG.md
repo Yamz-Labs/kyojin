@@ -19,6 +19,12 @@ Hy4-flash server hotfix: tool calling, a quiet exit when the client leaves, requ
 - Docs: the README test command uses the right port per server (Hy4-flash is on 8300) and the Hy4 example answers directly (`reasoning_effort` `no_think`); README states that reasoning goes to `reasoning_content`; README version line, CHANGELOG 1.9.1 wording and the venv command (`python3.12`) are consistent across the install docs.
 - New: `tools/hy4/tool_smoke.py`, a served smoke test of tool calling and client disconnect. New CPU tests: `tests/test_hy4_tools_cpu.py`, `tests/test_hy4_compat_cpu.py`, `tests/test_strix_scripts_cpu.py`.
 
+## Unreleased (1.9.3)
+
+- KV footprint: `HY4_KV_FP8_MTP=1` keeps the draft layer's K cache in fp8 too (needs `HY4_KV_FP8=1`), `HY4_KV_COMPACT=1` sets fp8 trunk + draft cache + the 1024-row window ring in one switch (about 11 KB per token instead of 113 KB); all off by default. `tools/hy4/kv_bytes.py` prints the per-component table, `tools/hy4/kv_bytes_probe.py` measures it. CPU tests: `tests/test_kv_bytes.py`.
+- KV footprint 2: `HY4_IX_POOL16=1` (fp16 indexer pool, -832 bytes per token) and `HY4_ROPE_POS=1` (rope cos / sin rows evaluated from the positions of a call, no tables to the full context, -1280 bytes per token), both part of `HY4_KV_COMPACT=1` now: 9220 bytes per token (9.0 KB, 9.1 KB at 1M) instead of 11332. Off by default. CPU tests (including the Triton interpreter): `tests/test_kv10.py`; GPU gate: `tools/hy4/step/kv10_driver.py`.
+- Long context: opt-in fp8 e4m3 latent K cache for the full-attention layers (`HY4_KV_FP8=1`, off by default; 644 bytes per token and layer instead of 2304) and the head-blocked split-K sparse attend that reads it (`HY4_LC_HB`, `HY4_LC_HB_SPLIT`; only runs on the fp8 cache). `-c 65536` keeps the fp32 cache. Guide: `doc/hy4.md`, "Long context option". CPU tests: `tests/test_kv_fp8.py`, `tests/test_hy4_shipped_flags.py`.
+
 ## 1.9.1
 
 Hy4-flash: faster prefill at every depth and faster decode on the same prompt (the 32K served decode cell reads lower than 1.9.0 because that prompt's tau and generated text differ; see the README table note), decensor preset, warm-up fix. Every lever below ships on and has its own switch: `HY4_<FLAG>=0` in the environment restores the 1.9.0 behaviour of that lever. The flag table is in `doc/env_vars.md`; numbers are in the release notes.

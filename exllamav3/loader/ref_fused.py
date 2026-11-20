@@ -16,6 +16,11 @@ ENABLED = os.environ.get("HY4_REF_FUSED", "0") == "1"
 HB = os.environ.get("HY4_MLA_HB", "0") == "1"      # head-batched fp16 tl.dot decode attention (opt-in)
 HB_BN = int(os.environ.get("HY4_MLA_HB_BN", "16"))
 HB_NW = int(os.environ.get("HY4_MLA_HB_NW", "4"))
+HB_ROWS = int(os.environ.get("HY4_MLA_HB_ROWS", "0"))      # >= 2: verify rows (2..HB_ROWS) of a head group share ONE pass over the K rows (M = 16 heads x rows in the tl.dot; default 0 = off)
+HB_ROWS_NW = int(os.environ.get("HY4_MLA_HB_ROWS_NW", "8"))
+HB_ROWS_BN = int(os.environ.get("HY4_MLA_HB_ROWS_BN", "16"))
+HB_ROWS_BH = int(os.environ.get("HY4_MLA_HB_ROWS_BH", "8"))      # heads per program of the rows kernel (M = BH x RG; M = 64 spilled registers: 1.4 KB scratch per thread, dec7)
+HB_ROWS_RG = int(os.environ.get("HY4_MLA_HB_ROWS_RG", "4"))      # rows per program (power of two <= 4): more rows are split over the grid
 HB_SPLIT = int(os.environ.get("HY4_MLA_HB_SPLIT", "0"))      # key splits per (row, head group): 0 = auto (fill the GPU: ~96 programs), 1 = off, n = fixed
 MAX_T = 16                  # rows per call handled by the attention kernel (decode / short verify); more = prefill -> torch GEMMs
 CLAMP_MIN = 6.103515625e-5  # the old router's `sum.clamp(min=...)`
@@ -267,6 +272,68 @@ if triton is not None:
         tl.store(WL + wi * BH + tl.arange(0, BH), l)
 
     @triton.jit
+    def _mla_hb_rows_split_kernel(QL, QP, CK, KP, QPOS, SINK, WA, WM, WL, T, N, scale, window,
+                                  s_ql_t, s_ql_h, s_qp_t, s_qp_h, s_ck, s_kp,
+                                  R: tl.constexpr, P: tl.constexpr, BH: tl.constexpr, RG: tl.constexpr, BN: tl.constexpr, HAS_WIN: tl.constexpr, RING: tl.constexpr,
+                                  S: tl.constexpr):
+        """_mla_hb_split_kernel with RG query rows per program: M = RG x BH tile rows (row i = (t0 + i // BH, head h0 + i % BH)); every K tile is loaded once for all RG rows (verify rows
+        read the same latent K). Row t sees keys <= qpos[t] (and the window); padded rows (t >= T) see nothing. Grid (RGroups, H / BH, S); partials land in the layout of
+        _mla_hb_combine ((t, g, split) major)."""
+        M: tl.constexpr = RG * BH
+        rg = tl.program_id(0)
+        g = tl.program_id(1)
+        sp = tl.program_id(2)
+        NG = tl.num_programs(1)
+        i = tl.arange(0, M)
+        tt = rg * RG + i // BH
+        hh = g * BH + i % BH
+        tok = tt < T
+        offr = tl.arange(0, R)
+        offp = tl.arange(0, P)
+        q = tl.load(QL + tt[:, None] * s_ql_t + hh[:, None] * s_ql_h + offr[None, :], mask=tok[:, None], other=0.0).to(tl.float16)
+        qp = tl.load(QP + tt[:, None] * s_qp_t + hh[:, None] * s_qp_h + offp[None, :], mask=tok[:, None], other=0.0).to(tl.float16)
+        qpos = tl.load(QPOS + tt, mask=tok, other=-1)
+        first = (sp == 0)
+        m = tl.where(first, tl.load(SINK + hh).to(tl.float32), -1e30)
+        l = tl.where(first, 1.0, 0.0) + tl.zeros([M], dtype=tl.float32)
+        acc = tl.zeros([M, R], dtype=tl.float32)
+        qlast = tl.load(QPOS + tl.minimum(rg * RG + RG - 1, T - 1))
+        qfirst = tl.load(QPOS + rg * RG)
+        lo = 0
+        hi = tl.minimum(N, qlast + 1)
+        if HAS_WIN:
+            lo = tl.maximum(0, qfirst - window + 1) // BN * BN
+        nblk = tl.maximum(0, (hi - lo + BN - 1) // BN)
+        per = (nblk + S - 1) // S
+        b0 = tl.minimum(nblk, sp * per)
+        b1 = tl.minimum(nblk, b0 + per)
+        for n0 in range(lo + b0 * BN, lo + b1 * BN, BN):
+            offn = n0 + tl.arange(0, BN)
+            inb = offn < N
+            vis = inb[None, :] & (offn[None, :] <= qpos[:, None])
+            if HAS_WIN:
+                vis = vis & ((qpos[:, None] - offn[None, :]) < window)
+            if RING > 0:
+                offs = offn % RING
+            else:
+                offs = offn
+            ck = tl.load(CK + offs[:, None] * s_ck + offr[None, :], mask=inb[:, None], other=0.0).to(tl.float16)
+            kp = tl.load(KP + offs[:, None] * s_kp + offp[None, :], mask=inb[:, None], other=0.0).to(tl.float16)
+            s = (tl.dot(q, tl.trans(ck)) + tl.dot(qp, tl.trans(kp))) * scale
+            s = tl.where(vis, s, float("-inf"))
+            mn = tl.maximum(m, tl.max(s, axis=1))
+            alpha = tl.exp(m - mn)
+            pr = tl.exp(s - mn[:, None])
+            l = l * alpha + tl.sum(pr, axis=1)
+            acc = acc * alpha[:, None] + tl.dot(pr.to(tl.float16), ck)
+            m = mn
+        wi = (tt * NG + g) * S + sp
+        tl.store(WA + wi[:, None] * (BH * R) + (i % BH)[:, None] * R + offr[None, :], acc, mask=tok[:, None])
+        tl.store(WM + wi * BH + i % BH, m, mask=tok)
+        tl.store(WL + wi * BH + i % BH, l, mask=tok)
+
+
+    @triton.jit
     def _mla_hb_combine(WA, WM, WL, O, s_o_t, s_o_h, R: tl.constexpr, BH: tl.constexpr, S: tl.constexpr):
         """grid (T, H / BH): merge the S key-split partials (flash-decoding combine): O = sum_s e^(m_s - M) acc_s / sum_s e^(m_s - M) l_s"""
         t = tl.program_id(0)
@@ -306,6 +373,21 @@ def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, windo
         out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
         ng = H // 16
         S = HB_SPLIT if HB_SPLIT > 0 else min(16, max(1, -(-96 // (T * ng))))
+        if HB_ROWS >= 2 and 2 <= T <= HB_ROWS:
+            BHr = HB_ROWS_BH
+            RG = min(HB_ROWS_RG, triton.next_power_of_2(T))
+            nrg = -(-T // RG)
+            ngr = H // BHr
+            nblk = (-(-(window + RG) // HB_ROWS_BN) + 1) if window else -(-N // HB_ROWS_BN)      # key blocks one program can walk: never more splits than blocks
+            S = HB_SPLIT if HB_SPLIT > 0 else min(16, max(1, -(-96 // (nrg * ngr))), max(1, nblk // 2))
+            wa = torch.empty(T * ngr * S * BHr * R, dtype=torch.float32, device=q_lat.device)
+            wm = torch.empty(T * ngr * S * BHr, dtype=torch.float32, device=q_lat.device)
+            wl = torch.empty(T * ngr * S * BHr, dtype=torch.float32, device=q_lat.device)
+            _mla_hb_rows_split_kernel[(nrg, ngr, S)](q_lat, q_pe, ckv, k_pe, qpos, sinks.float().contiguous(), wa, wm, wl, T, (1 << 30) if ring else N, float(scale), int(window),
+                                                    q_lat.stride(0), q_lat.stride(1), q_pe.stride(0), q_pe.stride(1), ckv.stride(0), k_pe.stride(0),
+                                                    R=R, P=P, BH=BHr, RG=RG, BN=HB_ROWS_BN, HAS_WIN=bool(window), RING=int(ring), S=S, num_warps=HB_ROWS_NW)
+            _mla_hb_combine[(T, ngr)](wa, wm, wl, out, out.stride(0), out.stride(1), R=R, BH=BHr, S=S, num_warps=4)
+            return out
         if S > 1:
             wa = torch.empty(T * ng * S * 16 * R, dtype=torch.float32, device=q_lat.device)
             wm = torch.empty(T * ng * S * 16, dtype=torch.float32, device=q_lat.device)
