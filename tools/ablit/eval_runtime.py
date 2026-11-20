@@ -22,7 +22,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 import torch
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator
 torch.set_grad_enabled(False)
-harm = E.load_prompts(os.path.join(ROOT, "scratch/ablit/prompts/harmful_heldout.jsonl"), a.n)
+import prompt_cache as PC
+harm = E.load_prompts(PC.default_file("harmful_heldout.jsonl", os.path.join(ROOT, "scratch/ablit/prompts")), a.n)
 config = Config.from_directory(a.model)
 model = Model.from_config(config)
 tok = Tokenizer.from_config(config)

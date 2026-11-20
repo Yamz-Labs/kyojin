@@ -11,7 +11,8 @@ import triton.language as tl
 ENABLED = os.environ.get("HY4_ROUTER_GEMV", "0") == "1"
 MAXT = 8
 BN = int(os.environ.get("HY4_RG_BN", "4"))
-BK = int(os.environ.get("HY4_RG_BK", "256"))
+TUNE = os.environ.get("HY4_RG_TUNE", "0") == "1"    # tuned K block (dec8_micro, real GGUF shape, fp16 weights): 1024 instead of 256, T=1 26.8 -> 16.2 us, T=4 30.7 -> 17.8 us per launch, max rel err 1.6e-6 (summation order only)
+BK = int(os.environ.get("HY4_RG_BK", "1024" if TUNE else "256"))
 NW = int(os.environ.get("HY4_RG_NW", "4"))
 F16 = os.environ.get("HY4_RG_F16", "0") == "1"      # router weights stored fp16 (GGUF F32 -> fp16: rel 5e-4 per weight, logits ~1e-5): half the bytes of the 41 gemvs; fp32 accumulate
 

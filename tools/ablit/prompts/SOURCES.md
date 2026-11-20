@@ -16,3 +16,8 @@
   URL: <https://raw.githubusercontent.com/paul-rottger/xstest/main/xstest_prompts.csv>
 - Alpaca instructions (`instruction` + `input`):
   HF `tatsu-lab/alpaca` (dataset card license CC BY-NC 4.0), fetched via `datasets`.
+
+The sets are not stored in this repository. `build_prompts.py` fetches them from the URLs above at first use and writes
+four jsonl files (harmful / harmless x collect / heldout) into `$XDG_CACHE_HOME/kyojin/ablit_prompts`
+(`~/.cache/kyojin/ablit_prompts`); the tools in this folder call it when a prompt file is not given. Each set stays
+under its own license (listed above).

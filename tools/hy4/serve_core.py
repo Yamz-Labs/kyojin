@@ -328,6 +328,25 @@ class OutputStream:
 
 
 # ------------------------------------------------------------------------------------------------ response bodies
+ABLIT_OFF = ("", "off", "0", "false", "no", "none")
+ABLIT_ON = ("on", "1", "preset", "true", "yes")
+
+
+def ablit_spec(environ, tree: str) -> str | None:
+    """Decensor preset of the Hy4 server (opt-in, off by default). HY4_ABLIT_SPEC unset, empty, 0, off, false, no or none -> None (no edit is installed, the forward is
+    the unmodified one); on, 1, preset, true or yes -> the preset bundled in the repository (None when its files are absent); any other value is the path of a spec."""
+    v = environ.get("HY4_ABLIT_SPEC")
+    if v is None:
+        return None
+    v = v.strip()
+    if v.lower() in ABLIT_OFF:
+        return None
+    if v.lower() in ABLIT_ON:
+        p = os.path.join(tree, "presets", "hy4-uncensor", "edit_spec.json")
+        return p if os.path.isfile(p) and os.path.isfile(os.path.join(os.path.dirname(p), "edit_spec.safetensors")) else None
+    return v
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
 

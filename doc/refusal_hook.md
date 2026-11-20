@@ -5,5 +5,6 @@ The engine can project one fixed direction out of the residual stream at run tim
 - The spec is a JSON file (`hidden`, `n_layers`, per-layer weights `attn_w[L]`, `mlp_w[L]`) plus a unit vector `r` in `spec.safetensors`.
 - After each attention and MLP block of layer L the output becomes `y - w_L * r * (r . y)`.
 - `EXL3_ABLIT_TORCH=1` forces the PyTorch path instead of the Triton kernel.
-- A direction fitted on refusals makes the model refuse less. Whoever uses a spec is responsible for it. This repository contains no spec file. Steering presets are published separately in the Yamz presets repository (https://github.com/yamz-labs/yamz-presets).
+- A direction fitted on refusals makes the model refuse less. Whoever uses a spec is responsible for it. The Qwen / MiMo steering presets are published separately in the Yamz presets repository (https://github.com/yamz-labs/yamz-presets); the Hy4-flash preset ships in this repository.
+- Hy4-flash has its own hook (`HY4_ABLIT_SPEC`, per-layer direction and offset, `exllamav3/loader/ablit_hy4.py`); its preset is `presets/hy4-uncensor/`.
 - Code: `exllamav3/modules/ablit_runtime.py`. Test: `tests/test_ablit_runtime_cpu.py`, `tests/test_uncensor_bundled_cpu.py`.

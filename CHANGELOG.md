@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.9.1
+
+Hy4-flash: faster prefill and decode on the same GGUF, decensor preset, warm-up fix. Every lever below ships on and has its own switch: `HY4_<FLAG>=0` in the environment restores the 1.9.0 behaviour of that lever. The flag table is in `doc/env_vars.md`; numbers are in the release notes.
+
+- Decensor preset for Hy4-flash, opt-in and off by default (`HY4_ABLIT_SPEC=on` loads the bundled preset; an explicit path loads another spec). Validated in no_think mode; in the default thinking mode some answers run long (2 of 17 hit the 4096-token cap in our check), a fix is in progress. A per-layer run-time edit of the attention and MLP / MoE outputs, no weight change. Files in `presets/hy4-uncensor/`, code in `exllamav3/loader/ablit_hy4.py`.
+- Prefill: lazy layer residual, 3 stream passes per layer (`HY4_PF_HC2`); head-major K / V and Q / O operands for the CK latent-attention core (`HY4_PF_KV_HM`, `HY4_PF_QO_HM`); Q3_K gate-up kernel V2 with packed fp16 decode and aligned dword loads, bit-identical to the old kernel (`HY4_PF_Q3K_V2`; needs the rebuilt MoE extension, which `install_strix.sh` rebuilds; the old kernel runs when the library is older or K / 256 is odd).
+- Decode: Q8_0 output head, one resident copy, the bf16 head is freed (`HY4_HEAD_Q8`); the shared-expert branch runs on a second stream inside the HIP graph (`HY4_GRAPH_FORK`); router mat-vec launch tuning, K block 1024 (`HY4_RG_TUNE`); block-wise absorb kernels, absorb v2 (`HY4_BG_V2`).
+- `HY4_PF_ROUTER16` (fp16 router logits of prefill rows) is shipped on but inactive with the fused router (`HY4_REF_FUSED=1`, the shipped decode path): it changes nothing in the shipped configuration.
+- Install: the CK latent-attention build (`install_strix.sh` step 3/3) finds the GCC install directory from `gcc` itself instead of a hard-coded GCC 13 path (`GCC_DIR` still overrides it).
+- Multi-session: `serve.py --slots N` (N > 1) now starts on the shipped defaults (the long-context sparse attend, which the multi-session engine does not take, is switched off when slots > 1).
+- Warm-up: the start-up warm-up prompt is clamped to the context window, so a small `-c` no longer fails the warm-up; it is skipped, with one log line, when the context is too small to warm anything useful.
+- Test: `tests/test_hy4_shipped_flags.py` checks that every 1.9.1 lever is on in `SHIPPED_ENV`, reads its environment switch with the 1.9.0 behaviour as the code default, and is not overridden when the user sets it.
+
 ## 1.9.0: Hy4-flash v1
 
 Hy4-flash (GGUF Q3_K) on one Strix Halo machine. Numbers: see the benchmark table in the release notes.

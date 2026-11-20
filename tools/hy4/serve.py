@@ -56,6 +56,9 @@ SHIPPED_ENV = {
     "HY4_PF_SPARSE": "1", "HY4_PF_SPARSE_MINN": "2048",            # sparse prefill attention (HIP kernel via SP_SO, Triton fallback) from 2048 keys (first measured from 16K keys): 33K prefill 60.6 -> 42 s, 128K flat ~790 tok/s; NLL 32K 4.5226 vs dense 4.5231 (nulls 4.511-4.515); below 16K dense CK (KL at 4096 with sparse 0.1089 vs nulls 0.0988-0.1054)
     "HY4_ENGRAM_NPHASH": "1", "HY4_ENGRAM_NATIVE_IO": "1", "HY4_ENGRAM_PF_WORKERS": "1", "HY4_PF_G_SWIGLU": "1", "HY4_PF_G_ADD": "1", "HY4_PF_MM_FINE": "1",   # prefill levers (box A/B 20/11 pf2_A / pf2_B: prefill +11 / +7.6 / +6.5 % at 8K / 32K / 64K, passkey 3/3, KL 0.108 vs noise nulls 0.103-0.108)
     "HY4_MLA_HB": "1", "HY4_BG_DOT": "1", "HY4_HEAD_DOT": "1", "HY4_RG_F16": "1",   # decode levers (box A/B 20/11, 256 tok x2: verify round -7 % at 4K, -4 % at 32K, plain flat; qual6 KL 0.94 x noise null)
+    "HY4_PF_KV_HM": "1", "HY4_PF_QO_HM": "1", "HY4_PF_HC2": "1", "HY4_PF_ROUTER16": "1",   # prefill set 3 (1.9.1): head-major CK attention operands, lazy layer residual (3 stream passes per layer), fp16 router logits of prefill rows (only on the HY4_REF_FUSED=0 router path)
+    "HY4_PF_Q3K_V2": "1",   # Q3_K prefill gate-up kernel with packed fp16 decode + aligned dword loads (bit-identical to the old kernel, -0.26 s per 8K chunk; needs the rebuilt gm_ext, else falls back; old kernel when K / 256 is odd)
+    "HY4_HEAD_Q8": "1", "HY4_GRAPH_FORK": "1", "HY4_RG_TUNE": "1", "HY4_BG_V2": "1",   # decode bundle 1 (1.9.1): Q8_0 output head (one resident copy, bf16 freed: -1.8 ms per step), shared-expert branch on a second capture stream (-1.7 ms per round), router mat-vec K block 1024, block-wise absorb kernels; quality gate: full bundle dNLL -0.0029 +- 0.011 vs noise null 0.0156
     "HY4_PF_WOT": "0", "HY4_MOE_HIP": "2", "HY4_PF_CK": "1", "HY4_PF_FUSE": "1",      # prefill set 2: shared gm_ext WMMA experts (HY4_GM_EXT), CK MLA core (EXL3_CKMLA_SO), one-pass hc / norm / indexer kernels
 }
 
@@ -82,9 +85,12 @@ def check_kernels() -> None:
         print(f"hy4 serve: WARNING {m}: slow path (HY4_ALLOW_SLOW=1)", file=sys.stderr, flush=True)
 
 
-def apply_env(ctx: int, model: str = "") -> None:
+SLOTS_OFF = ("HY4_LC_SPARSE",)     # shipped long-context levers that act on the single-session K / indexer buffers: mu_engine.MuEngine refuses them with --slots > 1
+
+
+def apply_env(ctx: int, model: str = "", slots: int = 1) -> None:
     for k, v in SHIPPED_ENV.items():
-        os.environ.setdefault(k, v)
+        os.environ.setdefault(k, "0" if slots > 1 and k in SLOTS_OFF else v)      # an explicit value still wins (and MuEngine refuses it)
     os.environ.setdefault("HY4_NOSYNC_CAP", str(((ctx + 64 + 511) // 512) * 512))   # K buffers / token history: fixed for the life of the process
     # the measured line also runs with frozen TunableOp results for the prefill GEMMs and a start-up request that compiles the prefill kernels and captures the decode graphs
     tune = os.path.join(TREE, "tools", "hy4", "tunableop_gfx1151.csv")
@@ -364,6 +370,13 @@ def load_in_background(st: State):
                 st.stage = s
                 print("load:", s, flush=True)
             eng.load(progress)
+            sp = C.ablit_spec(os.environ, TREE)    # decensor preset, opt-in (edit_spec.json + edit_spec.safetensors next to it): HY4_ABLIT_SPEC=on = the bundled one, a path = that spec; unset / 0 / empty / off = no edit installed
+            if sp:
+                eng.hf._AB.load_spec(sp, "cuda", D=eng.M.D, pin=True)   # all sites pinned so the graphs capture them; weights live in static buffers
+                eng.GR.clear()
+                print(f"decensor preset on (HY4_ABLIT_SPEC={sp})", flush=True)
+            else:
+                print("decensor preset off", flush=True)
             if a.slots > 1:
                 import mu_engine
                 st.sched = mu_engine.MuScheduler(eng, chunk=a.sched_chunk)
@@ -400,7 +413,7 @@ def main(argv=None):
     ap.add_argument("--slots", type=int, default=1, help="concurrent sessions decoded in ONE batched step (1 = the single-request engine behind the lock)")
     ap.add_argument("--sched-chunk", type=int, default=1024, help="prefill rows per scheduler turn with --slots > 1 (a decode round of the other sessions runs between chunks)")
     args = ap.parse_args(argv)
-    apply_env(args.max_ctx, args.model)
+    apply_env(args.max_ctx, args.model, args.slots)
     check_kernels()
     st = State(args)
     app = build_app(st)

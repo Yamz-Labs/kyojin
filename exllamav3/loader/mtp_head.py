@@ -77,18 +77,23 @@ class Hy4MTP:
         # draft head: "" = the trunk's bf16 head (Triton mat-vec), "q8" = Q8_0 copy (half the bytes), "sub<N>" = the first N vocabulary rows only (draft picks among them)
         hm = os.environ.get("HY4_MTP_HEAD", "")
         self.head_q8 = self.head_sub = self.ids = None
-        if hm == "q5k":          # Q5_K bytes of the bf16 head from a file (make_head_bin.py): 0.255 GB instead of 0.394 GB (Q8_0); falls back to Q8_0 when the file is missing
+        shared = getattr(fw, "out_q8", None)
+        if shared is not None and hm in ("q8", "q8share"):        # HY4_HEAD_Q8=1: the trunk's Q8_0 head bytes ARE the draft's Q8_0 head: one resident copy
+            self.head_q8 = shared
+        elif hm == "q5k":          # Q5_K bytes of the bf16 head from a file (make_head_bin.py): 0.255 GB instead of 0.394 GB (Q8_0); falls back to Q8_0 when the file is missing
             from . import dense_req as _DR
             self.head_q8 = _DR.head_from_file(self, os.environ.get("HY4_MTP_HEAD_BIN", "/path/to/head_q5_k.bin"))
             if self.head_q8 is None:
                 print("mtp_head: HY4_MTP_HEAD=q5k but no matching head file, using Q8_0", flush=True)
-                self.head_q8 = q8_linear(fw.out_w.float())
+                self.head_q8 = shared if shared is not None else q8_linear(fw.out_w.float())
         elif hm == "q8":
             self.head_q8 = q8_linear(fw.out_w.float())
         elif hm.startswith("sub"):
             n = int(hm[3:])
             self.head_sub = fw.out_w[:n].contiguous()
             self.ids = torch.arange(n, device=dev)
+        if shared is not None and self.head_q8 is None and self.head_sub is None:      # draft on "the trunk's head" = the shared Q8_0 bytes once the bf16 copy is gone
+            self.head_q8 = shared
         st = _ns.state(fw)
         self.cap = cap or st.cap
         self.ar = st.ar if st.ar.shape[0] >= self.cap else torch.arange(self.cap, device=dev)
@@ -99,6 +104,8 @@ class Hy4MTP:
             _AE.ensure(self.cap)
         except ImportError:
             pass
+        if hasattr(fw, "free_bf16_head"):
+            fw.free_bf16_head()              # HY4_HEAD_Q8=1: every consumer of the bf16 head values (draft head copies) has been built
 
     def reset(self):
         self.kbuf.zero_()

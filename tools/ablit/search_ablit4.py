@@ -98,7 +98,8 @@ def main():
     from hook_ablate import build_edit, AblationHooks, N_LAYERS as NL
     import eval_ablit as E
 
-    pdir = a.prompts or os.path.join(ROOT, "scratch", "ablit", "prompts")
+    import prompt_cache as PC
+    pdir = a.prompts or PC.ensure(os.path.join(ROOT, "scratch", "ablit", "prompts"))
     ddir = a.dirs or os.path.join(ROOT, "scratch", "ablit", "dirs")
     out = a.out
     os.makedirs(out, exist_ok=True)

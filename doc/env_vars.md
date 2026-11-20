@@ -1055,6 +1055,32 @@ edits no weights. `off`, `0`, `false`, `no` and `none` force it off. An explicit
 `uncensor_spec.json` that a model directory may carry, and a path that does not exist stops the
 load with an error naming the file. See [refusal_hook.md](refusal_hook.md).
 
+#### `HY4_ABLIT_SPEC` (default: unset, the hook is off)
+
+Hy4-flash server only. Path of an `edit_spec.json` (with `edit_spec.safetensors` next to it) that
+projects a per-layer direction out of the attention and MLP / MoE outputs at run time. It edits no
+weights. `on` (also `1`, `preset`, `true`, `yes`) loads the preset bundled in the repository, from any working directory. Any other value is the path of a
+spec. Unset, empty, `0`, `off`, `false`, `no` and `none`: no edit is installed. A malformed spec or a missing file stops
+the load. The preset is in `presets/hy4-uncensor/`. See [hy4.md](hy4.md).
+
+#### Hy4-flash 1.9.1 levers (all on by default; `=0` restores 1.9.0)
+
+Hy4-flash server only. `tools/hy4/serve.py` sets these in `SHIPPED_ENV` without overriding a value you set, so `HY4_<FLAG>=0 python tools/hy4/serve.py ...` is the rollback of one lever to the 1.9.0 behaviour. The levers are independent of each other. Guide: [hy4.md](hy4.md).
+
+| flag | default | what | rollback |
+|---|---|---|---|
+| `HY4_PF_HC2` | `1` | prefill: lazy layer residual, 3 stream passes per layer | `HY4_PF_HC2=0` |
+| `HY4_PF_KV_HM` | `1` | prefill: head-major K / V operands of the CK latent-attention core | `HY4_PF_KV_HM=0` |
+| `HY4_PF_QO_HM` | `1` | prefill: head-major Q / O operands of the CK latent-attention core | `HY4_PF_QO_HM=0` |
+| `HY4_PF_Q3K_V2` | `1` | prefill experts: Q3_K gate-up kernel V2 (packed fp16 decode, aligned dword loads, bit-identical output); needs the rebuilt MoE extension, the old kernel runs when the library is older or K / 256 is odd | `HY4_PF_Q3K_V2=0` |
+| `HY4_PF_ROUTER16` | `1` | prefill: fp16 router logits; inactive with the fused router (`HY4_REF_FUSED=1`, the shipped decode path), so no effect in the shipped configuration | `HY4_PF_ROUTER16=0` |
+| `HY4_HEAD_Q8` | `1` | decode: output head as Q8_0, one resident copy (the bf16 head is freed) | `HY4_HEAD_Q8=0` |
+| `HY4_GRAPH_FORK` | `1` | decode: the shared-expert branch runs on a second capture stream inside the HIP graph | `HY4_GRAPH_FORK=0` |
+| `HY4_RG_TUNE` | `1` | decode: router mat-vec with K block 1024 (was 256) | `HY4_RG_TUNE=0` |
+| `HY4_BG_V2` | `1` | decode: block-wise absorb kernels (absorb v2) | `HY4_BG_V2=0` |
+
+The warm-up clamp has no switch. The start-up warm-up prompt (`HY4_WARMUP_TOKENS`, default the smaller of 8493 and `-c` minus 128, also when you set it) is cut to what the context window accepts, and skipped with one log line when that is under 256 tokens. `HY4_WARMUP_TOKENS=0` skips the warm-up.
+
 #### `EXL3_ABLIT_TORCH` (default: `0`)
 
 `1` uses the PyTorch projection instead of the Triton kernel. It has no effect when Triton is not

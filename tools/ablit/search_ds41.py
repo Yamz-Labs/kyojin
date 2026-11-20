@@ -12,7 +12,7 @@ depth) and optionally the direction index (--proj-f list). Stops at the first PA
 first PASS is the least invasive one.
 
   python search_ds41.py --model PACK --dirs DIRS --kernel tools/ablit/kernel_glm_ablit5.json --out OUT \
-      --harmful tools/ablit/prompts/harmful_heldout.jsonl --harmless tools/ablit/prompts/harmless_heldout.jsonl \
+      [--harmful H.jsonl --harmless S.jsonl: default = the public sets fetched into ~/.cache/kyojin/ablit_prompts] \
       [--strengths 0.5,0.75,1,1.25,1.5,2] [--proj-f 26,29.34] [--n-harm 100] [--n-kl 50]
 
 Writes OUT/trial_*/edit_spec.{json,safetensors}, OUT/results.json, and OUT/best/ (+ OUT/best/uncensor_spec.json and
@@ -172,8 +172,8 @@ def main():
     ap.add_argument("--dirs", required=True)
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--harmful", required=True)
-    ap.add_argument("--harmless", required=True)
+    ap.add_argument("--harmful", default=None, help="jsonl (default: harmful_heldout.jsonl of the fetched public sets, see prompt_cache.py)")
+    ap.add_argument("--harmless", default=None, help="jsonl (default: harmless_heldout.jsonl of the fetched public sets)")
     ap.add_argument("--tokenizer", default=None)
     ap.add_argument("--strengths", default="0.5,0.75,1,1.25,1.5,2")
     ap.add_argument("--proj-f", default="")
@@ -203,8 +203,9 @@ def main():
     decode = lambda ids: tk.decode(ids, skip_special_tokens=False)
     eos_id = tk.token_to_id("<\uff5cend\u2581of\u2581sentence\uff5c>")
     eos_id = 1 if eos_id is None else eos_id
-    harmful = E.load_prompts(a.harmful, a.n_harm)
-    harmless = E.load_prompts(a.harmless, a.n_kl)
+    import prompt_cache as PC
+    harmful = E.load_prompts(a.harmful or PC.default_file("harmful_heldout.jsonl"), a.n_harm)
+    harmless = E.load_prompts(a.harmless or PC.default_file("harmless_heldout.jsonl"), a.n_kl)
     os.makedirs(a.out, exist_ok=True)
     pfs = [float(x) for x in a.proj_f.split(",") if x] or [None]
     specs, meta = [], {}

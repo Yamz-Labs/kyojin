@@ -100,10 +100,21 @@ def _table(buf, ebytes, E):
     return _ptrs[key]
 
 
+_Q3K_V2 = [True]      # HY4_PF_Q3K_V2 is read live; cleared when the built gm_ext predates the V2 kernel (rebuild: tools/hy4/install_strix.sh)
+
+
 def gate_up_shared(x, Wg, Wu, sp, be, P, topk, E, ebytes, lim, K, N, rowb, fmt, maxb):
     m = shared_module()
     H = torch.empty(maxb * MT, N, dtype=torch.float16, device=x.device)
-    m.gm_pf_gate_up(x, _table(Wg, ebytes, E), _table(Wu, ebytes, E), H, sp, be, P, topk, E, float(lim), K, N, rowb, maxb, 0 if fmt == 0 else 3)
+    args = (x, _table(Wg, ebytes, E), _table(Wu, ebytes, E), H, sp, be, P, topk, E, float(lim), K, N, rowb, maxb)
+    if fmt != 0 and _Q3K_V2[0] and os.environ.get("HY4_PF_Q3K_V2", "0") == "1" and (K // 256) % 2 == 0:       # Q3_K V2 (fmt 4): K / 256 even; the old kernel (fmt 3) otherwise
+        try:
+            m.gm_pf_gate_up(*args, 4)
+            return H
+        except RuntimeError:
+            _Q3K_V2[0] = False
+            print("[gm_ext] HY4_PF_Q3K_V2: the built kernel library has no V2 kernel, using the old one (rebuild: bash tools/hy4/install_strix.sh)", flush=True)
+    m.gm_pf_gate_up(*args, 0 if fmt == 0 else 3)
     return H
 
 
