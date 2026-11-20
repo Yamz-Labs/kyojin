@@ -66,6 +66,15 @@ class Hy4Engine:
             from draft_policy import CostPolicy
             os.environ["HY4_DRAFT_CONF"] = "1"        # the draft graph appends the confidences (read at the import of mtp_head, i.e. in load())
             self.policy = CostPolicy.from_env()
+        self.fires = {"rounds": 0, "depth2": 0, "gate_skip": 0, "gate_run": 0}     # python-side lever counters (cumulative over the server life): rounds drafted, rounds with 2 draft rows, gate tail skipped / run
+        self.gate = None                          # HY4_SPEC2_GATE=1: draft kb steps, then a tail step only when the confidence gate says it pays (tools/hy4/depth_gate.py); single session only
+        if os.environ.get("HY4_SPEC2_GATE", "0") == "1":
+            from depth_gate import DepthGate
+            assert self.policy is None, "HY4_SPEC2_GATE and HY4_DRAFT_POLICY are exclusive"
+            self.gate_kb = int(os.environ.get("HY4_SPEC2_KB", "2"))
+            assert 1 <= self.gate_kb and self.k == self.gate_kb + 1, "HY4_SPEC2_GATE: num-draft must be HY4_SPEC2_KB + 1 (one tail step)"
+            os.environ["HY4_DRAFT_CONF"] = "1"        # the draft graphs append the confidences (read at the import of mtp_head, i.e. in load())
+            self.gate = DepthGate.from_env(self.gate_kb, self.k - self.gate_kb)
         self.ready = False
         self.meta = None
         self.last_stats: dict = {}
@@ -129,6 +138,9 @@ class Hy4Engine:
         return self.SG.GraphDecoder(M)
 
     def _mtp_graph(self):
+        if self.gate is not None:
+            import importlib
+            return importlib.import_module(f"{self.SG.__name__.rsplit('.', 1)[0]}.mtp_gate").MTPGraphGate(self.MT, self.gate_kb, self.k - self.gate_kb)
         return self.MH.MTPGraph(self.MT, self.k)
 
     def _decode_flags(self):
@@ -320,6 +332,10 @@ class Hy4Engine:
         tdec = time.perf_counter()
         if speculative:
             k = self.k
+            kd0 = self.gate_kb if self.gate is not None else k          # drafts read from the first draft graph
+            if self.gate is not None:
+                from depth_gate import draft_with_gate
+                self.gate.reset()                     # decisions depend on this request only (HY4_SPEC2_MODE=carry keeps the old carried state: negative control)
             pc = time.perf_counter
             tm = [0.0, 0.0, 0.0]
             ng = None
@@ -361,21 +377,28 @@ class Hy4Engine:
                 planned = False
                 if td_prev is not None and not skip:
                     gap[0] += lt[0] - td_prev
+                gb = None
                 if skip:
                     d, ext = [], cl
                     tb = pc()
                 else:
                     d = dd.tolist()
                     confs = None
-                    if self.MH.CONF:                      # the draft graph appended the k confidences (fixed point 2^-20)
+                    if self.gate is not None:
+                        d, gext, gb = draft_with_gate(self.gate, self.MG, d, kd0, j)
+                    elif self.MH.CONF:                      # the draft graph appended the k confidences (fixed point 2^-20)
                         confs = [c / 1048576.0 for c in d[k:]]
                         d = d[:k]
                     if self.policy is not None:
                         d = d[:self.policy.choose(confs, 1 if ng is not None else 0)]
+                    self.fires["rounds"] += 1
+                    self.fires["depth2"] += len(d) == 2
+                    if gb is not None:
+                        self.fires["gate_run" if gext else "gate_skip"] += 1
                     tb = pc()
                     ext = []
                 if ng is not None and not skip:
-                    lim = min(self.ngram_ext, self.SG.TM - 1 - k)
+                    lim = min(self.ngram_ext, self.SG.TM - 1 - (len(d) if self.gate is not None else k))
                     if self.ngram_gate:
                         since += 1
                         lim = lim if rate >= 0.6 else (2 if rate >= 0.4 else (lim if since >= 8 else 0))
@@ -403,6 +426,8 @@ class Hy4Engine:
                 while acc < nd and toks[acc + 1] == amh[acc]:
                     acc += 1
                 kk = len(toks) - 1 - len(ext)             # drafted rows of this round (the policy may cut the chain below k)
+                if gb is not None:
+                    self.gate.update(gb, gext, min(acc, kk))
                 if skip:
                     pass
                 elif self.policy is not None and confs is not None:
@@ -444,6 +469,9 @@ class Hy4Engine:
             st["capture_s"] = GR.stats["capture_s"] - caps0
             if self.policy is not None:
                 st["policy"] = self.policy.stats()
+            if self.gate is not None:
+                st["gate"] = self.gate.stats()
+            st["fires"] = dict(self.fires)
             st["ngram"] = {"ext": self.ngram_ext, "min": self.ngram_min, "fill": self.ngram_fill, "hit_rounds": n_hit, "ext_rows": n_ext, "ext_accepted": n_extacc, "long": self.ngram_long, "long_rounds": n_long}
         else:
             while out_n < max_new and not stop and not cancel():

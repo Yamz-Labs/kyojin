@@ -1063,6 +1063,19 @@ weights. `on` (also `1`, `preset`, `true`, `yes`) loads the preset bundled in th
 spec. Unset, empty, `0`, `off`, `false`, `no` and `none`: no edit is installed. A malformed spec or a missing file stops
 the load. The preset is in `presets/hy4-uncensor/`. See [hy4.md](hy4.md).
 
+#### `HY4_SPEC2_GATE` (default `0`, off)
+
+Hy4-flash server only. `1` turns on the online draft-depth gate: the base draft graph runs `HY4_SPEC2_KB` steps (default `2`), and a tail graph
+runs one more step (plus its verify row) only when the gate says it pays. `--num-draft` must equal `HY4_SPEC2_KB + 1` (the shipped 3). It is exclusive with
+`HY4_DRAFT_POLICY`, and the gate turns `HY4_DRAFT_CONF` on by itself. Speculation stays lossless: the gate only changes how many drafts are verified.
+`HY4_SPEC2_MODE` picks the rule: `learn` (default, the measured S7 arm O: an online rule that learns the chance that the extension is accepted per confidence bin,
+reset at every request, so a repeated request repeats its decisions), `static` (extend when the product of the two base confidences is at least
+`HY4_SPEC2_THETA`, default `0.6`, no state), `carry` (the `learn` rule without the per-request reset, a negative control only). Other knobs of the learn rule:
+`HY4_SPEC2_STEP_MS`, `HY4_SPEC2_GAP_MS`, `HY4_SPEC2_PRIOR_N`, `HY4_SPEC2_PRIOR_Q`, `HY4_SPEC2_PROBE` (every N-th round extends whatever the bin says, default 16), `HY4_ROW_MS`
+(verify ms per row count). Fires counter: each request prints `FIRES gate mode=... depth_hist={2: n, 3: m} changed=a/b req_depth_hist=... req_changed=a/b`
+(depth chosen per round; `changed` = rounds where the gate cut the chain below the shipped depth; 0 means the gate did not fire) and `fires {...}` (rounds, depth2, gate_skip, gate_run).
+Rollback: unset the flag. See `tools/hy4/depth_gate.py`.
+
 #### Hy4-flash 1.9.1 levers (all on by default; `=0` restores 1.9.0)
 
 Hy4-flash server only. `tools/hy4/serve.py` sets these in `SHIPPED_ENV` without overriding a value you set, so `HY4_<FLAG>=0 python tools/hy4/serve.py ...` is the rollback of one lever to the 1.9.0 behaviour. The levers are independent of each other. Guide: [hy4.md](hy4.md).
