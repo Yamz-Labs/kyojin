@@ -19,10 +19,10 @@ HB_NW = int(os.environ.get("HY4_MLA_HB_NW", "4"))
 HB_SPLIT = int(os.environ.get("HY4_MLA_HB_SPLIT", "0"))      # key splits per (row, head group): 0 = auto (fill the GPU: ~96 programs), 1 = off, n = fixed
 ROWS2 = os.environ.get("HY4_MLA_ROWS2", "0") == "1"      # row-batched split-K decode attention (mla2): ONE pass over the K rows for all verify rows, q streamed (never resident in registers); default OFF
 R2_BH = int(os.environ.get("HY4_MLA_ROWS2_BH", "16"))      # heads per program (M tile = BH x RG rows of the WMMA tile)
-R2_RG = int(os.environ.get("HY4_MLA_ROWS2_RG", "2"))       # verify rows per program (power of two); more rows go over the grid
+R2_RG = int(os.environ.get("HY4_MLA_ROWS2_RG", "1"))       # verify rows per program (power of two); more rows go over the grid (micro 20/11: RG 1 ~ RG 2 per row, the win is the spill-free q stream, not the row sharing)
 R2_BN = int(os.environ.get("HY4_MLA_ROWS2_BN", "32"))      # keys per block
 R2_BK = int(os.environ.get("HY4_MLA_ROWS2_BK", "64"))      # latent chunk of the QK reduction (q / K streamed in chunks)
-R2_NW = int(os.environ.get("HY4_MLA_ROWS2_NW", "8"))
+R2_NW = int(os.environ.get("HY4_MLA_ROWS2_NW", "4"))
 R2_PROG = int(os.environ.get("HY4_MLA_ROWS2_PROG", "64"))  # target number of split programs (auto split count)
 R2_SPLIT = int(os.environ.get("HY4_MLA_ROWS2_SPLIT", "0"))  # key splits: 0 = auto, n = fixed
 R2_RS = int(os.environ.get("HY4_MLA_ROWS2_RS", "8"))       # column slices of the combine
