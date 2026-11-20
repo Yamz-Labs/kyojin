@@ -249,6 +249,13 @@ class MTPGraphMU(_MH.MTPGraph):
     """the draft chain graph per (slot, bucket): the captured graph holds the addresses of the slot's K buffer / indexer slab views (set `slot` and bind the session first)"""
     slot = 0
 
+    def run(self, tok, h, j):
+        """drafts of the bound session as a PRIVATE device tensor. The (slot, N) graphs share one memory pool and a graph's output can live in a block that an
+        earlier-captured graph used for intermediates: replaying graph A after graph B (two sessions whose slots were first drafted in the other order) overwrote
+        the drafts of B before the host read them (garbage token ids -> out-of-range embedding gather -> HSA 0x1016 in the verify replay). The clone is stream-ordered
+        right after its own replay, so no later replay can touch it."""
+        return super().run(tok, h, j).clone()
+
     def _graph(self, N):
         key = (self.slot, N)
         g = self.graphs.get(key)
