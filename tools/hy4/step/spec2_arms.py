@@ -6,7 +6,7 @@ Metric per class: tok/s, tau, ms per round = 1000 * tau / tok/s, paired delta vs
 B ships alone when C does not beat it; neither when both lose to A on code by more than 2 %.
 env: OD_PORT OD_NAME GGUF N1119 B2_H B2_DIR B2_GM B2_CO B2_PASSES SP2_ORDER SP2_REPS (default 2) SP2_LEVERS (default 1)
 Output: table on stdout + <N1119>/out/<OD_NAME>.spec2.json. ~50 min GPU: TMAX 3300."""
-import hashlib, json, os, re, signal, statistics, subprocess, sys, time, urllib.request
+import ast, hashlib, json, os, re, signal, statistics, subprocess, sys, time, urllib.request
 E = os.environ; tree = os.getcwd(); t0 = time.time()
 H = E.get("B2_H", "/home/kamel"); N = E.get("N1119", f"{H}/scratch/n1119")
 name, port = E["OD_NAME"], E["OD_PORT"]; tmax = int(E.get("OD_TMAX", "3300"))
@@ -50,6 +50,25 @@ def gate_lines(path):
                         "gate_rounds": cur and cur[0] - prev[0], "ext_rounds": cur and cur[1] - prev[1]})
             prev = cur or prev
     return out
+
+def fires_check(letter, path):
+    """CLAUDE.md fires-check: the engine's python-side counters (last 'fires {...}' of the server log, cumulative). Returns (ok, reasons). A must show 0 firings, B depth2 > 0,
+    C depth2 > 0 and the gate both skipping and running; any logged fallback reason about the lever fails the arm."""
+    f, fb = {}, []
+    for l in open(path, errors="replace"):
+        m = re.search(r"fires (\{[^}]*\})", l)
+        if m: f = ast.literal_eval(m.group(1))
+        if re.search(r"fallback|disabled|not supported", l, re.I) and re.search(r"spec2|gate|depth", l, re.I): fb.append(l.strip()[:200])
+    d2, gs, gr = f.get("depth2", 0), f.get("gate_skip", 0), f.get("gate_run", 0)
+    log(f"FIRES depth2 {d2}")
+    log(f"FIRES gate {gs}/{gr} (skipped/run)")
+    why = []
+    if letter == "A" and (d2 or gs or gr): why.append("arm A shows firings")
+    if letter == "B" and d2 == 0: why.append("FIRES depth2 = 0")
+    if letter == "C" and (d2 == 0 or gs == 0 or gr == 0): why.append(f"gate lever not firing (depth2 {d2}, skipped {gs}, run {gr})")
+    if not f and letter != "A": why.append("no fires counter in the server log")
+    why += [f"fallback: {x}" for x in fb]
+    return not why, why
 
 def precapture_line(path):
     return next((l.strip() for l in open(path, errors="replace") if l.startswith("precapture:")), None)
@@ -114,6 +133,9 @@ def main():
         if key in res["arms"]:
             res["arms"][key]["reqs"] = gate_lines(sl)
             res["arms"][key]["precapture"] = precapture_line(sl)
+            ok, why = fires_check(letter, sl)
+            res["arms"][key]["fires_ok"], res["arms"][key]["fires_why"] = ok, why
+            if not ok: log(f"FIRES FAIL arm {key}: {why}")
             for q, c in zip(res["arms"][key]["reqs"][1:], [p["cls"] for p in res["arms"][key]["points"].values()]):      # request 1 = the discarded warm-up
                 q["cls"] = c
         save()
@@ -141,7 +163,19 @@ def main():
         t = {l: mean_cls(l, cls) for l in "ABC"}
         if all(t.values()):
             print(f"SPEC2_VERDICT {cls}: A {t['A']:.2f} B(k=2) {t['B']:.2f} C(gate) {t['C']:.2f} tok/s  B vs A {100 * (t['B'] / t['A'] - 1):+.1f} %  C vs A {100 * (t['C'] / t['A'] - 1):+.1f} %  C vs B {100 * (t['C'] / t['B'] - 1):+.1f} %")
-    log("SPEC2_DONE", name, f"{time.time() - t0:.0f}s")
+    print("\nSPEC2 TAU per class (6 head_tau prompts x reps), gate: tau must not drop > 2 % vs A")
+    for cls in ("code", "prose", "chat"):
+        ta = [a["classes"][cls]["tau"] for a in arms.values() if a["letter"] == "A" and cls in a["classes"]]
+        row = f"{cls:<6}" + (f" A {statistics.mean(ta):.3f}" if ta else "")
+        for l in "BC":
+            tl = [a["classes"][cls]["tau"] for a in arms.values() if a["letter"] == l and cls in a["classes"]]
+            if tl and ta:
+                m = statistics.mean(tl); row += f" | {l} {m:.3f} {100 * (m / statistics.mean(ta) - 1):+.1f} % {'OK' if m >= 0.98 * statistics.mean(ta) else 'FAIL (> 2 % drop)'}"
+        print(row)
+    bad = [k for k, a in arms.items() if not a.get("fires_ok", False)]
+    missing = [l for l in "ABC" if not any(a["letter"] == l for a in arms.values())]
+    log("SPEC2_DONE", name, f"{time.time() - t0:.0f}s", "FIRES_FAIL " + ",".join(bad) if bad else "fires ok", "MISSING_ARMS " + ",".join(missing) if missing else "")
+    if bad or missing: sys.exit(1)
 
 if __name__ == "__main__":
     main()

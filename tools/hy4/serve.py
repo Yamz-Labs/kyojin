@@ -270,7 +270,9 @@ def build_app(st: State):
         print(f"req {st.served}: prompt {stats['prompt_tokens']} tok prefill {pf:.2f} s ({stats['prompt_tokens'] / pf:.0f} tok/s; trunk {stats.get('prefill_trunk_s', 0):.2f} s, "
               f"draft fill {stats.get('prime_s', 0):.2f} s {stats.get('prime_mode')}) | decode {stats['decode_tokens']} tok {dc:.2f} s = "
               f"{stats['decode_tokens'] / dc if dc else 0:.2f} tok/s spec={stats['speculative']} rounds {stats['rounds']} tau {stats['tau']} hist {stats['accept_hist']} | {finish}"
-              + (f" | gate {stats['gate']}" if stats.get("gate") else ""),
+              + (f" | gate {stats['gate']}" if stats.get("gate") else "") + (f" | fires {stats['fires']}" if stats.get("fires") else "")
+              + (f" | round_ms {[round(x, 1) for x in stats['round_ms']]} gap_ms {[round(x, 1) for x in stats['gap_ms']]} busy_ms {stats['busy_ms']:.1f} ngram {stats['ngram']}"
+                 if os.environ.get("HY4_REQ_ROUNDLOG", "0") == "1" and "round_ms" in stats and "ngram" in stats else ""),
               flush=True)
         yield ("end", stats, finish, n_gen)
 

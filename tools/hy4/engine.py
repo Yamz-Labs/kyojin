@@ -64,6 +64,7 @@ class Hy4Engine:
             from draft_policy import CostPolicy
             os.environ["HY4_DRAFT_CONF"] = "1"        # the draft graph appends the confidences (read at the import of mtp_head, i.e. in load())
             self.policy = CostPolicy.from_env()
+        self.fires = {"rounds": 0, "depth2": 0, "gate_skip": 0, "gate_run": 0}     # python-side lever counters (cumulative over the server life): rounds drafted, rounds with 2 draft rows, gate tail skipped / run
         self.gate = None                          # HY4_SPEC2_GATE=1: draft kb steps, then a tail step only when the confidence gate says it pays (tools/hy4/depth_gate.py); single session only
         if os.environ.get("HY4_SPEC2_GATE", "0") == "1":
             from depth_gate import DepthGate
@@ -367,6 +368,10 @@ class Hy4Engine:
                         d = d[:k]
                     if self.policy is not None:
                         d = d[:self.policy.choose(confs, 1 if ng is not None else 0)]
+                    self.fires["rounds"] += 1
+                    self.fires["depth2"] += len(d) == 2
+                    if gb is not None:
+                        self.fires["gate_run" if gext else "gate_skip"] += 1
                     tb = pc()
                     ext = []
                 if ng is not None and not skip:
@@ -443,6 +448,7 @@ class Hy4Engine:
                 st["policy"] = self.policy.stats()
             if self.gate is not None:
                 st["gate"] = self.gate.stats()
+            st["fires"] = dict(self.fires)
             st["ngram"] = {"ext": self.ngram_ext, "min": self.ngram_min, "fill": self.ngram_fill, "hit_rounds": n_hit, "ext_rows": n_ext, "ext_accepted": n_extacc, "long": self.ngram_long, "long_rounds": n_long}
         else:
             while out_n < max_new and not stop and not cancel():
