@@ -238,11 +238,20 @@ class MuScheduler(threading.Thread):
         self.cv = threading.Condition()
         self.pending: deque = deque()
         self.free = list(range(eng.slots))
+        self.pin = int(os.environ.get("HY4_MU_SLOT_PIN", "-1"))      # HY4_MU_SLOT_PIN=k: slot k is allocated first whenever it is free (tests one slot index: a single session always lands on it)
+        if self.pin >= eng.slots:
+            raise ValueError(f"HY4_MU_SLOT_PIN={self.pin} is past --slots {eng.slots}")
         self.pf: deque = deque()
         self.dec: list = []
         self.stop_flag = False
         self.stats = {"rounds": 0, "round_rows": 0, "pf_chunks": 0, "pf_s": 0.0, "dec_s": 0.0}
         self.trace: list = []                       # (t0, t1, kind, n) per scheduler action
+
+    def _take_slot(self):
+        if self.pin in self.free:
+            self.free.remove(self.pin)
+            return self.pin
+        return self.free.pop(0)
 
     def submit(self, req: Request):
         with self.cv:
@@ -285,7 +294,7 @@ class MuScheduler(threading.Thread):
                         return
                     while self.pending and self.free:
                         req = self.pending.popleft()
-                        req.sess = eng.open(self.free.pop(0))
+                        req.sess = eng.open(self._take_slot())
                         req.stats["admit"] = pc()
                         if req.cancel.is_set() or len(req.ids) + req.max_new + eng.k + 2 > eng.ctx:
                             req.error = None if req.cancel.is_set() else "context"

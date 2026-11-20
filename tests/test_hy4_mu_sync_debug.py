@@ -110,3 +110,19 @@ def test_step_slots_probe_runs_once_per_slot_set_and_restores(capsys, monkeypatc
     assert "mu-sync begin layer L1" in lines and "mu-sync begin L0 mla.attend L0" in lines and "mu-sync begin ffn L1" in lines
     assert [l for l in lines if "replay segment" in l] and len([1 for e in log if e[0] == "layer"]) == 4
     assert not any(k in d.fw.__dict__ for k in ("layer", "_ffn")) and "attend" not in d.fw.mlas[0].__dict__ and "indexer" not in d.gs.__dict__
+
+
+def test_sync_only_filters_stages_and_skips_the_probe(capsys, monkeypatch):
+    monkeypatch.setenv("HY4_MU_SYNC_DEBUG", "1")
+    monkeypatch.delenv("HY4_MU_SYNC_ONLY", raising=False)
+    assert D.probe_enabled()
+    monkeypatch.setenv("HY4_MU_SYNC_ONLY", "replay segment, draft chain")
+    assert not D.probe_enabled()
+    for name in ("step_slots T=1 replay segment 0/3", "spec_round draft chain slot 2 j 9", "prefill trunk step slot 1", "plain_round hcur clone slot 0 row 0"):
+        with D.stage(name):
+            pass
+    assert capsys.readouterr().out.splitlines() == ["mu-sync begin step_slots T=1 replay segment 0/3", "mu-sync begin spec_round draft chain slot 2 j 9"]
+    monkeypatch.setenv("HY4_MU_SYNC_ONLY", "probe")
+    assert D.probe_enabled()
+    monkeypatch.delenv("HY4_MU_SYNC_DEBUG")
+    assert not D.probe_enabled()

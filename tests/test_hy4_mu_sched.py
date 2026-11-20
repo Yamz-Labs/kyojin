@@ -75,6 +75,32 @@ def test_queue_past_slots_reuse_and_max_new():
     assert max(len(x[1]) for x in eng.log if x[0] == "dec") == 2          # never more rows than slots
 
 
+def test_slot_pin_allocates_slot_k_first(monkeypatch):
+    monkeypatch.setenv("HY4_MU_SLOT_PIN", "6")
+    eng = FakeEng(slots=8)
+    reqs = [ME.Request(list(range(6)), 3) for _ in range(3)]
+    run(reqs[:1], eng)
+    run(reqs[1:2], eng)                                                      # sequential single sessions: always slot 6
+    assert [x[1] for x in eng.log if x[0] == "open"] == [6, 6]
+    eng2 = FakeEng(slots=8)
+    sch = ME.MuScheduler(eng2, chunk=4)                                      # two at once: the pinned slot first, then the FIFO order of the others
+    assert [sch._take_slot(), sch._take_slot(), sch._take_slot()] == [6, 0, 1]
+    assert 6 not in sch.free and sch.free == [2, 3, 4, 5, 7]
+
+
+def test_slot_pin_off_keeps_fifo_and_rejects_a_slot_past_slots(monkeypatch):
+    monkeypatch.delenv("HY4_MU_SLOT_PIN", raising=False)
+    sch = ME.MuScheduler(FakeEng(slots=4), chunk=4)
+    assert [sch._take_slot() for _ in range(4)] == [0, 1, 2, 3]
+    monkeypatch.setenv("HY4_MU_SLOT_PIN", "4")
+    try:
+        ME.MuScheduler(FakeEng(slots=4), chunk=4)
+    except ValueError as ex:
+        assert "HY4_MU_SLOT_PIN=4" in str(ex)
+    else:
+        raise AssertionError("a pin past --slots must be refused")
+
+
 def test_prefill_chunk_is_interleaved_with_decode_rounds():
     eng = FakeEng(slots=2)
     a = ME.Request(list(range(4)), 40)

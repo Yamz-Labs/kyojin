@@ -219,7 +219,7 @@ class MultiDecoder(SG.GraphDecoder):
             self.hin[2, :T] = torch.tensor(bs)
             gs.inp.copy_(self.hin, non_blocking=True)
             self._stage_rows(rows)
-        if DBG.enabled():
+        if DBG.probe_enabled():
             self._probe(Nb, T, rows)
         with DBG.stage(what + " graph (capture if new)"):
             cgs, _out = self._graph(Nb, T)       # the solo capture: a LIST of graph segments (Engram split), replayed in order like step_rows

@@ -17,6 +17,17 @@ def enabled() -> bool:
     return os.environ.get("HY4_MU_SYNC_DEBUG", "0") not in ("", "0")
 
 
+def only() -> list:
+    """HY4_MU_SYNC_ONLY=a,b: with the debug on, only the stages whose name contains one of these substrings sync and log, and the eager per-layer probe is skipped unless `probe` is listed.
+    A fault that the full debug masks (its syncs remove the host / device overlap) is bisected by syncing one stage family per run: `replay segment`, `draft chain`, `draft catch-up`, `prefill`, `hcur clone`."""
+    return [x.strip() for x in os.environ.get("HY4_MU_SYNC_ONLY", "").split(",") if x.strip()]
+
+
+def probe_enabled() -> bool:
+    o = only()
+    return enabled() and (not o or "probe" in o)
+
+
 def sync():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -34,7 +45,12 @@ def _stage(name):
 
 
 def stage(name):
-    return _stage(name) if enabled() else contextlib.nullcontext()
+    if not enabled():
+        return contextlib.nullcontext()
+    o = only()
+    if o and not any(x in name for x in o):
+        return contextlib.nullcontext()
+    return _stage(name)
 
 
 _MISSING = object()
