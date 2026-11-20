@@ -70,7 +70,7 @@ The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, bot
 | `HY4_PF_HC2`, `HY4_PF_KV_HM`, `HY4_PF_QO_HM`, `HY4_PF_Q3K_V2` | 1 | 1.9.1 prefill: lazy layer residual, head-major K / V and Q / O operands of the CK core, Q3_K gate-up kernel V2 (`=0` restores 1.9.0) |
 | `HY4_HEAD_Q8`, `HY4_GRAPH_FORK`, `HY4_RG_TUNE`, `HY4_BG_V2` | 1 | 1.9.1 decode: Q8_0 output head, shared-expert branch on a second graph stream, router mat-vec K block 1024, absorb v2 (`=0` restores 1.9.0) |
 | `HY4_PF_ROUTER16` | 1 | fp16 router logits of prefill rows; inactive with the fused router (`HY4_REF_FUSED=1`, shipped), so no effect |
-| `HY4_ABLIT_SPEC` | bundled `presets/hy4-uncensor/edit_spec.json` (on) | path of `edit_spec.json` (tensor file next to it): run-time decensor edit of the attention and MLP / MoE outputs; an explicit path wins; `0`, empty or `off` disables |
+| `HY4_ABLIT_SPEC` | unset (off) | `on` loads the bundled `presets/hy4-uncensor/edit_spec.json`; a path loads that `edit_spec.json` (tensor file next to it): run-time decensor edit of the attention and MLP / MoE outputs; `0`, empty or `off` = no edit |
 
 Native Engram IO: `exllamav3/loader/engram_io.c` is compiled with `gcc` at first use into `~/.cache/kyojin/engram_io` (`XDG_CACHE_HOME` moves it). When `gcc` is missing or the build fails, the server prints one line and uses the Python reader, which does the same reads more slowly (`HY4_ENGRAM_NATIVE_IO=0` selects it directly).
 
@@ -94,17 +94,17 @@ The free memory is steady, not a load transient: at the default `-c 65536` it st
 
 128K (`-c 131072`) is opt-in. At load, fp32 KV, the server reached 110.4 GiB of GTT and the free memory fell to 7.8 GiB. It was not measured under a 128K prefill on the release build; if memory runs out, use a smaller `-c`.
 
-## Uncensor preset (on by default)
+## Uncensor preset (opt-in)
 
-The server loads the preset bundled in `presets/hy4-uncensor/` (found from the repository, any working directory). It is a run-time edit of the attention and MLP / MoE outputs and changes no weights. The start-up log prints `decensor preset on (HY4_ABLIT_SPEC=...)`.
-
-Switch it off:
+Off by default: the server runs the unmodified forward. The preset bundled in `presets/hy4-uncensor/` is a run-time edit of the attention and MLP / MoE outputs and changes no weights. Switch it on:
 
 ```bash
-HY4_ABLIT_SPEC=0 python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 65536 --num-draft 3
+HY4_ABLIT_SPEC=on python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 65536 --num-draft 3
 ```
 
-`0`, an empty value or `off` installs no edit: the forward is the unmodified one. `HY4_ABLIT_SPEC=<other path>/edit_spec.json` loads another spec. Details and files: [presets/hy4-uncensor](../presets/hy4-uncensor/README.md).
+`on` (also `1`, `preset`, `true`, `yes`) loads the bundled preset, found from the repository from any working directory. `HY4_ABLIT_SPEC=<other path>/edit_spec.json` loads another spec. Unset, `0`, an empty value or `off` installs no edit. The start-up log prints `decensor preset on (HY4_ABLIT_SPEC=...)` or `decensor preset off`.
+
+Known limit: the preset was validated in no_think mode (judge NO 2-4 of 17 on the development build). In the default thinking mode some answers run long (2 of 17 hit the 4096-token cap in our check); a fix is in progress. Details and files: [presets/hy4-uncensor](../presets/hy4-uncensor/README.md).
 
 ## Known limits
 

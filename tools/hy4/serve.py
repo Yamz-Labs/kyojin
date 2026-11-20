@@ -94,9 +94,6 @@ def apply_env(ctx: int, model: str = "") -> None:
     if os.path.isfile(tune):
         os.environ.setdefault("HY4_TUNABLEOP_FILE", tune)
     os.environ.setdefault("HY4_WARMUP_TOKENS", str(min(8493, max(ctx - 128, 0))))
-    sp = C.ablit_spec(os.environ, TREE)                         # decensor preset: the bundled one unless HY4_ABLIT_SPEC is set (0 / empty / off = off)
-    if sp and "HY4_ABLIT_SPEC" not in os.environ:
-        os.environ["HY4_ABLIT_SPEC"] = sp
     head = os.path.join(os.path.dirname(os.path.abspath(model)), "head_q5_k.bin") if model else ""
     if os.path.isfile(head):                                  # Q5_K draft head made by tools/hy4/make_head_bin.py, kept next to the GGUF
         os.environ.setdefault("HY4_MTP_HEAD_BIN", head)
@@ -370,7 +367,7 @@ def load_in_background(st: State):
                 st.stage = s
                 print("load:", s, flush=True)
             eng.load(progress)
-            sp = C.ablit_spec(os.environ, TREE)    # decensor preset, on by default (edit_spec.json + edit_spec.safetensors next to it); HY4_ABLIT_SPEC=0 / empty / off = no edit installed
+            sp = C.ablit_spec(os.environ, TREE)    # decensor preset, opt-in (edit_spec.json + edit_spec.safetensors next to it): HY4_ABLIT_SPEC=on = the bundled one, a path = that spec; unset / 0 / empty / off = no edit installed
             if sp:
                 eng.hf._AB.load_spec(sp, "cuda", D=eng.M.D, pin=True)   # all sites pinned so the graphs capture them; weights live in static buffers
                 eng.GR.clear()

@@ -46,7 +46,7 @@ At this setting, on a 128 GB machine with nothing else large resident, the serve
 - Prefill: lazy layer residual, head-major attention operands, Q3_K gate-up kernel V2. Decode: Q8_0 output head, shared-expert branch forked inside the HIP graph, router launch tuning, absorb v2.
 - Each lever is on by default and has an environment switch: `HY4_<FLAG>=0` restores the 1.9.0 behaviour ([flag table](doc/env_vars.md), [changelog](CHANGELOG.md)). Rebuild the kernels with `bash tools/hy4/install_strix.sh` after the update.
 - The start-up warm-up now fits any `-c`.
-- The decensor preset is on by default; it edits no weights. Switch it off with `HY4_ABLIT_SPEC=0`.
+- Decensor preset (opt-in, off by default): a small run-time edit of the Hy4 forward that changes no weights. Switch it on with `HY4_ABLIT_SPEC=on`. Note: validated in no_think mode (judge NO 2-4 of 17 on the dev tree); in the default thinking mode answers can run long (2 of 17 hit the 4096-token cap in our check), a fix is in progress.
 
 Served numbers, one Strix Halo machine, shipped settings, seeded prompts, tok/s (speculative decode is the best speculative setting, plain is no speculation, tau is accepted tokens per round):
 
@@ -120,7 +120,7 @@ It prints a Markdown block. Paste it in a [benchmark report](https://github.com/
 - Hy4-flash (public GGUF, Q3_K) on one Strix Halo machine: sparse-attention prefill, graph decode with MTP drafts, 64K context, 128K opt-in ([doc/hy4.md](doc/hy4.md), [changelog](CHANGELOG.md)).
 - Long context: up to 983K tokens (DeepSeek V4.1 Flash on a Mac Studio), 500K on GLM-5.3-Flash.
 - Image input on Qwen3.8-27B.
-- Optional uncensored mode: a small run-time preset on the normal packs, off by default; it edits no weights. How it works: [doc/refusal_hook.md](doc/refusal_hook.md). Hy4-flash ships a small run-time uncensor preset, on by default; it edits no weights ([presets/hy4-uncensor](presets/hy4-uncensor/README.md)). Switch it off with `HY4_ABLIT_SPEC=0`.
+- Optional uncensored mode: a small run-time preset on the normal packs, off by default; it edits no weights. How it works: [doc/refusal_hook.md](doc/refusal_hook.md). Hy4-flash ships a small run-time uncensor preset, off by default; it edits no weights ([presets/hy4-uncensor](presets/hy4-uncensor/README.md)). Switch it on with `HY4_ABLIT_SPEC=on`.
 
 ## Made with our models
 

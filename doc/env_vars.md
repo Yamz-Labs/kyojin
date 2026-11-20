@@ -1055,12 +1055,12 @@ edits no weights. `off`, `0`, `false`, `no` and `none` force it off. An explicit
 `uncensor_spec.json` that a model directory may carry, and a path that does not exist stops the
 load with an error naming the file. See [refusal_hook.md](refusal_hook.md).
 
-#### `HY4_ABLIT_SPEC` (default: the bundled `presets/hy4-uncensor/edit_spec.json`, the hook is on)
+#### `HY4_ABLIT_SPEC` (default: unset, the hook is off)
 
 Hy4-flash server only. Path of an `edit_spec.json` (with `edit_spec.safetensors` next to it) that
 projects a per-layer direction out of the attention and MLP / MoE outputs at run time. It edits no
-weights. Unset: the preset bundled in the repository is used, from any working directory. An explicit path wins. Empty, `0`, `off`,
-`false`, `no` and `none` switch it off: no edit is installed. A malformed spec or a missing file stops
+weights. `on` (also `1`, `preset`, `true`, `yes`) loads the preset bundled in the repository, from any working directory. Any other value is the path of a
+spec. Unset, empty, `0`, `off`, `false`, `no` and `none`: no edit is installed. A malformed spec or a missing file stops
 the load. The preset is in `presets/hy4-uncensor/`. See [hy4.md](hy4.md).
 
 #### Hy4-flash 1.9.1 levers (all on by default; `=0` restores 1.9.0)
