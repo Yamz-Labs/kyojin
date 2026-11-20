@@ -2,7 +2,7 @@
 
 ## Unreleased (1.9.3)
 
-- Decode levers, all opt-in (`=1` to enable, code default `0`), each with a fires counter printed after the load warm-up (`FIRES <name> {...}`, `loader/lever_fires.py`) and a CPU test (`tests/test_hy4_seta_levers_cpu.py`):
+- Decode levers, shipped on in `SHIPPED_ENV` (`HY4_<FLAG>=0` restores 1.9.2; code default `0`), each with a fires counter printed after the load warm-up (`FIRES <name> {...}`, `loader/lever_fires.py`) and a CPU test (`tests/test_hy4_seta_levers_cpu.py`):
   `HY4_DENSE_V2` (column-tiled few-row Q8_0 dense GEMV, `gm_dense_q8`, bit-identical to the stock kernel; rebuild `exl3_gm_ext` with `tools/hy4/install_strix.sh`),
   `HY4_MOE_V2` (routed experts through the HIP code object `moe_dec.co`, built by `install_strix.sh` step 2b, `MOE_DEC_CO` overrides the path),
   `HY4_DRAFT_MOE_TILES`, `HY4_DRAFT_MLA_BG`, `HY4_DRAFT_IX_GV` (draft MTP layer: int8 expert tile retune, Q8 absorb matrices, indexer mat-vec).

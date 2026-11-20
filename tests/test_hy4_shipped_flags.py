@@ -18,6 +18,11 @@ FLAGS = {
     "HY4_GRAPH_FORK": ("exllamav3/loader/hy4_forward.py", "1"),
     "HY4_RG_TUNE": ("exllamav3/loader/router_gemv.py", "1"),
     "HY4_BG_V2": ("exllamav3/loader/mla_bgemv.py", "1"),
+    "HY4_DENSE_V2": ("exllamav3/loader/hy4_forward.py", "1"),
+    "HY4_MOE_V2": ("exllamav3/loader/hy4_forward.py", "1"),
+    "HY4_DRAFT_MOE_TILES": ("exllamav3/loader/moe_i8.py", "1"),
+    "HY4_DRAFT_MLA_BG": ("exllamav3/loader/mtp_head.py", "1"),
+    "HY4_DRAFT_IX_GV": ("exllamav3/loader/mtp_head.py", "1"),
 }
 
 
