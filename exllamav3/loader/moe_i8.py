@@ -12,6 +12,8 @@ import torch
 import triton
 import triton.language as tl
 
+from . import lever_fires as _LVF
+
 
 class Int8Stack:
     def __init__(self, g, name, dev, chunk_experts=16):
@@ -81,10 +83,12 @@ def _k_down(wd_ptr, sd_ptr, sel_ptr, h_ptr, w_ptr, o_ptr, N, K, S: tl.constexpr,
 TILES = os.environ.get("HY4_DRAFT_MOE_TILES", "0") == "1"
 GU_T = (8, 512, 8) if TILES else (16, 128, 4)
 DN_T = (16, 512, 4) if TILES else (8, 128, 4)
+FIRES = _LVF.Fires("draft_moe_tiles", hit="calls")        # calls = experts_forward launches with the retuned tiles (HY4_DRAFT_MOE_TILES=1; capture / eager sites); with the flag off each launch counts as fallback flag_off, so two identical arms never both read as fired
 
 
 def experts_forward(gate, up, down, z, sel, w, lim):
     """z [K] fp32, sel [S] int64 device, w [S] fp32 -> lat [N] fp32 (K = gate/up K, N = gate/up N = down K, down N = latent)"""
+    FIRES.hit() if TILES else FIRES.miss("flag_off")
     S = sel.numel()
     h = torch.empty(S, gate.N, dtype=torch.float32, device=z.device)
     _k_gu[(S, triton.cdiv(gate.N, GU_T[0]))](gate.q, up.q, gate.s, up.s, sel, z, h, gate.N, gate.K, lim, BN=GU_T[0], BK=GU_T[1], num_warps=GU_T[2])

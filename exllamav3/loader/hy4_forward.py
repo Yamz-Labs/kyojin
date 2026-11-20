@@ -35,6 +35,7 @@ from . import attn_eager as _AE
 from . import router_gemv as _RG
 from . import mla_hy4 as _mla_mod
 from . import dense_req as _DR
+from . import lever_fires as _LVF
 from . import ablit_hy4 as _AB       # decensor edit hook (inert while _AB.ST is None)
 
 _HCF = None
@@ -203,11 +204,18 @@ def _ext():
 
 MOE_V2 = os.environ.get("HY4_MOE_V2", "0") == "1"      # routed experts through loader/moe_dec_hip.py (HIP code object, bit-equal to the shipped grouped kernels, fewer waits per row); default off
 _MD = []
+MOE_V2_FIRES = _LVF.Fires("moe_v2", hit="calls")      # calls = layer calls (graph capture / eager sites) that took the code object; fallback = {reason: n} of the calls that did not (only counted with the flag on)
 
 
-def _moe_v2(rs, T, K):
+def _moe_v2(rs, T, K, S=16):
     """the MoeDec scratch holder for this layer shape, or None (flag off / code object missing / shape or alignment outside the kernels' contract)"""
-    if not MOE_V2 or T > MMVQ_MAXR:
+    if not MOE_V2:
+        return None
+    if S != 16:
+        MOE_V2_FIRES.miss("topk!=16")
+        return None
+    if T > MMVQ_MAXR:
+        MOE_V2_FIRES.miss("T>maxr")
         return None
     if not _MD:
         try:
@@ -219,12 +227,20 @@ def _moe_v2(rs, T, K):
             _MD.extend([None, {}])
     md, cache = _MD[0], _MD[1]
     fmt = {0: "q4_k", 8: "q3_k"}.get(rs.fu)
-    if md is None or fmt is None or rs.fd != 0 or rs.nout != K or K % 256 or rs.nff % 256 or K != 1536 or rs.nff != 1536 or any(st % 16 for st in rs.strides) or (rs.bufs["gate"].data_ptr() % 16):
+    why = ("no_code_object" if md is None else "gate_up_fmt" if fmt is None else "down_fmt" if rs.fd != 0 else "nout!=K" if rs.nout != K
+           else "shape" if (K % 256 or rs.nff % 256 or K != 1536 or rs.nff != 1536) else "stride_align" if any(st % 16 for st in rs.strides)
+           else "ptr_align" if (rs.bufs["gate"].data_ptr() % 16) else None)
+    if why is not None:
+        MOE_V2_FIRES.miss(why)
         return None
     key = (T, fmt, K, rs.nff)
     if key not in cache:
         cache[key] = md.MoeDec(rs.bufs["gate"].device, T, 16, K, rs.nff, fmt, rs.E)
-    return cache[key] if cache[key].topk == 16 else None
+    if cache[key].topk != 16:
+        MOE_V2_FIRES.miss("topk")
+        return None
+    MOE_V2_FIRES.hit()
+    return cache[key]
 
 
 def mmvq_fn(ty, K):
@@ -295,19 +311,31 @@ _TM_HOLD = [None]          # the live _Tm (stage timers inside prefill dense cal
 
 
 DENSE_V2 = [os.environ.get("HY4_DENSE_V2", "0") == "1"]          # 1 = 2..16 decode rows with K <= 8192 through gm_ext gm_dense_q8 (column-tiled Q8_0 GEMV, activations in registers; bit-identical to fq_gemv_q8_0); read at call time (graph re-capture flips it)
+DENSE_FIRES = _LVF.Fires("dense_v2", hit="v2", miss="stock")      # v2 = dense_gemv calls that took gm_dense_q8; stock = {reason: n} of the calls that kept the stock launch (only counted with the flag on)
 DENSE_V2_KMAX = 8192                                             # above this (wo K=16384, layer-0 FFN down) the stock launch is as fast (opbench / dend_test 20/11)
 
 
 def dense_gemv(gemv, xf, packed, out):
     """out = Q8_0 GEMV of the [R, K] float rows xf: the stock launch, or (HY4_DENSE_V2, R >= 2) quantise once + the column-tiled kernel (1 / 2 / 3 columns per block at R <= 4 / <= 8 / more: measured best)"""
-    if DENSE_V2[0] and xf.shape[0] >= 2 and xf.shape[1] <= DENSE_V2_KMAX and getattr(gemv, "__name__", "") == "fq_gemv_q8_0":
-        g, e = _gm(), _ext()
-        if g is not None and e is not None and hasattr(g, "gm_dense_q8"):
-            R, K = xf.shape
-            qb = e.fq_q8_scratch(xf.device.index, R, K)
-            e.fq_quant_q8_1_rows(xf, qb)
-            if g.gm_dense_q8(qb, packed, out, 1 if R <= 4 else (2 if R <= 8 else 3)):
-                return
+    if DENSE_V2[0]:
+        if xf.shape[0] < 2:
+            DENSE_FIRES.miss("rows<2")
+        elif xf.shape[1] > DENSE_V2_KMAX:
+            DENSE_FIRES.miss("K>kmax")
+        elif getattr(gemv, "__name__", "") != "fq_gemv_q8_0":
+            DENSE_FIRES.miss("not_q8_0")
+        else:
+            g, e = _gm(), _ext()
+            if g is None or e is None or not hasattr(g, "gm_dense_q8"):
+                DENSE_FIRES.miss("no_gm_ext")
+            else:
+                R, K = xf.shape
+                qb = e.fq_q8_scratch(xf.device.index, R, K)
+                e.fq_quant_q8_1_rows(xf, qb)
+                if g.gm_dense_q8(qb, packed, out, 1 if R <= 4 else (2 if R <= 8 else 3)):
+                    DENSE_FIRES.hit()
+                    return
+                DENSE_FIRES.miss("kernel_rejected")
     gemv(xf, packed, out)
 
 
@@ -772,7 +800,7 @@ class Hy4Forward:
                 if getattr(self, "_gpart", None) is None or self._gpart.shape[1] != N:
                     self._gpart = torch.empty(MMVQ_MAXR * S, N, dtype=torch.float32, device=dev)
                     self._gout = torch.empty(MMVQ_MAXR, N, dtype=torch.float32, device=dev)
-                mv2 = _moe_v2(rs, T, z.shape[1]) if S == 16 else None
+                mv2 = _moe_v2(rs, T, z.shape[1], S)
                 if mv2 is not None:
                     out2 = mv2.run(z.half().contiguous(), sel.reshape(-1).contiguous(), w.half().reshape(-1).contiguous(), rs.ptrs, rs.strides, lim, "v3", "v3")
                     lat = out2 if (self.hook is None and not NO_ALIAS_LAT) else out2.clone()

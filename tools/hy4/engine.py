@@ -47,6 +47,8 @@ def _stub_package(tree: str):
 
 
 class Hy4Engine:
+    LF = None           # loader.lever_fires, set by load()
+
     def __init__(self, tree: str, gguf: str, ctx: int = 16384, k: int = 3, chunk: int = CHUNK_DEFAULT, prime_rows: int = 0):
         self.tree, self.gguf, self.k, self.chunk = tree, gguf, k, chunk
         self.ctx = ctx
@@ -95,7 +97,9 @@ class Hy4Engine:
         from exllamav3.loader import mla_hy4 as mh
         from exllamav3.loader import step_graph as SG
         from exllamav3.loader import mtp_head as MH
-        self.hf, self.mh, self.SG, self.MH = hf, mh, SG, MH
+        from exllamav3.loader import lever_fires as LF
+        from exllamav3.loader import moe_i8, mla_bgemv      # noqa: F401  (register their counters)
+        self.hf, self.mh, self.SG, self.MH, self.LF = hf, mh, SG, MH, LF
         self._decode_flags()
         self.phase("prefill")                     # the prefill kernels are selected at layer load time too (as in the prefill harness)
         t0 = time.time()
@@ -171,6 +175,8 @@ class Hy4Engine:
                 self.SG.PRIME_IX_BLK = old
         self.reset()
         print(f"warm-up {n} tokens: {time.perf_counter() - t0:.1f} s", flush=True)
+        if self.LF is not None:
+            print(self.LF.line(), flush=True)         # lever fires after the warm-up captured every graph: an arm whose flagged lever shows no hit (or a fallback reason) fails
         if os.environ.get("HY4_WARMUP_TAILS", "1") == "1":
             self.warmup_tails()
 

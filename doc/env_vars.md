@@ -1079,6 +1079,16 @@ Hy4-flash server only. `tools/hy4/serve.py` sets these in `SHIPPED_ENV` without 
 | `HY4_RG_TUNE` | `1` | decode: router mat-vec with K block 1024 (was 256) | `HY4_RG_TUNE=0` |
 | `HY4_BG_V2` | `1` | decode: block-wise absorb kernels (absorb v2) | `HY4_BG_V2=0` |
 
+Hy4-flash 1.9.3 decode levers: all five are opt-in (code default `0`, not in `SHIPPED_ENV`). Each one has a fires counter (`loader/lever_fires.py`), printed as one `FIRES <name> {...}` line after the load warm-up; a flagged lever that shows no hit, or any fallback reason, is not in effect (counters are python-side: they count graph capture and eager call sites).
+
+| Flag | Default | Effect | Fires counter |
+|---|---|---|---|
+| `HY4_DENSE_V2` | `0` | decode: 2..16 rows with K <= 8192 through the column-tiled Q8_0 GEMV `gm_dense_q8` (bit-identical to `fq_gemv_q8_0`); needs `exl3_gm_ext.so` rebuilt by `tools/hy4/install_strix.sh` | `dense_v2 {v2, stock: {reason: n}}` |
+| `HY4_MOE_V2` | `0` | decode: routed experts (16 per row, K = 1536, Q3_K / Q4_K gate-up) through the HIP code object `moe_dec.co` (bit-equal to the shipped grouped kernels); built by `install_strix.sh` step 2b, path override `MOE_DEC_CO` | `moe_v2 {calls, fallback: {reason: n}}` |
+| `HY4_DRAFT_MOE_TILES` | `0` | draft layer: int8 expert tile retune (gate-up 8 x 512, 8 warps; down 16 x 512, 4 warps) | `draft_moe_tiles {calls}` |
+| `HY4_DRAFT_MLA_BG` | `0` | draft layer: absorb matrices `wk_b` / `wv_b` as int8 + fp16 block scales on the batched mat-vec (needs `HY4_MLA_BG=1` and `HY4_MTP_FAST=1`, both shipped on) | `draft_mla_bg {calls}` |
+| `HY4_DRAFT_IX_GV` | `0` | draft layer: indexer fp32 matrices on the router mat-vec (needs `HY4_MTP_FAST=1`) | `draft_ix_gv {gv, gemm: {reason: n}}` |
+
 The warm-up clamp has no switch. The start-up warm-up prompt (`HY4_WARMUP_TOKENS`, default the smaller of 8493 and `-c` minus 128, also when you set it) is cut to what the context window accepts, and skipped with one log line when that is under 256 tokens. `HY4_WARMUP_TOKENS=0` skips the warm-up.
 
 #### `EXL3_ABLIT_TORCH` (default: `0`)

@@ -1,5 +1,5 @@
 """ab_dend.py: ONE load; paired ABBA graph-replay verify-round wall, T = 1..6, ctx 1000 / 4000, arm A = stock dense Q8_0 GEMV, arm B = HY4_DENSE_V2 (gm_ext gm_dense_q8 for 2..16 rows, K <= 8192).
-cwd = tree. Env: EXL3_GM_BUILD_DIR (the gm_ext build holding gm_dense_q8), PCTXS, PTS. Arm flip = fwm.DENSE_V2[0] + GR.clear() (graphs re-captured). Prints per-T ms for both arms, the logit equality (bit-identical expected) and the dense launch count."""
+cwd = tree. Env: GGUF (model path), WIKI (json list of token ids), EXL3_GM_BUILD_DIR (the gm_ext build holding gm_dense_q8), PCTXS, PTS. Arm flip = fwm.DENSE_V2[0] + GR.clear() (graphs re-captured). Prints per-T ms for both arms, the logit equality (bit-identical expected) and the dense launch count."""
 import json, os, statistics, sys, time
 tree = os.getcwd()
 sys.path.insert(0, os.path.join(tree, "tools", "hy4"))
@@ -7,7 +7,7 @@ import serve
 serve.apply_env(16384)
 import torch
 from engine import Hy4Engine
-GGUF = os.environ.get("GGUF", "/home/kamel/models/hy4-flash-gguf/Hy4-flash-Q3_K-00001-of-00002.gguf")
+GGUF = os.environ["GGUF"]
 e = Hy4Engine(tree, GGUF, ctx=16384, k=3)
 e.load(print)
 GR, M = e.GR, e.M
@@ -15,7 +15,7 @@ fwm = sys.modules[type(M).__module__]
 g = fwm._gm()
 print("gm_ext", None if g is None else (g.__file__, hasattr(g, "gm_dense_q8")), flush=True)
 assert g is not None and hasattr(g, "gm_dense_q8"), "gm_dense_q8 missing: set EXL3_GM_BUILD_DIR to the build holding it"
-wiki = json.load(open(os.environ.get("WIKI", "/home/kamel/scratch_w5/wiki_ids.json")))
+wiki = json.load(open(os.environ["WIKI"]))
 pc, sync = time.perf_counter, torch.cuda.synchronize
 
 

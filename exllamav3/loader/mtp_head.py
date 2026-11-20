@@ -103,6 +103,7 @@ class Hy4MTP:
         self.kbuf = torch.zeros(self.cap, mla.R + mla.rope_dim, device=dev)
         SG.indexer_static_init(self.ix, self.cap)
         self.ix.gv = self.fast and os.environ.get("HY4_DRAFT_IX_GV", "0") == "1"      # indexer fp32 matrices on the mat-vec
+        print(f"mtp_head: draft cfg fast={self.fast} moe_tiles={MI.GU_T}/{MI.DN_T} (flag {int(MI.TILES)}) mla_bg={getattr(mla, 'bg_kb', None) is not None and getattr(mla.bg_kb, 'draft', False)} (wk_b/wv_b int8) ix_gv={self.ix.gv}", flush=True)
         try:
             from . import attn_eager as _AE
             _AE.ensure(self.cap)

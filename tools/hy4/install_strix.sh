@@ -29,6 +29,9 @@ echo "install_strix: [1/3] sparse prefill attention (hipsp/libspmla.so)"
 bash hipsp/build.sh hipsp/sp_mla.cu hipsp/libspmla.so
 echo "install_strix: [2/3] MoE expert kernels (exl3_gm_ext)"
 EXL3_GM_BUILD=1 python -c "from exllamav3 import gm_ext; assert gm_ext.get() is not None, \"gm_ext build failed\""
+echo "install_strix: [2b/3] decode expert code object (moe_dec.co, used only with HY4_MOE_V2=1; a failure here is not fatal: the lever then falls back and says so)"
+MOE_CO=${MOE_DEC_CO:-$ROOT/exllamav3/exllamav3_ext/hip_kq/moe_dec.co}
+KYOJIN_ENGINE_DIR=$ROOT bash exllamav3/exllamav3_ext/hip_kq/build_moe.sh exllamav3/exllamav3_ext/hip_kq/moe_dec.cu "$MOE_CO" >/dev/null 2>&1; [ -s "$MOE_CO" ] || echo "install_strix: WARNING moe_dec.co not built: HY4_MOE_V2=1 will fall back to the shipped kernels (see the FIRES moe_v2 line)" >&2
 echo "install_strix: [3/3] CK latent attention (libckmla.so)"
 bash tools/strix_halo/ck_fmha/build_mla.sh
 GM=${EXL3_GM_BUILD_DIR:-$HOME/.cache/exl3_gm_ext}; CK=${EXL3_CKMLA_OUT:-${XDG_CACHE_HOME:-$HOME/.cache}/kyojin/ck-fmha/libckmla.so}

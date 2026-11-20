@@ -331,3 +331,5 @@ def warmup(sch: MuScheduler, n: int, new: int = 24):
         for r in reqs:
             r.done.wait(900)
     print(f"mu warm-up: {n} prompt tokens, 1..{eng.slots} sessions", flush=True)
+    if eng.LF is not None:
+        print(eng.LF.line(), flush=True)

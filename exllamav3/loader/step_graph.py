@@ -24,6 +24,7 @@ from . import step_nosync as _ns
 from .engram_rows import QB, E4M3, E8M0
 from . import attn_eager as _ae
 from . import router_gemv as _RG
+from . import lever_fires as _LVF
 from .engram_stage import EngramStager
 
 BUCKET = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
@@ -73,13 +74,23 @@ def indexer_static_init(ix, cap):
     ix._table(cap)
 
 
-@torch.no_grad()
+IX_GV_FIRES = _LVF.Fires("draft_ix_gv", hit="gv", miss="gemm")      # draft indexer matrices (ix has the gv attribute): gv = mat-vec calls, gemm = {reason: n} of the calls that kept the GEMM (the trunk's indexer has no gv attribute and is not counted)
+
+
 def _mmw(ix, a, name):
     """a @ ix.w[name].T; the draft layer's indexer (ix.gv, HY4_DRAFT_IX_GV=1) runs its small fp32 matrices through the router mat-vec (rocBLAS SGEMM at M = 1 runs these at 12-60 GB/s)"""
     w = ix.w[name]
-    return _RG.logits(a, w) if (getattr(ix, "gv", False) and _RG.usable(a, w)) else a @ w.T
+    gv = getattr(ix, "gv", None)
+    if gv is None:
+        return a @ w.T
+    if gv and _RG.usable(a, w):
+        IX_GV_FIRES.hit()
+        return _RG.logits(a, w)
+    IX_GV_FIRES.miss("flag_off" if not gv else "unusable_shape")
+    return a @ w.T
 
 
+@torch.no_grad()
 def indexer_keys_static(ix, x, pos, ar):
     """key side of indexer_forward_static: the per-position (value | gate) rows and the pool groups they complete (x [T, E], pos [T] long device, ascending). Needs no query and no selection."""
     k, d = ix.k, ix.d

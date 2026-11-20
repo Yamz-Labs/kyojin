@@ -1,6 +1,6 @@
 #!/bin/bash
 # arms.sh "ARMNAME:K=V,K=V" ...: one mtp_items round timing per arm (same process env otherwise), step-1 output checked against arm A
-cd ~/hermes-work/relay1114/hy4s/wt_mtp
+cd "${TREE:-$(git rev-parse --show-toplevel)}"   # env: GGUF (model path) + the HY4_DRAFT_* arms
 REF=/tmp/mtp_ref_$$.pt
 for arm in "$@"; do
   n=${arm%%:*}; kv=${arm#*:}; envs=""; [ -n "$kv" ] && envs=$(echo $kv | tr ',' ' ')

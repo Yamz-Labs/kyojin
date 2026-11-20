@@ -26,7 +26,7 @@ def shipped_env():
 ENV = shipped_env()
 for _k, _v in ENV.items():
     os.environ.setdefault(_k, _v)
-EXTRA_FLAGS = ("HY4_DENSE_V2", "HY4_DENSE_V2_CPB", "HY4_FFN_GROUPED", "BOLT_FQ_Q8_MROWS")      # op-agent flags outside SHIPPED_ENV: hashed only when set, so the existing point keys stay valid
+EXTRA_FLAGS = ("HY4_DENSE_V2", "HY4_MOE_V2", "HY4_DENSE_V2_CPB", "HY4_FFN_GROUPED", "BOLT_FQ_Q8_MROWS")      # op-agent flags outside SHIPPED_ENV: hashed only when set, so the existing point keys stay valid
 FLAGHASH = hashlib.sha1(json.dumps({**{k: os.environ.get(k) for k in sorted(ENV)}, **{k: os.environ[k] for k in EXTRA_FLAGS if k in os.environ}}, sort_keys=True).encode()).hexdigest()[:8]
 
 sys.path.insert(0, os.path.join(TREE, "tools", "hy4"))

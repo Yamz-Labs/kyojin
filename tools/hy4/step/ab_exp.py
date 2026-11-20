@@ -1,7 +1,7 @@
 """ab_exp.py: ONE load (HY4_MOE_V2=1 in the environment, code object exllamav3_ext/hip_kq/moe_dec.co built by hip_kq/build_moe.sh); cwd = tree.
 Paired ABBA graph-replay step wall, T = 1..6, ctx 1000 / 4000 (PCTXS, PTS): arm A = shipped grouped kernel (fq_moe_kq_grouped_mixed_q8), arm B = HY4_MOE_V2 stages.
 Prints head_ab.log style lines (ARM ... done, AB ctx T: A [...] B [...] ms delta, KL_mean top1_agree: the arms are bit-equal where the code object is bit-equal, so KL 0 is expected;
-a nonzero KL is a kernel bug, not noise). cwd = tree."""
+a nonzero KL is a kernel bug, not noise). cwd = tree. Env: GGUF (model path), WIKI (json list of token ids)."""
 import json, os, statistics, sys, time
 tree = os.getcwd()
 sys.path.insert(0, os.path.join(tree, "tools", "hy4"))
@@ -9,13 +9,13 @@ import serve
 serve.apply_env(16384)
 import torch
 from engine import Hy4Engine
-GGUF = os.environ.get("GGUF", "/home/kamel/models/hy4-flash-gguf/Hy4-flash-Q3_K-00001-of-00002.gguf")
+GGUF = os.environ["GGUF"]
 e = Hy4Engine(tree, GGUF, ctx=16384, k=3)
 e.load(print)
 GR, M = e.GR, e.M
 fwm = sys.modules[type(M).__module__]
 assert fwm.MOE_V2, "run with HY4_MOE_V2=1"
-wiki = json.load(open(os.environ.get("WIKI", "/home/kamel/scratch_w5/wiki_ids.json")))
+wiki = json.load(open(os.environ["WIKI"]))
 pc, sync = time.perf_counter, torch.cuda.synchronize
 
 
