@@ -9,6 +9,7 @@ Generic: shapes come from the tensors (E, k, R, P, H, N); nothing is keyed on a 
 (CPU tensor without TRITON_INTERPRET, T > MAX_T, no sinks, non-fp32) falls back to the old torch code, so a caller can always use these.
 """
 import os
+import sys
 
 import torch
 
@@ -29,6 +30,8 @@ R2_RS = int(os.environ.get("HY4_MLA_ROWS2_RS", "8"))       # column slices of th
 R2_MINB = int(os.environ.get("HY4_MLA_ROWS2_MINB", "2"))   # minimum key blocks per split
 R2_FIRES = {"calls": 0, "fallback": {}}      # fires-check of HY4_MLA_ROWS2: python-side counter of mla2 dispatches (graph capture / eager) and the reasons of decode-size calls that fell back
 R2_FIRES_FILE = os.environ.get("HY4_MLA_ROWS2_FIRES", "")      # when set: the counter is written there (first calls, then every 256th, and at exit): the job reads it back as `FIRES mla2 <calls>`
+R2_TRACE = os.environ.get("HY4_MLA_ROWS2_TRACE", "0") == "1"      # first sighting of every mla2 launch key on stderr: key, whether a graph capture is running, whether Triton compiled a NEW specialisation for it (JIT inside a capture = the hang hypothesis of 18_mla2_quality)
+R2_PRECOMPILE = os.environ.get("HY4_MLA_ROWS2_PRECOMPILE", "0") == "1"      # 1: mla2_precompile() (called by the engine at the end of load) compiles + loads every (T, S) specialisation OUTSIDE any graph capture; default 0 = as before
 MAX_T = 16                  # rows per call handled by the attention kernel (decode / short verify); more = prefill -> torch GEMMs
 CLAMP_MIN = 6.103515625e-5  # the old router's `sum.clamp(min=...)`
 
@@ -404,22 +407,50 @@ if triton is not None:
         tl.store(O + t * s_o_t + h[:, None] * s_o_h + offc[None, :], A / L[:, None])
 
 
+R2_ROLE = ["trunk"]      # who is capturing / running the graph: the draft head graph captures run under r2_draft (counted apart from the trunk)
+R2_BY_ROLE = {"trunk": {"calls": 0, "fallback": {}}, "draft": {"calls": 0, "fallback": {}}}
+
+
+def r2_draft(fn):
+    """decorator for the draft head graph capture entries: mla2 dispatches inside count as role draft"""
+    import functools
+
+    @functools.wraps(fn)
+    def w(*a, **k):
+        prev = R2_ROLE[0]
+        R2_ROLE[0] = "draft"
+        try:
+            return fn(*a, **k)
+        finally:
+            R2_ROLE[0] = prev
+    return w
+
+
 def _r2_note(reason=None):
-    """count one mla2 dispatch (reason None) or one decode-size fallback (reason = why), keep R2_FIRES_FILE current"""
+    """count one mla2 dispatch (reason None) or one decode-size fallback (reason = why), total and per role (trunk / draft), keep R2_FIRES_FILE current"""
+    r = R2_BY_ROLE[R2_ROLE[0]]
     if reason is None:
         R2_FIRES["calls"] += 1
+        r["calls"] += 1
     else:
         R2_FIRES["fallback"][reason] = R2_FIRES["fallback"].get(reason, 0) + 1
+        r["fallback"][reason] = r["fallback"].get(reason, 0) + 1
     n = R2_FIRES["calls"] + sum(R2_FIRES["fallback"].values())
     if R2_FIRES_FILE and (n <= 3 or n % 256 == 0 or reason is not None and R2_FIRES["fallback"][reason] <= 2):
         _r2_dump()
+
+
+def _r2_line():
+    t, d = R2_BY_ROLE["trunk"], R2_BY_ROLE["draft"]
+    return (f"FIRES mla2 {R2_FIRES['calls']} trunk {t['calls']} draft {d['calls']} fallback {R2_FIRES['fallback']} "
+            f"fallback_trunk {t['fallback']} fallback_draft {d['fallback']}")
 
 
 def _r2_dump():
     if R2_FIRES_FILE:
         try:
             with open(R2_FIRES_FILE, "w") as f:
-                f.write(f"FIRES mla2 {R2_FIRES['calls']} fallback {R2_FIRES['fallback']}\n")
+                f.write(_r2_line() + "\n")
         except OSError:
             pass
 
@@ -429,16 +460,40 @@ if R2_FIRES_FILE:
     atexit.register(_r2_dump)
 
 
-def _mla2_launch(q_lat, q_pe, ckv, k_pe, qpos, sinks, scale, window, ring, out):
+def _mla2_plan(T, H, N, window):
+    """-> (RG, nrg, ngr, S): the program grid of one mla2 launch (host arithmetic only, no GPU call)"""
+    RG = min(R2_RG, triton.next_power_of_2(T))
+    nrg = -(-T // RG)
+    ngr = H // R2_BH
+    nblk = (-(-(window + T) // R2_BN) + 1) if window else -(-N // R2_BN)      # key blocks one program can walk
+    S = R2_SPLIT if R2_SPLIT > 0 else min(16, max(1, -(-R2_PROG // (nrg * ngr))), max(1, nblk // R2_MINB))
+    return RG, nrg, ngr, S
+
+
+def _jit_count():
+    """number of compiled specialisations Triton holds for the two mla2 kernels (-1: API not found)"""
+    try:
+        return sum(len(v[0]) for f in (_mla2_split_kernel, _mla2_combine) for v in f.device_caches.values())
+    except Exception:
+        return -1
+
+
+_R2_SEEN = set()
+
+
+def _mla2_launch(q_lat, q_pe, ckv, k_pe, qpos, sinks, scale, window, ring, out, S=None):
     T, H, R = q_lat.shape
     N, P = ckv.shape[0], k_pe.shape[1]
     BH = R2_BH
-    RG = min(R2_RG, triton.next_power_of_2(T))
-    nrg = -(-T // RG)
-    ngr = H // BH
-    nblk = (-(-(window + T) // R2_BN) + 1) if window else -(-N // R2_BN)      # key blocks one program can walk
-    S = R2_SPLIT if R2_SPLIT > 0 else min(16, max(1, -(-R2_PROG // (nrg * ngr))), max(1, nblk // R2_MINB))
+    RG, nrg, ngr, S0 = _mla2_plan(T, H, N, window)
+    S = S0 if S is None else S
     dv = q_lat.device
+    n0, cap, first = -1, False, False
+    if R2_TRACE:
+        key = (T, S, bool(window), int(ring), N % 16 == 0, N == 1)
+        first = key not in _R2_SEEN
+        _R2_SEEN.add(key)
+        n0, cap = _jit_count(), (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
     wa = torch.empty(T * ngr * S * BH * R, dtype=torch.float32, device=dv)
     wm = torch.empty(T * ngr * S * BH, dtype=torch.float32, device=dv)
     wl = torch.empty(T * ngr * S * BH, dtype=torch.float32, device=dv)
@@ -447,7 +502,44 @@ def _mla2_launch(q_lat, q_pe, ckv, k_pe, qpos, sinks, scale, window, ring, out):
                                       R=R, P=P, BH=BH, RG=RG, BN=R2_BN, BK=R2_BK, HAS_WIN=bool(window), RING=int(ring), num_warps=R2_NW, num_stages=1)
     RS = max(1, min(R2_RS, R // 32))
     _mla2_combine[(T, ngr, RS)](wa, wm, wl, out, out.stride(0), out.stride(1), R=R, BH=BH, S=S, RC=R // RS, num_warps=4)
+    if n0 >= 0:
+        n1 = _jit_count()
+        if first or n1 > n0:
+            print(f"MLA2_FIRST key T={T} S={S} win={int(bool(window))} ring={ring} N={N} capturing={cap} new_specialisations={n1 - n0}" + ("  <<< JIT INSIDE CAPTURE" if cap and n1 > n0 else ""), file=sys.stderr, flush=True)
     return out
+
+
+def mla2_precompile(layers, ts, ns, device="cuda", log=print):
+    """compile + load every mla2 specialisation a decode graph can need, now, OUTSIDE any capture (HY4_MLA_ROWS2_PRECOMPILE=1, called by the engine at the end of load).
+    layers: iterable of (H, R, P, window, ring) of the model's attention layers; ts: verify row counts (1 .. TM); ns: context buckets of the graphs.
+    One real launch per distinct (layer kind, T, S): S comes from the SAME plan as the real launch (_mla2_plan, N = the bucket), the K buffers are small dummies in the real
+    layout (a [N, R + P] fp32 buffer, ckv / k_pe its two column views) so strides, alignment and int specialisation classes (N % 16, == 1) match. -> number of launches"""
+    import time
+    t0, n_launch, seen = time.perf_counter(), 0, set()
+    for (H, R, P, window, ring) in sorted(set(layers)):
+        if H % R2_BH or R != triton.next_power_of_2(R) or P != triton.next_power_of_2(P):
+            continue
+        nd = ring if ring else 512      # dummy key rows: a ring layer reads its ring buffer, the others a multiple of 16 (every real bucket is one)
+        kc = torch.zeros(nd, R + P, dtype=torch.float32, device=device)
+        sinks = torch.zeros(H, dtype=torch.float32, device=device)
+        for T in ts:
+            if R2_BH * min(R2_RG, triton.next_power_of_2(T)) < 16:
+                continue            # the real dispatcher declines it (M tile < 16)
+            ql = torch.zeros(T, H, R, dtype=torch.float32, device=device)
+            qp = torch.zeros(T, H, P, dtype=torch.float32, device=device)
+            qpos = torch.arange(T, dtype=torch.int64, device=device)
+            for N in ns:
+                S = _mla2_plan(T, H, N, window)[3]
+                key = (H, R, P, bool(window), int(ring), T, S)
+                if key in seen:
+                    continue
+                seen.add(key)
+                _mla2_launch(ql, qp, kc[:, :R], kc[:, R:], qpos, sinks, 1.0, window, ring, torch.empty(T, H, R, dtype=torch.float32, device=device), S=S)
+                n_launch += 1
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize()
+    log(f"mla2 precompile: {n_launch} launches ({len(seen)} keys), {time.perf_counter() - t0:.1f} s, {_jit_count()} specialisations held")
+    return n_launch
 
 
 def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, window=0, allow=None, kpos_is_arange=False, ring=0):

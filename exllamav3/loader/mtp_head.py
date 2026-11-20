@@ -18,6 +18,7 @@ import torch
 from . import moe_i8 as MI
 from . import step_graph as SG
 from . import graph_bucket as _gb
+from . import ref_fused as _rf
 from . import step_nosync as _ns
 from .engram_rows import load_dense, rms
 from .hy4_forward import _mv, head_gemm, QLinear, GG_DENSE, dense_fn
@@ -257,6 +258,7 @@ class MTPGraph:
             h = y
         return torch.cat(outs + confs)
 
+    @_rf.r2_draft
     def _graph(self, N):
         g = self.graphs.get(N)
         if g is not None:
@@ -327,6 +329,7 @@ class MTPGraphCU(MTPGraph):
             h = y
         return torch.cat(outs)
 
+    @_rf.r2_draft
     def _graph(self, N, a):
         g = self.graphs.get((N, a))
         if g is not None:

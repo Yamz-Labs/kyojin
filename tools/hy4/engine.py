@@ -114,6 +114,7 @@ class Hy4Engine:
         self.GR.prepare()                          # static K / indexer / Engram buffers at the full context size: addresses never change after this
         self.MT = MH.Hy4MTP(M)
         self.MG = self._mtp_graph()
+        self._mla2_precompile()
         MH._STAGE_OV[0] = os.environ.get("HY4_SERVE_STAGE_OV", "1") == "1"     # Engram row 0 of the next verify staged during the draft chain
         torch.cuda.synchronize()
         self.load_s = time.time() - t0
@@ -148,6 +149,21 @@ class Hy4Engine:
         hf.PF_MOE = hf.PF_DENSE = hf.PF_IX = True
         hf.PF_MOE_I8 = hf.PF_MOE_REF = hf.PF_DENSE_I8 = hf.PF_ROUTER = hf.PF_DIAG = False
         mh.PF_ATTN, mh.PF_ATTN_FLASH = True, False          # (rows <= 16 never take the prefill branches)
+
+    def _mla2_precompile(self):
+        """HY4_MLA_ROWS2=1 + HY4_MLA_ROWS2_PRECOMPILE=1: compile + load every mla2 kernel specialisation of the decode graphs now (a first launch inside a graph capture would JIT / hipModuleLoad there)"""
+        rf = self.hf._rf
+        if not (rf.ROWS2 and rf.R2_PRECOMPILE):
+            return
+        from exllamav3.loader import graph_bucket as gb
+        kinds = set()
+        for i in range(self.M.n_layers):
+            m = self.M._layer(i).mla
+            kinds.add((int(m.H), int(m.R), int(m.rope_dim), int(m.window), int(getattr(m, "kv_ring", 0))))
+        mt = self.MT.mla
+        kinds.add((int(mt.H), int(mt.R), int(mt.rope_dim), int(mt.window), 0))
+        ns = set(gb.buckets(self.GR.cap)) | set(gb.buckets(self.MG.mt.cap, self.MG.BUCKET))
+        rf.mla2_precompile(kinds, range(1, self.SG.TM + 1), sorted(ns), str(self.dev), log=lambda s: print("load:", s, flush=True))
 
     def warmup(self, n: int):
         """one synthetic request of n prompt tokens + 8 decode tokens: compiles the Triton prefill kernels (they would land in the first user chunk, about 0.3 s) and captures the decode graphs"""
