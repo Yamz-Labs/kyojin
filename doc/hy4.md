@@ -52,10 +52,21 @@ The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, bot
 | variable | shipped | effect |
 |---|---|---|
 | `HY4_LC_SPARSE` | 1 | exact top-k sparse attention in decode for long context |
-| `HY4_PF_SPARSE`, `HY4_PF_SPARSE_MINN` | 1, 16384 | sparse prefill attention from 16K keys |
+| `HY4_PF_SPARSE`, `HY4_PF_SPARSE_MINN` | 1, 2048 | sparse prefill attention from 2048 keys |
 | `HY4_PF_MM_SPLIT` | 8192 | dense prefill GEMMs of more than 8192 rows run in pieces of 8192 (`0` = off) |
 | `HY4_NGRAM_EXT`, `HY4_NGRAM_MIN` | 4, 8 | prompt-lookup rows added to the MTP drafts when the last 8 tokens occurred before |
 | `HY4_MTP_HEAD` | q5k | head of the MTP drafts |
+| `HY4_MLA_HB` | 1 | decode attention: one kernel reads each K tile once for 16 heads (fp16 `tl.dot`); `HY4_MLA_HB_SPLIT` adds a key-split path for few-row steps |
+| `HY4_BG_DOT`, `HY4_HEAD_DOT` | 1 | k_b / v_b and output-head products of the verify rows on `tl.dot` (used from 5 rows for k_b / v_b, from 3 rows for the head) |
+| `HY4_RG_F16` | 1 | fp16 resident router weights for the router mat-vec, fp32 accumulate |
+| `HY4_KV_FUSED_MAXT` | 16 | the fused K-row / q-rope kernels take verify rows up to this count (was 1 row) |
+| `HY4_PRIME_KVONLY` | 1 | the draft-cache fill at the end of prefill writes only K / V and the indexer key state (no queries, selection, attention or MoE) |
+| `HY4_PF_G_SWIGLU`, `HY4_PF_G_ADD`, `HY4_PF_MM_FINE` | 1 | prefill glue: fused SwiGLU + cast, fused cast-add of the MoE layer tail, finer M-split of the dense GEMMs |
+| `HY4_ENGRAM_NPHASH`, `HY4_ENGRAM_PF_WORKERS` | 1, 1 | Engram hash in numpy; one prefetch worker |
+| `HY4_ENGRAM_NATIVE_IO` | 1 | Engram row reads in C threads (`pread`, no GIL) |
+| `HY4_ENGRAM_FUSED` | 0 | two-launch fused Engram block in decode (opt-in) |
+
+Native Engram IO: `exllamav3/loader/engram_io.c` is compiled with `gcc` at first use into `~/.cache/kyojin/engram_io` (`XDG_CACHE_HOME` moves it). When `gcc` is missing or the build fails, the server prints one line and uses the Python reader, which does the same reads more slowly (`HY4_ENGRAM_NATIVE_IO=0` selects it directly).
 
 `--num-draft` is the number of MTP drafts per round (3 by default). Memory: the K buffers are sized by `-c` (about 0.1 MB per position).
 
