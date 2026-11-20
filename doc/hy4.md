@@ -41,7 +41,7 @@ The server finds `head_q5_k.bin` by itself when it sits next to the GGUF (`HY4_M
 ## Run
 
 ```bash
-python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 131072 --num-draft 3
+python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 65536 --num-draft 3
 curl http://127.0.0.1:8300/v1/chat/completions -H 'content-type: application/json' \
      -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
@@ -72,12 +72,14 @@ Native Engram IO: `exllamav3/loader/engram_io.c` is compiled with `gcc` at first
 
 ## Supported context
 
-128K tokens (`-c 131072`). Longer prompts are not supported in this release.
+64K tokens (`-c 65536`, the command above). Speed and passkey retrieval are measured on the release build at 4K, 16K, 32K and 64K. Longer prompts are refused with a context-length error.
+
+128K (`-c 131072`) is opt-in and not measured on the release build. Memory: the K buffers grow with `-c`, and at `-c 131072` (fp32 KV) the loaded server already reached 110.4 GiB of GTT and a minimum of 0.9 GiB of available memory on a 128 GB machine. Close other large processes first; if memory runs out, use a smaller `-c`.
 
 ## Known limits
 
 - One request at a time; other requests queue. `--slots N` (several sessions in one batched step) is experimental, see [HY4_MULTI_USER.md](HY4_MULTI_USER.md).
 - Decoding is greedy: sampling parameters are accepted and ignored. Speculation returns the same tokens as plain greedy decoding.
-- Context above 128K is not part of this release.
+- Context above 64K is opt-in (128K) and not measured on the release build; above 128K is not part of this release.
 - The Engram tables (59 GiB) are read from disk by row, so the first requests after a start depend on storage speed.
 - One model and one quantization (Q3_K). Other Hy4 quantizations are not tested.

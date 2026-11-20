@@ -11,7 +11,7 @@ Hy4-flash (GGUF Q3_K) on one Strix Halo machine. Numbers: see the benchmark tabl
 - Decode: static-buffer graph step, MTP head from a Q5_K copy of the output head, n-gram rows on top of the drafts, Engram rows prefetched by row.
 - The server applies the frozen TunableOp results (`tools/hy4/tunableop_gfx1151.csv`) and a start-up warm-up request by default (`HY4_TUNABLEOP_FILE`, `HY4_WARMUP_TOKENS=0` to skip it), and picks up `head_q5_k.bin` next to the GGUF.
 - Generic GGUF loader (`EXL3_GGUF_GENERIC=1`, off by default) and its CPU tests.
-- Context: 128K tokens. Single user (`--slots` is experimental). Greedy decoding only.
+- Context: 64K tokens measured (`-c 65536` in the guide); `-c 131072` is opt-in and uses almost all of the memory of a 128 GB machine. Single user (`--slots` is experimental). Greedy decoding only.
 - A missing built kernel library (repository extension, MoE extension, attention libraries) stops the server with the install step; `HY4_ALLOW_SLOW=1` keeps the old slow-path start.
 - Decode levers on by default: head-batched MLA attention (`HY4_MLA_HB`), k_b / v_b and output-head products on `tl.dot` (`HY4_BG_DOT`, `HY4_HEAD_DOT`), fp16 router weights (`HY4_RG_F16`), fused K-row / q-rope kernels for verify rows (`HY4_KV_FUSED_MAXT`). Step tests in `tools/hy4/step/`.
 - The MTP draft-cache fill after prefill writes only K / V and the indexer key state (`HY4_PRIME_KVONLY`, on by default).
