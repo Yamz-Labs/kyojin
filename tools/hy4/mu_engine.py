@@ -431,10 +431,13 @@ class MuScheduler(threading.Thread):
 
     def run(self):
         eng, pc = self.eng, time.perf_counter
-        prof, snap = _prof(), {}
+        prof, snap, printed = _prof(), {}, 0
         try:
             eng.phase("decode")
             while True:
+                if prof and HT["rounds"] > printed and not (self.pending or self.pf or self.dec):       # idle: one MUFAST line per burst of requests (a bench cell)
+                    printed = HT["rounds"]
+                    print(fires_line(eng, snap), flush=True)
                 with self.cv:
                     while not (self.pending or self.pf or self.dec) and not self.stop_flag:
                         self.cv.wait()
@@ -490,6 +493,7 @@ class MuScheduler(threading.Thread):
                         HT["round"] += t1 - t0
                         HT["emit"] += pc() - t1
                         if HT["rounds"] % 100 == 0:
+                            printed = HT["rounds"]
                             print(fires_line(eng, snap), flush=True)
         except Exception as ex:           # noqa: BLE001
             import traceback

@@ -303,3 +303,19 @@ def test_step_slots_rows_equal_in_both_modes(decoder, monkeypatch):
         d.step_slots(rows)
         got[fast] = (d.gs.eng_raw[:, :5].clone(), d.gs.eng_valid[:, :5].clone(), d.hin[:, :5].clone())
     assert all(torch.equal(a, b) for a, b in zip(got[False], got[True]))
+
+
+def test_fires_line_format_is_what_the_driver_parses():
+    import re
+    from exllamav3.loader import step_mu
+    eng = SimpleNamespace(SM=step_mu)
+    snap = {}
+    ME.HT["rounds"] += 100
+    ME.HT["rows"] += 400
+    line = ME.fires_line(eng, snap)
+    assert line.startswith("MUFAST rounds=")
+    got = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)(?=[ ])", line.split(" | ")[0] + " ")}
+    for k in ("fast", "plain", "spec", "hcur_idx", "bind_skip", "draft_cat", "stage_vec", "stage_ov", "inp_np", "rows_gt8", "steps"):
+        assert k in got, k
+    assert "rows/round=4.00" in line
+    assert ME.fires_line(SimpleNamespace(), None).startswith("MUFAST")
