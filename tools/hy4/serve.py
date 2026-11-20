@@ -454,6 +454,9 @@ def load_in_background(st: State):
                 if os.environ.get("HY4_WARMUP_TOKENS", "0") != "0":
                     st.stage = "warm-up"
                     mu_engine.warmup(st.sched, int(os.environ["HY4_WARMUP_TOKENS"]))
+                if os.environ.get("HY4_MU_PRECAP", "0") not in ("", "0"):      # HY4_MU_PRECAP=512,1024: every (bucket, rows) trunk graph + every (slot, bucket) draft graph before the first request
+                    st.stage = "precapture"
+                    mu_engine.precapture(st.sched)
             elif os.environ.get("HY4_WARMUP_TOKENS", "0") != "0":
                 st.stage = "warm-up"
                 print("load: warm-up", flush=True)

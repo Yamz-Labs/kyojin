@@ -6,12 +6,54 @@
 Greedy: a session's stream equals plain greedy decoding of the trunk (the verifier keeps only the rows the trunk agrees with)."""
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
 from collections import deque
 
 from engine import Hy4Engine, PRIME_ROWS, warmup_clamp
+
+
+# HY4_MU_HOSTFAST=1 (default OFF): the batched host path of a decode round (see MuEngine._hcur_set, plain_round, spec_round, step_mu.step_slots).
+# HY4_MU_HOSTPROF=1: perf_counter splits per round, one `MUFAST` line per 100 rounds in the server log (also the FIRES-CHECK path counters).
+FIRES = {"plain": 0, "spec": 0, "hcur_idx": 0, "bind_skip": 0, "draft_cat": 0}
+HT = {"rounds": 0, "rows": 0, "draft": 0.0, "wait": 0.0, "post": 0.0, "emit": 0.0, "round": 0.0}
+
+
+def _fast() -> bool:
+    return os.environ.get("HY4_MU_HOSTFAST", "0") not in ("", "0")
+
+
+def _prof() -> bool:
+    return os.environ.get("HY4_MU_HOSTPROF", "0") not in ("", "0")
+
+
+def fires_line(eng, last: dict | None = None) -> str:
+    """one log line: path counters (cumulative) + mean ms per decode round since the previous line (`last` = the previous snapshot, updated in place)"""
+    sm = getattr(eng, "SM", None)
+    fs = dict(FIRES)
+    ht = dict(HT)
+    if sm is not None:
+        fs.update(sm.FIRES)
+        ht.update({k: sm.HT[k] for k in ("stage", "launch", "inputs", "gpu", "bubble")})
+    last = {} if last is None else last
+    nr = max(1, ht["rounds"] - last.get("rounds", 0))
+    ms = {k: 1000.0 * (ht.get(k, 0.0) - last.get(k, 0.0)) / nr for k in ("round", "inputs", "stage", "launch", "draft", "wait", "post", "emit", "gpu", "bubble")}
+    ms["host"] = ms["round"] - ms["gpu"]            # round time the GPU did not spend replaying (0 gpu = HOSTPROF events off)
+    rows = (ht["rows"] - last.get("rows", 0)) / nr
+    last.clear()
+    last.update(ht)
+    return ("MUFAST rounds=%d fast=%d " % (ht["rounds"], int(_fast())) + " ".join(f"{k}={v}" for k, v in fs.items()) +
+            " | ms/round " + " ".join(f"{k}={v:.2f}" for k, v in ms.items()) + f" rows/round={rows:.2f}")
+
+
+def _stage(name):
+    """HY4_MU_SYNC_DEBUG=1: log the stage and sync the device when it ends (loader/mu_debug.py); a null context otherwise"""
+    if os.environ.get("HY4_MU_SYNC_DEBUG", "0") in ("", "0"):
+        return contextlib.nullcontext()
+    from exllamav3.loader import mu_debug
+    return mu_debug.stage(name)
 
 
 class MuEngine(Hy4Engine):
@@ -50,15 +92,17 @@ class MuEngine(Hy4Engine):
         if a == 0:
             M.prefetch_engram(s.ids, s.chunk)      # the row prefetch list is global: one prefill is in flight at a time, it starts with its first chunk
             s.tok_dev = torch.tensor(s.ids, dtype=torch.long, device=self.dev)
-        lg = M.step(s.ids[a:b])
-        hs = M.head_state(M._x)
+        with _stage(f"prefill trunk step slot {s.slot} rows {a}:{b} of {n}"):
+            lg = M.step(s.ids[a:b])
+            hs = M.head_state(M._x)
         M._x = None
         e_end = min(b, n - 1)                       # head pairs (token j + 1, trunk state h_j) for j = a .. min(b, n - 1) - 1
         if e_end > a:
             f16 = os.environ.get("HY4_PF_F16")
             os.environ["HY4_PF_F16"] = "0"          # the fp16 attention chain is tuned for the trunk's matrices; the draft layer takes the generic prefill path
             try:
-                MT.prime(s.tok_dev[a + 1:e_end + 1], hs[:e_end - a], MT.ar[a:e_end], ((e_end + 3) // 4) * 4)
+                with _stage(f"prefill draft prime slot {s.slot} rows {a}:{e_end}"):
+                    MT.prime(s.tok_dev[a + 1:e_end + 1], hs[:e_end - a], MT.ar[a:e_end], ((e_end + 3) // 4) * 4)
             finally:
                 if f16 is None:
                     os.environ.pop("HY4_PF_F16", None)
@@ -79,14 +123,91 @@ class MuEngine(Hy4Engine):
     # ------------------------------------------------------------------------------------------ decode rounds
     def plain_round(self, sess):
         """one row per session -> {session: [new token]}"""
+        if _fast():
+            return self._plain_round_fast(sess)
         rows = [(s, [s.y]) for s in sess]
         _lg, am, _x, hv = self.GR.step_slots(rows)
         amh = am.reshape(-1).tolist()
         out = {}
         for r, s in enumerate(sess):
             s.y = amh[r]
+            with _stage(f"plain_round hcur clone slot {s.slot} row {r}"):
+                s.hcur = hv[r:r + 1].clone()           # a later spec_round (fewer sessions decode) drafts from the trunk state of the last fed position and the n-gram history
+            if s.ng is not None:
+                s.ng.add([s.y])
             out[s] = [s.y]
         return out
+
+    # ---- HY4_MU_HOSTFAST: batched host work of a round
+    def _hcur_set(self, sess, hv, rows=None):
+        """s.hcur of every session in ONE indexed device copy into a preallocated [slots, D] buffer (no per-slot clone); s.hcur is then a [1, D] view of the session's row.
+        hv = the step's trunk states [T, D]; rows = the row of hv each session continues from (None: row r of session r, T == len(sess))."""
+        torch = self.torch
+        D = hv.shape[-1]
+        hb = getattr(self, "_hbuf", None)
+        if hb is None:
+            dev = hv.device
+            hb = self._hbuf = torch.zeros(self.slots, D, dtype=hv.dtype, device=dev)
+            self._hviews = [hb[i:i + 1] for i in range(self.slots)]
+            self._sidx = {}
+            n = max(self.slots, 16)
+            self._rpin = torch.zeros(n, dtype=torch.long).pin_memory() if dev.type == "cuda" else torch.zeros(n, dtype=torch.long)
+            self._rdev = torch.zeros(n, dtype=torch.long, device=dev)
+        key = tuple(s.slot for s in sess)
+        idx = self._sidx.get(key)
+        if idx is None:                                 # once per distinct slot tuple (a blocking pageable H2D): never in a steady round
+            idx = self._sidx[key] = torch.tensor(key, dtype=torch.long, device=hv.device)
+        src = hv.reshape(-1, D)
+        if rows is None:
+            src = src[:len(key)]
+        else:
+            n = len(rows)
+            self._rpin[:n] = torch.tensor(rows, dtype=torch.long)
+            self._rdev[:n].copy_(self._rpin[:n], non_blocking=True)      # the previous copy of this pinned slice was enqueued before the last readback (a sync): safe to overwrite
+            src = src.index_select(0, self._rdev[:n])
+        hb.index_copy_(0, idx, src)
+        views = self._hviews
+        for s in sess:
+            s.hcur = views[s.slot]
+        FIRES["hcur_idx"] += 1
+
+    @staticmethod
+    def _ng_flush(s):
+        """append the tokens of the previous round to the n-gram history (deferred out of the round's critical path)"""
+        p = getattr(s, "ng_pend", None)
+        if p and s.ng is not None:
+            s.ng.add(p)
+            p.clear()
+
+    def _plain_round_fast(self, sess):
+        pc = time.perf_counter
+        prof = _prof()
+        t0 = pc()
+        rows = [(s, [s.y]) for s in sess]
+        _lg, am, _x, hv = self.GR.step_slots(rows)           # launched, the GPU runs from here
+        for s in sess:
+            self._ng_flush(s)                                # history appends of the previous round overlap the replay
+        self._hcur_set(sess, hv)                             # stream-ordered after the replay: no host wait
+        t1 = pc()
+        amh = am.reshape(-1).tolist()                        # the ONE readback
+        t2 = pc()
+        out = {}
+        for r, s in enumerate(sess):
+            y = amh[r]
+            s.y = y
+            if s.ng is not None:
+                p = getattr(s, "ng_pend", None)
+                if p is None:
+                    p = s.ng_pend = []
+                p.append(y)
+            out[s] = [y]
+        FIRES["plain"] += 1
+        if prof:
+            t3 = pc()
+            HT["wait"] += t2 - t1
+            HT["post"] += t3 - t2
+        return out
+
 
     def _ng(self, s):
         if s.ng is None and self.ngram_ext > 0:
@@ -97,8 +218,13 @@ class MuEngine(Hy4Engine):
         return s.ng
 
     def spec_round(self, sess):
-        """speculative round of every session in sess: drafts per session (own head state), ONE verify replay over all rows. -> {session: [new tokens]}"""
+        """speculative round of every session in sess: drafts per session (own head state), ONE verify replay over all rows. -> {session: [new tokens]}
+        HY4_MU_HOSTFAST: no bind where the (slot, bucket) draft graph exists, ONE readback of all drafts, hcur by one indexed copy, history appends deferred"""
         torch, GR, MG, MT, k = self.torch, self.GR, self.MG, self.MT, self.k
+        fast = _fast()
+        prof = _prof()
+        pc = time.perf_counter
+        t0 = pc()
         TM = self.SG.TM
         Rs = max(1, TM // len(sess))               # verify rows per session
         ks = min(k, Rs - 1)
@@ -109,20 +235,36 @@ class MuEngine(Hy4Engine):
                 continue
             j = s.n - 1
             ng = self._ng(s)
+            if fast:
+                self._ng_flush(s)
             skip, cl = False, []
             if ng is not None and self.ngram_long > 0:
                 cl, ml = ng.propose([], Rs - 1)
                 skip = bool(cl) and ml >= self.ngram_long
             if skip:
-                plan.append((s, [s.y] + cl, True, j, s.hcur.clone()))
+                plan.append((s, [s.y] + cl, True, j, s.hcur if fast else s.hcur.clone()))       # fast: s.hcur is only replaced after the round
                 continue
-            GR.bind(s)
+            cap = getattr(MG, "captured", None)
+            if fast and cap is not None and cap(s.slot, j):
+                FIRES["bind_skip"] += 1                # a replay of a captured (slot, bucket) graph reads no eager state
+            else:
+                GR.bind(s)
             MG.slot = s.slot
-            plan.append((s, None, False, j, MG.run(s.y, s.hcur, j)))      # drafts launched; read below
+            with _stage(f"spec_round draft chain slot {s.slot} j {j}"):
+                plan.append((s, None, False, j, MG.run(s.y, s.hcur, j)))      # drafts launched; read below
+        drafts = {}
+        if fast:
+            pend = [p for p in plan if p[1] is None]
+            if pend:
+                flat = torch.cat([p[4] for p in pend]).tolist()               # ONE readback for the drafts of every session
+                L = len(flat) // len(pend)
+                for i, p in enumerate(pend):
+                    drafts[p[0]] = flat[i * L:i * L + ks]
+                FIRES["draft_cat"] += 1
         rows, meta = [], []
         for s, toks, skip, j, h in plan:
             if toks is None:
-                d = h.tolist()[:ks]
+                d = drafts[s] if fast else h.tolist()[:ks]
                 ext = []
                 ng = s.ng
                 if ng is not None:
@@ -140,15 +282,18 @@ class MuEngine(Hy4Engine):
             else:
                 meta.append((s, toks, skip, j, 0, ks))
             rows.append((s, toks))
+        t1 = pc()
         starts = {s: s.n for s, _ in rows}
         _lg, amv, _x, hv = GR.step_slots(rows)
+        t2 = pc()
         amh_all = amv.reshape(-1).tolist()
+        t3 = pc()
         out, o = {}, 0
+        accrow = []
         for s, toks, skip, j, next_, kk in meta:
             T = len(toks)
             amh = amh_all[o:o + T]
             hs = hv[o:o + T]
-            o += T
             acc, nd = 0, T - 1
             while acc < nd and toks[acc + 1] == amh[acc]:
                 acc += 1
@@ -162,17 +307,38 @@ class MuEngine(Hy4Engine):
                 GR.bind(s)
                 N = ((j + acc + 1 + 3) // 4) * 4
                 sts = torch.cat([skip_h(plan, s), hs[:acc]]) if acc > 0 else skip_h(plan, s)
-                MT.step(torch.tensor(toks[:acc + 1], dtype=torch.long, device=self.dev), sts, MT.ar[j:j + acc + 1], N)
+                with _stage(f"spec_round draft catch-up (skip) slot {s.slot} j {j} acc {acc} N {N}"):
+                    MT.step(torch.tensor(toks[:acc + 1], dtype=torch.long, device=self.dev), sts, MT.ar[j:j + acc + 1], N)
             elif self.ngram_fill and acc >= kk and kk > 0:
                 GR.bind(s)
                 N = ((j + acc + 1 + 3) // 4) * 4
-                MT.step(torch.tensor(toks[kk:acc + 1], dtype=torch.long, device=self.dev), hs[kk - 1:acc], MT.ar[j + kk:j + acc + 1], N)
+                with _stage(f"spec_round draft catch-up (fill) slot {s.slot} j {j} acc {acc} N {N}"):
+                    MT.step(torch.tensor(toks[kk:acc + 1], dtype=torch.long, device=self.dev), hs[kk - 1:acc], MT.ar[j + kk:j + acc + 1], N)
             if s.ng is not None:
-                s.ng.add(new)
-            s.y, s.hcur = amh[acc], hs[acc:acc + 1].clone()
+                if fast:
+                    p = getattr(s, "ng_pend", None)
+                    if p is None:
+                        p = s.ng_pend = []
+                    p.extend(new)
+                else:
+                    s.ng.add(new)
+            if fast:
+                s.y = amh[acc]
+                accrow.append(o + acc)
+            else:
+                s.y, s.hcur = amh[acc], hs[acc:acc + 1].clone()
+            o += T
             s.extra["hist"] = s.extra.get("hist", 0) + 1
             s.extra["acc_sum"] = s.extra.get("acc_sum", 0) + acc
             out[s] = new
+        if fast:
+            self._hcur_set([m[0] for m in meta], hv, accrow)
+            FIRES["spec"] += 1
+        if prof:
+            t4 = pc()
+            HT["draft"] += t1 - t0
+            HT["wait"] += t3 - t2
+            HT["post"] += t4 - t3
         return out
 
 
@@ -220,11 +386,20 @@ class MuScheduler(threading.Thread):
         self.cv = threading.Condition()
         self.pending: deque = deque()
         self.free = list(range(eng.slots))
+        self.pin = int(os.environ.get("HY4_MU_SLOT_PIN", "-1"))      # HY4_MU_SLOT_PIN=k: slot k is allocated first whenever it is free (tests one slot index: a single session always lands on it)
+        if self.pin >= eng.slots:
+            raise ValueError(f"HY4_MU_SLOT_PIN={self.pin} is past --slots {eng.slots}")
         self.pf: deque = deque()
         self.dec: list = []
         self.stop_flag = False
         self.stats = {"rounds": 0, "round_rows": 0, "pf_chunks": 0, "pf_s": 0.0, "dec_s": 0.0}
         self.trace: list = []                       # (t0, t1, kind, n) per scheduler action
+
+    def _take_slot(self):
+        if self.pin in self.free:
+            self.free.remove(self.pin)
+            return self.pin
+        return self.free.pop(0)
 
     def submit(self, req: Request):
         with self.cv:
@@ -257,9 +432,13 @@ class MuScheduler(threading.Thread):
 
     def run(self):
         eng, pc = self.eng, time.perf_counter
+        prof, snap, printed = _prof(), {}, 0
         try:
             eng.phase("decode")
             while True:
+                if prof and HT["rounds"] > printed and not (self.pending or self.pf or self.dec):       # idle: one MUFAST line per burst of requests (a bench cell)
+                    printed = HT["rounds"]
+                    print(fires_line(eng, snap), flush=True)
                 with self.cv:
                     while not (self.pending or self.pf or self.dec) and not self.stop_flag:
                         self.cv.wait()
@@ -267,7 +446,7 @@ class MuScheduler(threading.Thread):
                         return
                     while self.pending and self.free:
                         req = self.pending.popleft()
-                        req.sess = eng.open(self.free.pop(0))
+                        req.sess = eng.open(self._take_slot())
                         req.stats["admit"] = pc()
                         if req.cancel.is_set() or len(req.ids) + req.max_new + eng.k + 2 > eng.ctx:
                             req.error = None if req.cancel.is_set() else "context"
@@ -309,6 +488,14 @@ class MuScheduler(threading.Thread):
                         r.rounds += 1
                         if self._emit(r, out[r.sess], t1):
                             self._finish(r)
+                    if prof:
+                        HT["rounds"] += 1
+                        HT["rows"] += len(sess)
+                        HT["round"] += t1 - t0
+                        HT["emit"] += pc() - t1
+                        if HT["rounds"] % 100 == 0:
+                            printed = HT["rounds"]
+                            print(fires_line(eng, snap), flush=True)
         except Exception as ex:           # noqa: BLE001
             import traceback
             traceback.print_exc()
@@ -333,3 +520,54 @@ def warmup(sch: MuScheduler, n: int, new: int = 24):
     print(f"mu warm-up: {n} prompt tokens, 1..{eng.slots} sessions", flush=True)
     if eng.LF is not None:
         print(eng.LF.line(), flush=True)
+
+
+def precapture(sch: MuScheduler, nbs=None, ts=None, progress=print):
+    """HY4_MU_PRECAP=512,1024 (context buckets): capture every (bucket, rows) trunk graph for rows in 1..TM and every (slot, bucket) draft graph NOW, before any timing, and print
+    the replay curve `MUCURVE Nb T ms` (one timed replay each; rows of one dummy session on the last slot, which a real request re-zeroes on admission). Call before the server is ready:
+    the scheduler must be idle. Rows above 8 run the fallback kernels (mla_bgemv / router_gemv keep their MAXT = 8 guards, mu_slots MAX_T = 16): the curve shows their cost."""
+    eng, torch = sch.eng, sch.eng.torch
+    GR, MG = eng.GR, eng.MG
+    TM = eng.SG.TM
+    if nbs is None:
+        nbs = [int(x) for x in os.environ.get("HY4_MU_PRECAP", "512").replace("+", ",").split(",") if x.strip()]
+    ts = list(ts) if ts is not None else list(range(1, TM + 1))
+    pc = time.perf_counter
+    t00 = pc()
+    s = GR.new_session(eng.slots - 1)
+    for Nb in nbs:
+        for T in ts:
+            base = Nb - T                                   # top = Nb: the rows land in bucket Nb
+            for rep in range(3):
+                GR.rewind(s, 0)
+                s.tokens = [0] * base
+                s.n = base
+                t = pc()
+                GR.step_slots([(s, [(i * 7919 + 13) % 50000 for i in range(T)])])     # varied ids: the routed experts of the rows differ, the union grows with T like real text
+                torch.cuda.synchronize()
+                ms = (pc() - t) * 1000
+                if rep == 0:
+                    cap_ms = ms
+            progress(f"MUCURVE Nb={Nb} T={T} ms={ms:.1f} capture_or_first_ms={cap_ms:.0f}")
+    GR.rewind(s, 0)
+    nd = 0
+    for slot in range(eng.slots):                           # the draft chain graph is keyed (slot, bucket): every slot may serve the first request of a cell
+        s2 = GR.new_session(slot)
+        GR.bind(s2)
+        MG.slot = slot
+        for Nb in nbs:
+            if (slot, Nb) not in MG.graphs:
+                MG._graph(Nb)
+                nd += 1
+    free = None
+    try:
+        free = torch.cuda.mem_get_info()[0] / 2 ** 30
+    except Exception:       # noqa: BLE001
+        pass
+    sm = getattr(eng, "SM", None)
+    if sm is not None:                                       # the FIRES-CHECK counts the served requests only, never the precapture steps
+        for k in sm.FIRES: sm.FIRES[k] = 0
+        for k in sm.HT: sm.HT[k] = 0.0
+    for k in FIRES: FIRES[k] = 0
+    for k in HT: HT[k] = 0 if k in ("rounds", "rows") else 0.0
+    progress(f"mu precapture: buckets {nbs} rows {ts[0]}..{ts[-1]}: {len(nbs) * len(ts)} trunk graphs, {nd} draft graphs, {pc() - t00:.1f} s, free GiB {free}")
