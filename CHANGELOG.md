@@ -13,6 +13,7 @@ Hy4-flash server hotfix: tool calling, a quiet exit when the client leaves, requ
 
 ## Unreleased (1.9.3)
 
+- KV footprint: `HY4_KV_FP8_MTP=1` keeps the draft layer's K cache in fp8 too (needs `HY4_KV_FP8=1`), `HY4_KV_COMPACT=1` sets fp8 trunk + draft cache + the 1024-row window ring in one switch (about 11 KB per token instead of 113 KB); all off by default. `tools/hy4/kv_bytes.py` prints the per-component table, `tools/hy4/kv_bytes_probe.py` measures it. CPU tests: `tests/test_kv_bytes.py`.
 - Long context: opt-in fp8 e4m3 latent K cache for the full-attention layers (`HY4_KV_FP8=1`, off by default; 644 bytes per token and layer instead of 2304) and the head-blocked split-K sparse attend that reads it (`HY4_LC_HB`, `HY4_LC_HB_SPLIT`; only runs on the fp8 cache). `-c 65536` keeps the fp32 cache. Guide: `doc/hy4.md`, "Long context option". CPU tests: `tests/test_kv_fp8.py`, `tests/test_hy4_shipped_flags.py`.
 
 ## 1.9.1

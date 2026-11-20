@@ -15,6 +15,7 @@ import time
 
 import torch
 
+from . import kv_fp8 as _KV8
 from . import moe_i8 as MI
 from . import step_graph as SG
 from . import step_nosync as _ns
@@ -22,6 +23,8 @@ from .engram_rows import load_dense, rms
 from .hy4_forward import _mv, head_gemm, QLinear, GG_DENSE, dense_fn
 from .indexer_fused import FusedKPoolIndexer
 from .mla_hy4 import Hy4MLA
+
+KV_FP8_MTP = os.environ.get("HY4_KV_FP8_MTP", "0") == "1" and os.environ.get("HY4_KV_FP8", "0") == "1"     # draft layer K cache in fp8 like the trunk (644 B per token instead of 2304); needs HY4_KV_FP8=1
 
 
 def q8_0_pack(W):
@@ -97,7 +100,7 @@ class Hy4MTP:
         st = _ns.state(fw)
         self.cap = cap or st.cap
         self.ar = st.ar if st.ar.shape[0] >= self.cap else torch.arange(self.cap, device=dev)
-        self.kbuf = torch.zeros(self.cap, mla.R + mla.rope_dim, device=dev)
+        self.kbuf = _KV8.Fp8KV(self.cap, mla.R, mla.rope_dim, dev) if KV_FP8_MTP else torch.zeros(self.cap, mla.R + mla.rope_dim, device=dev)
         SG.indexer_static_init(self.ix, self.cap)
         try:
             from . import attn_eager as _AE
@@ -106,6 +109,13 @@ class Hy4MTP:
             pass
         if hasattr(fw, "free_bf16_head"):
             fw.free_bf16_head()              # HY4_HEAD_Q8=1: every consumer of the bf16 head values (draft head copies) has been built
+
+    def _kput(self, pos, kn):
+        """K rows by position (graph-capturable): fp32 index_copy_, or quantise on write when the draft cache is fp8"""
+        if isinstance(self.kbuf, _KV8.Fp8KV):
+            self.kbuf.write_pos(pos, kn)
+        else:
+            self.kbuf.index_copy_(0, pos, kn)
 
     def reset(self):
         self.kbuf.zero_()
@@ -143,7 +153,7 @@ class Hy4MTP:
         e = _ns.embed(fw, tok)
         x = torch.cat([nm(e, self.enorm), nm(h, self.hnorm)], -1) @ self.eh.T
         cur = nm(x, self.attn_norm)
-        self.kbuf.index_copy_(0, pos, mla.kv(cur, pos))
+        self._kput(pos, mla.kv(cur, pos))
         qr = nm(mla._q(cur, "wq_a") @ mla.wq_a.T, mla.q_a_norm)
         allow = SG.indexer_forward_static(self.ix, cur, qr, pos, N, self.ar)
         if self.fast:
@@ -176,7 +186,7 @@ class Hy4MTP:
         e = _ns.embed(self.fw, tok)
         x = torch.cat([nm(e, self.enorm), nm(h, self.hnorm)], -1) @ self.eh.T
         cur = nm(x, self.attn_norm)
-        self.kbuf.index_copy_(0, pos, self.mla.kv(cur, pos))
+        self._kput(pos, self.mla.kv(cur, pos))
         SG.indexer_keys_static(self.ix, cur, pos, self.ar)
 
     def prime(self, tok, h, pos, N):

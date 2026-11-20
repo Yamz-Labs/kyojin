@@ -99,6 +99,20 @@ The free memory is steady, not a load transient: at the default `-c 65536` it st
 
 128K (`-c 131072`) is opt-in. At load, fp32 KV, the server reached 110.4 GiB of GTT and the free memory fell to 7.8 GiB. It was not measured under a 128K prefill on the release build; if memory runs out, use a smaller `-c`.
 
+### KV bytes per token (persistent buffers at full capacity, `python tools/hy4/kv_bytes.py`)
+
+| component | 1.9.1 default | `HY4_KV_COMPACT=1` |
+|---|---|---|
+| latent K, 12 trunk full-attention layers | 27648 (fp32 2304 each) | 7728 (fp8 644 each) |
+| latent K, MTP draft layer | 2304 | 644 (`HY4_KV_FP8_MTP`) |
+| 30 window layers | 69120 | 0 (ring of 1024 rows, 71 MB constant, `HY4_SWA_RING`) |
+| indexer pool, 13 layers (one 128-d fp32 key per 4 tokens) | 1664 | 1664 |
+| indexer value / gate rows, 13 layers | 13312 | 0 (ring, 54 MB constant) |
+| token history, arange, rope tables | 1296 | 1296 |
+| total | 115344 B (112.6 KB) | 11332 B (11.1 KB) + 125 MB |
+
+The default row matches the measured slope of the memory table above (98 to 118 KB per token). `HY4_KV_COMPACT=1` is a shortcut that sets `HY4_KV_FP8=1`, `HY4_KV_FP8_MTP=1` and `HY4_SWA_RING=1024` unless you set them yourself; add `--draft-fill-rows 4096` to the serve command so the draft states of a long prompt (fp32 [n, 3072], 12 KB per token) are not kept. Transients not in the table: one prefill chunk of indexer scores (`chunk x n / 4 x 4` bytes) and, on the fp8 cache, one fp16 dequantised copy of one layer's cache for the sparse prefill (1152 bytes per token, freed per layer). Left to the 10 KB mark: the indexer pool in fp16 (-832) and the rope tables (1280). Measured: `tools/hy4/kv_bytes_probe.py`.
+
 ### Long context option: fp8 KV (`HY4_KV_FP8=1`, off by default)
 
 Default (`-c 65536`): fp32 latent K cache, the measured quality. For `-c 131072` and `-c 262144`, switch the fp8 cache on: `HY4_KV_FP8=1 python tools/hy4/serve.py ... -c 131072`. The 12 trunk full-attention layers keep their latent K in e4m3 (512 bytes) + one fp32 scale per token + bf16 rope dims: 644 bytes per token and layer instead of 2304. The MTP layer and the 30 window layers stay fp32. The sparse decode kernel decodes e4m3 itself; prefill and the other paths read a dequantised copy of the keys of the call. With the fp8 cache the head-blocked sparse attend (`HY4_LC_HB`, default 1: one key decode shared by 16 heads, split-K with `HY4_LC_HB_SPLIT=-1` auto) is on; it never runs on the fp32 cache. `HY4_LC_HB=0` returns to the one-head kernel; `HY4_KV_FP8=0` (or unset) returns to the fp32 cache.
