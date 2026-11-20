@@ -72,8 +72,9 @@ def step(a):
     os.makedirs(a.state, exist_ok=True)
     os.makedirs(os.path.join(a.out, "readouts"), exist_ok=True)
     meta_p = os.path.join(a.out, "rows.json")
-    harm = read_prompts(a.harmful, a.limit)
-    safe = read_prompts(a.harmless, a.limit)
+    import prompt_cache as PC
+    harm = read_prompts(a.harmful or PC.default_file("harmful_collect.jsonl"), a.limit)
+    safe = read_prompts(a.harmless or PC.default_file("harmless_collect.jsonl"), a.limit)
     prompts = harm + safe
     rows, kept = encode_rows(a.tokenizer, prompts, a.max_tokens)
     label = np.array([0 if k < len(harm) else 1 for k in kept], dtype=np.int8)  # 0 harmful, 1 harmless

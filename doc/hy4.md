@@ -87,6 +87,16 @@ The free memory is steady, not a load transient: at the default `-c 65536` it st
 
 128K (`-c 131072`) is opt-in. At load, fp32 KV, the server reached 110.4 GiB of GTT and the free memory fell to 7.8 GiB. It was not measured under a 128K prefill on the release build; if memory runs out, use a smaller `-c`.
 
+## Uncensor preset (optional)
+
+Off by default. One env line turns it on; the spec is a run-time edit of the attention and MLP / MoE outputs and changes no weights:
+
+```bash
+HY4_ABLIT_SPEC=<repo>/presets/hy4-uncensor/edit_spec.json python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 65536 --num-draft 3
+```
+
+`off` or an unset variable runs the unmodified forward. Details and files: [presets/hy4-uncensor](../presets/hy4-uncensor/README.md).
+
 ## Known limits
 
 - One request at a time; other requests queue. `--slots N` (several sessions in one batched step) is experimental, see [HY4_MULTI_USER.md](HY4_MULTI_USER.md).

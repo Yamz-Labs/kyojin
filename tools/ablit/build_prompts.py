@@ -7,7 +7,7 @@ Harmful (~500): AdvBench + HarmBench (public GitHub CSVs) + JailbreakBench
 Harmless (~500): XSTest safe rows (GitHub CSV) + Alpaca (HF tatsu-lab/alpaca).
 
 Sampling: deterministic (seed 0), stratified hold-out of 100 per class.
-Output (default scratch/ablit/prompts/):
+Output (default $XDG_CACHE_HOME/kyojin/ablit_prompts, see prompt_cache.py):
   harmful_collect.jsonl (400) / harmful_heldout.jsonl (100)
   harmless_collect.jsonl (400) / harmless_heldout.jsonl (100)
   SOURCES.md (source URLs + licenses)
@@ -111,12 +111,17 @@ def write_jsonl(path, rows):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="scratch/ablit/prompts")
-    ap.add_argument("--seed", type=int, default=0)
-    a = ap.parse_args()
+NOTE = """
+The sets are not stored in this repository. `build_prompts.py` fetches them from the URLs above at first use and writes
+four jsonl files (harmful / harmless x collect / heldout) into `$XDG_CACHE_HOME/kyojin/ablit_prompts`
+(`~/.cache/kyojin/ablit_prompts`); the tools in this folder call it when a prompt file is not given. Each set stays
+under its own license (listed above).
+"""
 
+
+def build(out, seed=0, n=500, hold=100):
+    """fetch the public sets and write the four jsonl files + SOURCES.md under out (n rows per class, hold of them held out)"""
+    a = argparse.Namespace(out=out, seed=seed)
     os.makedirs(a.out, exist_ok=True)
     rng = random.Random(a.seed)
 
@@ -128,18 +133,18 @@ def main():
     # 200 adv + 140 harmbench + 60 jbb = 400 collect; holdout 20/60/20... use
     # stratified: hold out 100 total proportional to source counts below.
     harm_pool = adv[:250] + hb[:180] + jbb[:100]  # 530 -> trim
-    harm_pool = harm_pool[:500]
+    harm_pool = harm_pool[:n]
     xs = get_xstest(200)
     al = get_alpaca(320, a.seed)
     rng.shuffle(xs)
     rng.shuffle(al)
-    safe_pool = (xs[:200] + al[:300])[:500]
+    safe_pool = (xs[:200] + al[:300])[:n]
 
-    assert len(harm_pool) == 500, len(harm_pool)
-    assert len(safe_pool) == 500, len(safe_pool)
+    assert len(harm_pool) == n, len(harm_pool)
+    assert len(safe_pool) == n, len(safe_pool)
 
-    harm_c, harm_h = split_holdout(harm_pool, 100, a.seed)
-    safe_c, safe_h = split_holdout(safe_pool, 100, a.seed + 1)
+    harm_c, harm_h = split_holdout(harm_pool, hold, a.seed)
+    safe_c, safe_h = split_holdout(safe_pool, hold, a.seed + 1)
 
     def tag(rows, split):
         for r in rows:
@@ -151,7 +156,7 @@ def main():
     write_jsonl(f"{a.out}/harmless_collect.jsonl", tag(safe_c, "collect"))
     write_jsonl(f"{a.out}/harmless_heldout.jsonl", tag(safe_h, "heldout"))
     with open(f"{a.out}/SOURCES.md", "w") as f:
-        f.write(SOURCES_MD.format(**URLS))
+        f.write(SOURCES_MD.format(**URLS) + NOTE)
 
     from collections import Counter
     print("harmful collect:", Counter(r["source"] for r in harm_c),
@@ -159,6 +164,15 @@ def main():
     print("harmless collect:", Counter(r["source"] for r in safe_c),
           "heldout:", Counter(r["source"] for r in safe_h))
     print(f"wrote 4 jsonl + SOURCES.md under {a.out}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=None, help="default: the user cache dir (see prompt_cache.py)")
+    ap.add_argument("--seed", type=int, default=0)
+    a = ap.parse_args()
+    from prompt_cache import cache_dir
+    build(a.out or cache_dir(), a.seed)
 
 
 if __name__ == "__main__":

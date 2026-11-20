@@ -347,6 +347,7 @@ if __name__ == "__main__":
     if a.mock:
         run_mock(a)
     else:
-        if not a.harmful or not a.harmless:
-            sys.exit("need --harmful/--harmless jsonl (or use --mock)")
+        import prompt_cache as PC
+        a.harmful = a.harmful or PC.default_file("harmful_collect.jsonl")
+        a.harmless = a.harmless or PC.default_file("harmless_collect.jsonl")
         run_real(a)
