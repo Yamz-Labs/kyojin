@@ -85,6 +85,9 @@ class MuEngine(Hy4Engine):
         out = {}
         for r, s in enumerate(sess):
             s.y = amh[r]
+            s.hcur = hv[r:r + 1].clone()           # a later spec_round (fewer sessions decode) drafts from the trunk state of the last fed position and the n-gram history
+            if s.ng is not None:
+                s.ng.add([s.y])
             out[s] = [s.y]
         return out
 
