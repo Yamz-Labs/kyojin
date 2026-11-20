@@ -6,10 +6,13 @@ verifies every token), so the stacks are quantised on load: w ~ q * s, q int8, s
   gate_up(z [K], sel [S]) -> h [S, N]   h[s] = silu(min(Wg[e] z, lim)) * clamp(Wu[e] z, -lim, lim)          e = sel[s]
   down(h [S, N], sel, w [S]) -> lat [N]  lat = sum_s w[s] * (Wd[e_s] h[s])
 Weights are [E, N, K] row-major (ggml ne0 = K fastest), K = N = 1536 here; generic in (E, N, K)."""
+import os
 import numpy as np
 import torch
 import triton
 import triton.language as tl
+
+from . import lever_fires as _LVF
 
 
 class Int8Stack:
@@ -76,13 +79,21 @@ def _k_down(wd_ptr, sd_ptr, sel_ptr, h_ptr, w_ptr, o_ptr, N, K, S: tl.constexpr,
     tl.store(o_ptr + rows, out, mask=rm)
 
 
+# tiles (BN, BK, num_warps): HY4_DRAFT_MOE_TILES=1 = the box sweep of 20/11 (mtp_micro.py, int8 [512, 1536, 1536] x 3, 16 experts): gate/up 385 -> 328 us, down 173 -> 163 us (196 -> 231 GB/s of the 240 roof)
+TILES = os.environ.get("HY4_DRAFT_MOE_TILES", "0") == "1"
+GU_T = (8, 512, 8) if TILES else (16, 128, 4)
+DN_T = (16, 512, 4) if TILES else (8, 128, 4)
+FIRES = _LVF.Fires("draft_moe_tiles", hit="calls")        # calls = experts_forward launches with the retuned tiles (HY4_DRAFT_MOE_TILES=1; capture / eager sites); with the flag off each launch counts as fallback flag_off, so two identical arms never both read as fired
+
+
 def experts_forward(gate, up, down, z, sel, w, lim):
     """z [K] fp32, sel [S] int64 device, w [S] fp32 -> lat [N] fp32 (K = gate/up K, N = gate/up N = down K, down N = latent)"""
+    FIRES.hit() if TILES else FIRES.miss("flag_off")
     S = sel.numel()
     h = torch.empty(S, gate.N, dtype=torch.float32, device=z.device)
-    _k_gu[(S, triton.cdiv(gate.N, 16))](gate.q, up.q, gate.s, up.s, sel, z, h, gate.N, gate.K, lim, BN=16, BK=128, num_warps=4)
+    _k_gu[(S, triton.cdiv(gate.N, GU_T[0]))](gate.q, up.q, gate.s, up.s, sel, z, h, gate.N, gate.K, lim, BN=GU_T[0], BK=GU_T[1], num_warps=GU_T[2])
     out = torch.empty(down.N, dtype=torch.float32, device=z.device)
-    _k_down[(triton.cdiv(down.N, 8),)](down.q, down.s, sel, h, w, out, down.N, down.K, S=S, BN=8, BK=128, num_warps=4)
+    _k_down[(triton.cdiv(down.N, DN_T[0]),)](down.q, down.s, sel, h, w, out, down.N, down.K, S=S, BN=DN_T[0], BK=DN_T[1], num_warps=DN_T[2])
     return out
 
 

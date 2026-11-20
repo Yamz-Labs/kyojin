@@ -61,6 +61,9 @@ class Hy4MTP:
         mla = Hy4MLA(g, il, lin=(lambda n: dl(n)) if self.fast else (lambda n: load_dense(g, n)))
         _mv(mla, dev, torch.float32)
         mla.post_norm, mla.sinks = mla.post_norm.to(dev), mla.sinks.to(dev)
+        if self.fast and os.environ.get("HY4_DRAFT_MLA_BG", "0") == "1":         # absorb matrices wk_b / wv_b (fp32 einsum = rocBLAS SGEMM at 80-135 us each) as int8 + fp16 block scales on the trunk's batched mat-vec
+            from . import mla_bgemv as _BGM
+            mla.bg_kb, mla.bg_vb = _BGM.Q8Batched.from_float(mla.wk_b), _BGM.Q8Batched.from_float(mla.wv_b)
         mla.kpos_arange = True
         mla.tm = fw.tm
         self.mla = mla
@@ -99,6 +102,8 @@ class Hy4MTP:
         self.ar = st.ar if st.ar.shape[0] >= self.cap else torch.arange(self.cap, device=dev)
         self.kbuf = torch.zeros(self.cap, mla.R + mla.rope_dim, device=dev)
         SG.indexer_static_init(self.ix, self.cap)
+        self.ix.gv = self.fast and os.environ.get("HY4_DRAFT_IX_GV", "0") == "1"      # indexer fp32 matrices on the mat-vec
+        print(f"mtp_head: draft cfg fast={self.fast} moe_tiles={MI.GU_T}/{MI.DN_T} (flag {int(MI.TILES)}) mla_bg={getattr(mla, 'bg_kb', None) is not None and getattr(mla.bg_kb, 'draft', False)} (wk_b/wv_b int8) ix_gv={self.ix.gv}", flush=True)
         try:
             from . import attn_eager as _AE
             _AE.ensure(self.cap)

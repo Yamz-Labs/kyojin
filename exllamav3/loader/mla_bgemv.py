@@ -11,6 +11,9 @@ import torch
 import triton
 import triton.language as tl
 
+from . import lever_fires as _LVF
+
+DRAFT_FIRES = _LVF.Fires("draft_mla_bg", hit="calls")      # calls = mat-vec launches (capture / eager sites) of the draft layer's Q8Batched.from_float matrices (HY4_DRAFT_MLA_BG)
 ENABLED = os.environ.get("HY4_MLA_BG", "0") == "1"
 BN = int(os.environ.get("HY4_BG_BN", "16"))
 BK = int(os.environ.get("HY4_BG_BK", "128"))
@@ -144,8 +147,24 @@ class Q8Batched:
         self.q = b[:, :, 2:].contiguous().view(torch.int8).reshape(H, N, K).contiguous()
         self.H, self.N, self.K = H, N, K
 
+    draft = False       # set on the matrices built by from_float (the draft layer's): their mat-vec launches are counted in DRAFT_FIRES
+
+    @classmethod
+    def from_float(cls, w):
+        """[H, N, K] float tensor (K % 32 == 0) -> Q8_0-style int8 + fp16 block scales (the draft layer's GGUF tensors are bf16: no stored Q8_0 bytes to read)"""
+        H, N, K = w.shape
+        blk = w.float().reshape(H * N, K // 32, 32)
+        d = (blk.abs().amax(-1) / 127.0).clamp_min(1e-30).half()
+        q = torch.round(blk / d.float()[..., None]).clamp(-127, 127).to(torch.int8)
+        o = cls.__new__(cls)
+        o.d, o.q, o.H, o.N, o.K = d.reshape(H, N, K // 32).contiguous(), q.reshape(H, N, K).contiguous(), H, N, K
+        o.draft = True
+        return o
+
     def mv(self, x):
         """x [T, H, K] fp32 -> [T, H, N] fp32 (T == 1: the single-row kernel; T > 1: one kernel, weights read once)"""
+        if self.draft:
+            DRAFT_FIRES.hit()
         if x.dim() == 3 and x.shape[0] > 1 and x.stride(-1) == 1:
             T = x.shape[0]
             out = torch.empty(T, self.H, self.N, dtype=torch.float32, device=x.device)

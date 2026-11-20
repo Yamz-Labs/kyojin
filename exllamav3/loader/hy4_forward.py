@@ -35,6 +35,7 @@ from . import attn_eager as _AE
 from . import router_gemv as _RG
 from . import mla_hy4 as _mla_mod
 from . import dense_req as _DR
+from . import lever_fires as _LVF
 from . import ablit_hy4 as _AB       # decensor edit hook (inert while _AB.ST is None)
 
 _HCF = None
@@ -201,6 +202,47 @@ def _ext():
     return _EXT[0]
 
 
+MOE_V2 = os.environ.get("HY4_MOE_V2", "0") == "1"      # routed experts through loader/moe_dec_hip.py (HIP code object, bit-equal to the shipped grouped kernels, fewer waits per row); default off
+_MD = []
+MOE_V2_FIRES = _LVF.Fires("moe_v2", hit="calls")      # calls = layer calls (graph capture / eager sites) that took the code object; fallback = {reason: n} of the calls that did not (only counted with the flag on)
+
+
+def _moe_v2(rs, T, K, S=16):
+    """the MoeDec scratch holder for this layer shape, or None (flag off / code object missing / shape or alignment outside the kernels' contract)"""
+    if not MOE_V2:
+        return None
+    if S != 16:
+        MOE_V2_FIRES.miss("topk!=16")
+        return None
+    if T > MMVQ_MAXR:
+        MOE_V2_FIRES.miss("T>maxr")
+        return None
+    if not _MD:
+        try:
+            from . import moe_dec_hip as md
+            _MD.append(md if os.path.exists(md.CO) else None)
+            _MD.append({})
+        except Exception as ex:            # noqa: BLE001
+            print("hy4_forward: HY4_MOE_V2 unavailable:", repr(ex)[:160], flush=True)
+            _MD.extend([None, {}])
+    md, cache = _MD[0], _MD[1]
+    fmt = {0: "q4_k", 8: "q3_k"}.get(rs.fu)
+    why = ("no_code_object" if md is None else "gate_up_fmt" if fmt is None else "down_fmt" if rs.fd != 0 else "nout!=K" if rs.nout != K
+           else "shape" if (K % 256 or rs.nff % 256 or K != 1536 or rs.nff != 1536) else "stride_align" if any(st % 16 for st in rs.strides)
+           else "ptr_align" if (rs.bufs["gate"].data_ptr() % 16) else None)
+    if why is not None:
+        MOE_V2_FIRES.miss(why)
+        return None
+    key = (T, fmt, K, rs.nff)
+    if key not in cache:
+        cache[key] = md.MoeDec(rs.bufs["gate"].device, T, 16, K, rs.nff, fmt, rs.E)
+    if cache[key].topk != 16:
+        MOE_V2_FIRES.miss("topk")
+        return None
+    MOE_V2_FIRES.hit()
+    return cache[key]
+
+
 def mmvq_fn(ty, K):
     """kernel for stored ggml type `ty` with row length K, or None (-> torch dequant path)"""
     f = GG_MMVQ.get(int(ty))
@@ -268,6 +310,35 @@ def dense_fn(ty, K):
 _TM_HOLD = [None]          # the live _Tm (stage timers inside prefill dense calls)
 
 
+DENSE_V2 = [os.environ.get("HY4_DENSE_V2", "0") == "1"]          # 1 = 2..16 decode rows with K <= 8192 through gm_ext gm_dense_q8 (column-tiled Q8_0 GEMV, activations in registers; bit-identical to fq_gemv_q8_0); read at call time (graph re-capture flips it)
+DENSE_FIRES = _LVF.Fires("dense_v2", hit="v2", miss="stock")      # v2 = dense_gemv calls that took gm_dense_q8; stock = {reason: n} of the calls that kept the stock launch (only counted with the flag on)
+DENSE_V2_KMAX = 8192                                             # above this (wo K=16384, layer-0 FFN down) the stock launch is as fast (opbench / dend_test 20/11)
+
+
+def dense_gemv(gemv, xf, packed, out):
+    """out = Q8_0 GEMV of the [R, K] float rows xf: the stock launch, or (HY4_DENSE_V2, R >= 2) quantise once + the column-tiled kernel (1 / 2 / 3 columns per block at R <= 4 / <= 8 / more: measured best)"""
+    if DENSE_V2[0]:
+        if xf.shape[0] < 2:
+            DENSE_FIRES.miss("rows<2")
+        elif xf.shape[1] > DENSE_V2_KMAX:
+            DENSE_FIRES.miss("K>kmax")
+        elif getattr(gemv, "__name__", "") != "fq_gemv_q8_0":
+            DENSE_FIRES.miss("not_q8_0")
+        else:
+            g, e = _gm(), _ext()
+            if g is None or e is None or not hasattr(g, "gm_dense_q8"):
+                DENSE_FIRES.miss("no_gm_ext")
+            else:
+                R, K = xf.shape
+                qb = e.fq_q8_scratch(xf.device.index, R, K)
+                e.fq_quant_q8_1_rows(xf, qb)
+                if g.gm_dense_q8(qb, packed, out, 1 if R <= 4 else (2 if R <= 8 else 3)):
+                    DENSE_FIRES.hit()
+                    return
+                DENSE_FIRES.miss("kernel_rejected")
+    gemv(xf, packed, out)
+
+
 class QLinear:
     """a dense [N, K] matrix kept as STORED bytes on the device; `x @ q.T` / q(x) = x [.., K] -> [.., N]"""
 
@@ -291,7 +362,7 @@ class QLinear:
         if x2.shape[0] <= DENSE_MAXR and self.gemv is not None:
             xf = x2.float().contiguous()
             out = torch.empty(xf.shape[0], N, dtype=torch.float32, device=x.device)
-            self.gemv(xf, self.packed, out)
+            dense_gemv(self.gemv, xf, self.packed, out)
             if self.stats is not None:
                 self.stats["dense_gemv"] = self.stats.get("dense_gemv", 0) + 1
         elif PF_DENSE and self.ty in (13, 14) and x2.is_cuda:       # requantised dense (HY4_DENSE_REQ_ARMS): fp16 dequant + fp16 GEMM, like the Q8_0 prefill path
@@ -729,10 +800,15 @@ class Hy4Forward:
                 if getattr(self, "_gpart", None) is None or self._gpart.shape[1] != N:
                     self._gpart = torch.empty(MMVQ_MAXR * S, N, dtype=torch.float32, device=dev)
                     self._gout = torch.empty(MMVQ_MAXR, N, dtype=torch.float32, device=dev)
-                ext.fq_moe_kq_set_swiglu_limit(lim)
-                ext.fq_moe_kq_grouped_mixed_q8(z.half().contiguous(), sel.contiguous(), w.half().contiguous(), *rs.ptrs, *rs.strides, rs.fu, rs.fd,
-                                               self._gpart[:T * S], self._gout[:T])
-                lat = self._gout[:T] if (self.hook is None and not NO_ALIAS_LAT) else self._gout[:T].clone()       # rup reads it before the next layer's grouped call overwrites _gout (one stream); hooks keep a copy
+                mv2 = _moe_v2(rs, T, z.shape[1], S)
+                if mv2 is not None:
+                    out2 = mv2.run(z.half().contiguous(), sel.reshape(-1).contiguous(), w.half().reshape(-1).contiguous(), rs.ptrs, rs.strides, lim, "v3", "v3")
+                    lat = out2 if (self.hook is None and not NO_ALIAS_LAT) else out2.clone()
+                else:
+                    ext.fq_moe_kq_set_swiglu_limit(lim)
+                    ext.fq_moe_kq_grouped_mixed_q8(z.half().contiguous(), sel.contiguous(), w.half().contiguous(), *rs.ptrs, *rs.strides, rs.fu, rs.fd,
+                                                   self._gpart[:T * S], self._gout[:T])
+                    lat = self._gout[:T] if (self.hook is None and not NO_ALIAS_LAT) else self._gout[:T].clone()       # rup reads it before the next layer's grouped call overwrites _gout (one stream); hooks keep a copy
             self.stats["grouped_calls"] = self.stats.get("grouped_calls", 0) + 1
             sel_l = []          # the per-expert pread loop below runs zero times
         if lat is None:

@@ -9,7 +9,7 @@ and one launch replace n. Results are cached per input tensor (identity + versio
 from __future__ import annotations
 import torch
 
-from .hy4_forward import QLinear, DENSE_MAXR
+from .hy4_forward import QLinear, DENSE_MAXR, dense_gemv
 from . import dense_req as _DR
 
 # attribute names of the MLA object that read the layer input `cur` (wq_a, wkv_a, wgate); keyed by role, not by model
@@ -35,7 +35,7 @@ class _Group:
         x2 = x.reshape(-1, self.K)
         xf = x2.float().contiguous()
         out = torch.empty(xf.shape[0], sum(self.sizes), dtype=torch.float32, device=x.device)
-        self.gemv(xf, self.packed, out)
+        dense_gemv(self.gemv, xf, self.packed, out)
         if self.stats is not None:
             self.stats["dense_gemv"] = self.stats.get("dense_gemv", 0) + 1
             self.stats["attn_grouped_calls"] = self.stats.get("attn_grouped_calls", 0) + 1
