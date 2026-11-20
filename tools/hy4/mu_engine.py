@@ -11,7 +11,7 @@ import threading
 import time
 from collections import deque
 
-from engine import Hy4Engine, PRIME_ROWS
+from engine import Hy4Engine, PRIME_ROWS, warmup_clamp
 
 
 class MuEngine(Hy4Engine):
@@ -321,6 +321,9 @@ class MuScheduler(threading.Thread):
 
 def warmup(sch: MuScheduler, n: int, new: int = 24):
     """compile / capture what a served mix needs at the first bucket: B = 1 .. slots concurrent requests of n prompt tokens (graphs per (bucket, rows), MTP chains per slot)"""
+    n = warmup_clamp(n, sch.eng.ctx, sch.eng.k, new)
+    if n <= 0:
+        return
     eng = sch.eng
     ids = [(i * 7919 + 13) % 50000 for i in range(n)]
     for B in range(1, eng.slots + 1):

@@ -21,6 +21,23 @@ CHUNK_DEFAULT = 8192
 PRIME_ROWS = int(os.environ.get("HY4_PRIME_ROWS", "2048"))           # rows per batched MTP draft-cache fill call
 
 
+WARMUP_MIN = 256        # below this many prompt tokens a warm-up compiles nothing useful: skip it
+WARMUP_PAD = 16         # row alignment of the last prefill chunk (the static buffers also keep 64 spare rows, see serve.apply_env)
+
+
+def warmup_clamp(n: int, ctx: int, k: int, new: int = 8) -> int:
+    """Prompt length of the load warm-up: generate() accepts n + new + k + 2 <= ctx, so a requested n above ctx - (new + k + 2 + WARMUP_PAD) is clamped
+    to that bound (the server would never become ready otherwise). Returns 0 (skip) when the bound is below WARMUP_MIN. Unchanged when n fits."""
+    room = ctx - (new + k + 2 + WARMUP_PAD)
+    if n <= room:
+        return n
+    if room < WARMUP_MIN:
+        print(f"warm-up skipped: ctx too small (requested {n}, ctx {ctx})", flush=True)
+        return 0
+    print(f"warm-up clamped {n} -> {room} (ctx {ctx})", flush=True)
+    return room
+
+
 def _stub_package(tree: str):
     """import loader modules by path without importing the whole exllamav3 package (as the bench harnesses do)"""
     for n, s in (("exllamav3", ""), ("exllamav3.loader", "loader")):
@@ -134,6 +151,9 @@ class Hy4Engine:
 
     def warmup(self, n: int):
         """one synthetic request of n prompt tokens + 8 decode tokens: compiles the Triton prefill kernels (they would land in the first user chunk, about 0.3 s) and captures the decode graphs"""
+        n = warmup_clamp(n, self.ctx, self.k)
+        if n <= 0:
+            return
         ids = [(i * 7919 + 13) % 50000 for i in range(n)]
         t0 = time.perf_counter()
         self.generate(ids, 8, lambda toks: False)
