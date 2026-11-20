@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -60,6 +61,8 @@ class ChatTemplate:
             return self.tpl.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt, **kwargs)
         except jinja2.exceptions.TemplateError as e:
             raise RequestError(f"chat template: {e}") from e
+        except (TypeError, ValueError, AttributeError, KeyError, IndexError) as e:      # a message shape the template cannot read (e.g. arguments that are not an object)
+            raise RequestError(f"chat template: {type(e).__name__}: {e}") from e
 
 
 # ------------------------------------------------------------------------------------------------ tokenizer
@@ -94,12 +97,111 @@ class Vocab:
         self.template = ChatTemplate(meta["tokenizer.chat_template"])
         self.think_begin = next((t for t in toks if t.startswith("<think")), None)
         self.think_end = next((t for t in toks if t.startswith("</think")), None)
+        self.tool_tags = ToolTags(tag_suffix(self.think_begin))
 
     def encode(self, text: str) -> list[int]:
         return self.tok.encode(text, add_special_tokens=False).ids
 
     def decode(self, ids: list[int]) -> str:
         return self.tok.decode(ids, skip_special_tokens=False)
+
+
+# ------------------------------------------------------------------------------------------------ tool calls
+def tag_suffix(think_begin: str | None) -> str:
+    """The suffix every control tag of the chat template carries (Hy4: ":6124c78e"), read from the think-open token `<think{suffix}>`."""
+    m = re.fullmatch(r"<think(.*)>", think_begin or "")
+    return m.group(1) if m else ""
+
+
+class ToolTags:
+    """The tool-call tags the chat template writes and the model reads back (GLM shape, every tag carries the template suffix):
+
+        <tool_calls:S><tool_call:S>NAME<arg_key:S>K</arg_key:S><arg_value:S>V</arg_value:S>...</tool_call:S>...</tool_calls:S>
+    """
+
+    def __init__(self, suffix: str = ""):
+        def tag(name: str, close: bool = False) -> str:
+            return f"<{'/' if close else ''}{name}{suffix}>"
+        self.suffix = suffix
+        self.calls_open, self.calls_close = tag("tool_calls"), tag("tool_calls", True)
+        self.call_open, self.call_close = tag("tool_call"), tag("tool_call", True)
+        self.args_re = re.compile(re.escape(tag("arg_key")) + r"(.*?)" + re.escape(tag("arg_key", True)) + r"\s*" + re.escape(tag("arg_value")) + r"(.*?)"
+                                  + re.escape(tag("arg_value", True)), re.S)
+        self.opens = (self.calls_open, self.call_open)
+
+
+_TOOL_NAME_RE = re.compile(r"\s*([^\s<]+)")
+
+
+def _reject_constant(name: str):
+    raise ValueError(name)
+
+
+def _loads(text: str) -> Any:
+    """json.loads that refuses NaN / Infinity (not JSON: the arguments string must stay valid JSON)"""
+    return json.loads(text, parse_constant=_reject_constant)
+
+
+def tool_schemas(tools: list | None) -> dict[str, dict]:
+    """declared tool name -> its `parameters.properties` (empty when the tool takes none)"""
+    out: dict[str, dict] = {}
+    for t in tools or []:
+        fn = t.get("function", t)
+        out[fn.get("name")] = (fn.get("parameters") or {}).get("properties") or {}
+    return out
+
+
+def coerce_arg(value: str, schema: dict | None) -> Any:
+    """One argument written as text -> a typed value. The declared type of the parameter wins: a string parameter keeps its text exactly ("3" stays "3");
+    without a declaration the value is JSON when it parses and text when not."""
+    if not schema:
+        try:
+            return _loads(value.strip())
+        except ValueError:
+            return value.strip()
+    kind = schema.get("type")
+    kinds = [k for k in (kind if isinstance(kind, list) else [kind]) if isinstance(k, str)]
+    text = value.strip()
+    if "string" in kinds and not (text == "null" and "null" in kinds):
+        return value
+    if "boolean" in kinds and text.lower() in ("true", "false"):
+        return text.lower() == "true"
+    if "null" in kinds and text in ("null", "None"):
+        return None
+    for want, conv in (("integer", int), ("number", float)):
+        if want in kinds:
+            try:
+                got = conv(text)
+            except ValueError:
+                continue
+            if isinstance(got, float) and not math.isfinite(got):
+                continue
+            return got
+    try:
+        return _loads(value)
+    except ValueError:
+        return value
+
+
+def parse_tool_call(body: str, tags: ToolTags, schemas: dict[str, dict]) -> dict | None:
+    """The text between <tool_call> and </tool_call> -> {"name", "arguments" (a JSON object string)}, or None when it is not a call: no name, or a name the
+    request did not declare (the request declared tools and this is not one of them)."""
+    m = _TOOL_NAME_RE.match(body)
+    if not m:
+        return None
+    name = m.group(1)
+    if schemas and name not in schemas:
+        return None
+    props = schemas.get(name) or {}
+    args = {}
+    for k, v in tags.args_re.findall(body[m.end():]):
+        k = k.strip()
+        args[k] = coerce_arg(v, props.get(k))
+    return {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}
+
+
+def new_call_id() -> str:
+    return f"call_{uuid.uuid4().hex[:24]}"
 
 
 # ------------------------------------------------------------------------------------------------ request parsing
@@ -174,28 +276,142 @@ def _content_text(c: Any) -> str:
     raise RequestError("message content must be a string or a list of text parts")
 
 
+def _function_tool(t: Any, where: str) -> dict:
+    """one tool of the request -> {"type": "function", "function": {name, description?, parameters?}}. Both spellings are read: the nested one
+    ({"type": "function", "function": {...}}) and the flat one the template also takes ({"name": ..., "parameters": ...})."""
+    if not isinstance(t, dict):
+        raise RequestError(f"{where} must be an object")
+    if t.get("type", "function") != "function":
+        raise RequestError(f"{where}: only function tools are supported (type {t.get('type')!r})")
+    fn = t["function"] if isinstance(t.get("function"), dict) else t
+    name = fn.get("name")
+    if not isinstance(name, str) or not re.fullmatch(r"[^\s<>]+", name):
+        raise RequestError(f"{where}: the function needs a name (a string without spaces)")
+    if fn.get("parameters") is not None and not isinstance(fn["parameters"], dict):
+        raise RequestError(f"{where}: parameters must be a JSON schema object")
+    return {"type": "function", "function": {k: v for k, v in fn.items() if k != "type" and v is not None}}
+
+
+TOOL_HINTS = {"required": "You must answer by calling one or more of the provided functions.",
+              "function": "You must answer by calling the function {name}."}
+
+
+def parse_tools(body: dict) -> dict:
+    """`tools` (or the legacy `functions`) and `tool_choice` (or the legacy `function_call`) of a chat request ->
+    {tools: the declared function tools the prompt carries (None = none), tool_choice: none | auto | required | function, tool_name, parse_tools, tool_hint}.
+    The chat template has no switch for tool_choice: "none" leaves the tools out of the prompt and the output is plain text; a named function keeps only that
+    tool in the prompt; "required" and a named function add one instruction line to the system message (best effort, the model decides)."""
+    raw = body.get("tools")
+    if raw is None or raw == []:
+        raw = body.get("functions")
+    if raw is not None and not isinstance(raw, list):
+        raise RequestError("tools must be a list")
+    tools = [_function_tool(t, f"tools[{i}]") for i, t in enumerate(raw or [])]
+    choice = body.get("tool_choice")
+    if choice is None:
+        choice = body.get("function_call")
+    name = None
+    if choice is None:
+        mode = "auto"
+    elif isinstance(choice, str):
+        if choice not in ("none", "auto", "required"):
+            raise RequestError("tool_choice must be none, auto, required or a function")
+        mode = choice
+    elif isinstance(choice, dict):
+        fn = choice.get("function") if isinstance(choice.get("function"), dict) else choice
+        name = fn.get("name")
+        if choice.get("type", "function") != "function" or not isinstance(name, str) or not name:
+            raise RequestError("tool_choice must be none, auto, required or {\"type\": \"function\", \"function\": {\"name\": ...}}")
+        mode = "function"
+    else:
+        raise RequestError("tool_choice must be a string or an object")
+    if mode in ("required", "function") and not tools:
+        raise RequestError(f"tool_choice {mode if mode == 'required' else repr(name)} needs tools")
+    if mode == "function":
+        tools = [t for t in tools if t["function"]["name"] == name]
+        if not tools:
+            raise RequestError(f"tool_choice names the function {name!r}, which is not in tools")
+    if mode == "none":
+        tools = []
+    return {"tools": tools or None, "tool_choice": mode, "tool_name": name, "parse_tools": bool(tools),
+            "tool_hint": TOOL_HINTS.get(mode, "").format(name=name)}
+
+
+def _call_arguments(args: Any, where: str) -> dict:
+    """arguments of an assistant tool call: a JSON object string (OpenAI) or an object -> the object the template iterates"""
+    if args is None or (isinstance(args, str) and not args.strip()):
+        return {}
+    if isinstance(args, str):
+        try:
+            args = _loads(args)
+        except ValueError:
+            raise RequestError(f"{where}: function.arguments is not valid JSON") from None
+    if not isinstance(args, dict):
+        raise RequestError(f"{where}: function.arguments must be a JSON object")
+    return args
+
+
+def _assistant_calls(m: dict, where: str) -> list[dict]:
+    calls = m.get("tool_calls")
+    if calls is None and isinstance(m.get("function_call"), dict):          # legacy single call
+        calls = [{"function": m["function_call"]}]
+    if calls is None:
+        return []
+    if not isinstance(calls, list):
+        raise RequestError(f"{where}: tool_calls must be a list")
+    out = []
+    for j, c in enumerate(calls):
+        w = f"{where}.tool_calls[{j}]"
+        fn = c.get("function") if isinstance(c, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+            raise RequestError(f"{w}: needs function.name")
+        item = {"type": "function", "function": {"name": fn["name"], "arguments": _call_arguments(fn.get("arguments"), w)}}
+        if isinstance(c.get("id"), str) and c["id"]:
+            item["id"] = c["id"]
+        out.append(item)
+    return out
+
+
+CHAT_ROLES = {"system": "system", "developer": "system", "user": "user", "assistant": "assistant", "tool": "tool", "function": "tool"}
+
+
 def parse_chat(body: dict, default_max: int = 1024) -> dict:
-    """-> {messages, effort, max_tokens, stream, stop, include_usage, speculative, ...}. Raises RequestError."""
+    """-> {messages, effort, max_tokens, stream, stop, include_usage, speculative, tools, tool_choice, parse_tools, ...}. Raises RequestError.
+    Messages: assistant messages may carry tool_calls (arguments as a JSON string or an object), `tool` messages carry the result of a call (tool_call_id)."""
     req = _common(body, default_max)
-    if body.get("tools") or body.get("functions") or body.get("tool_choice") not in (None, "none"):
-        raise RequestError("tool calling is not supported by this backend yet")
+    req.update(parse_tools(body))
     msgs = body.get("messages")
     if not isinstance(msgs, list) or not msgs:
         raise RequestError("messages must be a non-empty list")
     out = []
     for i, m in enumerate(msgs):
-        if not isinstance(m, dict) or m.get("role") not in ("system", "developer", "user", "assistant"):
-            raise RequestError(f"messages[{i}]: role must be system, user or assistant")
-        role = "system" if m["role"] == "developer" else m["role"]
+        if not isinstance(m, dict) or m.get("role") not in CHAT_ROLES:
+            raise RequestError(f"messages[{i}]: role must be system, user, assistant or tool")
+        role = CHAT_ROLES[m["role"]]
         if role == "system" and i != 0:
             raise RequestError(f"messages[{i}]: a system message is only allowed first")
         item = {"role": role, "content": _content_text(m.get("content"))}
         rc = m.get("reasoning_content", m.get("reasoning"))
-        if role == "assistant" and isinstance(rc, str) and rc:
-            item["reasoning_content"] = rc
+        if role == "assistant":
+            if isinstance(rc, str) and rc:
+                item["reasoning_content"] = rc
+            calls = _assistant_calls(m, f"messages[{i}]")
+            if calls:
+                item["tool_calls"] = calls
+        elif role == "tool":
+            tcid = m.get("tool_call_id")
+            if tcid is not None and not isinstance(tcid, str):
+                raise RequestError(f"messages[{i}]: tool_call_id must be a string")
+            if tcid:
+                item["tool_call_id"] = tcid
         out.append(item)
     if out[-1]["role"] == "assistant":
         raise RequestError("the last message must come from the user")
+    if req["tool_hint"]:
+        if out[0]["role"] == "system":
+            out[0] = dict(out[0], content=(out[0]["content"] + "\n\n" if out[0]["content"] else "") + req["tool_hint"])
+        else:
+            out.insert(0, {"role": "system", "content": req["tool_hint"]})
     req.update(messages=out, effort=parse_effort(body))
     return req
 
@@ -255,22 +471,72 @@ def _hold(text: str, markers: list[str]) -> int:
 
 
 class OutputStream:
-    """Per request: token ids in, (channel, text) deltas out, channel = "reasoning" | "content".
+    """Per request: token ids in, (channel, payload) deltas out, channel = "reasoning" | "content" (payload: text) | "tool_call" (payload: {"name", "arguments"},
+    arguments = a JSON object string).
     in_think: the prompt ended inside an open think block, so the text starts as reasoning until `think_end`.
-    Stops on an EOS id (dropped) or a stop string (cut; only searched in the content channel)."""
+    Stops on an EOS id (dropped) or a stop string (cut; only searched in the content channel).
+    parse_tools: a tool block (<tool_calls> ... </tool_calls>, or a bare <tool_call> ... </tool_call>) in the content is held back and read call by call, each call
+    leaves as a "tool_call" delta the moment its </tool_call> arrives. `tools` (the declared tools) types the arguments and names the calls that count: a block
+    that is not a valid call (cut off, no name, a function the request did not declare) stays plain content. A tool block is only looked for after the reasoning."""
 
-    def __init__(self, vocab: Vocab, in_think: bool = False, stops: list[str] | None = None):
+    def __init__(self, vocab: Vocab, in_think: bool = False, stops: list[str] | None = None, tools: list | None = None, parse_tools: bool = False):
         self.v = vocab
         self.dec = IncrementalDecoder(vocab)
         self.in_think = bool(in_think and vocab.think_end)
         self.stops = stops or []
+        self.tags = vocab.tool_tags
+        self.parse_tools = bool(parse_tools)
+        self.schemas = tool_schemas(tools)
+        self.tool_text: str | None = None      # the tool block being read (None: not inside one); for <tool_calls> the text after the open tag
+        self.tool_wrapped = False
+        self.tool_pos = 0
+        self.n_calls = 0
         self.buf = ""
         self.done = False
         self.finish_reason: str | None = None
         self.n_tokens = 0          # generated tokens counted (EOS and anything after it excluded)
 
-    def _drain(self, final: bool) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
+    def _tool_open(self) -> tuple[int, str]:
+        hits = [(i, t) for t in self.tags.opens for i in [self.buf.find(t)] if i >= 0]
+        return min(hits) if hits else (-1, "")
+
+    def _read_tool_block(self, out: list, final: bool) -> bool:
+        """read the held tool block as far as it is complete; True when the block ended (the text after it is content again)"""
+        tg = self.tags
+        self.tool_text += self.buf
+        self.buf = ""
+        while True:
+            t, pos = self.tool_text, self.tool_pos
+            end = t.find(tg.calls_close, pos) if self.tool_wrapped else -1
+            start = t.find(tg.call_open, pos)
+            if end >= 0 and (start < 0 or end < start):
+                if t[pos:end].strip():
+                    out.append(("content", t[pos:end].strip()))
+                self.buf, self.tool_text = t[end + len(tg.calls_close):], None
+                return True
+            stop = t.find(tg.call_close, start + len(tg.call_open)) if start >= 0 else -1
+            if stop < 0:
+                break
+            if t[pos:start].strip():
+                out.append(("content", t[pos:start].strip()))
+            call = parse_tool_call(t[start + len(tg.call_open):stop], tg, self.schemas)
+            if call:
+                self.n_calls += 1
+                out.append(("tool_call", call))
+            else:
+                out.append(("content", t[start:stop + len(tg.call_close)]))
+            self.tool_pos = stop + len(tg.call_close)
+            if not self.tool_wrapped:
+                self.buf, self.tool_text = t[self.tool_pos:], None
+                return True
+        if final:
+            if t[pos:].strip():
+                out.append(("content", t[pos:].strip()))         # a block cut off by the end of the stream
+            self.tool_text = None
+        return False
+
+    def _drain(self, final: bool) -> list[tuple[str, Any]]:
+        out: list[tuple[str, Any]] = []
         while True:
             if self.in_think:
                 i = self.buf.find(self.v.think_end)
@@ -285,20 +551,37 @@ class OutputStream:
                     out.append(("reasoning", self.buf[:len(self.buf) - k]))
                     self.buf = self.buf[len(self.buf) - k:]
                 break
+            if self.tool_text is not None:
+                if self._read_tool_block(out, final):
+                    continue
+                break
             cut = min((j for j in (self.buf.find(s) for s in self.stops) if j >= 0), default=-1)
-            if cut >= 0:
+            at, tag = self._tool_open() if self.parse_tools else (-1, "")
+            if cut >= 0 and (at < 0 or cut < at):
                 if cut:
                     out.append(("content", self.buf[:cut]))
                 self.buf, self.done, self.finish_reason = "", True, "stop"
                 break
-            k = 0 if final else _hold(self.buf, self.stops)
+            if at >= 0:
+                if self.buf[:at].rstrip():
+                    out.append(("content", self.buf[:at].rstrip()))
+                self.tool_wrapped, self.tool_pos = tag == self.tags.calls_open, 0
+                self.tool_text = self.buf[at + len(tag):] if self.tool_wrapped else self.buf[at:]
+                self.buf = ""
+                continue
+            k = 0 if final else _hold(self.buf, self.stops + (list(self.tags.opens) if self.parse_tools else []))
+            if self.parse_tools and not final:       # the whitespace before a tool block is dropped: wait for the next character
+                start = len(self.buf) - k
+                while start > 0 and self.buf[start - 1].isspace():
+                    start -= 1
+                k = len(self.buf) - start
             if len(self.buf) > k:
                 out.append(("content", self.buf[:len(self.buf) - k]))
                 self.buf = self.buf[len(self.buf) - k:]
             break
         return out
 
-    def push(self, ids: list[int]) -> list[tuple[str, str]]:
+    def push(self, ids: list[int]) -> list[tuple[str, Any]]:
         """feed the tokens of one decode round; returns the deltas that are safe to send. `done` turns True on EOS or a stop string."""
         if self.done:
             return []
@@ -317,7 +600,7 @@ class OutputStream:
             self.done, self.finish_reason = True, "stop"
         return out
 
-    def finish(self) -> list[tuple[str, str]]:
+    def finish(self) -> list[tuple[str, Any]]:
         """flush at the end of the stream when it ended on the length limit (nothing is left after EOS or a stop string)"""
         if self.done:
             return []
@@ -325,6 +608,11 @@ class OutputStream:
         out = self._drain(final=True)
         self.buf = ""
         return out
+
+    def final_reason(self) -> str:
+        """finish_reason of the reply: tool_calls when the model ended its turn with calls, else stop / length"""
+        reason = self.finish_reason or "length"
+        return "tool_calls" if self.n_calls and reason == "stop" else reason
 
 
 # ------------------------------------------------------------------------------------------------ response bodies
@@ -356,10 +644,25 @@ def chat_chunk(rid: str, model: str, created: int, delta: dict, finish: str | No
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], **extra}
 
 
-def chat_response(rid: str, model: str, created: int, content: str, reasoning: str, finish: str, usage: dict, **extra: Any) -> dict:
+def tool_call_item(call: dict, call_id: str) -> dict:
+    """{"name", "arguments"} of the parser -> an OpenAI tool_calls entry"""
+    return {"id": call_id, "type": "function", "function": {"name": call["name"], "arguments": call["arguments"]}}
+
+
+def tool_call_deltas(index: int, call_id: str, call: dict) -> list[dict]:
+    """the two streaming deltas of one call, as OpenAI sends them: id + name (empty arguments), then the arguments"""
+    return [{"tool_calls": [{"index": index, "id": call_id, "type": "function", "function": {"name": call["name"], "arguments": ""}}]},
+            {"tool_calls": [{"index": index, "function": {"arguments": call["arguments"]}}]}]
+
+
+def chat_response(rid: str, model: str, created: int, content: str, reasoning: str, finish: str, usage: dict, tool_calls: list[dict] | None = None, **extra: Any) -> dict:
     msg: dict[str, Any] = {"role": "assistant", "content": content}
     if reasoning:
         msg["reasoning_content"] = reasoning
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+        if not content.strip():
+            msg["content"] = None
     return {"id": rid, "object": "chat.completion", "created": created, "model": model,
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}], "usage": usage, **extra}
 
