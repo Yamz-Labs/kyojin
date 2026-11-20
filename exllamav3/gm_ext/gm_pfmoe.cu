@@ -15,6 +15,8 @@
 #include <torch/extension.h>
 #include <cstdint>
 
+typedef uint32_t pf_u3 __attribute__((ext_vector_type(3), aligned(4)));
+typedef uint32_t pf_u2 __attribute__((ext_vector_type(2), aligned(4)));
 typedef __attribute__((__vector_size__(16 * sizeof(__fp16)))) __fp16 pf_h16;
 typedef __attribute__((__vector_size__(8 * sizeof(float)))) float pf_f8;
 
@@ -23,6 +25,9 @@ constexpr int PF_MT = 128, PF_KT = 64, PF_TH = 256;
 __device__ __forceinline__ float pf_h2f(uint32_t b) { return (float)__builtin_bit_cast(_Float16, (uint16_t)b); }
 __device__ __forceinline__ uint32_t pf_f2hb(float f) { return (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)f); }
 __device__ __forceinline__ uint32_t pf_pk2(float a, float b) { return pf_f2hb(a) | (pf_f2hb(b) << 16); }
+typedef _Float16 pf_hh2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ pf_hh2 pf_as_hh2(uint32_t x) { return __builtin_bit_cast(pf_hh2, x); }
+__device__ __forceinline__ uint32_t pf_from_hh2(pf_hh2 x) { return __builtin_bit_cast(uint32_t, x); }
 __device__ __forceinline__ uint32_t pf_perm16(uint32_t x) { return __builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xfedcba98, false, false); }
 __device__ __forceinline__ uint32_t pf_funnel(uint32_t lo, uint32_t hi, uint32_t sh) { return __builtin_amdgcn_alignbit(hi, lo, sh); }
 
@@ -58,6 +63,21 @@ template <int FMT> __device__ __forceinline__ void pf_load(PfW& r, const uint8_t
         r.a = *(const uint4*)blk;
         r.q0 = *(const uint2*)(blk + 16 + 32 * jq + 8 * h);
         r.q1 = *(const uint2*)(blk + 16 + 32 * jq + 16 + 8 * h);
+    } else if (FMT == 4) {       // Q3_K, 110-byte blocks, aligned dword loads: the block start is 4-aligned for even kb and 2 bytes off for odd kb (110 = 2 mod 4),
+        // so (K / 256 even, checked by the caller) load from the 4-aligned address below it and funnel-shift by 16 * (kb & 1) (wave-uniform, no branch, 3 dwords per 8 bytes)
+        const int odd = kb & 1, half = jq >> 1;
+        const uint32_t* p0 = (const uint32_t*)(wrow + kb * 110 - 2 * odd);
+        const uint32_t sh = 16 * odd;
+        const pf_u3 a = *(const pf_u3*)(p0 + 8 + 8 * half + 2 * h), b = *(const pf_u3*)(p0 + 12 + 8 * half + 2 * h);
+        const pf_u3 c = *(const pf_u3*)(p0 + 2 * h), d = *(const pf_u3*)(p0 + 4 + 2 * h);
+        const pf_u2 e = *(const pf_u2*)(p0 + 24 + (jq & 1)), f = *(const pf_u2*)(p0 + 26);   // dwords up to 27 = the last 4 bytes of an odd-kb window: nothing past the block (rows are 4-aligned: K / 256 even)
+        r.q0 = make_uint2(pf_funnel(a.x, a.y, sh), pf_funnel(a.y, a.z, sh));
+        r.q1 = make_uint2(pf_funnel(b.x, b.y, sh), pf_funnel(b.y, b.z, sh));
+        r.m0 = make_uint2(pf_funnel(c.x, c.y, sh), pf_funnel(c.y, c.z, sh));
+        r.m1 = make_uint2(pf_funnel(d.x, d.y, sh), pf_funnel(d.y, d.z, sh));
+        r.s0 = pf_funnel(e.x, e.y, sh);
+        r.s1 = pf_funnel(f.x, f.y, sh);
+        r.dd = (p0[27] >> sh) & 0xffffu;
     } else if (FMT == 3) {       // Q3_K, 110-byte blocks: 32 hmask, 64 qs, 12 scale bytes, fp16 d
         const uint8_t* blk = wrow + kb * 110;
         const int half = jq >> 1;
@@ -99,6 +119,15 @@ template <int FMT> __device__ __forceinline__ void pf_scales(PfSc& c, const PfW&
             c.ds[sbi] = d * (float)sc;
             c.dmn[sbi] = dm * (float)mn;
         }
+    } else if (FMT == 4) {       // Q3_K, packed fp16 decode: ds[ks] = the fp16 scale (-32..31) twice, dmn[0] = fp16 d twice, as float bit patterns
+        #pragma unroll
+        for (int ks = 0; ks < 4; ks++) {
+            const uint32_t lo = ((r.s0 >> (8 * ks)) >> (4 * (jq >> 1))) & 15;
+            const uint32_t hi = ((r.s1 >> (8 * ks)) >> (2 * jq)) & 3;
+            const uint32_t h = pf_f2hb((float)((int)(lo | (hi << 4)) - 32));
+            c.ds[ks] = __builtin_bit_cast(float, h | (h << 16));
+        }
+        c.dmn[0] = __builtin_bit_cast(float, (r.dd & 0xffffu) * 0x10001u);
     } else if (FMT == 3) {       // slice ks -> scale idx 4 jq + ks: low nibble of byte 96 + (idx & 7), high 2 bits of byte 104 + (idx & 3); value = ((q * sc) * d)
         #pragma unroll
         for (int ks = 0; ks < 4; ks++) {
@@ -127,6 +156,24 @@ template <int FMT> __device__ __forceinline__ void pf_dec(uint32_t o[4], const P
             const int sh = 16 * (p & 1) + sh0;
             const float q0 = (float)((word >> sh) & 15), q1 = (float)((word >> (sh + 8)) & 15);
             o[p] = pf_pk2(fmaf(q0, ds, -dmn), fmaf(q1, ds, -dmn));
+        }
+    } else if (FMT == 4) {
+        // value = fp16((v * sc) * d), v = (q | 4 hm) - 4 in -4..3. fp16 arithmetic is exact here: v * sc is an integer below 2^8 and one fp16 multiply by d
+        // rounds the exact product once, as the fp32 product + convert of FMT 3 does (same bits). Index bytes -> half2 (0x6400 | idx) = 1024 + idx.
+        const int sbi = ks >> 1, t = ks & 1;
+        const uint2 q = t ? r.q1 : r.q0, m = t ? r.m1 : r.m0;
+        const int shq = 4 * (jq & 1) + 2 * sbi, shm = (2 * jq + sbi) & 7;
+        const pf_hh2 sc = pf_as_hh2(__builtin_bit_cast(uint32_t, c.ds[ks])), d = pf_as_hh2(__builtin_bit_cast(uint32_t, c.dmn[0]));
+        const pf_hh2 bias = pf_as_hh2(0xe404e404u);     // -1028
+        #pragma unroll
+        for (int wd = 0; wd < 2; wd++) {
+            const uint32_t wq = wd ? q.y : q.x, wm = wd ? m.y : m.x;
+            const uint32_t idx = ((wq >> shq) & 0x03030303u) | (((wm >> shm) & 0x01010101u) << 2);
+            #pragma unroll
+            for (int hp = 0; hp < 2; hp++) {
+                const uint32_t x = __builtin_amdgcn_perm(0x64646464u, idx, hp ? 0x04030402u : 0x04010400u);   // [idx byte 2hp, 0x64, idx byte 2hp+1, 0x64]
+                o[2 * wd + hp] = pf_from_hh2(__builtin_elementwise_fma((pf_as_hh2(x) + bias) * sc, d, pf_hh2{0, 0}));     // fma with +0: a zero value is +0 as in FMT 3
+            }
         }
     } else if (FMT == 3) {
         const int sbi = ks >> 1, t = ks & 1;
@@ -172,7 +219,7 @@ __device__ __forceinline__ pf_h16 pf_mk_bfrag(const uint32_t o[4])
 
 // GU = true: gate+up (two weight matrices, gathered rows of X, SwiGLU epilogue -> H); false: down (two column tiles per wave, rows of Hin,
 // weighted fp32 scatter to OUT[pair]). Row groups of 16 beyond the block's valid rows are skipped (a wave-uniform branch).
-template <int FMT, bool GU>
+template <int FMT, bool GU, bool V2>
 __device__ __forceinline__ void pf_body(const uint16_t* __restrict__ X, const uint8_t* const* __restrict__ W0, const uint8_t* const* __restrict__ W1,
                                         void* __restrict__ OUT, const float* __restrict__ wts, const int* __restrict__ sp, const int* __restrict__ be,
                                         int P, int topk, int E, float lim, int K, int N, int ROWB)
@@ -187,7 +234,8 @@ __device__ __forceinline__ void pf_body(const uint16_t* __restrict__ X, const ui
     const int ar = tid >> 1, ah = tid & 1;
     const int pair = sp[by * PF_MT + ar];
     const bool valid = pair < P;
-    const int nv16 = (__syncthreads_count(valid) / 2 + 15) >> 4;     // valid rows are a prefix of the block
+    const int nvc = (__syncthreads_count(valid) / 2 + 15) >> 4;     // valid rows are a prefix of the block
+    const int nv16 = V2 ? __builtin_amdgcn_readfirstlane(nvc) : nvc;       // V2: scalar, so the `g < nv16` row-group tests are scalar branches (no exec masking)
     const uint4* arow = (const uint4*)(X + (long)(GU ? (pair / topk) : (by * PF_MT + ar)) * K);
     const uint8_t* wr[NM];
     #pragma unroll
@@ -274,26 +322,27 @@ __device__ __forceinline__ void pf_body(const uint16_t* __restrict__ X, const ui
     }
 }
 
-template <int FMT>
+template <int FMT, bool V2>
 __global__ __launch_bounds__(PF_TH) void gm_pf_gu_k(const uint16_t* X, const uint8_t* const* Wg, const uint8_t* const* Wu, uint16_t* H, const int* sp,
                                                     const int* be, int P, int topk, int E, float lim, int K, int N, int ROWB)
-{ pf_body<FMT, true>(X, Wg, Wu, H, nullptr, sp, be, P, topk, E, lim, K, N, ROWB); }
-template <int FMT>
+{ pf_body<FMT, true, V2>(X, Wg, Wu, H, nullptr, sp, be, P, topk, E, lim, K, N, ROWB); }
+template <int FMT, bool V2>
 __global__ __launch_bounds__(PF_TH) void gm_pf_down_k(const uint16_t* Hin, const uint8_t* const* Wd, float* Out, const float* wts, const int* sp,
                                                       const int* be, int P, int E, int K, int N, int ROWB)
-{ pf_body<FMT, false>(Hin, Wd, nullptr, Out, wts, sp, be, P, 1, E, 0.f, K, N, ROWB); }
+{ pf_body<FMT, false, V2>(Hin, Wd, nullptr, Out, wts, sp, be, P, 1, E, 0.f, K, N, ROWB); }
 
 // x [R, K] fp16 -> H [maxb * 128, N] fp16 (SwiGLU applied, rows in the sorted block layout). sp / be = route_blocks tables (BM = 128).
 void gm_pf_gate_up(const at::Tensor& x, const at::Tensor& gate_ptrs, const at::Tensor& up_ptrs, at::Tensor& H, const at::Tensor& sp, const at::Tensor& be,
                    int64_t P, int64_t topk, int64_t E, double lim, int64_t K, int64_t N, int64_t rowb, int64_t maxb, int64_t fmt)
 {
-    TORCH_CHECK(fmt == 0 || fmt == 3, "gm_pf_gate_up: Q4_K (0) or Q3_K (3)");
+    TORCH_CHECK(fmt == 0 || fmt == 3 || fmt == 4 || fmt == 5, "gm_pf_gate_up: Q4_K (0), Q3_K (3), V2 variants: Q3_K (4), Q4_K (5)");
     TORCH_CHECK(x.is_cuda() && x.dtype() == at::kHalf && x.is_contiguous(), "gm_pf_gate_up: x must be contiguous half on the device");
-    TORCH_CHECK(K % 256 == 0 && N % 128 == 0 && rowb == (K / 256) * (fmt == 0 ? 144 : 110), "gm_pf_gate_up: row bytes, K % 256, N % 128");
+    TORCH_CHECK(K % 256 == 0 && N % 128 == 0 && rowb == (K / 256) * (fmt == 0 || fmt == 5 ? 144 : 110), "gm_pf_gate_up: row bytes, K % 256, N % 128");
+    TORCH_CHECK(fmt != 4 || (K / 256) % 2 == 0, "gm_pf_gate_up: Q3_K V2 needs K / 256 even (4-byte aligned rows)");
     TORCH_CHECK(H.numel() >= maxb * PF_MT * N && H.dtype() == at::kHalf, "gm_pf_gate_up: H too small");
     const at::cuda::OptionalCUDAGuard guard(x.device());
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    auto launch = fmt == 0 ? gm_pf_gu_k<0> : gm_pf_gu_k<3>;
+    auto launch = fmt == 0 ? gm_pf_gu_k<0, false> : fmt == 3 ? gm_pf_gu_k<3, false> : fmt == 4 ? gm_pf_gu_k<4, true> : gm_pf_gu_k<0, true>;
     launch<<<dim3((unsigned)(N / 128), (unsigned)maxb), PF_TH, 0, stream>>>(
         reinterpret_cast<const uint16_t*>(x.data_ptr()), reinterpret_cast<const uint8_t* const*>(gate_ptrs.data_ptr()),
         reinterpret_cast<const uint8_t* const*>(up_ptrs.data_ptr()), reinterpret_cast<uint16_t*>(H.data_ptr()),
@@ -304,8 +353,8 @@ void gm_pf_gate_up(const at::Tensor& x, const at::Tensor& gate_ptrs, const at::T
 void gm_pf_down(const at::Tensor& H, const at::Tensor& down_ptrs, const at::Tensor& wts, const at::Tensor& sp, const at::Tensor& be, at::Tensor& out,
                 int64_t P, int64_t E, int64_t K, int64_t N, int64_t rowb, int64_t fmt, int64_t maxb)
 {
-    TORCH_CHECK(fmt == 0 || fmt == 2, "gm_pf_down: Q4_K (0) or Q6_K (2)");
-    TORCH_CHECK(K % 256 == 0 && N % 256 == 0 && rowb == (K / 256) * (fmt == 0 ? 144 : 210), "gm_pf_down: row bytes, K % 256, N % 256");
+    TORCH_CHECK(fmt == 0 || fmt == 2 || fmt == 4, "gm_pf_down: Q4_K (0), Q6_K (2), or Q4_K V2 (4)");
+    TORCH_CHECK(K % 256 == 0 && N % 256 == 0 && rowb == (K / 256) * (fmt == 0 || fmt == 4 ? 144 : 210), "gm_pf_down: row bytes, K % 256, N % 256");
     TORCH_CHECK(out.numel() >= P * N && out.dtype() == at::kFloat && wts.dtype() == at::kFloat, "gm_pf_down: out fp32 [P, N], wts fp32");
     const at::cuda::OptionalCUDAGuard guard(H.device());
     hipStream_t stream = at::cuda::getCurrentCUDAStream().stream();
@@ -313,10 +362,11 @@ void gm_pf_down(const at::Tensor& H, const at::Tensor& down_ptrs, const at::Tens
     auto a = std::make_tuple(reinterpret_cast<const uint16_t*>(H.data_ptr()), reinterpret_cast<const uint8_t* const*>(down_ptrs.data_ptr()),
                              reinterpret_cast<float*>(out.data_ptr()), reinterpret_cast<const float*>(wts.data_ptr()),
                              reinterpret_cast<const int*>(sp.data_ptr()), reinterpret_cast<const int*>(be.data_ptr()));
-    if (fmt == 0)
-        gm_pf_down_k<0><<<grid, PF_TH, 0, stream>>>(std::get<0>(a), std::get<1>(a), std::get<2>(a), std::get<3>(a), std::get<4>(a), std::get<5>(a), (int)P, (int)E, (int)K, (int)N, (int)rowb);
-    else
-        gm_pf_down_k<2><<<grid, PF_TH, 0, stream>>>(std::get<0>(a), std::get<1>(a), std::get<2>(a), std::get<3>(a), std::get<4>(a), std::get<5>(a), (int)P, (int)E, (int)K, (int)N, (int)rowb);
+    if (fmt == 0 || fmt == 4) {
+        auto launch = fmt == 0 ? gm_pf_down_k<0, false> : gm_pf_down_k<0, true>;
+        launch<<<grid, PF_TH, 0, stream>>>(std::get<0>(a), std::get<1>(a), std::get<2>(a), std::get<3>(a), std::get<4>(a), std::get<5>(a), (int)P, (int)E, (int)K, (int)N, (int)rowb);
+    } else
+        gm_pf_down_k<2, false><<<grid, PF_TH, 0, stream>>>(std::get<0>(a), std::get<1>(a), std::get<2>(a), std::get<3>(a), std::get<4>(a), std::get<5>(a), (int)P, (int)E, (int)K, (int)N, (int)rowb);
 }
 
 #endif

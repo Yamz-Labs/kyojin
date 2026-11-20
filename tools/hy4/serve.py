@@ -57,6 +57,7 @@ SHIPPED_ENV = {
     "HY4_ENGRAM_NPHASH": "1", "HY4_ENGRAM_NATIVE_IO": "1", "HY4_ENGRAM_PF_WORKERS": "1", "HY4_PF_G_SWIGLU": "1", "HY4_PF_G_ADD": "1", "HY4_PF_MM_FINE": "1",   # prefill levers (box A/B 20/11 pf2_A / pf2_B: prefill +11 / +7.6 / +6.5 % at 8K / 32K / 64K, passkey 3/3, KL 0.108 vs noise nulls 0.103-0.108)
     "HY4_MLA_HB": "1", "HY4_BG_DOT": "1", "HY4_HEAD_DOT": "1", "HY4_RG_F16": "1",   # decode levers (box A/B 20/11, 256 tok x2: verify round -7 % at 4K, -4 % at 32K, plain flat; qual6 KL 0.94 x noise null)
     "HY4_PF_KV_HM": "1", "HY4_PF_QO_HM": "1", "HY4_PF_HC2": "1", "HY4_PF_ROUTER16": "1",   # prefill set 3 (1.9.1): head-major CK attention operands, lazy layer residual (3 stream passes per layer), fp16 router logits of prefill rows (only on the HY4_REF_FUSED=0 router path)
+    "HY4_PF_Q3K_V2": "1",   # Q3_K prefill gate-up kernel with packed fp16 decode + aligned dword loads (bit-identical to the old kernel, -0.26 s per 8K chunk; needs the rebuilt gm_ext, else falls back; old kernel when K / 256 is odd)
     "HY4_PF_WOT": "0", "HY4_MOE_HIP": "2", "HY4_PF_CK": "1", "HY4_PF_FUSE": "1",      # prefill set 2: shared gm_ext WMMA experts (HY4_GM_EXT), CK MLA core (EXL3_CKMLA_SO), one-pass hc / norm / indexer kernels
 }
 
