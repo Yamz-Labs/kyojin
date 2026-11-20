@@ -83,8 +83,20 @@ if triton is not None:
         tl.store(NSEL + t, tl.sum(sel.to(tl.int32), 0))
 
     @triton.jit
-    def _blk(q, qp, CK, KPE, offn, vis, s_ck, s_kp, offr, offp, mr, mp, scale, m, l, acc):
-        ck = tl.load(CK + offn[:, None].to(tl.int64) * s_ck + offr[None, :], mask=vis[:, None] & mr[None, :], other=0.0).to(tl.float32)
+    def _dq8(raw):
+        b = raw.to(tl.int32)
+        e = (b >> 3) & 15
+        m = (b & 7).to(tl.float32)
+        v = tl.where(e == 0, m * 0.001953125, (8.0 + m) * tl.exp2((e - 10).to(tl.float32)))
+        return tl.where(((b >> 7) & 1) == 1, -v, v)
+
+    @triton.jit
+    def _blk(q, qp, CK, KPE, SCL, offn, vis, s_ck, s_kp, offr, offp, mr, mp, scale, m, l, acc, QF: tl.constexpr):
+        if QF:      # HY4_KV_FP8: e4m3 latent bytes + one fp32 scale per token, decoded here
+            ck = _dq8(tl.load(CK + offn[:, None].to(tl.int64) * s_ck + offr[None, :], mask=vis[:, None] & mr[None, :], other=0)) \
+                * tl.load(SCL + offn.to(tl.int64), mask=vis, other=0.0)[:, None]
+        else:
+            ck = tl.load(CK + offn[:, None].to(tl.int64) * s_ck + offr[None, :], mask=vis[:, None] & mr[None, :], other=0.0).to(tl.float32)
         kp = tl.load(KPE + offn[:, None].to(tl.int64) * s_kp + offp[None, :], mask=vis[:, None] & mp[None, :], other=0.0).to(tl.float32)
         s = (tl.sum(ck * q[None, :], axis=1) + tl.sum(kp * qp[None, :], axis=1)) * scale
         s = tl.where(vis, s, float("-inf"))
@@ -97,8 +109,8 @@ if triton is not None:
         return mn, l, acc
 
     @triton.jit
-    def _sparse_mla_kernel(QL, QP, CK, KPE, POS, IDX, NSEL, SINK, O, scale, s_ql_t, s_ql_h, s_qp_t, s_qp_h, s_ck, s_kp, s_o_t, s_o_h,
-                           R: tl.constexpr, P: tl.constexpr, BR: tl.constexpr, BPE: tl.constexpr, BN: tl.constexpr, KG: tl.constexpr, NTOP: tl.constexpr):
+    def _sparse_mla_kernel(QL, QP, CK, KPE, SCL, POS, IDX, NSEL, SINK, O, scale, s_ql_t, s_ql_h, s_qp_t, s_qp_h, s_ck, s_kp, s_o_t, s_o_h,
+                           R: tl.constexpr, P: tl.constexpr, BR: tl.constexpr, BPE: tl.constexpr, BN: tl.constexpr, KG: tl.constexpr, NTOP: tl.constexpr, QF: tl.constexpr):
         t = tl.program_id(0)
         h = tl.program_id(1)
         offr = tl.arange(0, BR)
@@ -114,14 +126,14 @@ if triton is not None:
         lo = qpos - qpos % KG                                                   # open tail group of the row (select_tail)
         kk = tl.arange(0, BN)
         offn = lo + kk
-        m, l, acc = _blk(q, qp, CK, KPE, offn, offn <= qpos, s_ck, s_kp, offr, offp, mr, mp, scale, m, l, acc)
+        m, l, acc = _blk(q, qp, CK, KPE, SCL, offn, offn <= qpos, s_ck, s_kp, offr, offp, mr, mp, scale, m, l, acc, QF)
         n = tl.load(NSEL + t)
         nk = n * KG
         for i0 in range(0, nk, BN):
             kj = i0 + kk
             inb = kj < nk
             g = tl.load(IDX + t * NTOP + kj // KG, mask=inb, other=0)
-            m, l, acc = _blk(q, qp, CK, KPE, g * KG + kj % KG, inb, s_ck, s_kp, offr, offp, mr, mp, scale, m, l, acc)
+            m, l, acc = _blk(q, qp, CK, KPE, SCL, g * KG + kj % KG, inb, s_ck, s_kp, offr, offp, mr, mp, scale, m, l, acc, QF)
         tl.store(O + t * s_o_t + h * s_o_h + offr, acc / l, mask=mr)
 
 
@@ -147,15 +159,16 @@ class SparseSel:
         self.idx, self.nsel, self.kp, self.tail, self.n_top = idx, nsel, kp, tail, idx.shape[1]
 
 
-def sparse_mla_attend(q_lat, q_pe, ckv, k_pe, qpos, sel, scale, sinks):
+def sparse_mla_attend(q_lat, q_pe, ckv, k_pe, qpos, sel, scale, sinks, scl=None):
     """q_lat [T,H,R] fp32, q_pe [T,H,P], ckv [N,R], k_pe [N,P] (row strides free), qpos [T] long, sel SparseSel -> o_lat [T,H,R] fp32"""
     T, H, R = q_lat.shape
     P = k_pe.shape[1]
-    assert sel.tail and q_lat.dtype == torch.float32 and ckv.dtype == torch.float32 and q_lat.stride(-1) == 1 and q_pe.stride(-1) == 1 and ckv.stride(-1) == 1 and k_pe.stride(-1) == 1
+    qf = scl is not None           # ckv = uint8 e4m3 bytes [N, R], scl [N] fp32, k_pe bf16 [N, P]
+    assert sel.tail and q_lat.dtype == torch.float32 and (ckv.dtype == torch.uint8 if qf else ckv.dtype == torch.float32) and q_lat.stride(-1) == 1 and q_pe.stride(-1) == 1 and ckv.stride(-1) == 1 and k_pe.stride(-1) == 1
     out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
-    _sparse_mla_kernel[(T, H)](q_lat, q_pe, ckv, k_pe, qpos, sel.idx, sel.nsel, sinks.float().contiguous(), out, float(scale),
+    _sparse_mla_kernel[(T, H)](q_lat, q_pe, ckv, k_pe, scl if qf else ckv, qpos, sel.idx, sel.nsel, sinks.float().contiguous(), out, float(scale),
                                q_lat.stride(0), q_lat.stride(1), q_pe.stride(0), q_pe.stride(1), ckv.stride(0), k_pe.stride(0), out.stride(0), out.stride(1),
-                               R=R, P=P, BR=triton.next_power_of_2(R), BPE=triton.next_power_of_2(P), BN=16, KG=sel.kp, NTOP=sel.n_top, num_warps=4)
+                               R=R, P=P, BR=triton.next_power_of_2(R), BPE=triton.next_power_of_2(P), BN=16, KG=sel.kp, NTOP=sel.n_top, QF=qf, num_warps=4)
     return out
 
 

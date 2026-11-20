@@ -897,7 +897,7 @@ class Hy4Forward:
         ring = getattr(mla, "kv_ring", 0)           # HY4_SWA_RING: window layers keep a ring of `ring` K rows instead of the full context
         mla.ring_call = ring if gs is not None else 0
         slots = gs is not None and getattr(gs, "slots", False)         # multi-session step (step_mu): K rows / indexer / attention go through the slot slabs
-        if gs is not None and 1 <= gs.T <= _KVF.MAXT and _KVF.ENABLED and _AE.ENABLED and not slots:       # HY4_KV_FUSED: rms + rope + K-row write in ONE kernel
+        if gs is not None and 1 <= gs.T <= _KVF.MAXT and _KVF.ENABLED and _AE.ENABLED and not slots and _ns.state(self).kv.get(i).__class__.__name__ != "Fp8KV":       # HY4_KV_FUSED: rms + rope + K-row write in ONE kernel
             kc = gs.kv_row_fused(i, mla, cur, pos)
         else:
             with tm.t("attn proj"):

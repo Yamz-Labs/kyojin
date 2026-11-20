@@ -51,6 +51,8 @@ def _rms(x, w, eps):
 from . import pool_fused as _PF
 from . import lc_sparse as _LS
 _PF.ENABLED = os.environ.get("HY4_IDX_POOLK", "0") == "1"
+from . import kv_fp8 as _KV8
+KV_FP8 = os.environ.get("HY4_KV_FP8", "0") == "1"      # latent K cache of the full-attention layers in fp8 e4m3 + per-token scale (+ bf16 rope dims)
 
 
 def indexer_static_init(ix, cap):
@@ -203,6 +205,9 @@ class _GS:
         if ring:                                  # window layer: ring buffer, slot = position % ring; attention reads the whole ring through absolute positions
             b.index_copy_(0, self.pos % ring, kn)
             return b
+        if b.__class__.__name__ == "Fp8KV":           # HY4_KV_FP8: quantise + scatter the rows
+            b.write_pos(self.pos, kn)
+            return b[:self.Nb]
         b.index_copy_(0, self.pos, kn)
         return b[:self.Nb]
 
@@ -272,6 +277,12 @@ class GraphDecoder:
             if getattr(m, "kv_ring", 0):
                 if b is None or b.shape[0] != m.kv_ring:
                     st.kv[i] = torch.zeros(m.kv_ring, 512 + 64, dtype=torch.float32, device=fw.dev)
+                continue
+            if KV_FP8 and not m.swa and fw._layer(i).ix and not isinstance(b, _KV8.Fp8KV):          # full-attention layer: fp8 latent cache
+                nb = _KV8.Fp8KV(self.cap, 512, 64, fw.dev)
+                if b is not None:
+                    nb.write(0, b[:min(b.shape[0], self.cap)])
+                st.kv[i] = nb
                 continue
             if b is None or b.shape[0] < self.cap:
                 nb = torch.zeros(self.cap, 512 + 64, dtype=torch.float32, device=fw.dev) if b is None else torch.zeros(self.cap, b.shape[1], dtype=b.dtype, device=fw.dev)
