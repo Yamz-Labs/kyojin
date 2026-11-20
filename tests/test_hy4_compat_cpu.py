@@ -67,24 +67,14 @@ class Parser(unittest.TestCase):
     def test_response_format(self):
         for rf in (None, {"type": "text"}):
             self.assertEqual(parse(response_format=rf)["messages"], USER)
-        r = parse(response_format={"type": "json_object"})
-        self.assertEqual(r["messages"][0], {"role": "system", "content": C.JSON_HINT})
-        self.assertEqual(r["messages"][1:], USER)
-        self.assertIn(C.JSON_HINT, self.render(r))
-        schema = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
-        r = C.parse_chat({"messages": [{"role": "system", "content": "Be brief."}, *USER],
-                          "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": schema}}})
-        self.assertTrue(r["messages"][0]["content"].startswith("Be brief.\n\n" + C.JSON_SCHEMA_HINT))
-        self.assertIn(json.dumps(schema), r["messages"][0]["content"])
-        for bad in ("json", {"type": "xml"}, {}, {"type": "json_schema"}, {"type": "json_schema", "json_schema": {"name": "x"}}):
+        for rf in ({"type": "json_object"}, {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}}):
+            with self.assertRaises(C.RequestError, msg=str(rf)) as cm:           # no constrained decoding: a clean 400, not a reply that silently is not JSON
+                parse(response_format=rf)
+            self.assertIn("not supported yet", str(cm.exception))
+            self.assertEqual(cm.exception.status, 400)
+        for bad in ("json", {"type": "xml"}, {}, 5):
             with self.assertRaises(C.RequestError, msg=str(bad)):
                 parse(response_format=bad)
-
-    def test_response_format_and_tool_choice_share_one_instruction_block(self):
-        tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}]
-        r = parse(tools=tools, tool_choice="required", response_format={"type": "json_object"})
-        self.assertEqual(len(r["messages"]), 2)
-        self.assertEqual(r["messages"][0]["content"], C.TOOL_HINTS["required"] + "\n\n" + C.JSON_HINT)
 
     # -- content parts
     def test_null_and_empty_content_parts(self):
@@ -109,16 +99,55 @@ class Parser(unittest.TestCase):
     def test_system_and_developer_roles(self):
         r = C.parse_chat({"messages": [{"role": "developer", "content": "Be brief."}, *USER]})
         self.assertEqual(r["messages"][0], {"role": "system", "content": "Be brief."})
-        r = C.parse_chat({"messages": [{"role": "system", "content": "Rule one."}, {"role": "developer", "content": "Rule two."}, *USER]})
-        self.assertEqual([m["role"] for m in r["messages"]], ["system", "system", "user"])
+        self.assertEqual(len(r["messages"]), 2)
+
+    def test_several_system_messages_become_one_leading_message(self):
+        msgs = [{"role": "system", "content": "Rule one."}, {"role": "developer", "content": [{"type": "text", "text": "Rule two."}]}, *USER,
+                {"role": "assistant", "content": "hello"}, {"role": "system", "content": "Switch to French."}, {"role": "user", "content": "again"}]
+        r = C.parse_chat({"messages": msgs})
+        self.assertEqual([m["role"] for m in r["messages"]], ["system", "user", "assistant", "user"])
+        self.assertEqual(r["messages"][0]["content"], "Rule one.\n\nRule two.\n\nSwitch to French.")
         text = self.render(r)
+        self.assertEqual(text.count("hy_start:6124c78e｜>system"), 1)
         self.assertLess(text.index("Rule one."), text.index("Rule two."))
-        self.assertLess(text.index("Rule two."), text.index("｜>hi"))
-        r = C.parse_chat({"messages": [*USER, {"role": "assistant", "content": "hello"}, {"role": "developer", "content": "Switch to French."}, {"role": "user", "content": "again"}]})
-        self.assertEqual([m["role"] for m in r["messages"]], ["user", "assistant", "system", "user"])        # a system message in the middle is rendered where it stands
-        text = self.render(r)
-        self.assertLess(text.index("hello"), text.index("Switch to French."))
-        self.assertLess(text.index("Switch to French."), text.index("again"))
+        self.assertLess(text.index("Rule two."), text.index("Switch to French."))
+        self.assertLess(text.index("Switch to French."), text.index("｜>hi"))
+
+    def test_system_messages_without_text_add_nothing(self):
+        r = C.parse_chat({"messages": [{"role": "system", "content": None}, {"role": "developer", "content": ""}, *USER]})
+        self.assertEqual([m["role"] for m in r["messages"]], ["user"])
+        self.assertEqual(r["messages"], USER)
+
+    def test_system_messages_merge_with_the_tool_instruction(self):
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}]
+        r = C.parse_chat({"messages": [{"role": "system", "content": "Be brief."}, *USER, {"role": "developer", "content": "Late rule."}], "tools": tools, "tool_choice": "required"})
+        self.assertEqual(len(r["messages"]), 2)
+        self.assertEqual(r["messages"][0]["content"], "Be brief.\n\nLate rule.\n\n" + C.TOOL_HINTS["required"])
+
+    def test_only_system_messages_is_a_400(self):
+        with self.assertRaises(C.RequestError):
+            C.parse_chat({"messages": [{"role": "system", "content": "Be brief."}]})
+
+    # -- prefill: a last assistant message
+    def test_last_assistant_message_is_a_prefill(self):
+        r = C.parse_chat({"messages": [*USER, {"role": "assistant", "content": "Sure, the answer is"}]})
+        self.assertTrue(r["prefill"])
+        text = self.v.template.render_chat(r)
+        self.assertTrue(text.endswith("｜>assistant<｜hy_middle:6124c78e｜>Sure, the answer is"))      # the turn stays open: no end marker, no generation prompt
+        self.assertFalse(parse()["prefill"])
+        self.assertTrue(self.v.template.render_chat(parse()).endswith("<think:6124c78e>"))
+
+    def test_an_empty_last_assistant_message_is_dropped(self):
+        for empty in ("", None, [None]):
+            r = C.parse_chat({"messages": [*USER, {"role": "assistant", "content": empty}]})
+            self.assertEqual((r["prefill"], r["messages"]), (False, USER))
+
+    def test_bad_prefills_are_a_400(self):
+        calls = [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]
+        for msgs in ([{"role": "assistant", "content": "x"}], [*USER, {"role": "assistant", "content": "", "tool_calls": calls}],
+                     [{"role": "system", "content": "s"}, {"role": "assistant", "content": "x"}]):
+            with self.assertRaises(C.RequestError, msg=str(msgs)):
+                C.parse_chat({"messages": msgs})
 
     def test_unknown_role_is_a_400(self):
         with self.assertRaises(C.RequestError):
@@ -159,11 +188,22 @@ class Http(unittest.IsolatedAsyncioTestCase):
         events = [e[6:] for e in (await r.read()).decode().split("\n\n") if e.startswith("data: ")]
         self.assertTrue(all("usage" not in json.loads(e) for e in events[:-1]))
 
-    async def test_json_object_adds_the_instruction_to_the_prompt(self):
-        r = await self.chat(response_format={"type": "json_object"}, messages=[{"role": "developer", "content": "Be brief."}, *USER])
-        self.assertEqual(r.status, 200)
-        prompt = self.st.vocab.decode(self.st.engine.calls[-1][0])
-        self.assertIn("Be brief.\n\n" + C.JSON_HINT, prompt)
+    async def test_json_response_format_is_a_clean_400(self):
+        for rf in ({"type": "json_object"}, {"type": "json_schema", "json_schema": {"name": "x", "schema": {}}}):
+            r = await self.chat(response_format=rf)
+            j = await r.json()
+            self.assertEqual((r.status, j["error"]["type"]), (400, "invalid_request_error"))
+            self.assertIn("not supported yet", j["error"]["message"])
+        self.assertEqual((await self.chat(response_format={"type": "text"})).status, 200)
+
+    async def test_prefill_continues_the_last_assistant_message(self):
+        self.st.engine = type(self.st.engine)(self.st.vocab, " forty-two.")
+        r = await self.client.post("/v1/chat/completions", json={"messages": [*USER, {"role": "assistant", "content": "The answer is"}], "max_tokens": 50})
+        j = await r.json()
+        self.assertEqual(r.status, 200, j)
+        self.assertEqual(j["choices"][0]["message"]["content"], " forty-two.")           # the continuation only, no reasoning split: the turn is already past its think block
+        self.assertNotIn("reasoning_content", j["choices"][0]["message"])
+        self.assertTrue(self.st.vocab.decode(self.st.engine.calls[0][0]).endswith("The answer is"))
 
     async def test_developer_and_null_parts_are_served(self):
         r = await self.chat(messages=[{"role": "developer", "content": [{"type": "text", "text": "Be brief."}, None]}, {"role": "user", "content": None}])

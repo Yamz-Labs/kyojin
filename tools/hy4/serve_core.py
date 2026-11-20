@@ -56,6 +56,10 @@ class ChatTemplate:
         self.source = source
         self.tpl = env.from_string(source)
 
+    def render_chat(self, r: dict) -> str:
+        """the prompt of a parsed chat request (parse_chat): its tools and effort; a prefill keeps the last assistant turn open"""
+        return self.render(r["messages"], r["tools"], True, reasoning_effort=r["effort"], **({"raw_last_assistant": True} if r.get("prefill") else {}))
+
     def render(self, messages: list[dict], tools: list | None = None, add_generation_prompt: bool = True, **kwargs: Any) -> str:
         try:
             return self.tpl.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt, **kwargs)
@@ -302,25 +306,17 @@ def _function_tool(t: Any, where: str) -> dict:
     return {"type": "function", "function": {k: v for k, v in fn.items() if k != "type" and v is not None}}
 
 
-JSON_HINT = "Respond with a single valid JSON object and nothing else (no code fences, no commentary)."
-JSON_SCHEMA_HINT = "Respond with a single valid JSON object that matches this JSON schema, and nothing else (no code fences, no commentary): "
-
-
-def response_format_hint(body: dict) -> str:
-    """`response_format` -> the instruction line it adds to the system message. The decoder has no grammar: json_object and json_schema are best effort
-    (the model is told to answer with JSON), text is the default."""
+def check_response_format(body: dict) -> None:
+    """`response_format`: text is the default. json_object and json_schema need constrained decoding, which this decoder does not have: a clean 400 beats a reply
+    that silently is not JSON."""
     rf = body.get("response_format")
     if rf is None:
-        return ""
+        return
     kind = rf.get("type") if isinstance(rf, dict) else None
-    if kind not in ("text", "json_object", "json_schema"):
+    if kind in ("json_object", "json_schema"):
+        raise RequestError(f"response_format {kind} is not supported yet (no constrained decoding): ask for JSON in the prompt instead")
+    if kind != "text":
         raise RequestError("response_format.type must be text, json_object or json_schema")
-    if kind == "json_schema":
-        schema = (rf.get("json_schema") or {}).get("schema") if isinstance(rf.get("json_schema"), dict) else None
-        if not isinstance(schema, dict):
-            raise RequestError("response_format.json_schema.schema must be a JSON schema object")
-        return JSON_SCHEMA_HINT + json.dumps(schema, ensure_ascii=False)
-    return JSON_HINT if kind == "json_object" else ""
 
 
 TOOL_HINTS = {"required": "You must answer by calling one or more of the provided functions.",
@@ -407,20 +403,27 @@ CHAT_ROLES = {"system": "system", "developer": "system", "user": "user", "assist
 
 
 def parse_chat(body: dict, default_max: int = 1024) -> dict:
-    """-> {messages, effort, max_tokens, stream, stop, include_usage, speculative, tools, tool_choice, parse_tools, ...}. Raises RequestError.
-    Messages: assistant messages may carry tool_calls (arguments as a JSON string or an object), `tool` messages carry the result of a call (tool_call_id)."""
+    """-> {messages, effort, max_tokens, stream, stop, include_usage, speculative, tools, tool_choice, parse_tools, prefill, ...}. Raises RequestError.
+    Messages: assistant messages may carry tool_calls (arguments as a JSON string or an object), `tool` messages carry the result of a call (tool_call_id).
+    All system / developer messages (and the instruction line of tool_choice) are merged into ONE leading system message, in order.
+    A last assistant message is a prefill: the model continues it (`prefill` True; the template's raw_last_assistant); an empty one is dropped."""
     req = _common(body, default_max)
     req.update(parse_tools(body))
+    check_response_format(body)
     msgs = body.get("messages")
     if not isinstance(msgs, list) or not msgs:
         raise RequestError("messages must be a non-empty list")
-    out = []
+    system, out = [], []
     for i, m in enumerate(msgs):
         if not isinstance(m, dict) or m.get("role") not in CHAT_ROLES:
             raise RequestError(f"messages[{i}]: role must be system, user, assistant or tool")
-        role = CHAT_ROLES[m["role"]]          # developer = system; the template renders a system message wherever it stands
+        role = CHAT_ROLES[m["role"]]          # developer = system
         item = {"role": role, "content": _content_text(m.get("content"))}
         rc = m.get("reasoning_content", m.get("reasoning"))
+        if role == "system":
+            if item["content"]:
+                system.append(item["content"])
+            continue
         if role == "assistant":
             if isinstance(rc, str) and rc:
                 item["reasoning_content"] = rc
@@ -434,15 +437,21 @@ def parse_chat(body: dict, default_max: int = 1024) -> dict:
             if tcid:
                 item["tool_call_id"] = tcid
         out.append(item)
-    if out[-1]["role"] == "assistant":
+    while out and out[-1]["role"] == "assistant" and not out[-1]["content"] and "tool_calls" not in out[-1]:
+        out.pop()                             # an empty trailing assistant message is not a prefill
+    if not out:
+        raise RequestError("messages must contain a user message")
+    prefill = out[-1]["role"] == "assistant"
+    if prefill and "tool_calls" in out[-1]:
+        raise RequestError("the last assistant message has tool_calls: add a tool message with each result")
+    if prefill and len(out) < 2:
         raise RequestError("the last message must come from the user")
-    hint = "\n\n".join(h for h in (req.pop("tool_hint"), response_format_hint(body)) if h)
-    if hint:                                  # instructions the template has no switch for: one block at the end of the leading system message
-        if out[0]["role"] == "system":
-            out[0] = dict(out[0], content=(out[0]["content"] + "\n\n" if out[0]["content"] else "") + hint)
-        else:
-            out.insert(0, {"role": "system", "content": hint})
-    req.update(messages=out, effort=parse_effort(body))
+    if req["tool_hint"]:
+        system.append(req["tool_hint"])
+    if system:
+        out.insert(0, {"role": "system", "content": "\n\n".join(system)})
+    req.pop("tool_hint")
+    req.update(messages=out, effort=parse_effort(body), prefill=prefill)
     return req
 
 

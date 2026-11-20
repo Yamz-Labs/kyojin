@@ -515,6 +515,43 @@ class Http(unittest.IsolatedAsyncioTestCase):
         j = await (await self.client.post("/apply-template", json=self.body())).json()
         self.assertIn("# Tools", j["prompt"])
 
+    # -- an engine error
+    async def test_engine_error_after_the_stream_began_is_an_error_event(self):
+        st = await self.start("hello world")
+
+        class Boom(FakeEngine):
+            def generate(self, ids, max_new, on_tokens, speculative=True, cancel=lambda: False):
+                on_tokens(self.ids[:3])
+                raise RuntimeError("HIP error: device lost")
+
+        st.engine = Boom(st.vocab, "hello world")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            r = await asyncio.wait_for(self.client.post("/v1/chat/completions", json=self.body(stream=True, tools=None)), 10)
+            raw = (await asyncio.wait_for(r.read(), 10)).decode()
+        self.assertEqual(r.status, 200)
+        events = [e[6:] for e in raw.split("\n\n") if e.startswith("data: ")]
+        self.assertEqual(events[-1], "[DONE]")
+        err = json.loads(events[-2])
+        self.assertEqual((err["error"]["type"], "device lost" in err["error"]["message"]), ("server_error", True))
+        self.assertIn("stream failed", out.getvalue())
+        st.engine = FakeEngine(st.vocab, "ok")                      # the lock was released
+        r = await self.client.post("/v1/chat/completions", json=self.body(tools=None))
+        self.assertEqual(r.status, 200)
+
+    async def test_engine_error_without_a_stream_is_a_500_body(self):
+        st = await self.start("hello world")
+
+        class Boom(FakeEngine):
+            def generate(self, ids, max_new, on_tokens, speculative=True, cancel=lambda: False):
+                raise RuntimeError("HIP error: device lost")
+
+        st.engine = Boom(st.vocab, "x")
+        with contextlib.redirect_stderr(io.StringIO()):
+            r = await asyncio.wait_for(self.client.post("/v1/chat/completions", json=self.body()), 10)
+        j = await r.json()
+        self.assertEqual((r.status, j["error"]["type"]), (500, "server_error"))
+
     # -- a client that closes the stream
     async def test_a_failed_write_cancels_the_generation_quietly(self):
         """the traceback of the report: resp.write raises ClientConnectionResetError ("Cannot write to closing transport")"""

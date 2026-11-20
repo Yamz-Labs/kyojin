@@ -167,10 +167,10 @@ def build_app(st: State):
 
     def prompt_for_chat(body):
         r = C.parse_chat(body, args.default_max_tokens)
-        text = st.vocab.template.render(r["messages"], r["tools"], True, reasoning_effort=r["effort"])
+        text = st.vocab.template.render_chat(r)
         ids = st.vocab.encode(text)
         v = st.vocab
-        r["in_think"] = r["effort"] != "no_think" and bool(v.think_begin) and text.rstrip().endswith(v.think_begin)
+        r["in_think"] = not r["prefill"] and r["effort"] != "no_think" and bool(v.think_begin) and text.rstrip().endswith(v.think_begin)
         return r, ids
 
     def check_len(n, max_new):
@@ -279,14 +279,24 @@ def build_app(st: State):
                                     tau=stats["tau"], accept_hist=stats["accept_hist"], ttft_ms=stats["ttft_s"] * 1000,
                                     prefill_trunk_ms=stats.get("prefill_trunk_s", 0) * 1000, draft_fill_ms=stats.get("prime_s", 0) * 1000)
 
+    def event(chunk: dict) -> bytes:
+        return b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
+
     async def sse(request, chunks):
         """stream `chunks` (an async generator of JSON-able chunks) as server-sent events. A client that closes the stream makes the write raise: that cancels the
-        generation (closing `chunks` runs run_job's cleanup, which stops the engine) and ends the request with one log line, not a traceback."""
+        generation (closing `chunks` runs run_job's cleanup, which stops the engine) and ends the request with one log line, not a traceback. An error after the
+        stream began (the engine failed) cannot become a second response: it is sent as an error event, then [DONE]."""
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
         try:
             await resp.prepare(request)
-            async for chunk in chunks:
-                await resp.write(b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n")
+            try:
+                async for chunk in chunks:
+                    await resp.write(event(chunk))
+            except (ConnectionError, ClientConnectionError, ClientGone, asyncio.CancelledError):
+                raise
+            except Exception as e:      # noqa: BLE001
+                print(f"stream failed: {type(e).__name__}: {e}", flush=True)
+                await resp.write(event(C.error_body(str(e), "server_error")))
             await resp.write(b"data: [DONE]\n\n")
         except (ConnectionError, ClientConnectionError, ClientGone) as e:
             print(f"client closed the stream ({type(e).__name__}): generation cancelled", flush=True)
@@ -397,7 +407,7 @@ def build_app(st: State):
         try:
             need_ready()
             r = C.parse_chat(await read_body(request), args.default_max_tokens)
-            return web.json_response({"prompt": st.vocab.template.render(r["messages"], r["tools"], True, reasoning_effort=r["effort"])})
+            return web.json_response({"prompt": st.vocab.template.render_chat(r)})
         except C.RequestError as e:
             return _err(e.status, str(e), e.code)
 
