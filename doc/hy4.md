@@ -1,7 +1,7 @@
 # Hy4-flash on Strix Halo (GGUF, one machine)
 
 Kyojin loads the public Hy4-flash GGUF (Q3_K split, 2 files, 144 GiB) and serves it on one Strix Halo machine with ROCm. Prefill runs the sparse-attention
-fast path; decode runs a HIP graph with multi-token-prediction (MTP) drafts and prompt-lookup rows. Speed numbers: see the benchmark table in the release notes.
+fast path; decode runs a HIP graph with multi-token-prediction (MTP) drafts and prompt-lookup rows. Speed numbers: see the benchmark table in the README and the release notes.
 
 ## Requirements
 
@@ -46,6 +46,8 @@ curl http://127.0.0.1:8300/v1/chat/completions -H 'content-type: application/jso
      -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
 ```
 
+The 1.9.1 levers are listed with their rollback switches in the [env_vars.md](env_vars.md) table "Hy4-flash 1.9.1 levers". After updating from 1.9.0 run `bash tools/hy4/install_strix.sh` again (the Q3_K V2 kernel needs the rebuilt MoE extension; without it the old kernel runs).
+
 The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, both with streaming; `/v1/models`, `/health`, `/tokenize`, `/apply-template`).
 `tools/hy4/serve.py` runs itself under `tools/strix_halo/env.sh` (the HSA runtime torch needs on gfx1151) and sets the shipped kernel flags (`SHIPPED_ENV` in the file); every one can be overridden from the environment. The main ones:
 
@@ -65,11 +67,16 @@ The server speaks the OpenAI API (`/v1/chat/completions`, `/v1/completions`, bot
 | `HY4_ENGRAM_NPHASH`, `HY4_ENGRAM_PF_WORKERS` | 1, 1 | Engram hash in numpy; one prefetch worker |
 | `HY4_ENGRAM_NATIVE_IO` | 1 | Engram row reads in C threads (`pread`, no GIL) |
 | `HY4_ENGRAM_FUSED` | 0 | two-launch fused Engram block in decode (opt-in) |
+| `HY4_PF_HC2`, `HY4_PF_KV_HM`, `HY4_PF_QO_HM`, `HY4_PF_Q3K_V2` | 1 | 1.9.1 prefill: lazy layer residual, head-major K / V and Q / O operands of the CK core, Q3_K gate-up kernel V2 (`=0` restores 1.9.0) |
+| `HY4_HEAD_Q8`, `HY4_GRAPH_FORK`, `HY4_RG_TUNE`, `HY4_BG_V2` | 1 | 1.9.1 decode: Q8_0 output head, shared-expert branch on a second graph stream, router mat-vec K block 1024, absorb v2 (`=0` restores 1.9.0) |
+| `HY4_PF_ROUTER16` | 1 | fp16 router logits of prefill rows; inactive with the fused router (`HY4_REF_FUSED=1`, shipped), so no effect |
 | `HY4_ABLIT_SPEC` | bundled `presets/hy4-uncensor/edit_spec.json` (on) | path of `edit_spec.json` (tensor file next to it): run-time decensor edit of the attention and MLP / MoE outputs; an explicit path wins; `0`, empty or `off` disables |
 
 Native Engram IO: `exllamav3/loader/engram_io.c` is compiled with `gcc` at first use into `~/.cache/kyojin/engram_io` (`XDG_CACHE_HOME` moves it). When `gcc` is missing or the build fails, the server prints one line and uses the Python reader, which does the same reads more slowly (`HY4_ENGRAM_NATIVE_IO=0` selects it directly).
 
 `--num-draft` is the number of MTP drafts per round (3 by default). Memory: the K buffers are sized by `-c` (about 0.1 MB per position); see Supported context for the measured totals.
+
+The start-up warm-up prompt is clamped to the context window (and skipped with one log line when the window is too small), so a small `-c` starts normally.
 
 ## Supported context
 

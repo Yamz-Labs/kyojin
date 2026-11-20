@@ -41,6 +41,22 @@ python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --por
 
 At this setting, on a 128 GB machine with nothing else large resident, the server peaked at 102.7 GiB of GTT and kept about 16 GiB of memory free (15 GiB during a 64K prefill); a smaller `-c` leaves more ([doc/hy4.md](doc/hy4.md)). Close other GPU or memory-heavy apps first.
 
+### New in 1.9.1 (Hy4-flash)
+
+- Prefill: lazy layer residual, head-major attention operands, Q3_K gate-up kernel V2. Decode: Q8_0 output head, shared-expert branch forked inside the HIP graph, router launch tuning, absorb v2.
+- Each lever is on by default and has an environment switch: `HY4_<FLAG>=0` restores the 1.9.0 behaviour ([flag table](doc/env_vars.md), [changelog](CHANGELOG.md)). Rebuild the kernels with `bash tools/hy4/install_strix.sh` after the update.
+- The start-up warm-up now fits any `-c`.
+- The decensor preset is on by default; it edits no weights. Switch it off with `HY4_ABLIT_SPEC=0`.
+
+Served numbers, one Strix Halo machine, shipped settings, seeded prompts, tok/s (speculative decode is the best speculative setting, plain is no speculation, tau is accepted tokens per round):
+
+| depth | prefill 1.9.0 | prefill 1.9.1 | decode spec 1.9.0 | decode spec 1.9.1 | tau 1.9.1 | decode plain 1.9.0 | decode plain 1.9.1 |
+|---|---|---|---|---|---|---|---|
+| 4K | 785 | {{PF4K}} | 22.5 | {{DEC4K}} | {{TAU4K}} | 14.6 | {{PLAIN4K}} |
+| 16K | 869 | {{PF16K}} | 23.7 | {{DEC16K}} | {{TAU16K}} | - | - |
+| 32K | 859 | {{PF32K}} | 22.7 | {{DEC32K}} | {{TAU32K}} | 14.5 | {{PLAIN32K}} |
+| 64K | 842 | {{PF64K}} | 23.9 | {{DEC64K}} | {{TAU64K}} | - | - |
+
 RTX 3090 (NVIDIA): build for CUDA once ([tools/cuda/README.md](tools/cuda/README.md)), then Qwen3.8-27B with 245K of context (the served settings, one session), with turboderp's 4.0 bpw pack:
 
 ```bash
