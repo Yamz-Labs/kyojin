@@ -13,6 +13,7 @@ import os
 
 import torch
 
+from . import mu_debug as DBG
 from . import mu_slots as MS
 from . import step_graph as SG
 from . import step_nosync as _ns
@@ -100,6 +101,10 @@ class MultiDecoder(SG.GraphDecoder):
 
     # -- sessions
     def new_session(self, slot):
+        with DBG.stage(f"new_session slot {slot}"):
+            return self._new_session(slot)
+
+    def _new_session(self, slot):
         s = Session(slot)
         c = self.cap
         for b in self.gs.kvflat.values():
@@ -143,10 +148,31 @@ class MultiDecoder(SG.GraphDecoder):
     def start_graph_state(self, s):
         """after the eager prefill of s: fold the open indexer group of each layer into the static vg rows (the solo `expect_n != start` branch)"""
         fw = self.fw
-        self.bind(s)
-        for i in self.gs.slabs:
-            SG.indexer_static_init(fw._indexer_fused(i), self.cap)
-        self.save(s)
+        with DBG.stage(f"start_graph_state slot {s.slot} n {s.n}"):
+            self.bind(s)
+            for i in self.gs.slabs:
+                SG.indexer_static_init(fw._indexer_fused(i), self.cap)
+            self.save(s)
+
+    def _probe(self, Nb, T, rows):
+        """HY4_MU_SYNC_DEBUG: the first step of each (bucket, rows, slot set) runs ONE eager body (captured graph or not) with a device sync + log around every layer and op
+        (mu_debug.probe_wrap), on the static inputs of this very step: a fault that depends on the slot index is caught on the first step that uses it"""
+        key = (Nb, T, tuple(sorted({s.slot for s, _ in rows})))
+        seen = self.__dict__.setdefault("_probed", set())
+        if key in seen:
+            return
+        seen.add(key)
+        fw, gs = self.fw, self.gs
+        tg = [(fw, "layer", "layer"), (fw, "_ffn", "ffn"), (gs, "indexer", "indexer"), (gs, "append_kv", "append_kv"), (gs, "engram", "engram")]
+        tg += [(fw._layer(i).mla, "attend", f"L{i} mla.attend") for i in range(fw.n_layers)]
+        gs.Nb, gs.T = Nb, T
+        old = fw._gs
+        fw._gs = gs
+        try:
+            with DBG.probe_wrap(tg), DBG.stage(f"probe eager body Nb={Nb} T={T} slots={key[2]}"):
+                self.body(self.bounds())
+        finally:
+            fw._gs = old
 
     # -- host side of the Engram rows of a multi-session step
     def _stage_rows(self, rows):
@@ -186,16 +212,22 @@ class MultiDecoder(SG.GraphDecoder):
             top = max(top, s.n + len(toks))
         Nb = min(self.cap, ((top - 1) // SG.BUCKET + 1) * SG.BUCKET)
         gs.Nb = Nb
-        self.hin[0, :T] = torch.tensor(tk)
-        self.hin[1, :T] = torch.tensor(ps)
-        self.hin[2, :T] = torch.tensor(bs)
-        gs.inp.copy_(self.hin, non_blocking=True)
-        self._stage_rows(rows)
-        cgs, _out = self._graph(Nb, T)       # the solo capture: a LIST of graph segments (Engram split), replayed in order like step_rows
+        what = f"step_slots T={T} Nb={Nb} rows={[(s.slot, s.n, len(t)) for s, t in rows]}"
+        with DBG.stage(what + " inputs + Engram rows"):
+            self.hin[0, :T] = torch.tensor(tk)
+            self.hin[1, :T] = torch.tensor(ps)
+            self.hin[2, :T] = torch.tensor(bs)
+            gs.inp.copy_(self.hin, non_blocking=True)
+            self._stage_rows(rows)
+        if DBG.enabled():
+            self._probe(Nb, T, rows)
+        with DBG.stage(what + " graph (capture if new)"):
+            cgs, _out = self._graph(Nb, T)       # the solo capture: a LIST of graph segments (Engram split), replayed in order like step_rows
         self.x_out = _out[2]
         fw._h = _out[3]
-        for cg in cgs:                       # every Engram row of the step is already staged by _stage_rows: no per-segment staging, only the order
-            cg.replay()
+        for si, cg in enumerate(cgs):        # every Engram row of the step is already staged by _stage_rows: no per-segment staging, only the order
+            with DBG.stage(f"{what} replay segment {si}/{len(cgs)}"):
+                cg.replay()
         self.ev.record()
         self.ev_set = True
         for s, toks in rows:

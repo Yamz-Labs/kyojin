@@ -6,12 +6,21 @@
 Greedy: a session's stream equals plain greedy decoding of the trunk (the verifier keeps only the rows the trunk agrees with)."""
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
 from collections import deque
 
 from engine import Hy4Engine, PRIME_ROWS, warmup_clamp
+
+
+def _stage(name):
+    """HY4_MU_SYNC_DEBUG=1: log the stage and sync the device when it ends (loader/mu_debug.py); a null context otherwise"""
+    if os.environ.get("HY4_MU_SYNC_DEBUG", "0") in ("", "0"):
+        return contextlib.nullcontext()
+    from exllamav3.loader import mu_debug
+    return mu_debug.stage(name)
 
 
 class MuEngine(Hy4Engine):
@@ -50,15 +59,17 @@ class MuEngine(Hy4Engine):
         if a == 0:
             M.prefetch_engram(s.ids, s.chunk)      # the row prefetch list is global: one prefill is in flight at a time, it starts with its first chunk
             s.tok_dev = torch.tensor(s.ids, dtype=torch.long, device=self.dev)
-        lg = M.step(s.ids[a:b])
-        hs = M.head_state(M._x)
+        with _stage(f"prefill trunk step slot {s.slot} rows {a}:{b} of {n}"):
+            lg = M.step(s.ids[a:b])
+            hs = M.head_state(M._x)
         M._x = None
         e_end = min(b, n - 1)                       # head pairs (token j + 1, trunk state h_j) for j = a .. min(b, n - 1) - 1
         if e_end > a:
             f16 = os.environ.get("HY4_PF_F16")
             os.environ["HY4_PF_F16"] = "0"          # the fp16 attention chain is tuned for the trunk's matrices; the draft layer takes the generic prefill path
             try:
-                MT.prime(s.tok_dev[a + 1:e_end + 1], hs[:e_end - a], MT.ar[a:e_end], ((e_end + 3) // 4) * 4)
+                with _stage(f"prefill draft prime slot {s.slot} rows {a}:{e_end}"):
+                    MT.prime(s.tok_dev[a + 1:e_end + 1], hs[:e_end - a], MT.ar[a:e_end], ((e_end + 3) // 4) * 4)
             finally:
                 if f16 is None:
                     os.environ.pop("HY4_PF_F16", None)
@@ -85,7 +96,8 @@ class MuEngine(Hy4Engine):
         out = {}
         for r, s in enumerate(sess):
             s.y = amh[r]
-            s.hcur = hv[r:r + 1].clone()           # a later spec_round (fewer sessions decode) drafts from the trunk state of the last fed position and the n-gram history
+            with _stage(f"plain_round hcur clone slot {s.slot} row {r}"):
+                s.hcur = hv[r:r + 1].clone()           # a later spec_round (fewer sessions decode) drafts from the trunk state of the last fed position and the n-gram history
             if s.ng is not None:
                 s.ng.add([s.y])
             out[s] = [s.y]
@@ -121,7 +133,8 @@ class MuEngine(Hy4Engine):
                 continue
             GR.bind(s)
             MG.slot = s.slot
-            plan.append((s, None, False, j, MG.run(s.y, s.hcur, j)))      # drafts launched; read below
+            with _stage(f"spec_round draft chain slot {s.slot} j {j}"):
+                plan.append((s, None, False, j, MG.run(s.y, s.hcur, j)))      # drafts launched; read below
         rows, meta = [], []
         for s, toks, skip, j, h in plan:
             if toks is None:
@@ -165,11 +178,13 @@ class MuEngine(Hy4Engine):
                 GR.bind(s)
                 N = ((j + acc + 1 + 3) // 4) * 4
                 sts = torch.cat([skip_h(plan, s), hs[:acc]]) if acc > 0 else skip_h(plan, s)
-                MT.step(torch.tensor(toks[:acc + 1], dtype=torch.long, device=self.dev), sts, MT.ar[j:j + acc + 1], N)
+                with _stage(f"spec_round draft catch-up (skip) slot {s.slot} j {j} acc {acc} N {N}"):
+                    MT.step(torch.tensor(toks[:acc + 1], dtype=torch.long, device=self.dev), sts, MT.ar[j:j + acc + 1], N)
             elif self.ngram_fill and acc >= kk and kk > 0:
                 GR.bind(s)
                 N = ((j + acc + 1 + 3) // 4) * 4
-                MT.step(torch.tensor(toks[kk:acc + 1], dtype=torch.long, device=self.dev), hs[kk - 1:acc], MT.ar[j + kk:j + acc + 1], N)
+                with _stage(f"spec_round draft catch-up (fill) slot {s.slot} j {j} acc {acc} N {N}"):
+                    MT.step(torch.tensor(toks[kk:acc + 1], dtype=torch.long, device=self.dev), hs[kk - 1:acc], MT.ar[j + kk:j + acc + 1], N)
             if s.ng is not None:
                 s.ng.add(new)
             s.y, s.hcur = amh[acc], hs[acc:acc + 1].clone()
