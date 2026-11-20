@@ -191,10 +191,11 @@ class MultiDecoder(SG.GraphDecoder):
         self.hin[2, :T] = torch.tensor(bs)
         gs.inp.copy_(self.hin, non_blocking=True)
         self._stage_rows(rows)
-        cg, _out = self._graph(Nb, T)
+        cgs, _out = self._graph(Nb, T)       # the solo capture: a LIST of graph segments (Engram split), replayed in order like step_rows
         self.x_out = _out[2]
         fw._h = _out[3]
-        cg.replay()
+        for cg in cgs:                       # every Engram row of the step is already staged by _stage_rows: no per-segment staging, only the order
+            cg.replay()
         self.ev.record()
         self.ev_set = True
         for s, toks in rows:
