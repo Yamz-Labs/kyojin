@@ -27,7 +27,8 @@ from . import router_gemv as _RG
 from . import lever_fires as _LVF
 from .engram_stage import EngramStager
 
-BUCKET = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
+from . import graph_bucket as _gb
+BUCKET = _gb.BASE
 TM = int(os.environ.get("HY4_GRAPH_TM", "8"))          # max rows of one graph step (verify rows)
 MASK64 = (1 << 64) - 1
 PERT = None                      # [cap, D] fp32 noise table (measurement arms only)
@@ -413,7 +414,7 @@ class GraphDecoder:
 
     def bucket(self, start, T=1):
         """context bucket Nb of a step of T rows at positions start .. start + T - 1 (rows past the last position are masked inside the graph)"""
-        return min(self.cap, ((start + T - 1) // BUCKET + 1) * BUCKET)
+        return _gb.bucket(start + T, self.cap)
 
     def graph(self, Nb, T=1):
         """the captured (graph, outputs) of a T-row step at context bucket Nb (captured now if not yet). Row-generic: T = rows of ONE sequence (verify) or any
@@ -425,7 +426,7 @@ class GraphDecoder:
         nbs: iterable of buckets (default every bucket up to the cap), ts: row counts (default 1 .. TM). Returns [(Nb, T, ms)] of the graphs built. The static
         inputs keep their last values: call it between requests (the K / indexer rows it rewrites are the same ones the last step wrote) and reset() after."""
         import time
-        nbs = sorted(set(nbs)) if nbs is not None else list(range(BUCKET, self.cap + 1, BUCKET))
+        nbs = sorted(set(nbs)) if nbs is not None else _gb.buckets(self.cap)
         ts = sorted(set(ts)) if ts is not None else list(range(1, TM + 1))
         if not self.prepared:
             self.prepare()

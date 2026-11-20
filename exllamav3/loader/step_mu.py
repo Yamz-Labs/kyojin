@@ -256,7 +256,7 @@ class MultiDecoder(SG.GraphDecoder):
             ps += list(range(s.n, s.n + len(toks)))
             bs += [s.slot * self.cap] * len(toks)
             top = max(top, s.n + len(toks))
-        Nb = min(self.cap, ((top - 1) // SG.BUCKET + 1) * SG.BUCKET)
+        Nb = SG._gb.bucket(top, self.cap)
         gs.Nb = Nb
         what = f"step_slots T={T} Nb={Nb} rows={[(s.slot, s.n, len(t)) for s, t in rows]}" if (not fast or DBG.enabled()) else "step_slots"
         bnds = self.bounds() if fast else None

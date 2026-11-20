@@ -18,6 +18,8 @@ import torch
 from . import kv_fp8 as _KV8
 from . import moe_i8 as MI
 from . import step_graph as SG
+from . import graph_bucket as _gb
+from . import ref_fused as _rf
 from . import step_nosync as _ns
 from .engram_rows import load_dense, rms
 from .hy4_forward import _mv, head_gemm, QLinear, GG_DENSE, dense_fn
@@ -242,7 +244,7 @@ class MTPGraph:
     """the draft chain of k head steps as ONE HIP graph per context bucket: static inputs (token, trunk state, head position), greedy argmax feeds the next
     step on the device, output = the k drafted tokens [k] (device). No host work between the steps."""
 
-    BUCKET = 512
+    BUCKET = 512          # base granule; the bucket of a long context is coarser (graph_bucket)
 
     def __init__(self, mt, k):
         self.mt, self.k = mt, k
@@ -271,6 +273,7 @@ class MTPGraph:
             h = y
         return torch.cat(outs + confs)
 
+    @_rf.r2_draft
     def _graph(self, N):
         g = self.graphs.get(N)
         if g is not None:
@@ -291,7 +294,7 @@ class MTPGraph:
     def precapture(self, ns=None):
         """capture the draft graph of every context bucket now (default: every bucket up to the cap); -> number built"""
         mt = self.mt
-        ns = sorted(set(ns)) if ns is not None else list(range(self.BUCKET, mt.cap + 1, self.BUCKET))
+        ns = sorted(set(ns)) if ns is not None else _gb.buckets(mt.cap, self.BUCKET)
         built = 0
         for N in ns:
             if N not in self.graphs:
@@ -302,7 +305,7 @@ class MTPGraph:
     def run(self, tok, h, j):
         """tok: host int (the token of the pair, x_{j+1}), h: device [1, D] trunk state h_j, j: head position -> device tensor [k] of drafts"""
         mt = self.mt
-        N = min(mt.cap, ((j + self.k) // self.BUCKET + 1) * self.BUCKET)
+        N = _gb.bucket(j + self.k + 1, mt.cap, self.BUCKET)
         if self.ev_set:
             self.ev.synchronize()
         self.hin[0], self.hin[1] = int(tok), int(j)
@@ -341,6 +344,7 @@ class MTPGraphCU(MTPGraph):
             h = y
         return torch.cat(outs)
 
+    @_rf.r2_draft
     def _graph(self, N, a):
         g = self.graphs.get((N, a))
         if g is not None:
@@ -362,7 +366,7 @@ class MTPGraphCU(MTPGraph):
         """toks: host ints [a + 1] (accepted drafts then the new token), h_rows [a + 1, D] device (trunk hidden of the positions pos0 .. pos0 + a),
         pos0: first head position -> device [k] drafts"""
         mt, a = self.mt, len(toks) - 1
-        N = min(mt.cap, ((pos0 + a + self.k) // self.BUCKET + 1) * self.BUCKET)
+        N = _gb.bucket(pos0 + a + self.k + 1, mt.cap, self.BUCKET)
         if self.ev_set:
             self.ev.synchronize()
         self.hin[:a + 1] = torch.tensor([int(t) for t in toks])
