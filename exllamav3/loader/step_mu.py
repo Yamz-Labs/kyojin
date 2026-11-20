@@ -27,7 +27,7 @@ TM = SG.TM
 # right before its own graph segment so the reads overlap the GPU (the solo step_rows pipeline); the step inputs are written through a numpy view of the pinned buffer.
 # HY4_MU_HOSTPROF=1: perf_counter splits per step (HT, seconds) for the server log line of mu_engine.
 FIRES = {"stage_vec": 0, "stage_ov": 0, "inp_np": 0, "rows_gt8": 0, "steps": 0}      # path counters (FIRES-CHECK): a flagged arm with 0 stage_ov FAILS
-HT = {"stage": 0.0, "launch": 0.0, "inputs": 0.0}
+HT = {"stage": 0.0, "launch": 0.0, "inputs": 0.0, "gpu": 0.0, "bubble": 0.0}      # gpu = summed replay time of the segments, bubble = GPU idle between segments (events, HOSTPROF only)
 
 
 def hostfast() -> bool:
@@ -242,6 +242,12 @@ class MultiDecoder(SG.GraphDecoder):
         t0 = pc() if prof else 0.0
         if self.ev_set:
             self.ev.synchronize()
+            if prof and getattr(self, "_tev_n", 0):          # the previous step is done: its per-segment event pairs give the GPU time and the idle gaps between segments
+                pr = self._tev_pool[:self._tev_n]
+                gpu = sum(a.elapsed_time(b) for a, b in pr)
+                HT["gpu"] += gpu / 1000
+                HT["bubble"] += (pr[0][0].elapsed_time(pr[-1][1]) - gpu) / 1000
+                self._tev_n = 0
         tk, ps, bs, top = [], [], [], 0
         for s, toks in rows:
             assert s.n + len(toks) <= self.cap, "context past the slab"
@@ -297,13 +303,21 @@ class MultiDecoder(SG.GraphDecoder):
                     dt = pc() - t2
                     HT["stage"] += dt
                     t0 += dt                                 # launch = the replay calls only
+            if prof:
+                if getattr(self, "_tev_pool", None) is None:
+                    self._tev_pool = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(8)]
+                self._tev_pool[si][0].record()
             with DBG.stage(f"{what} replay segment {si}/{len(cgs)}"):
                 cg.replay()
+            if prof:
+                self._tev_pool[si][1].record()
         if ov:
             FIRES["stage_ov"] += 1
         if T > 8:
             FIRES["rows_gt8"] += 1
         FIRES["steps"] += 1
+        if prof:
+            self._tev_n = len(cgs)
         self.ev.record()
         self.ev_set = True
         for s, toks in rows:

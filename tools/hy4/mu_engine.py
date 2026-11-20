@@ -36,10 +36,11 @@ def fires_line(eng, last: dict | None = None) -> str:
     ht = dict(HT)
     if sm is not None:
         fs.update(sm.FIRES)
-        ht.update({"stage": sm.HT["stage"], "launch": sm.HT["launch"], "inputs": sm.HT["inputs"]})
+        ht.update({k: sm.HT[k] for k in ("stage", "launch", "inputs", "gpu", "bubble")})
     last = {} if last is None else last
     nr = max(1, ht["rounds"] - last.get("rounds", 0))
-    ms = {k: 1000.0 * (ht.get(k, 0.0) - last.get(k, 0.0)) / nr for k in ("round", "inputs", "stage", "launch", "draft", "wait", "post", "emit")}
+    ms = {k: 1000.0 * (ht.get(k, 0.0) - last.get(k, 0.0)) / nr for k in ("round", "inputs", "stage", "launch", "draft", "wait", "post", "emit", "gpu", "bubble")}
+    ms["host"] = ms["round"] - ms["gpu"]            # round time the GPU did not spend replaying (0 gpu = HOSTPROF events off)
     rows = (ht["rows"] - last.get("rows", 0)) / nr
     last.clear()
     last.update(ht)
@@ -540,7 +541,7 @@ def precapture(sch: MuScheduler, nbs=None, ts=None, progress=print):
                 s.tokens = [0] * base
                 s.n = base
                 t = pc()
-                GR.step_slots([(s, [1] * T)])
+                GR.step_slots([(s, [(i * 7919 + 13) % 50000 for i in range(T)])])     # varied ids: the routed experts of the rows differ, the union grows with T like real text
                 torch.cuda.synchronize()
                 ms = (pc() - t) * 1000
                 if rep == 0:
@@ -561,4 +562,10 @@ def precapture(sch: MuScheduler, nbs=None, ts=None, progress=print):
         free = torch.cuda.mem_get_info()[0] / 2 ** 30
     except Exception:       # noqa: BLE001
         pass
+    sm = getattr(eng, "SM", None)
+    if sm is not None:                                       # the FIRES-CHECK counts the served requests only, never the precapture steps
+        for k in sm.FIRES: sm.FIRES[k] = 0
+        for k in sm.HT: sm.HT[k] = 0.0
+    for k in FIRES: FIRES[k] = 0
+    for k in HT: HT[k] = 0 if k in ("rounds", "rows") else 0.0
     progress(f"mu precapture: buckets {nbs} rows {ts[0]}..{ts[-1]}: {len(nbs) * len(ts)} trunk graphs, {nd} draft graphs, {pc() - t00:.1f} s, free GiB {free}")
