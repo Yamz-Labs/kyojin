@@ -83,6 +83,7 @@ class RoutingCFG:
     router_logits_gfx12: torch.Tensor | None = None
     routing_weights_gfx12: torch.Tensor | None = None
     selected_experts_gfx12: torch.Tensor | None = None
+    norm_topk: bool = True   # False: weights are the full-softmax probabilities of the picks (olmoe), not renormalised
 
 
 _HIP_ROUTER_HIDDEN = 2560
@@ -284,6 +285,24 @@ def _routing_nogroup_torch(cfg, y, params, scores):
     return selected_experts, routing_weights.half()
 
 
+def _routing_std_nonorm(cfg, y, params):
+    """norm_topk=False (llama.cpp olmoe, expert_weights_norm=0): softmax over ALL experts, gather the top-k probabilities, no
+    renormalisation. Pure torch for every row count and device (the fused routing_std kernels hard-code the renorm).
+    Same stable-sort selection as _routing_std_torch."""
+    logits = _router_logits(cfg, y).float()
+    probs = torch.softmax(logits, dim = -1)
+    if params.get("activate_all_experts"):
+        selected_experts = torch.arange(cfg.num_experts, dtype = torch.long, device = y.device).expand(y.shape[0], -1)
+        routing_weights = probs
+    else:
+        _, idx = torch.sort(logits, dim = -1, descending = True, stable = True)
+        selected_experts = idx[:, :cfg.num_experts_per_tok].contiguous()
+        routing_weights = torch.gather(probs, 1, selected_experts)
+    if cfg.per_expert_scale is not None:
+        routing_weights = routing_weights * cfg.per_expert_scale.float()[selected_experts]
+    return selected_experts, routing_weights.half()
+
+
 def routing_std(bsz, cfg, y, params):
     if (gguf_ri("router") and 2 <= bsz <= GGUF_ROW_INV_MAX_ROWS and y.dim() == 2 and y.shape[0] == bsz
             and not params.get("activate_all_experts")):
@@ -291,6 +310,8 @@ def routing_std(bsz, cfg, y, params):
         # logits differ in the last bits and a near tie flips an expert. One one-row routing per row, the bits of the plain step.
         outs = [routing_std(1, cfg, y[i:i + 1], params) for i in range(bsz)]
         return torch.cat([o[0].clone() for o in outs]), torch.cat([o[1].clone() for o in outs])
+    if not cfg.norm_topk:
+        return _routing_std_nonorm(cfg, y, params)
     if _hip_router_call_supported(bsz, cfg, y, params):
         _prepare_hip_router_gate_t(cfg)
         scores, selected_experts, routing_weights = _hip_router_buffers(cfg, bsz)

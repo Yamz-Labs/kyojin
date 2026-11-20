@@ -79,6 +79,7 @@ def apply_scale_grid(w: torch.Tensor, scale: torch.Tensor, block: tuple | None =
 
 
 
+
 class _ForeignInner:
     """Linear inner over a ForeignLinear payload (NVFP4 served as stored): the ForeignLinear kernels, Linear's interface."""
 
@@ -102,8 +103,11 @@ class _ForeignInner:
         return self.bias
 
     def forward(self, x, params, out_dtype = None):
-        y = self.fl.forward(x, params, out_dtype)
-        return y + self.bias if self.bias is not None else y
+        if self.bias is None:
+            return self.fl.forward(x, params, out_dtype)
+        self.fl._bias_fused = False
+        y = self.fl.forward(x, params, out_dtype, bias = self.bias)    # EXL3_FQ_MMVQ_EPI: the mmvq epilogue may add it (then _bias_fused)
+        return y if self.fl._bias_fused else y + self.bias
 
 
 class Linear(Module):
@@ -680,9 +684,12 @@ class Linear(Module):
         g, fm = getattr(self.config, "gguf", None), getattr(self.config, "gguf_formats", None)
         if g is None or not fm or not isinstance(key, str) or self.is_sliced or self.weight_scale != 1.0:
             return False
+        if os.environ.get("EXL3_GGUF_GENERIC", "0") == "1" and g.new_tensors and (key + ".weight") in g.new_tensors:
+            return False  # in-memory fp override (e.g. dequantized GDN b/a projs) wins over the stored quant blocks
         gname = g.name_map.get(key + ".weight")
         gname = gname[0] if isinstance(gname, tuple) else gname
-        fmt = fm.get(gname) if gname else None
+        from ..loader.gguf_collection import gguf_fmt as _gguf_fmt
+        fmt = _gguf_fmt(fm, gname)
         if fmt is None or fmt == "fp" or fmt.startswith("unk"):
             return False
         from .foreign_linear import ForeignLinear

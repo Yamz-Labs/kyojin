@@ -150,4 +150,11 @@ ARCHITECTURES = {
 }
 
 def get_architectures():
+    # EXL3_GGUF_GENERIC=1 (default off), read at call time: the generic GGUF architecture is added, nothing else changes
+    import os
+    if os.environ.get("EXL3_GGUF_GENERIC", "0") == "1":
+        from .gguf_generic import GGUFGenericModel
+        a = GGUFGenericModel.config_class.arch_string
+        if a not in ARCHITECTURES:
+            ARCHITECTURES[a] = {"architecture": a, "config_class": GGUFGenericModel.config_class, "model_class": GGUFGenericModel}
     return ARCHITECTURES

@@ -26,8 +26,11 @@ def _act_mul(
     y: torch.Tensor,
     z: torch.Tensor,
     act_limit: float,
+    act_limit_gate: float | None = None,
+    act_limit_up: float | None = None,
 ) -> None:
-    """Match act_mul_kernel_{h,f}'s dtype and clamp contract."""
+    """Match act_mul_kernel_{h,f}'s dtype and clamp contract. act_limit_gate / act_limit_up (torch path only, no kernel
+    takes them): min(act(x), act_limit_gate) and clip(y, +-act_limit_up), the split form of a pre-activation gate clamp."""
     if x.dtype not in (torch.float16, torch.float32) or y.dtype != x.dtype:
         raise TypeError("activation multiply expects matching float16 or float32 inputs")
     if z.dtype != torch.float16:
@@ -37,6 +40,10 @@ def _act_mul(
     if act_limit != 0.0:
         x_act = x_act.clamp(max = act_limit)
         y = y.clamp(min = -act_limit, max = act_limit)
+    if act_limit_gate is not None:
+        x_act = torch.minimum(x_act, torch.as_tensor(act_limit_gate, dtype = x_act.dtype, device = x_act.device))
+    if act_limit_up is not None:
+        y = y.clamp(min = -act_limit_up, max = act_limit_up)
     result = x_act * y
     # The float-input native kernels saturate before the float-to-half store.
     if x.dtype == torch.float32:
@@ -51,6 +58,35 @@ def silu_mul(
     act_limit: float = 0.0,
 ) -> None:
     _act_mul(F.silu, x, y, z, act_limit)
+
+
+def silu_limit_exact(lim: float, dtype: torch.dtype) -> torch.Tensor:
+    """silu(c) in `dtype` for the c whose silu is `lim` (= c * sigmoid(c), c > 0), computed by torch's own silu on c cast to
+    `dtype`, so min(silu(g), silu_limit_exact(lim)) is bit-equal to silu(min(g, c)) (silu is monotone above -1.278)."""
+    import math
+    c = float(lim)
+    for _ in range(60):                                   # Newton on c * sigmoid(c) = lim, in float64
+        sg = 1.0 / (1.0 + math.exp(-c))
+        f = c * sg - lim
+        d = sg * (1.0 + c * (1.0 - sg))
+        if d == 0.0: break
+        n = c - f / d
+        if n == c: break
+        c = n
+    return F.silu(torch.tensor(c, dtype = dtype))
+
+
+def silu_mul_split(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    z: torch.Tensor,
+    act_limit_gate: float | None = None,
+    act_limit_up: float | None = None,
+) -> None:
+    """Hy4 swiglu_clamp_exp: silu(min(g, c)) * clip(u, -c, c) == min(silu(g), silu(c)) * clip(u, -c, c). Pure torch, any device;
+    act_limit_gate = silu(c), act_limit_up = c."""
+    lg = None if act_limit_gate is None else silu_limit_exact(act_limit_gate, x.dtype).to(x.device)
+    _act_mul(F.silu, x, y, z, 0.0, lg, act_limit_up)
 
 def silu_oai_mul(
     x: torch.Tensor,

@@ -146,12 +146,29 @@ class GGUFCollection:
         mapped = self.name_map.get(key, key)
         return mapped[0] if isinstance(mapped, tuple) else mapped
 
+    def _exps_slice(self, name: str):
+        """"<gguf3d>.e<idx>[.weight|.bias]" -> (stacked tensor name, expert idx) when that stacked tensor exists, else None.
+        .bias: stacked F32 bias dims (row, E) (gpt-oss ffn_*_exps.bias), expert idx = one row."""
+        sfx = ".bias" if name.endswith(".bias") else ".weight"
+        mb = name[:-len(sfx)] if name.endswith(sfx) else name
+        if ".e" not in mb:
+            return None
+        bb_, es_ = mb.rsplit(".e", 1)
+        if es_.isdigit() and (bb_ + sfx) in self.infos:
+            return bb_ + sfx, int(es_)
+        return None
+
     def has_tensor(self, key: str) -> bool:
         if self._is_aux(key):
             return self.aux.has_tensor(key)
         if self.new_tensors and key in self.new_tensors:
             return True
-        return self._resolve(key) in self.infos
+        r = self._resolve(key)
+        if r in self.infos:
+            return True
+        if "_exps.e" in r:   # generic-loader expert slice name: "<gguf3d>.e<idx>[.weight]"
+            return self._exps_slice(r) is not None
+        return False
 
     # Deferred-load arena API (SafetensorsCollection): ForeignLinear and the
     # fp16 paths load eagerly, so these are no-ops. Present because
@@ -241,6 +258,11 @@ class GGUFCollection:
         want_T = False
         if isinstance(mapped, tuple):
             mapped, want_T = mapped[0], (mapped[1] == "T")
+        if exp_idx is None and mapped not in self.infos and "_exps.e" in mapped:
+            # engine key mapped by name_map to "<gguf3d>.e<idx>[.weight]" (generic loader): same slice protocol, after the map
+            sl = self._exps_slice(mapped)
+            if sl is not None:
+                mapped, exp_idx = sl
         info = self.infos.get(mapped)
         if info is None:
             if not optional:
@@ -267,8 +289,16 @@ class GGUFCollection:
                 raise ValueError("transpose not supported for quant payloads")
             return t.to(dev)
         if ty in (0, 1, 30):  # F32 / F16 / BF16 (BF16 widened to float32: bit shift, exact)
+            stacked_bias = exp_idx is not None and ty == 0 and mapped.endswith(".bias") and len(dims) == 2
+            if exp_idx is not None and not stacked_bias:
+                # Not implemented for float payloads: refuse by name rather than return the whole stack.
+                raise ValueError(f"per-expert slice of a {({0: 'F32', 1: 'F16', 30: 'BF16'})[ty]} "
+                                 f"stacked tensor is not supported: {mapped} (expert {exp_idx})")
             dt = np.float32 if ty == 0 else np.float16
             es = 4 if ty == 0 else 2
+            if stacked_bias:   # stacked bias (row, E): one expert = one contiguous row of dims[0] values
+                assert 0 <= exp_idx < dims[1]
+                off, dims = off + exp_idx * dims[0] * es, (dims[0],)
             n = int(np.prod(dims))
             raw = self._pread(off, n * es)
             if ty == 30:
@@ -296,4 +326,19 @@ class GGUFCollection:
             elif allow_bf16 and t.dtype == torch.float32:
                 t = t.bfloat16()
             return _pad_to(t.to(dev), pad_to)
+        if ty == 43:
+            raise ValueError(f"{key}: ggml F8_E4M3 (type 43) is row-lookup-only; read rows through loader/engram_rows.F8Rows, not get_tensor")
         raise ValueError(f"unsupported gguf type {ty} for {key}")
+
+
+def gguf_fmt(fm: dict, gname: str | None):
+    """ggml format of a GGUF tensor name. A per-expert slice name 'blk.N.ffn_*_exps.eK.weight' is not in the
+    file's tensor table: it takes the format of its stacked tensor 'blk.N.ffn_*_exps.weight'."""
+    if not gname:
+        return None
+    fmt = fm.get(gname)
+    if fmt is None and "_exps.e" in gname:
+        base, e = (gname[:-7] if gname.endswith(".weight") else gname).rsplit(".e", 1)
+        if e.isdigit():
+            fmt = fm.get(base + ".weight")
+    return fmt

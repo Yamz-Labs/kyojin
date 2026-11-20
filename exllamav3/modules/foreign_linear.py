@@ -25,6 +25,7 @@ from .module import Module
 from ..ext import exllamav3_ext as ext
 from ..foreign_quant.gap_formats import dequant as gap_dequant
 from ..foreign_quant import triton_iq
+from ..foreign_quant.gguf_fast import flag
 from ..foreign_quant import triton_gap
 from ..foreign_quant import triton_rows
 from ..util.row_inv import GGUF_ROW_INV, GGUF_ROW_INV_MAX_ROWS, gguf_ri
@@ -99,6 +100,45 @@ _MMQ_FEW_MINR = {"q5_k": 3, "q4_k": 4, "q6_k": 4, "q8_0": 5, "q3_k": 4, "iq4_xs"
 # BOLT_FQ_MMQ_FEW_IQ4XS_ANY=1 serves every 4..24-row call. The other formats keep the unconditional gate.
 _MMQ_FEW_CAPTURE_ONLY = () if os.environ.get("BOLT_FQ_MMQ_FEW_IQ4XS_ANY", "0") == "1" else ("iq4_xs",)
 _MMVQ_QK = {"iq4_nl": 32}
+# EXL3_FQ_MMVQ_LEGACY (default 0): Q4_0 / Q4_1 / Q5_0 / Q5_1 single decode row through the mmvq kernel (ggml vec_dot_q*_q8_1 port, q8_1 activations) instead
+# of the Triton triton_gap.gemv (~37 GB/s on gpt-oss-20b UD-Q4_K_XL attention q/k/v). Off = unchanged. 2+ rows stay on the Triton path.
+_LEGACY_FMTS = ("q4_0", "q4_1", "q5_0", "q5_1")
+_MMVQ_FN.update({f: "fq_mmvq_" + f for f in _LEGACY_FMTS})      # the legacy entries are always present; _mmvq_legacy_on() gates their use (call time)
+_MMVQ_QK.update({f: 32 for f in _LEGACY_FMTS})
+
+
+def _mmvq_legacy_on() -> bool:
+    return flag("EXL3_FQ_MMVQ_LEGACY") and bool(torch.version.cuda) and not torch.version.hip
+
+
+_MMVQ_LEGACY = _mmvq_legacy_on()    # import-time snapshot, kept for the tests; the dispatch reads _mmvq_legacy_on()
+# EXL3_FQ_MMVQ_EPI (default 0, CUDA only, read at call time): (A1) a ForeignLinear bias (_ForeignInner) is added inside the mmvq store (half out: round the dot to
+# half, then half(float(h) + float(b)), torch's `y + bias` order; float out: v + float(b)) instead of a separate torch add; (A2) q, k and v of one attention
+# layer read the same normed x: it is quantized to q8_1 once (attn.project_qkv brackets the three calls with q8_share_begin / q8_share_end; the key is
+# x.data_ptr + x._version + R + K + device, valid only inside that bracket). Off = exactly the previous code.
+def _epi_on() -> bool:
+    return flag("EXL3_FQ_MMVQ_EPI") and bool(torch.version.cuda) and not torch.version.hip
+
+
+_Q8S = {"on": False, "key": None}
+
+
+def q8_share_begin() -> None:
+    _Q8S["on"] = _epi_on()
+    _Q8S["key"] = None
+
+
+def q8_share_end() -> None:
+    _Q8S["on"] = False
+    _Q8S["key"] = None
+
+
+# EXL3_LEGACY_PREFILL_DQ (default 0, CUDA only, read at call time): Q4_0 / Q5_0 weights at rows > 1 dequantize with ONE Triton launch into a per-call fp16 tensor
+# (freed after the matmul, nothing resident) instead of the ~15 torch ops of gap_formats.dequant. Output bit-identical. Q5_1 already has its own Triton dequant.
+def _legacy_dq_on() -> bool:
+    return flag("EXL3_LEGACY_PREFILL_DQ") and bool(torch.version.cuda) and not torch.version.hip
+
+
 _DEQ_IQ_ID = {"iq2_xs": 1, "iq2_s": 2, "iq3_xxs": 3, "iq3_s": 4, "iq4_nl": 5}
 if os.environ.get("BOLT_FQ_DEQ_Q3K", "1") != "0":   # CUDA and HIP
     _DEQ_IQ_ID["q3_k"] = 10   # native Q3_K dequant (prefill dequant + GEMM; the torch gap_dequant is ~2.5x slower at 8K)   # fq_dequant_iq format ids (the others have native dequants already)
@@ -225,6 +265,10 @@ class ForeignLinear(Module):
             out = torch.empty((count, self.in_features), dtype=torch.float16, device=dev)
             ext.fq_dequant_iq(self.packed[first:first + count].reshape(count, -1).contiguous(), out, _DEQ_IQ_ID[self.format])
             return out
+        if self.format in ("q4_0", "q5_0") and _legacy_dq_on() and self.packed.is_cuda:
+            from ..foreign_quant import legacy_dq
+            if legacy_dq.HAVE_TRITON:
+                return legacy_dq.dequant(self.format, self.packed[first:first + count])
         if self.format in _GAP_FORMATS:
             return gap_dequant(self.format, self.packed[first:first + count])
         if self.format in _KQ_FORMATS:
@@ -271,7 +315,10 @@ class ForeignLinear(Module):
         x: torch.Tensor,
         params: dict,
         out_dtype: torch.dtype | None = None,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # bias: only consumed by the mmvq epilogue under EXL3_FQ_MMVQ_EPI; self._bias_fused tells the caller whether it was added
+        self._bias_fused = False
         shape = x.shape
         K = self.in_features
         assert shape[-1] == K, f"{self.key}: width {shape[-1]} != {K}"
@@ -298,14 +345,30 @@ class ForeignLinear(Module):
                 out = None
         if out is not None:
             pass
-        elif (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format in ("q5_k", "q4_k", "q6_k", "q3_k") else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
+        elif (_MMVQ_ON and self.format in _MMVQ_FN and flat.dtype == torch.half and (self.format not in _LEGACY_FMTS or (R == 1 and _mmvq_legacy_on())) and R <= (min(_MMVQ_MAXR, FUSED_ROWS_MAX - 1) if self.format in ("q5_k", "q4_k", "q6_k", "q3_k") else _MMVQ_MAXR) and K % _MMVQ_QK.get(self.format, 256) == 0
                 and hasattr(ext, _MMVQ_FN[self.format])):
             N = self.out_features
             out = torch.empty((R, N), dtype=dtype if dtype in (torch.half, torch.float) else torch.half, device=dev)
             dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
             qb = ext.fq_q8_scratch(dev_idx, R, K)
-            ext.fq_quant_q8_1_rows(flat, qb)
-            if ri and R > 4:      # 5..8 columns launch 2 warps per row (other sum order than the one-row launch's 4): at most 4 columns per launch
+            try:
+                _ver = flat._version
+            except RuntimeError:        # inference tensor: no version counter (nothing writes x between q, k and v)
+                _ver = -1
+            _sk = (flat.data_ptr(), _ver, R, K, dev_idx)
+            if _Q8S["on"] and _Q8S["key"] == _sk:
+                pass        # q8_1 of this exact x is already in the scratch (q / k / v of one layer)
+            else:
+                ext.fq_quant_q8_1_rows(flat, qb)
+                _Q8S["key"] = _sk if _Q8S["on"] else None
+            _bf = None
+            if (bias is not None and R == 1 and out.dtype == dtype and bias.dtype == torch.half and bias.is_cuda and bias.is_contiguous()
+                    and bias.numel() == N and self.post_scale == 1.0 and self.softcap == 0.0 and _epi_on() and hasattr(ext, "fq_mmvq_epi_abi")):
+                _bf = bias
+                self._bias_fused = True
+            if _bf is not None:
+                getattr(ext, _MMVQ_FN[self.format])(qb, self.packed.reshape(N, -1), out, _bf)
+            elif ri and R > 4:      # 5..8 columns launch 2 warps per row (other sum order than the one-row launch's 4): at most 4 columns per launch
                 for a in range(0, R, 4):
                     getattr(ext, _MMVQ_FN[self.format])(qb[a:a + 4], self.packed.reshape(N, -1), out[a:a + 4])
             else:
@@ -331,6 +394,7 @@ class ForeignLinear(Module):
             dev_idx = dev.index if dev.index is not None else torch.cuda.current_device()
             qb = ext.fq_q8_scratch(dev_idx, R, K)
             ext.fq_quant_q8_1_rows(flat, qb)
+            _Q8S["key"] = None
             getattr(ext, _IQ_Q8_FN[self.format])(qb, self.packed.reshape(N, -1), out)
             if out.dtype != dtype:
                 out = out.to(dtype)

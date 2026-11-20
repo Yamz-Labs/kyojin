@@ -64,11 +64,13 @@ class TransformerBlock(Module):
         if attn_hc is not None or mlp_hc is not None:
             assert attn_hc is not None and mlp_hc is not None, \
                 "hyperconnections require both attn_hc and mlp_hc"
+            # post norms (Hy4: llama.cpp norms the sublayer output before the post mix) need both sites, or none
+            assert (attn_post_norm is None) == (mlp_post_norm is None), \
+                "hyperconnections need attn_post_norm and mlp_post_norm together (or neither)"
             assert all(v is None for v in (
-                attn_post_norm, mlp_post_norm,
                 key_layer_scalar, key_attn_resid_scalar, key_mlp_resid_scalar,
             )), \
-                "hyperconnections cannot combine with residual scalars/post-norms"
+                "hyperconnections cannot combine with residual scalars"
 
         self.register_submodule(self.attn_hc)
         self.register_submodule(self.attn_norm)
@@ -147,7 +149,7 @@ class TransformerBlock(Module):
         """MLP half of forward (norm, MLP, residual/hc apply). `y_resid` is a pending attention
         output whose residual add is folded into the MLP input norm. Returns the new residual."""
         if self.mlp:
-            if self.mlp_hc and self._moe_fused_on:
+            if self.mlp_hc and self._moe_fused_on and not self.mlp_post_norm:
                 fused_x = moe_fused.maybe_apply(self, x, params, hc_pending)
                 if fused_x is not None:
                     return fused_x
@@ -211,7 +213,11 @@ class TransformerBlock(Module):
                 ablit_runtime.project(y, self.ablit[1], *self.ablit[2:])
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
-            if self.mlp_hc:
+            if self.mlp_hc and self.mlp_post_norm:
+                # Hy4 order: collapse -> mlp_norm -> mlp -> post norm -> post mix into the streams (M:5943 / 6089)
+                y = self.mlp_post_norm.forward(y, params)
+                x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
+            elif self.mlp_hc:
                 # EXL3_PF_HC_FUSE: defer into the next block's attn mix_norm (see pf_can_defer)
                 if hc_defer and HyperConnection.pf_can_defer(x, y, hc_post, hc_comb, params):
                     params["hc_pending"] = (x, y, hc_post, hc_comb)
@@ -307,7 +313,11 @@ class TransformerBlock(Module):
                     ablit_runtime.project(y, self.ablit[0], *self.ablit[2:])
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
-            if self.attn_hc:
+            if self.attn_hc and self.attn_post_norm:
+                # Hy4 order: collapse -> attn_norm -> attn -> post norm -> post mix into the streams
+                y = self.attn_post_norm.forward(y, params)
+                x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
+            elif self.attn_hc:
                 if self.mlp and self.mlp_hc and self.mlp_norm \
                         and HyperConnection.pf_can_defer(x, y, hc_post, hc_comb, params):
                     mlp_pending = (x, y, hc_post, hc_comb)

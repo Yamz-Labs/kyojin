@@ -77,6 +77,7 @@ void fq_moe_iq4xs_grouped_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor w
                              torch::Tensor down_ptrs,
                              int64_t gate_stride, int64_t up_stride, int64_t down_stride,
                              torch::Tensor partial, torch::Tensor out);
+void fq_moe_kq_set_swiglu_limit(double lim);   // 0 = off; gate <= lim, |up| <= lim on routed slots of the grouped kq kernels
 void fq_moe_kq_grouped_mixed_q8(torch::Tensor h, torch::Tensor sel, torch::Tensor wts,
                                 torch::Tensor gate_ptrs, torch::Tensor up_ptrs,
                                 torch::Tensor down_ptrs,

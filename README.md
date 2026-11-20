@@ -31,6 +31,16 @@ hf download yamz-labs/GLM-5.3-Flash-EXL3-Yamz --local-dir ./glm-pack
 python tools/glm/serve.py --model ./glm-pack --port 8000 -c 131072 --num-draft 2
 ```
 
+Hy4-flash (GGUF Q3_K, 64K context, one Strix Halo machine): after the install of [doc/install.md](doc/install.md), download the publisher's GGUF, build the kernels once and run `tools/hy4/serve.py` ([doc/hy4.md](doc/hy4.md)):
+
+```bash
+hf download AngelSlim/Hy4-flash-GGUF --include "Hy4-flash-Q3_K-*.gguf" --local-dir ./hy4
+bash tools/hy4/install_strix.sh        # once: builds the Hy4 kernels, prints "install_strix: OK"
+python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --port 8300 -c 65536
+```
+
+At this setting, on a 128 GB machine with nothing else large resident, the server peaked at 102.7 GiB of GTT and kept about 16 GiB of memory free (15 GiB during a 64K prefill); a smaller `-c` leaves more ([doc/hy4.md](doc/hy4.md)). Close other GPU or memory-heavy apps first.
+
 RTX 3090 (NVIDIA): build for CUDA once ([tools/cuda/README.md](tools/cuda/README.md)), then Qwen3.8-27B with 245K of context (the served settings, one session), with turboderp's 4.0 bpw pack:
 
 ```bash
@@ -91,6 +101,7 @@ It prints a Markdown block. Paste it in a [benchmark report](https://github.com/
 ## What is inside
 
 - Speculative decoding, on by default; it returns the same tokens as plain decoding.
+- Hy4-flash (public GGUF, Q3_K) on one Strix Halo machine: sparse-attention prefill, graph decode with MTP drafts, 64K context, 128K opt-in ([doc/hy4.md](doc/hy4.md), [changelog](CHANGELOG.md)).
 - Long context: up to 983K tokens (DeepSeek V4.1 Flash on a Mac Studio), 500K on GLM-5.3-Flash.
 - Image input on Qwen3.8-27B.
 - Optional uncensored mode: a small run-time preset on the normal packs, off by default; it edits no weights. How it works: [doc/refusal_hook.md](doc/refusal_hook.md).
@@ -121,6 +132,7 @@ All packs are EXL3 on Hugging Face: ours on [yamz-labs](https://huggingface.co/y
 
 - Strix Halo needs Linux (Ubuntu/Debian tested), a gfx1151 machine with 128 GB and ROCm 7.0 or newer; ROCm 6.4 has no gfx1151 code ([install](doc/install.md)).
 - NVIDIA needs sm_80 or newer; tested on one RTX 3090 with 24 GB ([RTX](doc/rtx.md)).
+- Hy4-flash: one request at a time, greedy decoding, 64K context measured, with about 15 GiB of memory free at `-c 65536` on a 128 GB machine; 128K is opt-in and not measured under a 128K prefill (110.4 GiB of GTT and 7.8 GiB free at load) ([doc/hy4.md](doc/hy4.md)).
 - The first GLM launch tunes its kernels for about 10 minutes, and the port stays closed until it finishes ([install](doc/install.md)).
 - GLM at `-c 131072` leaves about 10 GiB free on a 128 GB machine ([install](doc/install.md)).
 - The 763B model on one 128 GB machine is experimental: real decode is about 5 to 11 tokens per second ([Strix Halo](doc/strix.md)).

@@ -619,6 +619,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fq_mlp_shared_iq2xxs", &fq_mlp_shared_iq2xxs, "fq_mlp_shared_iq2xxs",
           py::arg("x"), py::arg("up_packed"), py::arg("h"));
 #endif
+    m.def("fq_moe_fold", &fq_moe_fold, "fq_moe_fold", py::arg("d"), py::arg("rw"), py::arg("out"));
+    m.def("fq_mmvq_epi_abi", &fq_mmvq_epi_abi, "fq_mmvq_epi_abi");
     m.def("fq_q8_scratch", &fq_q8_scratch, "fq_q8_scratch",
           py::arg("dev"), py::arg("M"), py::arg("K"));
     m.def("fq_quant_q8_1_rows", &fq_quant_q8_1_rows, "fq_quant_q8_1_rows",
@@ -646,32 +648,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fq_gemv_iq3_s_q8", &fq_gemv_iq3_s_q8, "fq_gemv_iq3_s_q8",
           py::arg("qb"), py::arg("packed"), py::arg("out"));
     m.def("fq_mmvq_iq2_xxs", &fq_mmvq_iq2_xxs, "fq_mmvq_iq2_xxs",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_mmvq_iq2_xs", &fq_mmvq_iq2_xs, "fq_mmvq_iq2_xs",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_mmvq_iq2_s", &fq_mmvq_iq2_s, "fq_mmvq_iq2_s",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_mmvq_iq3_xxs", &fq_mmvq_iq3_xxs, "fq_mmvq_iq3_xxs",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_mmvq_iq3_s", &fq_mmvq_iq3_s, "fq_mmvq_iq3_s",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_mmvq_iq4_nl", &fq_mmvq_iq4_nl, "fq_mmvq_iq4_nl",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_mmvq_iq4_xs", &fq_mmvq_iq4_xs, "fq_mmvq_iq4_xs",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_dequant_iq", &fq_dequant_iq, "fq_dequant_iq", py::arg("packed"), py::arg("out"), py::arg("fmt"));
     m.def("fq_moe_mmvq_grouped", &fq_moe_mmvq_grouped, "fq_moe_mmvq_grouped",
           py::arg("h"), py::arg("sel"), py::arg("wts"), py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
           py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"), py::arg("type_ug"), py::arg("type_down"),
           py::arg("partial"), py::arg("out"));
+    m.def("fq_mxfp4_moe_gu", &fq_mxfp4_moe_gu, "fq_mxfp4_moe_gu",
+          py::arg("qb"), py::arg("sel"), py::arg("gate_ptrs"), py::arg("gate_bias"), py::arg("up_ptrs"), py::arg("up_bias"), py::arg("act"),
+          py::arg("I"), py::arg("K"), py::arg("lim"));
+    m.def("fq_mxfp4_moe_down", &fq_mxfp4_moe_down, "fq_mxfp4_moe_down",
+          py::arg("qb"), py::arg("sel"), py::arg("down_ptrs"), py::arg("down_bias"), py::arg("out"), py::arg("N"), py::arg("K"));
     m.def("fq_mmvq_q5_k", &fq_mmvq_q5_k, "fq_mmvq_q5_k",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_mmvq_q4_k", &fq_mmvq_q4_k, "fq_mmvq_q4_k",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_mmvq_q6_k", &fq_mmvq_q6_k, "fq_mmvq_q6_k",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
     m.def("fq_mmvq_q3_k", &fq_mmvq_q3_k, "fq_mmvq_q3_k",
-          py::arg("qb"), py::arg("packed"), py::arg("out"));
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
+    m.def("fq_mmvq_q4_0", &fq_mmvq_q4_0, "fq_mmvq_q4_0",
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
+    m.def("fq_mmvq_q4_1", &fq_mmvq_q4_1, "fq_mmvq_q4_1",
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
+    m.def("fq_mmvq_q5_0", &fq_mmvq_q5_0, "fq_mmvq_q5_0",
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
+    m.def("fq_mmvq_q5_1", &fq_mmvq_q5_1, "fq_mmvq_q5_1",
+          py::arg("qb"), py::arg("packed"), py::arg("out"), py::arg("bias") = py::none());
 #if !defined(USE_ROCM)
     m.def("fq_mmq_few", &fq_mmq_few, "fq_mmq_few",
           py::arg("x"), py::arg("scratch"), py::arg("packed"), py::arg("out"), py::arg("fmt"));
@@ -697,6 +712,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
           py::arg("gate_stride"), py::arg("up_stride"), py::arg("down_stride"),
           py::arg("partial"), py::arg("out"));
+    m.def("fq_moe_kq_set_swiglu_limit", &fq_moe_kq_set_swiglu_limit, "fq_moe_kq_set_swiglu_limit", py::arg("lim"));
     m.def("fq_moe_kq_grouped_mixed_q8", &fq_moe_kq_grouped_mixed_q8, "fq_moe_kq_grouped_mixed_q8",
           py::arg("h"), py::arg("sel"), py::arg("wts"),
           py::arg("gate_ptrs"), py::arg("up_ptrs"), py::arg("down_ptrs"),
