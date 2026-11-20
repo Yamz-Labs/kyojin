@@ -9,6 +9,7 @@ Cases (each needs the real model: the reply is whatever the model decides):
   2. tool call, streamed        same, read from delta.tool_calls chunks (index, id + name, then the arguments)
   3. multi-turn round trip      the call and its result are sent back -> a final text answer, finish_reason "stop"
   4. disconnect mid-stream      close a long stream after a few chunks -> the engine is free again within a few seconds
+  5. forced tool_choice         a greeting with tool_choice naming get_weather -> still a get_weather call, finish_reason "tool_calls"
 Standard library only (http.client): it runs in the release venv as it is.
 """
 from __future__ import annotations
@@ -182,6 +183,22 @@ class Smoke:
             return False, f"finish_reason {ch['finish_reason']!r}, content {content[:160]!r}, tool_calls {ch['message'].get('tool_calls')}"
         return True, f"answer {content.strip()[:100]!r} (mentions 18: {'18' in content})"
 
+    def case_forced(self):
+        choice = {"type": "function", "function": {"name": "get_weather"}}
+        r = self.post(self.body([{"role": "user", "content": "Say hello to me."}], tool_choice=choice))
+        if r.status_code != 200:
+            return False, f"HTTP {r.status_code}: {r.text[:200]}"
+        ch = r.json()["choices"][0]
+        calls = ch["message"].get("tool_calls") or []
+        if ch["finish_reason"] != "tool_calls" or not calls:
+            return False, f"finish_reason {ch['finish_reason']!r}, no tool_calls; content {str(ch['message'].get('content'))[:160]!r}"
+        fn = calls[0]["function"]
+        try:
+            json.loads(fn["arguments"])
+        except ValueError:
+            return False, f"arguments are not JSON: {fn['arguments'][:120]!r}"
+        return fn["name"] == "get_weather", f"{fn['name']}({fn['arguments']})"
+
     def case_disconnect(self):
         quick = self.body([{"role": "user", "content": "Say hello in one word."}], max_tokens=16, reasoning_effort="no_think")
         quick.pop("tools")
@@ -229,6 +246,7 @@ def main(argv=None) -> int:
     sm.run("2 tool call (stream)", sm.case_stream)
     sm.run("3 multi-turn with a tool result", sm.case_multi_turn)
     sm.run("4 disconnect mid-stream", sm.case_disconnect)
+    sm.run("5 forced tool_choice", sm.case_forced)
     failed = [n for n, ok, _ in sm.results if not ok]
     print(f"{len(sm.results) - len(failed)}/{len(sm.results)} passed" + (f"; failed: {', '.join(failed)}" if failed else ""))
     return 1 if failed else 0

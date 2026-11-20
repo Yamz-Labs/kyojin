@@ -118,11 +118,11 @@ class Parser(unittest.TestCase):
         self.assertEqual([m["role"] for m in r["messages"]], ["user"])
         self.assertEqual(r["messages"], USER)
 
-    def test_system_messages_merge_with_the_tool_instruction(self):
+    def test_system_messages_merge_with_tools_declared(self):
         tools = [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {}}}}]
         r = C.parse_chat({"messages": [{"role": "system", "content": "Be brief."}, *USER, {"role": "developer", "content": "Late rule."}], "tools": tools, "tool_choice": "required"})
         self.assertEqual(len(r["messages"]), 2)
-        self.assertEqual(r["messages"][0]["content"], "Be brief.\n\nLate rule.\n\n" + C.TOOL_HINTS["required"])
+        self.assertEqual(r["messages"][0]["content"], "Be brief.\n\nLate rule.")
 
     def test_only_system_messages_is_a_400(self):
         with self.assertRaises(C.RequestError):

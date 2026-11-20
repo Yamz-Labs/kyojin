@@ -103,6 +103,15 @@ class Vocab:
         self.think_end = next((t for t in toks if t.startswith("</think")), None)
         self.tool_tags = ToolTags(tag_suffix(self.think_begin))
 
+    def chat_prompt(self, r: dict) -> tuple[str, str]:
+        """parsed chat request -> (prompt text, forced prefix). tool_choice required / a named function: the assistant turn is prefilled with the call opening
+        <tool_calls><tool_call> (and the function name when it is named); the output stream is seeded with the same text so the parser sees the whole call."""
+        text = self.template.render_chat(r)
+        prefix = ""
+        if r.get("force"):
+            prefix = self.tool_tags.calls_open + self.tool_tags.call_open + (r["tool_name"] or "")
+        return text + prefix, prefix
+
     def encode(self, text: str) -> list[int]:
         return self.tok.encode(text, add_special_tokens=False).ids
 
@@ -319,15 +328,12 @@ def check_response_format(body: dict) -> None:
         raise RequestError("response_format.type must be text, json_object or json_schema")
 
 
-TOOL_HINTS = {"required": "You must answer by calling one or more of the provided functions.",
-              "function": "You must answer by calling the function {name}."}
-
-
 def parse_tools(body: dict) -> dict:
     """`tools` (or the legacy `functions`) and `tool_choice` (or the legacy `function_call`) of a chat request ->
-    {tools: the declared function tools the prompt carries (None = none), tool_choice: none | auto | required | function, tool_name, parse_tools, tool_hint}.
+    {tools: the declared function tools the prompt carries (None = none), tool_choice: none | auto | required | function, tool_name, parse_tools, force}.
     The chat template has no switch for tool_choice: "none" leaves the tools out of the prompt and the output is plain text; a named function keeps only that
-    tool in the prompt; "required" and a named function add one instruction line to the system message (best effort, the model decides)."""
+    tool in the prompt; "required" and a named function are FORCED: `force` is True and the assistant turn is prefilled with the call opening (Vocab.chat_prompt),
+    so the model can only write the arguments (named) or the call (required)."""
     raw = body.get("tools")
     if raw is None or raw == []:
         raw = body.get("functions")
@@ -361,7 +367,7 @@ def parse_tools(body: dict) -> dict:
     if mode == "none":
         tools = []
     return {"tools": tools or None, "tool_choice": mode, "tool_name": name, "parse_tools": bool(tools),
-            "tool_hint": TOOL_HINTS.get(mode, "").format(name=name)}
+            "force": mode in ("required", "function")}
 
 
 def _call_arguments(args: Any, where: str) -> dict:
@@ -446,12 +452,14 @@ def parse_chat(body: dict, default_max: int = 1024) -> dict:
         raise RequestError("the last assistant message has tool_calls: add a tool message with each result")
     if prefill and len(out) < 2:
         raise RequestError("the last message must come from the user")
-    if req["tool_hint"]:
-        system.append(req["tool_hint"])
     if system:
         out.insert(0, {"role": "system", "content": "\n\n".join(system)})
-    req.pop("tool_hint")
-    req.update(messages=out, effort=parse_effort(body), prefill=prefill)
+    effort = parse_effort(body)
+    if req["force"]:
+        if prefill:
+            raise RequestError("tool_choice required / a named function cannot be combined with a last assistant message")
+        effort = "no_think"                   # the forced call replaces the reasoning: the turn opens with an empty think block
+    req.update(messages=out, effort=effort, prefill=prefill)
     return req
 
 
@@ -516,9 +524,10 @@ class OutputStream:
     Stops on an EOS id (dropped) or a stop string (cut; only searched in the content channel).
     parse_tools: a tool block (<tool_calls> ... </tool_calls>, or a bare <tool_call> ... </tool_call>) in the content is held back and read call by call, each call
     leaves as a "tool_call" delta the moment its </tool_call> arrives. `tools` (the declared tools) types the arguments and names the calls that count: a block
-    that is not a valid call (cut off, no name, a function the request did not declare) stays plain content. A tool block is only looked for after the reasoning."""
+    that is not a valid call (cut off, no name, a function the request did not declare) stays plain content. A tool block is only looked for after the reasoning.
+    prefix: the forced call opening the prompt ended with; it is parsed as the first text of the reply."""
 
-    def __init__(self, vocab: Vocab, in_think: bool = False, stops: list[str] | None = None, tools: list | None = None, parse_tools: bool = False):
+    def __init__(self, vocab: Vocab, in_think: bool = False, stops: list[str] | None = None, tools: list | None = None, parse_tools: bool = False, prefix: str = ""):
         self.v = vocab
         self.dec = IncrementalDecoder(vocab)
         self.in_think = bool(in_think and vocab.think_end)
@@ -530,7 +539,7 @@ class OutputStream:
         self.tool_wrapped = False
         self.tool_pos = 0
         self.n_calls = 0
-        self.buf = ""
+        self.buf = prefix                      # text the prompt already ended with (a forced tool call opening): read as the start of the reply
         self.done = False
         self.finish_reason: str | None = None
         self.n_tokens = 0          # generated tokens counted (EOS and anything after it excluded)

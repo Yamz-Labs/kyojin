@@ -94,7 +94,7 @@ curl http://localhost:8300/v1/chat/completions -H "Content-Type: application/jso
 
 ### Tool calling
 
-The Hy4-flash server speaks the OpenAI tool-calling API: `tools` (and the legacy `functions`), `tool_choice` (`none`, `auto`, `required` or a named function; the model template has no switch for it, so `required` and a named function add one instruction line to the system message and the model decides), assistant messages with `tool_calls`, and `tool` messages with the result. A reply that calls a function has `finish_reason` `"tool_calls"` and `message.tool_calls`; streamed, the calls arrive as `delta.tool_calls`. The reasoning stays in `reasoning_content`.
+The Hy4-flash server speaks the OpenAI tool-calling API: `tools` (and the legacy `functions`), `tool_choice` (`none`, `auto`, `required` or a named function; `required` and a named function are forced: the reply skips the reasoning and starts with the call, the model writes only the arguments, and the name too for `required`), assistant messages with `tool_calls`, and `tool` messages with the result. A reply that calls a function has `finish_reason` `"tool_calls"` and `message.tool_calls`; streamed, the calls arrive as `delta.tool_calls`. The reasoning stays in `reasoning_content`.
 
 ```bash
 curl http://localhost:8300/v1/chat/completions -H "Content-Type: application/json" -d '{

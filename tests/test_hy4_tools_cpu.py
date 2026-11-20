@@ -180,6 +180,24 @@ class Parser(unittest.TestCase):
         seen = o.push(v.encode(second[20:] + ENDCALLS))
         self.assertEqual([p["name"] for c, p in seen if c == "tool_call"], ["search"])
 
+    def test_a_forced_call_is_parsed_from_the_prefix_and_the_generated_rest(self):
+        v = self.vocabs["special tags"]
+        prefix = f"{CALLS}<tool_call{TK}>get_weather"
+        rest = f"<arg_key{TK}>city</arg_key{TK}><arg_value{TK}>Paris</arg_value{TK}></tool_call{TK}>{ENDCALLS}"
+        for step in (1, 3, 1000):
+            ids = v.encode(rest)
+            o, ev = C.OutputStream(v, False, None, TOOLS, True, prefix=prefix), []
+            for i in range(0, len(ids), step):
+                ev += o.push(ids[i:i + step])
+            ev += o.push([v.eos_id]) + o.finish()
+            self.assertEqual(collect(ev), {"reasoning": "", "content": "", "calls": [("get_weather", {"city": "Paris"})]})
+            self.assertEqual(o.final_reason(), "tool_calls")
+        o = C.OutputStream(v, False, None, TOOLS, True, prefix=f"{CALLS}<tool_call{TK}>")        # required: the model writes the name too
+        ev = o.push(v.encode(f"search<arg_key{TK}>query</arg_key{TK}><arg_value{TK}>rain</arg_value{TK}></tool_call{TK}>{ENDCALLS}") + [v.eos_id]) + o.finish()
+        self.assertEqual(collect(ev)["calls"], [("search", {"query": "rain"})])
+        o = C.OutputStream(v, False, None, TOOLS, True, prefix=prefix)                          # no token at all: nothing valid, nothing lost
+        self.assertEqual(collect(o.finish())["calls"], [])
+
     def test_random_piece_sizes(self):
         text = f"plan{UNTHINK}Let me check.{CALLS}{call('get_weather', city='Paris')}{call('search', query='a b', limit=2)}{ENDCALLS}"
         rng = random.Random(7)
@@ -235,16 +253,30 @@ class Request(unittest.TestCase):
         r = self.parse(tools=TOOLS, function_call="auto")
         self.assertEqual(r["tool_choice"], "auto")
 
-    def test_tool_choice_hint_goes_into_the_system_message(self):
+    def test_forced_tool_choice_prefills_the_call(self):
         r = self.parse(tools=TOOLS, tool_choice="required")
-        self.assertEqual(r["messages"][0]["role"], "system")
-        self.assertIn("must answer by calling", r["messages"][0]["content"])
-        msgs = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "x"}]
-        r = C.parse_chat({"messages": msgs, "tools": TOOLS, "tool_choice": {"type": "function", "function": {"name": "search"}}})
-        self.assertTrue(r["messages"][0]["content"].startswith("Be brief.\n\n"))
-        self.assertIn("function search", r["messages"][0]["content"])
-        self.assertEqual(len(r["messages"]), 2)
-        self.assertEqual(self.parse(tools=TOOLS)["messages"][0]["role"], "user")      # auto: the messages are untouched
+        self.assertEqual((r["force"], r["effort"], r["tool_name"]), (True, "no_think", None))
+        r = self.parse(tools=TOOLS, tool_choice={"type": "function", "function": {"name": "search"}}, reasoning_effort="max")
+        self.assertEqual((r["force"], r["effort"], r["tool_name"]), (True, "no_think", "search"))
+        self.assertEqual(r["messages"], [{"role": "user", "content": "weather in Paris?"}])      # the messages are untouched
+        for choice in ("auto", "none"):
+            r = self.parse(tools=TOOLS, tool_choice=choice)
+            self.assertFalse(r["force"])
+            self.assertEqual(r["effort"], "high")
+        with self.assertRaises(C.RequestError):
+            C.parse_chat({"messages": [*r["messages"], {"role": "assistant", "content": "Sure"}], "tools": TOOLS, "tool_choice": "required"})
+
+    def test_chat_prompt_ends_with_the_forced_call_opening(self):
+        r = self.parse(tools=TOOLS, tool_choice={"type": "function", "function": {"name": "get_weather"}})
+        text, prefix = self.v.chat_prompt(r)
+        self.assertEqual(prefix, f"{CALLS}<tool_call{TK}>get_weather")
+        self.assertTrue(text.endswith(f"{START}assistant{MIDDLE}{THINK}{UNTHINK}{prefix}"))
+        self.assertNotIn('"name": "search"', text)                    # only the named tool is declared
+        text, prefix = self.v.chat_prompt(self.parse(tools=TOOLS, tool_choice="required"))
+        self.assertEqual(prefix, f"{CALLS}<tool_call{TK}>")
+        self.assertTrue(text.endswith(prefix))
+        text, prefix = self.v.chat_prompt(self.parse(tools=TOOLS))
+        self.assertEqual((prefix, text.endswith(THINK)), ("", True))
 
     def test_bad_tool_requests_are_a_400(self):
         bad = [dict(tools="x"), dict(tools=[1]), dict(tools=[{"type": "function"}]), dict(tools=[{"type": "function", "function": {"name": "a b"}}]),
@@ -303,7 +335,7 @@ class Request(unittest.TestCase):
         text = self.render(messages=[{"role": "system", "content": "Be brief."}, {"role": "user", "content": "weather?"}], tools=TOOLS)
         self.assertLess(text.index("# Tools"), text.index("Be brief."))
         self.assertNotIn("# Tools", self.render(messages=[{"role": "user", "content": "x"}], tools=TOOLS, tool_choice="none"))
-        self.assertIn("function get_weather", self.render(messages=[{"role": "user", "content": "x"}], tools=TOOLS, tool_choice={"function": {"name": "get_weather"}}))
+        self.assertNotIn('"name": "search"', self.render(messages=[{"role": "user", "content": "x"}], tools=TOOLS, tool_choice={"function": {"name": "get_weather"}}))
 
     def test_multi_turn_history_is_rendered_back_in_the_template_format(self):
         msgs = self.history('{"city": "Paris", "days": 2}', content="Let me check.")
@@ -509,6 +541,38 @@ class Http(unittest.IsolatedAsyncioTestCase):
             j = await r.json()
             self.assertEqual(r.status, 400, (extra, j))
             self.assertEqual(j["error"]["type"], "invalid_request_error")
+
+    async def test_named_tool_choice_forces_the_call(self):
+        """the model is only asked for the arguments: the prompt already ends with the call opening and the function name"""
+        rest = f"<arg_key{TK}>city</arg_key{TK}><arg_value{TK}>Paris</arg_value{TK}></tool_call{TK}>{ENDCALLS}"
+        for stream in (False, True):
+            st = await self.start(rest)
+            body = self.body(tool_choice={"type": "function", "function": {"name": "get_weather"}}, stream=stream, reasoning_effort="high")
+            if stream:
+                chunks = await self.sse_chunks(tool_choice=body["tool_choice"], reasoning_effort="high")
+                deltas = [c["choices"][0]["delta"] for c in chunks if c["choices"]]
+                tcs = [tc for d in deltas for tc in d.get("tool_calls", [])]
+                self.assertEqual(tcs[0]["function"]["name"], "get_weather")
+                self.assertEqual(json.loads(tcs[1]["function"]["arguments"]), {"city": "Paris"})
+                self.assertEqual([c["choices"][0]["finish_reason"] for c in chunks if c["choices"]][-1], "tool_calls")
+            else:
+                j = await (await self.client.post("/v1/chat/completions", json=body)).json()
+                ch = j["choices"][0]
+                self.assertEqual(ch["finish_reason"], "tool_calls")
+                self.assertIsNone(ch["message"]["content"])
+                [tc] = ch["message"]["tool_calls"]
+                self.assertEqual((tc["function"]["name"], json.loads(tc["function"]["arguments"])), ("get_weather", {"city": "Paris"}))
+            prompt = st.vocab.decode(st.engine.calls[0][0])
+            self.assertTrue(prompt.endswith(f"{UNTHINK}{CALLS}<tool_call{TK}>get_weather"), prompt[-120:])
+            await self.client.close()
+
+    async def test_required_tool_choice_forces_a_call(self):
+        await self.start(f"search<arg_key{TK}>query</arg_key{TK}><arg_value{TK}>rain</arg_value{TK}></tool_call{TK}>{ENDCALLS}")
+        j = await (await self.client.post("/v1/chat/completions", json=self.body(tool_choice="required", reasoning_effort="high"))).json()
+        ch = j["choices"][0]
+        self.assertEqual(ch["finish_reason"], "tool_calls")
+        self.assertEqual(ch["message"]["tool_calls"][0]["function"]["name"], "search")
+        self.assertTrue(self.st.vocab.decode(self.st.engine.calls[0][0]).endswith(f"{CALLS}<tool_call{TK}>"))
 
     async def test_apply_template_with_tools(self):
         await self.start("x")

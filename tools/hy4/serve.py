@@ -167,7 +167,7 @@ def build_app(st: State):
 
     def prompt_for_chat(body):
         r = C.parse_chat(body, args.default_max_tokens)
-        text = st.vocab.template.render_chat(r)
+        text, r["prefix"] = st.vocab.chat_prompt(r)
         ids = st.vocab.encode(text)
         v = st.vocab
         r["in_think"] = not r["prefill"] and r["effort"] != "no_think" and bool(v.think_begin) and text.rstrip().endswith(v.think_begin)
@@ -182,7 +182,7 @@ def build_app(st: State):
         from mu_engine import Request
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
-        out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"], tools=r.get("tools"), parse_tools=r.get("parse_tools", False))
+        out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"], tools=r.get("tools"), parse_tools=r.get("parse_tools", False), prefix=r.get("prefix", ""))
 
         def on_tokens(toks):
             for ch, tx in out.push(toks):
@@ -225,7 +225,7 @@ def build_app(st: State):
             return
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
-        out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"], tools=r.get("tools"), parse_tools=r.get("parse_tools", False))
+        out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"], tools=r.get("tools"), parse_tools=r.get("parse_tools", False), prefix=r.get("prefix", ""))
         cancel = threading.Event()
         res: dict = {}
 
@@ -407,7 +407,7 @@ def build_app(st: State):
         try:
             need_ready()
             r = C.parse_chat(await read_body(request), args.default_max_tokens)
-            return web.json_response({"prompt": st.vocab.template.render_chat(r)})
+            return web.json_response({"prompt": st.vocab.chat_prompt(r)[0]})
         except C.RequestError as e:
             return _err(e.status, str(e), e.code)
 
