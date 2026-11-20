@@ -313,6 +313,7 @@ class Hy4Engine:
             kd0 = self.gate_kb if self.gate is not None else k          # drafts read from the first draft graph
             if self.gate is not None:
                 from depth_gate import draft_with_gate
+                self.gate.reset()                     # decisions depend on this request only (HY4_SPEC2_MODE=carry keeps the old carried state: negative control)
             pc = time.perf_counter
             tm = [0.0, 0.0, 0.0]
             ng = None

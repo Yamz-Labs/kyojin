@@ -86,11 +86,15 @@ def generate(policy, p_ok, n_new=400, seed=1, kfix=3, gate=None):
     out, rounds, ms = [y], 0, 0.0
     kb = gate.kb if gate else kfix
     mg = FakeMG(gr, kb, gate.ext if gate else 0, p_ok, rng)
+    mg.decisions = []
+    if gate:
+        gate.reset()                             # engine.generate: the gate state is per request
     while len(out) < n_new:
         j = gr.n - 1
         dd = mg.run(y, j).tolist()
         if gate:
             d, gext, gb = draft_with_gate(gate, mg, dd, kb, j)
+            mg.decisions.append(bool(gext))
         else:
             d, gext, gb = dd[:kb], False, None
         toks = [y] + d
@@ -129,6 +133,50 @@ def truth(n_new):
     return out
 
 
+def determinism():
+    """S7b: the same request twice on ONE gate object (a server serving two identical reps). static and learn (reset per request) must repeat decisions, digest and text exactly;
+    carry (the job 17 behaviour, no reset) is the NEGATIVE CONTROL: it must diverge on at least one of the scenarios, else this test proves nothing. Returns the number of mismatching repeats."""
+    bad = 0
+    for mode in ("static", "learn"):
+        for p_ok in (0.55, 0.75, 0.93):
+            for seed in (1, 2):
+                g = DepthGate(ROW, 3.0, 0.3, 2, 1, mode=mode, theta=0.6)
+                r1 = generate("gate", p_ok, n_new=300, seed=seed, gate=g)
+                st1 = g.stats()
+                # a different request in between (state of an unrelated prompt must not leak)
+                generate("gate", 0.9 - p_ok / 3, n_new=200, seed=seed + 50, gate=g)
+                r2 = generate("gate", p_ok, n_new=300, seed=seed, gate=g)
+                st2 = g.stats()
+                same = r1[0] == r2[0] and r1[4].decisions == r2[4].decisions and st1["digest"] == st2["digest"] and st1["req_rounds"] == st2["req_rounds"]
+                bad += not same
+                g2 = DepthGate(ROW, 3.0, 0.3, 2, 1, mode=mode, theta=0.6)
+                r3 = generate("gate", p_ok, n_new=300, seed=seed, gate=g2)
+                bad += not (r3[4].decisions == r1[4].decisions)          # fresh object = same decisions (no hidden global state)
+    # the decision of the static gate is a pure function of the confidences
+    g = DepthGate(ROW, 3.0, 0.3, 2, 1, mode="static", theta=0.6)
+    for c in ([0.9, 0.9], [0.5, 0.5], [0.8, 0.75], [0.99, 0.2]):
+        outs = {g.decide(c)[0] for _ in range(5)}
+        bad += len(outs) != 1
+        assert outs == {c[0] * c[1] >= 0.6}, (c, outs)
+    # lifetime counters survive reset, per-request ones do not
+    g = DepthGate(ROW, 3.0, 0.3, 2, 1, mode="learn")
+    generate("gate", 0.8, n_new=200, gate=g)
+    life = g.stats()["rounds"]
+    g.reset()
+    assert g.stats()["rounds"] == life and g.stats()["req_rounds"] == 0
+    # negative control
+    diverged = 0
+    for p_ok in (0.55, 0.75, 0.93):
+        g = DepthGate(ROW, 3.0, 0.3, 2, 1, mode="carry")
+        r1 = generate("gate", p_ok, n_new=300, seed=1, gate=g)
+        r2 = generate("gate", p_ok, n_new=300, seed=1, gate=g)
+        diverged += r1[4].decisions != r2[4].decisions
+        assert r1[0] == r2[0]                                              # text is exact in the fake (exact verify); on the real engine row count T changes the logits
+    print(f"CONTROL carry_diverges {diverged}/3 scenarios")
+    assert diverged >= 1, "negative control: the carried gate must diverge on identical requests"
+    return bad
+
+
 def main():
     ref = truth(400)
     for p_ok in (0.55, 0.9):
@@ -162,7 +210,10 @@ def main():
         print(f"{name}: ext rate {mg.tail_calls / r:.2f} gate {1000 * len(o) / ms:.2f} tok/s fixed k2 {1000 * rates[2]:.2f} k3 {1000 * rates[3]:.2f}")
         assert len(o) / ms >= 0.97 * min(rates.values())
     assert res["chat-like"][0] < res["code-like"][0] - 0.2, res
+    det_mismatch = determinism()
     print("test_depth_gate OK")
+    print(f"FIRES gate_det {det_mismatch}")
+    assert det_mismatch == 0
 
 
 if __name__ == "__main__":

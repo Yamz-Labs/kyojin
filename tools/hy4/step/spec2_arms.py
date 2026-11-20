@@ -1,7 +1,8 @@
 """spec2_arms.py: ONE staged runner job for the S7 draft-depth A/B (perf/hy4-strix-spec2). Runner driver: cwd = tree, env = lane env + XENV, GPU locks held by the runner.
 Question: tau and ms per round on the 6 head_tau prompts (code / prose / chat x 2, 256 tok, greedy, spec) for
-  A = deployed b2 arm C (k = 3)    B = A with --num-draft 2 (plain shallow chain: the free control)    C = A + HY4_SPEC2_GATE=1 (k = 2 base graph + confidence-gated tail step)
-order SP2_ORDER (default ABCA: the second A is the drift control, reported as A2). Phase 0: graph-replay ms per verify round at T = 1..6 (4K, arm C flags) = the missing T3 / T5 / T6 of the cost model.
+  A = deployed b2 arm C (k = 3)    B = A with --num-draft 2 (plain shallow chain: the free control)    C = A + HY4_SPEC2_GATE=1 (k = 2 base graph + confidence-gated tail step), state carried across requests (job 17, NOT deterministic)
+  O = gate with the online rule, reset per request    N = gate with a static threshold HY4_SPEC2_THETA (SP2_THETA, default 0.6) on s = c1 * c2 (no state)   [S7b, perf/hy4-strix-spec3]
+order SP2_ORDER (default AONN: N twice = the reproducibility proof; reported as N and N2). FIRES gate_det <n> per gate arm = prompts whose two reps (or the warm-up) differ in text md5 / gate digest; must be 0 for O, N; N vs N2 must match on every point. Phase 0: graph-replay ms per verify round at T = 1..6 (4K, arm C flags) = the missing T3 / T5 / T6 of the cost model.
 Metric per class: tok/s, tau, ms per round = 1000 * tau / tok/s, paired delta vs A (mean of both A runs). Gate rule (s7_model.py): C ships when it is >= B on code by 2 % and not below B on chat / prose by more than 1 %;
 B ships alone when C does not beat it; neither when both lose to A on code by more than 2 %.
 env: OD_PORT OD_NAME GGUF N1119 B2_H B2_DIR B2_GM B2_CO B2_PASSES SP2_ORDER SP2_REPS (default 2) SP2_LEVERS (default 1)
@@ -17,7 +18,12 @@ COMMON = {"EXL3_GM_BUILD_DIR": GM, "HY4_GM_EXT": f"{GM}/exl3_gm_ext.so", "MOE_DE
 ARM_C = {"HY4_HEAD_Q8": "1", "HY4_GRAPH_FORK": "1", "HY4_RG_TUNE": "1", "HY4_BG_V2": "1", "HY4_DENSE_V2": "1", "HY4_MOE_V2": "1",
          "HY4_DRAFT_MOE_TILES": "1", "HY4_DRAFT_MLA_BG": "1", "HY4_DRAFT_IX_GV": "1",
          "HY4_DRAFT_VOCAB": "0", "HY4_DRAFT_VOCAB_REQ": "0", "HY4_DRAFT_TOPK": "0", "HY4_NGRAM_REPLACE": "0", "HY4_SPEC2_GATE": "0", "HY4_REQ_ROUNDLOG": "1"}
-ARMS = {"A": ({}, "3"), "B": ({}, "2"), "C": ({"HY4_SPEC2_GATE": "1", "HY4_SPEC2_KB": "2"}, "3")}        # arm -> (extra env, --num-draft)
+GATE = {"HY4_SPEC2_GATE": "1", "HY4_SPEC2_KB": "2"}
+ARMS = {"A": ({}, "3"), "B": ({}, "2"),
+        "C": ({**GATE, "HY4_SPEC2_MODE": "carry"}, "3"),                                           # job 17 gate: adaptive state carried across requests (the non-deterministic one)
+        "O": ({**GATE, "HY4_SPEC2_MODE": "learn"}, "3"),                                           # old online rule, reset at every request (isolates the reset)
+        "N": ({**GATE, "HY4_SPEC2_MODE": "static", "HY4_SPEC2_THETA": E.get("SP2_THETA", "0.6")}, "3")}   # static threshold on s = c1 * c2, no state (S7b)
+GATE_LETTERS = "CON"; DET_LETTERS = "ON"                    # DET_LETTERS: arms whose gate_det must be 0 (C is the carried-state negative control)
 def log(*a): print(time.strftime("%T"), *a, flush=True)
 
 def stop(srv):
@@ -38,16 +44,41 @@ def row_ms_env(levers):
     t = {int(k.split("_T")[1]): v["median"] for k, v in levers["round_ms"].items() if k.startswith("4096_T")}
     return ",".join(f"{T}:{t[T]:.2f}" for T in sorted(t)) if len(t) >= 3 else None
 
+def det_mismatch(pts, reqs):
+    """FIRES gate_det: prompts whose two identical reps differ (text md5, or the gate decision digest when the server logged one). reqs[0] = the discarded warm-up (same request as the
+    first prompt rep 0: its digest must also match). Returns (mismatches, prompts compared)."""
+    by, bad = {}, 0
+    for k, p in pts.items(): by.setdefault(k.rsplit("#", 1)[0], []).append(k)
+    dig = {k: q.get("digest") for k, q in zip(pts, (reqs or [])[1:])}
+    for lab, ks in by.items():
+        ks = sorted(ks)
+        if len(ks) < 2: continue
+        if len({pts[k]["md5"] for k in ks}) > 1 or len({dig.get(k) for k in ks}) > 1: bad += 1
+    if reqs and reqs[0].get("digest") and dig:
+        first = next(iter(pts))
+        if reqs[0]["digest"] != dig.get(first): bad += 1
+    return bad, len(by)
+
+def cross_mismatch(a, b):
+    """same prompt + rep in two boots of the same arm: md5 and digest must be identical"""
+    bad = 0
+    da = {k: q.get("digest") for k, q in zip(a["points"], (a.get("reqs") or [])[1:])}
+    db = {k: q.get("digest") for k, q in zip(b["points"], (b.get("reqs") or [])[1:])}
+    for k, p in a["points"].items():
+        q = b["points"].get(k)
+        if q is None or p["md5"] != q["md5"] or da.get(k) != db.get(k): bad += 1
+    return bad
+
 def gate_lines(path):
     """per request (server log line 'req N: ...'): rounds, tau, ext rounds of the gate when present (the gate stats are cumulative over the server's life: differenced per request)"""
     out, prev = [], (0, 0)
     for l in open(path, errors="replace"):
         m = re.search(r"^req (\d+): .*rounds (\d+) tau ([0-9.]+) hist (\[[^\]]*\])", l)
         if m:
-            g = re.search(r"gate \{'rounds': (\d+), 'ext_rounds': (\d+)", l)
+            g = re.search(r"gate \{'rounds': (\d+), 'ext_rounds': (\d+)", l); dg = re.search(r"'digest': '([0-9a-f]+)'", l)
             cur = (int(g.group(1)), int(g.group(2))) if g else None
             out.append({"req": int(m.group(1)), "rounds": int(m.group(2)), "tau": float(m.group(3)), "hist": json.loads(m.group(4)),
-                        "gate_rounds": cur and cur[0] - prev[0], "ext_rounds": cur and cur[1] - prev[1]})
+                        "gate_rounds": cur and cur[0] - prev[0], "ext_rounds": cur and cur[1] - prev[1], "digest": dg.group(1) if dg else None})
             prev = cur or prev
     return out
 
@@ -65,7 +96,7 @@ def fires_check(letter, path):
     why = []
     if letter == "A" and (d2 or gs or gr): why.append("arm A shows firings")
     if letter == "B" and d2 == 0: why.append("FIRES depth2 = 0")
-    if letter == "C" and (d2 == 0 or gs == 0 or gr == 0): why.append(f"gate lever not firing (depth2 {d2}, skipped {gs}, run {gr})")
+    if letter in GATE_LETTERS and (d2 == 0 or gs == 0 or gr == 0): why.append(f"gate lever not firing (depth2 {d2}, skipped {gs}, run {gr})")
     if not f and letter != "A": why.append("no fires counter in the server log")
     why += [f"fallback: {x}" for x in fb]
     return not why, why
@@ -82,7 +113,7 @@ def class_means(pts):
     return r
 
 def main():
-    res = {"levers": None, "arms": {}, "order": E.get("SP2_ORDER", "ABCA")}
+    res = {"levers": None, "arms": {}, "order": E.get("SP2_ORDER", "AONN")}
     def save(): json.dump(res, open(f"{OUT}/{name}.spec2.json", "w"), indent=1)
     if E.get("SP2_LEVERS", "1") == "1":
         lg = f"{OUT}/{name}.levers.log"
@@ -134,6 +165,11 @@ def main():
             res["arms"][key]["reqs"] = gate_lines(sl)
             res["arms"][key]["precapture"] = precapture_line(sl)
             ok, why = fires_check(letter, sl)
+            nbad, nprm = det_mismatch(res["arms"][key]["points"], res["arms"][key]["reqs"])
+            log(f"FIRES gate_det {nbad}   (arm {key}: {nbad} mismatches over {nprm} prompts x 2 reps + warm-up)")
+            res["arms"][key]["gate_det"] = nbad
+            if nbad and letter in DET_LETTERS: ok, why = False, why + [f"gate_det {nbad} > 0: gate decisions / text not reproducible"]
+            if nbad and letter == "A": ok, why = False, why + [f"arm A not reproducible ({nbad})"]
             res["arms"][key]["fires_ok"], res["arms"][key]["fires_why"] = ok, why
             if not ok: log(f"FIRES FAIL arm {key}: {why}")
             for q, c in zip(res["arms"][key]["reqs"][1:], [p["cls"] for p in res["arms"][key]["points"].values()]):      # request 1 = the discarded warm-up
@@ -141,6 +177,14 @@ def main():
         save()
     # ---- table
     arms = res["arms"]
+    for l in dict.fromkeys(res["order"]):                     # repeat boots of the same arm (N, N2): identical md5 + digest per prompt and rep
+        ks = [k for k, a in arms.items() if a["letter"] == l]
+        for k2 in ks[1:]:
+            nb = cross_mismatch(arms[ks[0]], arms[k2])
+            log(f"FIRES gate_det {nb}   (arm {ks[0]} vs repeat boot {k2}: {nb} of {len(arms[ks[0]]['points'])} points differ)")
+            arms[k2]["gate_det_cross"] = nb
+            if nb and l != "C":
+                arms[k2]["fires_ok"] = False; arms[k2]["fires_why"] = arms[k2].get("fires_why", []) + [f"cross-boot gate_det {nb} > 0"]
     ref = [a for k, a in arms.items() if a["letter"] == "A"]
     print("\nSPEC2 TABLE: per class, mean of the head_tau prompts x reps: tok/s | tau | ms per round; delta tok/s vs A (mean of the A runs)")
     for cls in ("code", "prose", "chat"):
@@ -159,21 +203,22 @@ def main():
     def mean_cls(letter, cls):
         v = [a["classes"][cls]["tps"] for a in arms.values() if a["letter"] == letter and cls in a["classes"]]
         return statistics.mean(v) if v else None
+    LETTERS = list(dict.fromkeys(res["order"]))
     for cls in ("code", "prose", "chat"):
-        t = {l: mean_cls(l, cls) for l in "ABC"}
+        t = {l: mean_cls(l, cls) for l in LETTERS}
         if all(t.values()):
-            print(f"SPEC2_VERDICT {cls}: A {t['A']:.2f} B(k=2) {t['B']:.2f} C(gate) {t['C']:.2f} tok/s  B vs A {100 * (t['B'] / t['A'] - 1):+.1f} %  C vs A {100 * (t['C'] / t['A'] - 1):+.1f} %  C vs B {100 * (t['C'] / t['B'] - 1):+.1f} %")
+            print(f"SPEC2_VERDICT {cls}: " + "  ".join(f"{l} {t[l]:.2f}" + ("" if l == "A" else f" ({100 * (t[l] / t['A'] - 1):+.1f} % vs A)") for l in LETTERS) + " tok/s")
     print("\nSPEC2 TAU per class (6 head_tau prompts x reps), gate: tau must not drop > 2 % vs A")
     for cls in ("code", "prose", "chat"):
         ta = [a["classes"][cls]["tau"] for a in arms.values() if a["letter"] == "A" and cls in a["classes"]]
         row = f"{cls:<6}" + (f" A {statistics.mean(ta):.3f}" if ta else "")
-        for l in "BC":
+        for l in LETTERS[1:]:
             tl = [a["classes"][cls]["tau"] for a in arms.values() if a["letter"] == l and cls in a["classes"]]
             if tl and ta:
                 m = statistics.mean(tl); row += f" | {l} {m:.3f} {100 * (m / statistics.mean(ta) - 1):+.1f} % {'OK' if m >= 0.98 * statistics.mean(ta) else 'FAIL (> 2 % drop)'}"
         print(row)
     bad = [k for k, a in arms.items() if not a.get("fires_ok", False)]
-    missing = [l for l in "ABC" if not any(a["letter"] == l for a in arms.values())]
+    missing = [l for l in dict.fromkeys(res["order"]) if not any(a["letter"] == l for a in arms.values())]
     log("SPEC2_DONE", name, f"{time.time() - t0:.0f}s", "FIRES_FAIL " + ",".join(bad) if bad else "fires ok", "MISSING_ARMS " + ",".join(missing) if missing else "")
     if bad or missing: sys.exit(1)
 
