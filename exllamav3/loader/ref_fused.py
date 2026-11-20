@@ -27,6 +27,8 @@ R2_PROG = int(os.environ.get("HY4_MLA_ROWS2_PROG", "64"))  # target number of sp
 R2_SPLIT = int(os.environ.get("HY4_MLA_ROWS2_SPLIT", "0"))  # key splits: 0 = auto, n = fixed
 R2_RS = int(os.environ.get("HY4_MLA_ROWS2_RS", "8"))       # column slices of the combine
 R2_MINB = int(os.environ.get("HY4_MLA_ROWS2_MINB", "2"))   # minimum key blocks per split
+R2_FIRES = {"calls": 0, "fallback": {}}      # fires-check of HY4_MLA_ROWS2: python-side counter of mla2 dispatches (graph capture / eager) and the reasons of decode-size calls that fell back
+R2_FIRES_FILE = os.environ.get("HY4_MLA_ROWS2_FIRES", "")      # when set: the counter is written there (first calls, then every 256th, and at exit): the job reads it back as `FIRES mla2 <calls>`
 MAX_T = 16                  # rows per call handled by the attention kernel (decode / short verify); more = prefill -> torch GEMMs
 CLAMP_MIN = 6.103515625e-5  # the old router's `sum.clamp(min=...)`
 
@@ -402,6 +404,31 @@ if triton is not None:
         tl.store(O + t * s_o_t + h[:, None] * s_o_h + offc[None, :], A / L[:, None])
 
 
+def _r2_note(reason=None):
+    """count one mla2 dispatch (reason None) or one decode-size fallback (reason = why), keep R2_FIRES_FILE current"""
+    if reason is None:
+        R2_FIRES["calls"] += 1
+    else:
+        R2_FIRES["fallback"][reason] = R2_FIRES["fallback"].get(reason, 0) + 1
+    n = R2_FIRES["calls"] + sum(R2_FIRES["fallback"].values())
+    if R2_FIRES_FILE and (n <= 3 or n % 256 == 0 or reason is not None and R2_FIRES["fallback"][reason] <= 2):
+        _r2_dump()
+
+
+def _r2_dump():
+    if R2_FIRES_FILE:
+        try:
+            with open(R2_FIRES_FILE, "w") as f:
+                f.write(f"FIRES mla2 {R2_FIRES['calls']} fallback {R2_FIRES['fallback']}\n")
+        except OSError:
+            pass
+
+
+if R2_FIRES_FILE:
+    import atexit
+    atexit.register(_r2_dump)
+
+
 def _mla2_launch(q_lat, q_pe, ckv, k_pe, qpos, sinks, scale, window, ring, out):
     T, H, R = q_lat.shape
     N, P = ckv.shape[0], k_pe.shape[1]
@@ -436,10 +463,16 @@ def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, windo
             or q_lat.stride(-1) != 1 or q_pe.stride(-1) != 1 or ckv.stride(-1) != 1 or k_pe.stride(-1) != 1):
         if ring:
             raise RuntimeError("ring K buffer: the fused kernel declined and the torch reference cannot read a ring")
+        if ROWS2 and T <= MAX_T:
+            _r2_note("kernel declined (usable / dtype / stride / sinks / N)")
         return mla_sink_attend_ref(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks, window, allow)
-    if (ROWS2 and allow is None and kpos_is_arange and R == triton.next_power_of_2(R) and P == triton.next_power_of_2(P) and H % R2_BH == 0
-            and R2_BH * min(R2_RG, triton.next_power_of_2(T)) >= 16 and not (ring and not window)):
-        return _mla2_launch(q_lat, q_pe, ckv, k_pe, qpos, sinks, scale, window, ring, torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device))
+    if ROWS2:
+        why = ("allow mask" if allow is not None else "kpos not arange" if not kpos_is_arange else "R / P not a power of two" if (R != triton.next_power_of_2(R) or P != triton.next_power_of_2(P))
+               else f"H {H} % BH {R2_BH}" if H % R2_BH else "M tile < 16" if R2_BH * min(R2_RG, triton.next_power_of_2(T)) < 16 else "ring without window" if (ring and not window) else None)
+        if why is None:
+            _r2_note()
+            return _mla2_launch(q_lat, q_pe, ckv, k_pe, qpos, sinks, scale, window, ring, torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device))
+        _r2_note(why)
     if HB and allow is None and kpos_is_arange and R == triton.next_power_of_2(R) and P == triton.next_power_of_2(P) and H % 16 == 0 and not (ring and not window):
         out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
         ng = H // 16
