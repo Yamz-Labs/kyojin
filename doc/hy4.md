@@ -74,9 +74,17 @@ Native Engram IO: `exllamav3/loader/engram_io.c` is compiled with `gcc` at first
 
 64K tokens (`-c 65536`, the command above). Speed and passkey retrieval are measured on the release build at 4K, 16K, 32K and 64K. Longer prompts are refused with a context-length error.
 
-Memory at the default `-c 65536`, measured through a full run (4K to 64K spec, passkey, plain): GTT peak 102.7 GiB, minimum available memory 0.9 GiB, no GPU fault. The model itself (weights and buffers) fills a 128 GB machine, so the margin is about 1 GiB at any `-c`: run it on a 128 GB Strix Halo machine with nothing else large resident, and close other GPU or memory-heavy apps first.
+Memory, measured on a 128 GB Strix Halo machine with nothing else large resident (free memory in GiB = MemAvailable, GTT = GPU memory used through the shared pool; one launch per `-c`, then 60 s idle, one large request, 60 s idle):
 
-128K (`-c 131072`) is opt-in. At load, fp32 KV, the server reached 110.4 GiB of GTT (7.7 GiB more than the 64K peak). It was not measured under a 128K prefill on the release build; if memory runs out, use a smaller `-c`.
+| `-c` | free at load (min) | free idle | free during the largest prefill | free after | GTT peak |
+|---|---|---|---|---|---|
+| 16384 (12K prompt) | 20.8 | 20.8 | 20.9 | 27.1 | 97.9 |
+| 32768 (28K prompt) | 17.9 | 19.1 | 18.3 | 23.7 | 99.7 |
+| 65536 (64K prompt, default) | 16.1 | 16.0 | 15.1 | 20.9 | 102.7 |
+
+The free memory is steady, not a load transient: at the default `-c 65536` it stays at about 16 GiB, and 15 GiB during a 64K prefill (the page cache holds 8 to 10 GiB at ready). A smaller `-c` leaves more. Close other GPU or memory-heavy apps first.
+
+128K (`-c 131072`) is opt-in. At load, fp32 KV, the server reached 110.4 GiB of GTT and the free memory fell to 7.8 GiB. It was not measured under a 128K prefill on the release build; if memory runs out, use a smaller `-c`.
 
 ## Known limits
 
