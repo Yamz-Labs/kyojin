@@ -9,6 +9,7 @@ Hy4-flash: faster prefill and decode on the same GGUF, decensor preset, warm-up 
 - Decode: Q8_0 output head, one resident copy, the bf16 head is freed (`HY4_HEAD_Q8`); the shared-expert branch runs on a second stream inside the HIP graph (`HY4_GRAPH_FORK`); router mat-vec launch tuning, K block 1024 (`HY4_RG_TUNE`); block-wise absorb kernels, absorb v2 (`HY4_BG_V2`).
 - `HY4_PF_ROUTER16` (fp16 router logits of prefill rows) is shipped on but inactive with the fused router (`HY4_REF_FUSED=1`, the shipped decode path): it changes nothing in the shipped configuration.
 - Install: the CK latent-attention build (`install_strix.sh` step 3/3) finds the GCC install directory from `gcc` itself instead of a hard-coded GCC 13 path (`GCC_DIR` still overrides it).
+- Multi-session: `serve.py --slots N` (N > 1) now starts on the shipped defaults (the long-context sparse attend, which the multi-session engine does not take, is switched off when slots > 1).
 - Warm-up: the start-up warm-up prompt is clamped to the context window, so a small `-c` no longer fails the warm-up; it is skipped, with one log line, when the context is too small to warm anything useful.
 - Test: `tests/test_hy4_shipped_flags.py` checks that every 1.9.1 lever is on in `SHIPPED_ENV`, reads its environment switch with the 1.9.0 behaviour as the code default, and is not overridden when the user sets it.
 
