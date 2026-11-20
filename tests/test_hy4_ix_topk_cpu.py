@@ -2,6 +2,11 @@
 _ix_topk_kernel must pick exactly the groups of the reference _ix_select_kernel (same ids in the same ascending order, same count) on the candidate path, the
 sample-retry path and the exact fallback path (natt=0, heavy ties); ix_select_blocked must equal ix_scores_fused + ix_select(sparse=True)."""
 import os, sys, types
+if __name__ != "__main__":
+    # script-style test: it reads the tree from sys.argv[1] and swaps stub exllamav3 packages into sys.modules at import time, so under pytest it fails at
+    # collection and breaks every test file collected after it. Run it as: python tests/<this file> TREE (Triton CPU interpreter, no GPU)
+    import pytest
+    pytest.skip("script-style test, run as: python tests/test_hy4_ix_topk_cpu.py TREE", allow_module_level=True)
 os.environ["TRITON_INTERPRET"] = "1"
 os.environ["HIP_VISIBLE_DEVICES"] = ""
 os.environ["CUDA_VISIBLE_DEVICES"] = ""

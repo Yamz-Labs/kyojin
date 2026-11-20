@@ -1,6 +1,11 @@
 """CPU test (TRITON_INTERPRET=1, no GPU) of the per-query sparse gather attention: python test_hy4_sparse_attn_cpu.py TREE
 ix_select(sparse=True) -> PfSparse must expand to exactly the dense allow mask; mla_sparse must match an fp64 reference built from that mask (masked keys contribute 0, sink in the denominator only)."""
 import os, sys, types
+if __name__ != "__main__":
+    # script-style test: it reads the tree from sys.argv[1] and swaps stub exllamav3 packages into sys.modules at import time, so under pytest it fails at
+    # collection and breaks every test file collected after it. Run it as: python tests/<this file> TREE (Triton CPU interpreter, no GPU)
+    import pytest
+    pytest.skip("script-style test, run as: python tests/test_hy4_sparse_attn_cpu.py TREE", allow_module_level=True)
 os.environ["TRITON_INTERPRET"] = "1"
 os.environ["HIP_VISIBLE_DEVICES"] = ""
 os.environ["CUDA_VISIBLE_DEVICES"] = ""

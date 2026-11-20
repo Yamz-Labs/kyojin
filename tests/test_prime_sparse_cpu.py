@@ -2,6 +2,11 @@
 Hy4MLA._sparse_o (draft-cache fill above the blocked-selection threshold) must equal the dense masked attention over PfSparse.to_dense(), also when the K buffer holds
 rows beyond start + T (the draft head passes N rounded up to a multiple of 4: those rows are garbage / zeros and must never be read)."""
 import os, sys, types
+if __name__ != "__main__":
+    # script-style test: it reads the tree from sys.argv[1] and swaps stub exllamav3 packages into sys.modules at import time, so under pytest it fails at
+    # collection and breaks every test file collected after it. Run it as: python tests/<this file> TREE (Triton CPU interpreter, no GPU)
+    import pytest
+    pytest.skip("script-style test, run as: python tests/test_prime_sparse_cpu.py TREE", allow_module_level=True)
 os.environ["TRITON_INTERPRET"] = "1"
 os.environ["HIP_VISIBLE_DEVICES"] = ""
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
