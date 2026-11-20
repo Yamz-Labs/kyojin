@@ -71,3 +71,14 @@ class Fp8KV:
     def dequant16(self):
         """(lat16 [n, R], pe16 [n, P]) fp16, clamped like the fp32 -> fp16 conversion of the CK path"""
         return (dq8(self.lat) * self.sc[:, None]).clamp(-65504.0, 65504.0).half().contiguous(), self.pe.float().clamp(-65504.0, 65504.0).half().contiguous()
+
+    def dequant16_cat(self, chunk=65536):
+        """the whole cache as ONE fp16 [n, R+P] tensor (latent * scale, clamped like the fp32 -> fp16 cast; rope as is): the sparse prefill kernel reads it.
+        torch fp8 cast (exact, same values as dq8), chunked so the fp32 temporaries stay small at 1M rows."""
+        n, R = self.lat.shape[0], self.R
+        out = torch.empty(n, R + self.P, dtype=torch.float16, device=self.device)
+        for s in range(0, n, chunk):
+            e = min(n, s + chunk)
+            out[s:e, :R] = (self.lat[s:e].view(torch.float8_e4m3fn).float() * self.sc[s:e, None]).clamp(-65504.0, 65504.0).half()
+            out[s:e, R:] = self.pe[s:e].float().clamp(-65504.0, 65504.0).half()
+        return out

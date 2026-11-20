@@ -26,6 +26,16 @@ def test_roundtrip():
     assert kv.shape == (100, 576) and kv[10:20].shape == (10, 576) and kv.nbytes() == 100 * (512 + 4 + 128)
     lat16, pe16 = kv[5:69].dequant16(); assert lat16.dtype == torch.float16 and pe16.shape == (64, 64)
 
+def test_dequant16_cat():
+    g = torch.Generator().manual_seed(1)
+    kn = torch.randn(300, 576, generator=g) * torch.logspace(-2, 3, 300)[:, None]
+    kv = KV.Fp8KV(300, 512, 64, DEV); kv.write(0, kn.to(DEV))
+    a = kv.dequant16_cat(chunk=128)
+    lat16, pe16 = kv.dequant16()
+    assert a.dtype == torch.float16 and a.shape == (300, 576)
+    assert torch.equal(a[:, :512], lat16) and torch.equal(a[:, 512:], pe16)
+    assert torch.equal(kv[10:200].dequant16_cat(chunk=64), a[10:200])
+
 def test_kernel_matches_dequant():
     if DEV == "cpu" and os.environ.get("TRITON_INTERPRET") != "1":
         return
@@ -46,4 +56,4 @@ def test_kernel_matches_dequant():
     print("fp8 vs exact attend max abs diff", (a - c).abs().max().item(), "out scale", c.abs().mean().item())
 
 if __name__ == "__main__":
-    test_dq8_matches_torch(); test_roundtrip(); test_kernel_matches_dequant(); print("kv_fp8 ok")
+    test_dq8_matches_torch(); test_roundtrip(); test_dequant16_cat(); test_kernel_matches_dequant(); print("kv_fp8 ok")

@@ -329,6 +329,8 @@ class Hy4MLA:
         qa, self._qa_pre = self._qa_pre, None
         if allow.__class__.__name__ == "PfSparse":
             if self._f16_ok(cur) and self.H % 32 == 0:
+                if isinstance(kcache, _KV8.Fp8KV):      # HY4_KV_FP8: the sparse prefill kernel reads fp16 rows
+                    kcache = kcache.dequant16_cat()
                 return self.attend16(cur, pos, kcache, allow, qa)
             if not (PRIME_SPARSE and cur.is_cuda):
                 allow = allow.to_dense()          # else: generic path below, sparse gather (draft-cache fill at long context: a dense [T, N] mask costs O(T x N) and compiles N-sized kernels)
