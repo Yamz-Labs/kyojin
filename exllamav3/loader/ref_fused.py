@@ -17,6 +17,16 @@ HB = os.environ.get("HY4_MLA_HB", "0") == "1"      # head-batched fp16 tl.dot de
 HB_BN = int(os.environ.get("HY4_MLA_HB_BN", "16"))
 HB_NW = int(os.environ.get("HY4_MLA_HB_NW", "4"))
 HB_SPLIT = int(os.environ.get("HY4_MLA_HB_SPLIT", "0"))      # key splits per (row, head group): 0 = auto (fill the GPU: ~96 programs), 1 = off, n = fixed
+ROWS2 = os.environ.get("HY4_MLA_ROWS2", "0") == "1"      # row-batched split-K decode attention (mla2): ONE pass over the K rows for all verify rows, q streamed (never resident in registers); default OFF
+R2_BH = int(os.environ.get("HY4_MLA_ROWS2_BH", "16"))      # heads per program (M tile = BH x RG rows of the WMMA tile)
+R2_RG = int(os.environ.get("HY4_MLA_ROWS2_RG", "2"))       # verify rows per program (power of two); more rows go over the grid
+R2_BN = int(os.environ.get("HY4_MLA_ROWS2_BN", "32"))      # keys per block
+R2_BK = int(os.environ.get("HY4_MLA_ROWS2_BK", "64"))      # latent chunk of the QK reduction (q / K streamed in chunks)
+R2_NW = int(os.environ.get("HY4_MLA_ROWS2_NW", "8"))
+R2_PROG = int(os.environ.get("HY4_MLA_ROWS2_PROG", "64"))  # target number of split programs (auto split count)
+R2_SPLIT = int(os.environ.get("HY4_MLA_ROWS2_SPLIT", "0"))  # key splits: 0 = auto, n = fixed
+R2_RS = int(os.environ.get("HY4_MLA_ROWS2_RS", "8"))       # column slices of the combine
+R2_MINB = int(os.environ.get("HY4_MLA_ROWS2_MINB", "2"))   # minimum key blocks per split
 MAX_T = 16                  # rows per call handled by the attention kernel (decode / short verify); more = prefill -> torch GEMMs
 CLAMP_MIN = 6.103515625e-5  # the old router's `sum.clamp(min=...)`
 
@@ -287,6 +297,131 @@ if triton is not None:
         h = g * BH + offb
         tl.store(O + t * s_o_t + h[:, None] * s_o_h + offr[None, :], A / L[:, None])
 
+    @triton.jit
+    def _mla2_split_kernel(QL, QP, CK, KP, QPOS, SINK, WA, WM, WL, T, N, scale, window,
+                           s_ql_t, s_ql_h, s_qp_t, s_qp_h, s_ck, s_kp, S,
+                           R: tl.constexpr, P: tl.constexpr, BH: tl.constexpr, RG: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                           HAS_WIN: tl.constexpr, RING: tl.constexpr):
+        """row-batched split-K decode attention. ONE program = RG verify rows x BH heads (M = RG x BH tile rows: row i = (t0 + i // BH, head h0 + i % BH)) over ONE key split:
+        every K block is read once for all RG rows. q is NOT held in registers (a [M, 512] fp16 dot operand needs 256+ VGPRs per wave on gfx11 and spilled ~3.7 KB / thread in the
+        _mla_hb kernels): the QK reduction streams q and K in BK chunks, S = sum_c q_c @ K_c^T, so the live state is acc [M, R] fp32 + one S tile. fp16 tl.dot with fp32 accumulation,
+        fp32 online softmax per row, the sink is a key of zero value on split 0. Grid (row groups, H / BH, S); partials in the layout of _mla_hb_combine ((t, g, split) major)."""
+        M: tl.constexpr = RG * BH
+        rg = tl.program_id(0)
+        g = tl.program_id(1)
+        sp = tl.program_id(2)
+        NG = tl.num_programs(1)
+        i = tl.arange(0, M)
+        tt = rg * RG + i // BH
+        hh = g * BH + i % BH
+        tok = tt < T
+        offk = tl.arange(0, BK)
+        offp = tl.arange(0, P)
+        qb = QL + tt[:, None] * s_ql_t + hh[:, None] * s_ql_h
+        qpb = QP + tt[:, None] * s_qp_t + hh[:, None] * s_qp_h
+        qpos = tl.load(QPOS + tt, mask=tok, other=-1)
+        first = (sp == 0)
+        m = tl.where(first, tl.load(SINK + hh).to(tl.float32), -1e30)
+        l = tl.where(first, 1.0, 0.0) + tl.zeros([M], dtype=tl.float32)
+        RQ: tl.constexpr = R // 4              # the output is kept as 4 column quarters (acc0..acc3): the PV operand tile of ONE quarter is live at a time (a [BN, 512] fp16 B operand is 128 VGPRs / wave on gfx11)
+        offq = tl.arange(0, RQ)
+        acc0 = tl.zeros([M, RQ], dtype=tl.float32)
+        acc1 = tl.zeros([M, RQ], dtype=tl.float32)
+        acc2 = tl.zeros([M, RQ], dtype=tl.float32)
+        acc3 = tl.zeros([M, RQ], dtype=tl.float32)
+        qlast = tl.load(QPOS + tl.minimum(rg * RG + RG - 1, T - 1))
+        qfirst = tl.load(QPOS + rg * RG)
+        lo = 0
+        hi = tl.minimum(N, qlast + 1)
+        if HAS_WIN:
+            lo = tl.maximum(0, qfirst - window + 1) // BN * BN
+        nblk = tl.maximum(0, (hi - lo + BN - 1) // BN)
+        per = (nblk + S - 1) // S
+        b0 = tl.minimum(nblk, sp * per)
+        b1 = tl.minimum(nblk, b0 + per)
+        for n0 in range(lo + b0 * BN, lo + b1 * BN, BN):
+            offn = n0 + tl.arange(0, BN)
+            inb = offn < N
+            vis = inb[None, :] & (offn[None, :] <= qpos[:, None])
+            if HAS_WIN:
+                vis = vis & ((qpos[:, None] - offn[None, :]) < window)
+            if RING > 0:
+                offs = offn % RING
+            else:
+                offs = offn
+            kb = CK + offs[None, :] * s_ck
+            s = tl.zeros([M, BN], dtype=tl.float32)
+            for c in range(0, R, BK):
+                qc = tl.load(qb + (c + offk)[None, :], mask=tok[:, None], other=0.0).to(tl.float16)
+                kc = tl.load(kb + (c + offk)[:, None], mask=inb[None, :], other=0.0).to(tl.float16)
+                s = tl.dot(qc, kc, s)
+            qpc = tl.load(qpb + offp[None, :], mask=tok[:, None], other=0.0).to(tl.float16)
+            kpc = tl.load(KP + offs[None, :] * s_kp + offp[:, None], mask=inb[None, :], other=0.0).to(tl.float16)
+            s = tl.dot(qpc, kpc, s) * scale
+            s = tl.where(vis, s, float("-inf"))
+            mn = tl.maximum(m, tl.max(s, axis=1))
+            alpha = tl.exp(m - mn)
+            pr = tl.exp(s - mn[:, None])
+            l = l * alpha + tl.sum(pr, axis=1)
+            p16 = pr.to(tl.float16)
+            cb = CK + offs[:, None] * s_ck + offq[None, :]
+            acc0 = tl.dot(p16, tl.load(cb, mask=inb[:, None], other=0.0).to(tl.float16), acc0 * alpha[:, None])
+            acc1 = tl.dot(p16, tl.load(cb + RQ, mask=inb[:, None], other=0.0).to(tl.float16), acc1 * alpha[:, None])
+            acc2 = tl.dot(p16, tl.load(cb + 2 * RQ, mask=inb[:, None], other=0.0).to(tl.float16), acc2 * alpha[:, None])
+            acc3 = tl.dot(p16, tl.load(cb + 3 * RQ, mask=inb[:, None], other=0.0).to(tl.float16), acc3 * alpha[:, None])
+            m = mn
+        wi = (tt * NG + g) * S + sp
+        wb = WA + wi[:, None] * (BH * R) + (i % BH)[:, None] * R + offq[None, :]
+        tl.store(wb, acc0, mask=tok[:, None])
+        tl.store(wb + RQ, acc1, mask=tok[:, None])
+        tl.store(wb + 2 * RQ, acc2, mask=tok[:, None])
+        tl.store(wb + 3 * RQ, acc3, mask=tok[:, None])
+        tl.store(WM + wi * BH + i % BH, m, mask=tok)
+        tl.store(WL + wi * BH + i % BH, l, mask=tok)
+
+    @triton.jit
+    def _mla2_combine(WA, WM, WL, O, s_o_t, s_o_h, R: tl.constexpr, BH: tl.constexpr, S: tl.constexpr, RC: tl.constexpr):
+        """grid (T, H / BH, R / RC): flash-decoding merge of the S key-split partials for one RC-wide column slice (many small programs, the S partial loads are independent)"""
+        t = tl.program_id(0)
+        g = tl.program_id(1)
+        rs = tl.program_id(2)
+        NG = tl.num_programs(1)
+        offb = tl.arange(0, BH)
+        offc = rs * RC + tl.arange(0, RC)
+        base = (t * NG + g) * S
+        M = tl.load(WM + base * BH + offb)
+        for sp in tl.static_range(1, S):
+            M = tl.maximum(M, tl.load(WM + (base + sp) * BH + offb))
+        L = tl.zeros([BH], dtype=tl.float32)
+        A = tl.zeros([BH, RC], dtype=tl.float32)
+        for sp in tl.static_range(0, S):
+            w = tl.exp(tl.load(WM + (base + sp) * BH + offb) - M)
+            L += w * tl.load(WL + (base + sp) * BH + offb)
+            A += w[:, None] * tl.load(WA + (base + sp) * (BH * R) + offb[:, None] * R + offc[None, :])
+        h = g * BH + offb
+        tl.store(O + t * s_o_t + h[:, None] * s_o_h + offc[None, :], A / L[:, None])
+
+
+def _mla2_launch(q_lat, q_pe, ckv, k_pe, qpos, sinks, scale, window, ring, out):
+    T, H, R = q_lat.shape
+    N, P = ckv.shape[0], k_pe.shape[1]
+    BH = R2_BH
+    RG = min(R2_RG, triton.next_power_of_2(T))
+    nrg = -(-T // RG)
+    ngr = H // BH
+    nblk = (-(-(window + T) // R2_BN) + 1) if window else -(-N // R2_BN)      # key blocks one program can walk
+    S = R2_SPLIT if R2_SPLIT > 0 else min(16, max(1, -(-R2_PROG // (nrg * ngr))), max(1, nblk // R2_MINB))
+    dv = q_lat.device
+    wa = torch.empty(T * ngr * S * BH * R, dtype=torch.float32, device=dv)
+    wm = torch.empty(T * ngr * S * BH, dtype=torch.float32, device=dv)
+    wl = torch.empty(T * ngr * S * BH, dtype=torch.float32, device=dv)
+    _mla2_split_kernel[(nrg, ngr, S)](q_lat, q_pe, ckv, k_pe, qpos, sinks.float().contiguous(), wa, wm, wl, T, (1 << 30) if ring else N, float(scale), int(window),
+                                      q_lat.stride(0), q_lat.stride(1), q_pe.stride(0), q_pe.stride(1), ckv.stride(0), k_pe.stride(0), S,
+                                      R=R, P=P, BH=BH, RG=RG, BN=R2_BN, BK=R2_BK, HAS_WIN=bool(window), RING=int(ring), num_warps=R2_NW, num_stages=1)
+    RS = max(1, min(R2_RS, R // 32))
+    _mla2_combine[(T, ngr, RS)](wa, wm, wl, out, out.stride(0), out.stride(1), R=R, BH=BH, S=S, RC=R // RS, num_warps=4)
+    return out
+
 
 def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, window=0, allow=None, kpos_is_arange=False, ring=0):
     """drop-in for mla_sink_attend: q_lat [T,H,R], q_pe [T,H,P], ckv [N,R], k_pe [N,P] (row strides free), qpos [T], kpos [N],
@@ -302,6 +437,9 @@ def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, windo
         if ring:
             raise RuntimeError("ring K buffer: the fused kernel declined and the torch reference cannot read a ring")
         return mla_sink_attend_ref(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks, window, allow)
+    if (ROWS2 and allow is None and kpos_is_arange and R == triton.next_power_of_2(R) and P == triton.next_power_of_2(P) and H % R2_BH == 0
+            and R2_BH * min(R2_RG, triton.next_power_of_2(T)) >= 16 and not (ring and not window)):
+        return _mla2_launch(q_lat, q_pe, ckv, k_pe, qpos, sinks, scale, window, ring, torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device))
     if HB and allow is None and kpos_is_arange and R == triton.next_power_of_2(R) and P == triton.next_power_of_2(P) and H % 16 == 0 and not (ring and not window):
         out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
         ng = H // 16
