@@ -16,7 +16,7 @@ from engine import Hy4Engine, PRIME_ROWS, warmup_clamp
 
 class MuEngine(Hy4Engine):
     def __init__(self, *a, slots: int = 4, **kw):
-        for f in ("HY4_SWA_RING", "HY4_LC_SPARSE", "HY4_KV_FP8_MTP"):        # long-context levers act on the single-session K / indexer buffers, not on the slot slabs
+        for f in ("HY4_SWA_RING", "HY4_LC_SPARSE", "HY4_KV_FP8_MTP", "HY4_IX_POOL16", "HY4_ROPE_POS"):        # long-context levers act on the single-session K / indexer buffers, not on the slot slabs
             if os.environ.get(f, "0") not in ("", "0"):
                 raise RuntimeError(f + " is not supported with --slots > 1")
         super().__init__(*a, **kw)

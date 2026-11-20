@@ -6,7 +6,7 @@ RING_ROWS, VG_RING_ROWS = 1024, 4096
 ROPE_TABLES_B = 256 + 2 * 512        # assumption, checked by the measured residual: indexer cos / sin (rope 64, shared) + two attn_eager tables [n, 2, 32, 2] fp32
 
 
-def per_token(fp8=False, fp8_mtp=False, swa_ring=False, pool_bytes=4):
+def per_token(fp8=False, fp8_mtp=False, swa_ring=False, pool_bytes=4, rope_pos=False):
     """-> {component: (bytes per token, constant bytes)} of the persistent buffers at full capacity"""
     lat32, lat8 = (R + P) * 4, R + 4 + 2 * P            # fp32 latent + rope, fp8 e4m3 + fp32 scale + bf16 rope
     d = {}
@@ -16,7 +16,7 @@ def per_token(fp8=False, fp8_mtp=False, swa_ring=False, pool_bytes=4):
     d["indexer pool (13 layers)"] = ((FULL + MTP) * (DIX // KP) * pool_bytes, 0)
     d["indexer value|gate rows (13)"] = (0, (FULL + MTP) * VG_RING_ROWS * 2 * DIX * 4) if swa_ring else ((FULL + MTP) * 2 * DIX * 4, 0)
     d["token history + arange"] = (16, 0)
-    d["rope tables"] = (ROPE_TABLES_B, 0)
+    d["rope tables"] = (0, 0) if rope_pos else (ROPE_TABLES_B, 0)           # HY4_ROPE_POS: rows of the call, evaluated from the positions (kv10: transient, T rows)
     return d
 
 
@@ -24,11 +24,23 @@ def total(d):
     return sum(v[0] for v in d.values()), sum(v[1] for v in d.values())
 
 
+CTX_1M = 1 << 20
+ARMS = (("1.9.1 default (fp32)", {}), ("fp8 trunk only", dict(fp8=True)), ("HY4_KV_COMPACT=1 (bcfb9e5)", dict(fp8=True, fp8_mtp=True, swa_ring=True, pool_bytes=4)),
+        ("COMPACT + HY4_IX_POOL16 (fp16 pool)", dict(fp8=True, fp8_mtp=True, swa_ring=True, pool_bytes=2)),
+        ("COMPACT + HY4_ROPE_POS (rope rows from positions)", dict(fp8=True, fp8_mtp=True, swa_ring=True, rope_pos=True)),
+        ("HY4_KV_COMPACT=1 now (fp16 pool + rope rows)", dict(fp8=True, fp8_mtp=True, swa_ring=True, pool_bytes=2, rope_pos=True)))
+
+
+def at_1m(d):
+    """bytes per token at a 1M context: the per-token slope plus the constant buffers (window rings, indexer rings) spread over the context"""
+    t, c = total(d)
+    return t + c / CTX_1M
+
+
 if __name__ == "__main__":
-    for name, kw in (("1.9.1 default (fp32)", {}), ("fp8 trunk only", dict(fp8=True)), ("HY4_KV_COMPACT=1", dict(fp8=True, fp8_mtp=True, swa_ring=True)),
-                     ("COMPACT + fp16 pool", dict(fp8=True, fp8_mtp=True, swa_ring=True, pool_bytes=2))):
+    for name, kw in ARMS:
         d = per_token(**kw)
         t, c = total(d)
-        print(f"== {name}: {t} B / token ({t / 1024:.1f} KB) + constant {c / 2**20:.0f} MiB")
+        print(f"== {name}: {t} B / token ({t / 1024:.2f} KiB) + constant {c / 2**20:.0f} MiB -> {at_1m(d):.0f} B / token at 1M ({at_1m(d) / 1024:.2f} KiB; owner rule <= 10 KiB)")
         for k, (b, cc) in d.items():
             print(f"   {k:34s} {b:7d} B/token  const {cc / 2**20:7.1f} MiB")

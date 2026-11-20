@@ -101,17 +101,18 @@ The free memory is steady, not a load transient: at the default `-c 65536` it st
 
 ### KV bytes per token (persistent buffers at full capacity, `python tools/hy4/kv_bytes.py`)
 
-| component | 1.9.1 default | `HY4_KV_COMPACT=1` |
-|---|---|---|
-| latent K, 12 trunk full-attention layers | 27648 (fp32 2304 each) | 7728 (fp8 644 each) |
-| latent K, MTP draft layer | 2304 | 644 (`HY4_KV_FP8_MTP`) |
-| 30 window layers | 69120 | 0 (ring of 1024 rows, 71 MB constant, `HY4_SWA_RING`) |
-| indexer pool, 13 layers (one 128-d fp32 key per 4 tokens) | 1664 | 1664 |
-| indexer value / gate rows, 13 layers | 13312 | 0 (ring, 54 MB constant) |
-| token history, arange, rope tables | 1296 | 1296 |
-| total | 115344 B (112.6 KB) | 11332 B (11.1 KB) + 125 MB |
+| component | 1.9.1 default | `HY4_KV_COMPACT=1` before kv10 (bcfb9e5) | `HY4_KV_COMPACT=1` now |
+|---|---|---|---|
+| latent K, 12 trunk full-attention layers | 27648 (fp32 2304 each) | 7728 (fp8 644 each) | 7728 |
+| latent K, MTP draft layer | 2304 | 644 (`HY4_KV_FP8_MTP`) | 644 |
+| 30 window layers | 69120 | 0 (ring of 1024 rows, 71 MB constant, `HY4_SWA_RING`) | 0 |
+| indexer pool, 13 layers (one 128-d key per 4 tokens) | 1664 (fp32) | 1664 | 832 (fp16, `HY4_IX_POOL16`) |
+| indexer value / gate rows, 13 layers | 13312 | 0 (ring, 54 MB constant) | 0 |
+| token history, arange | 16 | 16 | 16 |
+| rope tables (indexer cos / sin 256 + two attention tables 2 x 512) | 1280 | 1280 | 0 (`HY4_ROPE_POS`: rows of the call, evaluated from the positions) |
+| total | 115344 B (112.6 KB) | 11332 B (11.1 KB) + 120 MB | 9220 B (9.0 KB) + 120 MB (9340 B = 9.1 KB per token at 1M) |
 
-The default row matches the measured slope of the memory table above (98 to 118 KB per token). `HY4_KV_COMPACT=1` is a shortcut that sets `HY4_KV_FP8=1`, `HY4_KV_FP8_MTP=1` and `HY4_SWA_RING=1024` unless you set them yourself; add `--draft-fill-rows 4096` to the serve command so the draft states of a long prompt (fp32 [n, 3072], 12 KB per token) are not kept. Transients not in the table: one prefill chunk of indexer scores (`chunk x n / 4 x 4` bytes) and, on the fp8 cache, one fp16 dequantised copy of one layer's cache for the sparse prefill (1152 bytes per token, freed per layer). Left to the 10 KB mark: the indexer pool in fp16 (-832) and the rope tables (1280). Measured: `tools/hy4/kv_bytes_probe.py`.
+The default row matches the measured slope of the memory table above (98 to 118 KB per token). `HY4_KV_COMPACT=1` is a shortcut that sets `HY4_KV_FP8=1`, `HY4_KV_FP8_MTP=1`, `HY4_SWA_RING=1024`, `HY4_IX_POOL16=1` and `HY4_ROPE_POS=1` unless you set them yourself; add `--draft-fill-rows 4096` to the serve command so the draft states of a long prompt (fp32 [n, 3072], 12 KB per token) are not kept. `HY4_IX_POOL16=1` stores the pooled indexer keys in fp16 (the prefill scorer already scores with the fp16 copy); it can change which groups the top-k picks at the cut-off, so it is gated on the top-k set overlap and a paired NLL (`tools/hy4/step/kv10_driver.py`). `HY4_ROPE_POS=1` evaluates the rope cos / sin of a call from its positions in fp64 (the same expression the tables were built with) instead of keeping tables to the full context; neither lever runs with `--slots > 1`. Transients not in the table: one prefill chunk of indexer scores (`chunk x n / 4 x 4` bytes), the rope rows of one call (about 1.3 KB per row of the call), and, on the fp8 cache, one fp16 dequantised copy of one layer's cache for the sparse prefill (1152 bytes per token, freed per layer). Measured: `tools/hy4/kv_bytes_probe.py`.
 
 ### Long context option: fp8 KV (`HY4_KV_FP8=1`, off by default)
 

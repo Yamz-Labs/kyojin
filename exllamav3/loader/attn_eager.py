@@ -13,6 +13,7 @@ import os
 import torch
 from . import mla_bgemv as _BG
 from . import kv_fused as _KVF
+from . import rope_rows as _RR
 
 _F = os.environ.get("HY4_ATTN_EAGER", "0")
 ENABLED = _F in ("1", "2")
@@ -54,11 +55,19 @@ def table(P, base, dev, pos):
     return tab
 
 
+def table_rows(P, base, dev, pos):
+    """-> (tab, per_row): the rope rows the kernels read. HY4_ROPE_POS=1: rows of THIS call's positions [T, 2, P/2, 2] (per_row = True, the kernel indexes by row),
+    else the full-context table (indexed by position)"""
+    if _RR.ENABLED:
+        return _RR.attn_rows(P, base, pos), True
+    return table(P, base, dev, pos), False
+
+
 def rope(x, pos, base, out=None):
     """== mla_hy4.rope_norm (bit-exact). x [T, ..., P] with unit last stride (views / slices allowed); out: optional [T, ..., P] view"""
     P = x.shape[-1]
     h = P // 2
-    g = table(P, base, x.device, pos).index_select(0, pos.long())            # [T, 2, h, 2]
+    g = _RR.attn_rows(P, base, pos) if _RR.ENABLED else table(P, base, x.device, pos).index_select(0, pos.long())            # [T, 2, h, 2]
     shp = (x.shape[0],) + (1,) * (x.dim() - 2) + (h, 2)
     a, b = g[:, 0].reshape(shp), g[:, 1].reshape(shp)
     xv = x.unflatten(-1, (h, 2))
@@ -93,7 +102,8 @@ def q(m, cur, pos):
     qq = (m._q(qr, "wq_b") @ m.wq_b.T).view(T, H, m.hd)
     qn = qq[..., :m.nope]
     if _KVF.ENABLED and 1 <= T <= _KVF.MAXT and qq.is_cuda:         # HY4_KV_FUSED: the pe rotation in one launch (no slice copies)
-        qp = _KVF.rope_q(qq, table(m.rope_dim, m.theta, qq.device, pos), pos, m.nope, m.rope_dim)
+        tab, per_row = table_rows(m.rope_dim, m.theta, qq.device, pos)
+        qp = _KVF.rope_q(qq, tab, pos, m.nope, m.rope_dim, per_row)
     else:
         qp = rope(qq[..., m.nope:], pos, m.theta)
     qlat = m.bg_kb.mv(m._q(qn, "kb")) if (_BG.ENABLED and T <= _BG.MAXT and getattr(m, "bg_kb", None) is not None) else torch.einsum("hrk,thk->thr", m.wk_b, m._q(qn, "kb"))

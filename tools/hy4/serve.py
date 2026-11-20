@@ -90,8 +90,8 @@ SLOTS_OFF = ("HY4_LC_SPARSE",)     # shipped long-context levers that act on the
 
 
 def apply_env(ctx: int, model: str = "", slots: int = 1) -> None:
-    if os.environ.get("HY4_KV_COMPACT", "0") == "1":      # long lane footprint (about 11 KB per token, doc/hy4.md): fp8 latent K for the trunk and the draft layer, window layers in a 1024-row ring; each can still be set by hand
-        for k, v in (("HY4_KV_FP8", "1"), ("HY4_KV_FP8_MTP", "1"), ("HY4_SWA_RING", "1024")):
+    if os.environ.get("HY4_KV_COMPACT", "0") == "1":      # long lane footprint (about 9 KB per token, doc/hy4.md): fp8 latent K for the trunk and the draft layer, window layers in a 1024-row ring, fp16 indexer pool, rope rows from the positions (no per-token tables); each can still be set by hand
+        for k, v in (("HY4_KV_FP8", "1"), ("HY4_KV_FP8_MTP", "1"), ("HY4_SWA_RING", "1024"), ("HY4_IX_POOL16", "1"), ("HY4_ROPE_POS", "1")):
             os.environ.setdefault(k, v)
     for k, v in SHIPPED_ENV.items():
         os.environ.setdefault(k, "0" if slots > 1 and k in SLOTS_OFF else v)      # an explicit value still wins (and MuEngine refuses it)

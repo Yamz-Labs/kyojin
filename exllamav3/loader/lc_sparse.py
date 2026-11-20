@@ -286,7 +286,7 @@ def sparse_mla_attend(q_lat, q_pe, ckv, k_pe, qpos, sel, scale, sinks, scl=None)
 def check_rows(iq, wt, pool, pos, Pb, n_top, kp, sel):
     """debug: dense reference selection (the stock torch path of step_graph.indexer_forward_static) vs the sparse one; counts rows whose group sets differ
     and the largest score gap between a swapped pair (a pure tie / rounding swap has gap ~ 1e-7)"""
-    kq = torch.relu(torch.einsum("nhd,pd->nhp", iq, pool[:Pb]))
+    kq = torch.relu(torch.einsum("nhd,pd->nhp", iq, pool[:Pb].to(iq.dtype)))
     sc = (kq * wt[:, :, None]).sum(1)
     gend = torch.arange(Pb, device=iq.device) * kp + (kp - 1)
     vis = gend[None] < pos[:, None]
