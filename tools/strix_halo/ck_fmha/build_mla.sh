@@ -14,6 +14,7 @@ GCC_DIR=${GCC_DIR:-$(dirname "$(gcc -print-libgcc-file-name)")}
 F=$CK_SRC/example/ck_tile/01_fmha
 B=$(mktemp -d); trap 'rm -rf "$B"' EXIT
 mkdir -p "$B/gen" "$B/obj" "$(dirname "$OUT")"
+rm -f "$OUT"     # a failed build must not leave an old library to be found
 python3 "$F/generate.py" --targets gfx1151 --api fwd --optdim ${CKMLA_HD:-256} -r 0 \
     -f "*fp16*batch*_nlogits_*_nlse_ndropout_nskip_nqscale*" -o "$B/gen" >/dev/null
 FLAGS="--gcc-install-dir=$GCC_DIR -std=c++20 -O3 -fPIC -x hip --offload-arch=gfx1151 -I$CK_SRC/include -I$F -I$B/gen \
@@ -21,4 +22,5 @@ FLAGS="--gcc-install-dir=$GCC_DIR -std=c++20 -O3 -fPIC -x hip --offload-arch=gfx
  -DCK_TILE_FMHA_FWD_PAGEDKV_API=0 -DCK_TILE_FMHA_FWD_BATCH_PREFILL_API=0 -w"
 ls "$B"/gen/*.cpp "$HERE/ckmla_shim.cpp" | xargs -P "${CK_JOBS:-8}" -I{} sh -c "$CXX $FLAGS -c {} -o $B/obj/\$(basename {} .cpp).o"
 "$CXX" --gcc-install-dir="$GCC_DIR" -shared -fPIC --offload-arch=gfx1151 "$B"/obj/*.o -o "$OUT"
+[ -s "$OUT" ] || { echo "build_mla.sh: no library at $OUT" >&2; exit 1; }
 echo "built $OUT ($(ls "$B"/gen/*.cpp | wc -l) instance files)"

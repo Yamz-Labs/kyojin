@@ -14,7 +14,7 @@ Thank you for helping. Kyojin is the Yamz inference engine for AMD Strix Halo, b
 Follow the Quickstart in `README.md`. In short:
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install --pre torch rocm-sdk-devel --index-url https://rocm.nightlies.amd.com/v2/gfx1151/
 pip install -r requirements.txt
 rocm-sdk init

@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import aclosing
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TREE = os.path.dirname(os.path.dirname(HERE))
@@ -102,6 +103,25 @@ def apply_env(ctx: int, model: str = "", slots: int = 1) -> None:
         os.environ.setdefault("HY4_MTP_HEAD_BIN", head)
 
 
+class ClientGone(Exception):
+    """the client closed its end of the connection: the generation is cancelled"""
+
+
+def client_gone(request) -> bool:
+    tr = getattr(request, "transport", None)
+    return request is not None and (tr is None or tr.is_closing())
+
+
+def watch_client(request, q: asyncio.Queue):
+    """task: puts ("gone",) on `q` when the client closes its end. A reply that is not streamed writes nothing before its end, so without this a closed socket
+    would go unseen and the engine would finish a generation nobody reads."""
+    async def watch():
+        while not client_gone(request):
+            await asyncio.sleep(0.5)
+        q.put_nowait(("gone",))
+    return asyncio.ensure_future(watch())
+
+
 class State:
     def __init__(self, args):
         self.args = args
@@ -121,7 +141,7 @@ def _err(status: int, message: str, code: str = "invalid_request_error"):
 
 
 def build_app(st: State):
-    from aiohttp import web
+    from aiohttp import ClientConnectionError, web
     args = st.args
 
     async def health(_req):
@@ -147,10 +167,10 @@ def build_app(st: State):
 
     def prompt_for_chat(body):
         r = C.parse_chat(body, args.default_max_tokens)
-        text = st.vocab.template.render(r["messages"], None, True, reasoning_effort=r["effort"])
+        text, r["prefix"] = st.vocab.chat_prompt(r)
         ids = st.vocab.encode(text)
         v = st.vocab
-        r["in_think"] = r["effort"] != "no_think" and bool(v.think_begin) and text.rstrip().endswith(v.think_begin)
+        r["in_think"] = not r["prefill"] and r["effort"] != "no_think" and bool(v.think_begin) and text.rstrip().endswith(v.think_begin)
         return r, ids
 
     def check_len(n, max_new):
@@ -162,7 +182,7 @@ def build_app(st: State):
         from mu_engine import Request
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
-        out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"])
+        out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"], tools=r.get("tools"), parse_tools=r.get("parse_tools", False), prefix=r.get("prefix", ""))
 
         def on_tokens(toks):
             for ch, tx in out.push(toks):
@@ -172,20 +192,24 @@ def build_app(st: State):
         req = Request(ids, r["max_tokens"], speculative=r["speculative"], on_tokens=on_tokens)
         req.on_done = lambda: loop.call_soon_threadsafe(q.put_nowait, ("end",))
         st.sched.submit(req)
+        watcher = watch_client(request, q)
         try:
             while True:
                 ev = await q.get()
                 if ev[0] == "end":
                     break
+                if ev[0] == "gone":
+                    raise ClientGone()
                 yield ev
         finally:
+            watcher.cancel()
             req.cancel.set()
         for ch, tx in out.finish():
             yield ("delta", ch, tx)
         if req.error:
             raise RuntimeError(req.error)
         stats = req.engine_stats(st.engine.k)
-        finish = out.finish_reason or "length"
+        finish = out.final_reason()
         st.served += 1
         pf, dc = stats["prefill_s"], stats["decode_s"]
         print(f"req {st.served}: prompt {stats['prompt_tokens']} tok ttft {pf:.2f} s (own prefill {stats['prefill_trunk_s']:.2f} s) | decode {stats['decode_tokens']} tok {dc:.2f} s = "
@@ -195,12 +219,13 @@ def build_app(st: State):
     async def run_job(ids, r, in_think, request):
         """async generator of ("delta", channel, text) events, then ("end", stats, finish_reason, n_generated)"""
         if st.sched is not None:
-            async for ev in run_job_mu(ids, r, in_think, request):
-                yield ev
+            async with aclosing(run_job_mu(ids, r, in_think, request)) as events:
+                async for ev in events:
+                    yield ev
             return
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue()
-        out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"])
+        out = C.OutputStream(st.vocab, in_think=in_think, stops=r["stop"], tools=r.get("tools"), parse_tools=r.get("parse_tools", False), prefix=r.get("prefix", ""))
         cancel = threading.Event()
         res: dict = {}
 
@@ -222,19 +247,23 @@ def build_app(st: State):
 
         async with st.lock:
             fut = loop.run_in_executor(None, work)
+            watcher = watch_client(request, q)
             try:
                 while True:
                     ev = await q.get()
                     if ev[0] == "end":
                         break
+                    if ev[0] == "gone":
+                        raise ClientGone()
                     yield ev
             finally:
+                watcher.cancel()
                 cancel.set()
                 await fut
         if "error" in res:
             raise RuntimeError(res["error"])
         stats = res["stats"]
-        finish = out.finish_reason or "length"
+        finish = out.final_reason()
         st.served += 1
         n_gen = out.n_tokens
         pf, dc = stats["prefill_s"], stats["decode_s"]
@@ -250,12 +279,32 @@ def build_app(st: State):
                                     tau=stats["tau"], accept_hist=stats["accept_hist"], ttft_ms=stats["ttft_s"] * 1000,
                                     prefill_trunk_ms=stats.get("prefill_trunk_s", 0) * 1000, draft_fill_ms=stats.get("prime_s", 0) * 1000)
 
-    async def sse(request, gen_chunks):
+    def event(chunk: dict) -> bytes:
+        return b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n"
+
+    async def sse(request, chunks):
+        """stream `chunks` (an async generator of JSON-able chunks) as server-sent events. A client that closes the stream makes the write raise: that cancels the
+        generation (closing `chunks` runs run_job's cleanup, which stops the engine) and ends the request with one log line, not a traceback. An error after the
+        stream began (the engine failed) cannot become a second response: it is sent as an error event, then [DONE]."""
         resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
-        await resp.prepare(request)
-        async for chunk in gen_chunks:
-            await resp.write(b"data: " + json.dumps(chunk, ensure_ascii=False).encode() + b"\n\n")
-        await resp.write(b"data: [DONE]\n\n")
+        try:
+            await resp.prepare(request)
+            try:
+                async for chunk in chunks:
+                    await resp.write(event(chunk))
+            except (ConnectionError, ClientConnectionError, ClientGone, asyncio.CancelledError):
+                raise
+            except Exception as e:      # noqa: BLE001
+                print(f"stream failed: {type(e).__name__}: {e}", flush=True)
+                await resp.write(event(C.error_body(str(e), "server_error")))
+            await resp.write(b"data: [DONE]\n\n")
+        except (ConnectionError, ClientConnectionError, ClientGone) as e:
+            print(f"client closed the stream ({type(e).__name__}): generation cancelled", flush=True)
+        except asyncio.CancelledError:
+            print("client closed the stream (request cancelled): generation cancelled", flush=True)
+            raise
+        finally:
+            await chunks.aclose()
         return resp
 
     async def chat(request):
@@ -266,29 +315,41 @@ def build_app(st: State):
             rid, created = C.new_id("chatcmpl"), int(time.time())
             m = args.model_id
             if not r["stream"]:
-                content, reasoning, stats, finish, n_gen = [], [], None, "length", 0
-                async for ev in run_job(ids, r, r["in_think"], request):
-                    if ev[0] == "delta":
-                        (reasoning if ev[1] == "reasoning" else content).append(ev[2])
-                    else:
-                        _, stats, finish, n_gen = ev
-                return web.json_response(C.chat_response(rid, m, created, "".join(content), "".join(reasoning), finish,
-                                                         serve_compat.usage(len(ids), n_gen), timings=timings(stats), system_fingerprint="hy4-strix-graph-mtp"))
+                content, reasoning, calls, stats, finish, n_gen = [], [], [], None, "length", 0
+                async with aclosing(run_job(ids, r, r["in_think"], request)) as events:
+                    async for ev in events:
+                        if ev[0] != "delta":
+                            _, stats, finish, n_gen = ev
+                        elif ev[1] == "tool_call":
+                            calls.append(C.tool_call_item(ev[2], C.new_call_id()))
+                        else:
+                            (reasoning if ev[1] == "reasoning" else content).append(ev[2])
+                return web.json_response(C.chat_response(rid, m, created, "".join(content), "".join(reasoning), finish, serve_compat.usage(len(ids), n_gen),
+                                                         calls, timings=timings(stats), system_fingerprint="hy4-strix-graph-mtp"))
 
             async def chunks():
                 yield C.chat_chunk(rid, m, created, {"role": "assistant", "content": ""})
-                async for ev in run_job(ids, r, r["in_think"], request):
-                    if ev[0] == "delta":
-                        yield C.chat_chunk(rid, m, created, {"reasoning_content" if ev[1] == "reasoning" else "content": ev[2]})
-                    else:
-                        _, stats, finish, n_gen = ev
-                        yield C.chat_chunk(rid, m, created, {}, finish, timings=timings(stats))
-                        if r["include_usage"]:
-                            yield {"id": rid, "object": "chat.completion.chunk", "created": created, "model": m, "choices": [],
-                                   "usage": serve_compat.usage(len(ids), n_gen)}
+                n_calls = 0
+                async with aclosing(run_job(ids, r, r["in_think"], request)) as events:
+                    async for ev in events:
+                        if ev[0] != "delta":
+                            _, stats, finish, n_gen = ev
+                            yield C.chat_chunk(rid, m, created, {}, finish, timings=timings(stats))
+                            if r["include_usage"]:
+                                yield {"id": rid, "object": "chat.completion.chunk", "created": created, "model": m, "choices": [],
+                                       "usage": serve_compat.usage(len(ids), n_gen)}
+                        elif ev[1] == "tool_call":
+                            for delta in C.tool_call_deltas(n_calls, C.new_call_id(), ev[2]):
+                                yield C.chat_chunk(rid, m, created, delta)
+                            n_calls += 1
+                        else:
+                            yield C.chat_chunk(rid, m, created, {"reasoning_content" if ev[1] == "reasoning" else "content": ev[2]})
             return await sse(request, chunks())
         except C.RequestError as e:
             return _err(e.status, str(e), e.code)
+        except ClientGone:
+            print("client closed the connection: generation cancelled", flush=True)
+            return web.Response(status=499)
         except RuntimeError as e:
             return _err(500, str(e), "server_error")
 
@@ -301,27 +362,32 @@ def build_app(st: State):
             rid, created, m = C.new_id("cmpl"), int(time.time()), args.model_id
             if not r["stream"]:
                 text, stats, finish, n_gen = [], None, "length", 0
-                async for ev in run_job(ids, r, False, request):
-                    if ev[0] == "delta":
-                        text.append(ev[2])
-                    else:
-                        _, stats, finish, n_gen = ev
+                async with aclosing(run_job(ids, r, False, request)) as events:
+                    async for ev in events:
+                        if ev[0] == "delta":
+                            text.append(ev[2])
+                        else:
+                            _, stats, finish, n_gen = ev
                 body = C.completion_chunk(rid, m, created, "".join(text), finish)
                 body.update(usage=serve_compat.usage(len(ids), n_gen), timings=timings(stats))
                 return web.json_response(body)
 
             async def chunks():
-                async for ev in run_job(ids, r, False, request):
-                    if ev[0] == "delta":
-                        yield C.completion_chunk(rid, m, created, ev[2])
-                    else:
-                        _, stats, finish, n_gen = ev
-                        yield C.completion_chunk(rid, m, created, "", finish, timings=timings(stats))
-                        if r["include_usage"]:
-                            yield {"id": rid, "object": "text_completion", "created": created, "model": m, "choices": [], "usage": serve_compat.usage(len(ids), n_gen)}
+                async with aclosing(run_job(ids, r, False, request)) as events:
+                    async for ev in events:
+                        if ev[0] == "delta":
+                            yield C.completion_chunk(rid, m, created, ev[2])
+                        else:
+                            _, stats, finish, n_gen = ev
+                            yield C.completion_chunk(rid, m, created, "", finish, timings=timings(stats))
+                            if r["include_usage"]:
+                                yield {"id": rid, "object": "text_completion", "created": created, "model": m, "choices": [], "usage": serve_compat.usage(len(ids), n_gen)}
             return await sse(request, chunks())
         except C.RequestError as e:
             return _err(e.status, str(e), e.code)
+        except ClientGone:
+            print("client closed the connection: generation cancelled", flush=True)
+            return web.Response(status=499)
         except RuntimeError as e:
             return _err(500, str(e), "server_error")
 
@@ -341,7 +407,7 @@ def build_app(st: State):
         try:
             need_ready()
             r = C.parse_chat(await read_body(request), args.default_max_tokens)
-            return web.json_response({"prompt": st.vocab.template.render(r["messages"], None, True, reasoning_effort=r["effort"])})
+            return web.json_response({"prompt": st.vocab.chat_prompt(r)[0]})
         except C.RequestError as e:
             return _err(e.status, str(e), e.code)
 
