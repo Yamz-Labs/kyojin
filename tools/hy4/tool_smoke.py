@@ -9,16 +9,16 @@ Cases (each needs the real model: the reply is whatever the model decides):
   2. tool call, streamed        same, read from delta.tool_calls chunks (index, id + name, then the arguments)
   3. multi-turn round trip      the call and its result are sent back -> a final text answer, finish_reason "stop"
   4. disconnect mid-stream      close a long stream after a few chunks -> the engine is free again within a few seconds
-Needs only the standard library and `requests`.
+Standard library only (http.client): it runs in the release venv as it is.
 """
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import sys
 import time
-
-import requests
+from urllib.parse import urlsplit
 
 TOOLS = [{"type": "function", "function": {
     "name": "get_weather", "description": "Current weather of a city.",
@@ -28,28 +28,62 @@ QUESTION = [{"role": "user", "content": "What is the weather in Paris right now?
 RESULT = json.dumps({"city": "Paris", "temp": 18, "unit": "c", "sky": "sunny"})
 
 
+class Reply:
+    """one HTTP reply: status and the whole body"""
+
+    def __init__(self, status: int, body: bytes):
+        self.status_code, self.text = status, body.decode("utf-8", "replace")
+
+    def json(self):
+        return json.loads(self.text)
+
+
 class Smoke:
     def __init__(self, base: str, model: str | None, effort: str, max_tokens: int, timeout: float):
+        u = urlsplit(base if "//" in base else f"http://{base}")
+        self.host, self.port, self.prefix = u.hostname or "127.0.0.1", u.port or (443 if u.scheme == "https" else 80), u.path.rstrip("/")
+        self.https = u.scheme == "https"
         self.base, self.effort, self.max_tokens, self.timeout = base.rstrip("/"), effort, max_tokens, timeout
         self.model = model or "Hy4-flash"
         self.call: dict | None = None            # the tool call of case 1 (id, name, arguments), reused by case 3
         self.results: list[tuple[str, bool, str]] = []
 
     # -- plumbing
+    def connect(self, timeout: float | None = None) -> http.client.HTTPConnection:
+        cls = http.client.HTTPSConnection if self.https else http.client.HTTPConnection
+        return cls(self.host, self.port, timeout=timeout or self.timeout)
+
+    def send(self, method: str, path: str, body: dict | None = None, timeout: float | None = None):
+        """-> (connection, response) with the headers read; the body is read by the caller"""
+        conn = self.connect(timeout)
+        data = json.dumps(body).encode() if body is not None else None
+        conn.request(method, self.prefix + path, body=data, headers={"Content-Type": "application/json"} if data else {})
+        return conn, conn.getresponse()
+
+    def get(self, path: str, timeout: float | None = None) -> Reply:
+        conn, resp = self.send("GET", path, timeout=timeout)
+        try:
+            return Reply(resp.status, resp.read())
+        finally:
+            conn.close()
+
     def body(self, messages, **kw) -> dict:
         return {"model": self.model, "messages": messages, "tools": TOOLS, "max_tokens": self.max_tokens, "reasoning_effort": self.effort, **kw}
 
-    def post(self, body: dict, **kw) -> requests.Response:
-        return requests.post(f"{self.base}/v1/chat/completions", json=body, timeout=self.timeout, **kw)
+    def post(self, body: dict) -> Reply:
+        conn, resp = self.send("POST", "/v1/chat/completions", body)
+        try:
+            return Reply(resp.status, resp.read())
+        finally:
+            conn.close()
 
     def wait_ready(self, seconds: float = 600) -> None:
         end = time.time() + seconds
         while True:
             try:
-                r = requests.get(f"{self.base}/health", timeout=5)
-                if r.status_code == 200:
+                if self.get("/health", timeout=5).status_code == 200:
                     return
-            except requests.RequestException:
+            except (OSError, http.client.HTTPException):
                 pass
             if time.time() > end:
                 sys.exit(f"server at {self.base} is not ready")
@@ -97,30 +131,33 @@ class Smoke:
         return ok, detail
 
     def case_stream(self):
-        r = self.post(self.body(QUESTION, stream=True), stream=True)
-        if r.status_code != 200:
-            return False, f"HTTP {r.status_code}: {r.text[:200]}"
-        calls: dict[int, dict] = {}
-        finish, done, n_chunks, text = None, False, 0, ""
-        for raw in r.iter_lines():
-            if not raw.startswith(b"data: "):
-                continue
-            data = raw[6:].decode()
-            if data == "[DONE]":
-                done = True
-                break
-            ch = json.loads(data)
-            n_chunks += 1
-            if not ch.get("choices"):
-                continue
-            c = ch["choices"][0]
-            text += c["delta"].get("content") or ""
-            for tc in c["delta"].get("tool_calls") or []:
-                slot = calls.setdefault(tc["index"], {"id": None, "name": "", "arguments": ""})
-                slot["id"] = tc.get("id") or slot["id"]
-                slot["name"] += (tc.get("function") or {}).get("name") or ""
-                slot["arguments"] += (tc.get("function") or {}).get("arguments") or ""
-            finish = c.get("finish_reason") or finish
+        conn, resp = self.send("POST", "/v1/chat/completions", self.body(QUESTION, stream=True))
+        try:
+            if resp.status != 200:
+                return False, f"HTTP {resp.status}: {resp.read().decode('utf-8', 'replace')[:200]}"
+            calls: dict[int, dict] = {}
+            finish, done, n_chunks, text = None, False, 0, ""
+            for raw in resp:
+                if not raw.startswith(b"data: "):
+                    continue
+                data = raw[6:].decode().strip()
+                if data == "[DONE]":
+                    done = True
+                    break
+                ch = json.loads(data)
+                n_chunks += 1
+                if not ch.get("choices"):
+                    continue
+                c = ch["choices"][0]
+                text += c["delta"].get("content") or ""
+                for tc in c["delta"].get("tool_calls") or []:
+                    slot = calls.setdefault(tc["index"], {"id": None, "name": "", "arguments": ""})
+                    slot["id"] = tc.get("id") or slot["id"]
+                    slot["name"] += (tc.get("function") or {}).get("name") or ""
+                    slot["arguments"] += (tc.get("function") or {}).get("arguments") or ""
+                finish = c.get("finish_reason") or finish
+        finally:
+            conn.close()
         if not done:
             return False, "the stream ended without [DONE]"
         if finish != "tool_calls" or not calls:
@@ -156,14 +193,14 @@ class Smoke:
         long = self.body([{"role": "user", "content": "Count from 1 to 1000, one number per line, no other text."}], max_tokens=self.max_tokens * 2, reasoning_effort="no_think")
         long.pop("tools")
         long["stream"] = True
-        s = self.post(long, stream=True)
+        conn, resp = self.send("POST", "/v1/chat/completions", long)
         n = 0
-        for raw in s.iter_lines():
+        for raw in resp:
             if raw.startswith(b"data: "):
                 n += 1
                 if n >= 5:
                     break
-        s.close()                                   # the client leaves mid-stream
+        conn.close()                                # the client leaves mid-stream
         t1 = time.time()
         r = self.post(quick)                        # queued behind the abandoned generation until the engine stops
         after = time.time() - t1
@@ -185,8 +222,8 @@ def main(argv=None) -> int:
     sm.wait_ready()
     if args.model is None:
         try:
-            sm.model = requests.get(f"{sm.base}/v1/models", timeout=10).json()["data"][0]["id"]
-        except (requests.RequestException, KeyError, IndexError, ValueError):
+            sm.model = sm.get("/v1/models", timeout=10).json()["data"][0]["id"]
+        except (OSError, http.client.HTTPException, KeyError, IndexError, ValueError):
             pass
     sm.run("1 tool call (non-stream)", sm.case_non_stream)
     sm.run("2 tool call (stream)", sm.case_stream)

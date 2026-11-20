@@ -63,6 +63,8 @@ for _c in "${EXL3_HSA_LIB:-}" "${_SDK_ROOT:-/nonexistent}/lib/libhsa-runtime64.s
 done
 if [ -n "$_HSA" ]; then
     export LD_PRELOAD="$_HSA"
+elif [[ "${LD_PRELOAD:-}" == *libhsa-runtime64* ]]; then
+    :                                                  # the caller already preloads one (a lane script, serve.py): keep it
 elif [ "${EXL3_ALLOW_NO_HSA:-0}" = "1" ]; then
     echo "[env.sh] WARNING: no libhsa-runtime64.so.1 found (EXL3_ALLOW_NO_HSA=1): any GPU use of torch will segfault on gfx1151 (Trap 1)." >&2
 else

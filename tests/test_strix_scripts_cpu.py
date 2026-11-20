@@ -16,7 +16,7 @@ BASH = shutil.which("bash")
 def script(path, body):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
-        f.write("#!/bin/bash\n" + body)
+        f.write(f"#!{BASH}\n" + body)           # the absolute bash: a Nix build sandbox has no /bin/bash
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
 
 
@@ -83,6 +83,12 @@ class EnvSh(unittest.TestCase):
         r = self.source(PATH=os.path.dirname(BASH) + os.pathsep + "/usr/bin" + os.pathsep + "/bin")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("no libhsa-runtime64.so.1", r.stderr)
+
+    def test_a_runtime_already_preloaded_counts_as_found(self):
+        self.fake_rocm_sdk(None)
+        r = self.source(LD_PRELOAD="/somewhere/libhsa-runtime64.so.1")           # a lane script that set LD_PRELOAD itself
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("LD_PRELOAD=/somewhere/libhsa-runtime64.so.1", r.stdout)
 
     def test_allow_no_hsa_only_warns(self):
         self.fake_rocm_sdk(None)
