@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (1.9.2.1)
+## 1.9.2.1
 
 Hy4-flash server: a refused request must never stop the server, and fewer harmless content parts are refused (issue #222).
 
