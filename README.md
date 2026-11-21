@@ -104,7 +104,7 @@ curl http://localhost:8300/v1/chat/completions -H "Content-Type: application/jso
   "reasoning_effort": "low", "max_tokens": 1024}'
 ```
 
-Send the result back with the call: add the assistant message with its `tool_calls` and a `{"role": "tool", "tool_call_id": "<id of the call>", "content": "<result>"}` message, and the model answers in text. `python tools/hy4/tool_smoke.py --base http://localhost:8300` checks a running server end to end (tool call, stream, round trip, a client that closes the stream). `response_format` `json_object` / `json_schema` is not supported yet (a 400); several system messages are merged into one, and a last assistant message is continued (prefill).
+Send the result back with the call: add the assistant message with its `tool_calls` and a `{"role": "tool", "tool_call_id": "<id of the call>", "content": "<result>"}` message, and the model answers in text. `python tools/hy4/tool_smoke.py --base http://localhost:8300` checks a running server end to end (tool call, stream, round trip, a client that closes the stream). `python tools/hy4/client_smoke.py --base http://localhost:8300 --ctx 16384` is the client smoke gate every public release must pass on the real model: SDK chat and completions (stream and not), tool calls (auto / required / named, multi-turn), image / audio / file parts, a dropped stream, no max_tokens on a long prompt, oversized max_tokens, 4 concurrent requests, replayed requests of three agent clients, and a normal request after every case; it prints one PASS / FAIL table (start the server with `-c 16384`). `response_format` `json_object` / `json_schema` is not supported yet (a 400); several system messages are merged into one, and a last assistant message is continued (prefill).
 
 ## Speed by context
 
