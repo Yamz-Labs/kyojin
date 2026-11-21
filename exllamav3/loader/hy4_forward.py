@@ -207,6 +207,20 @@ _MD = []
 MOE_V2_FIRES = _LVF.Fires("moe_v2", hit="calls")      # calls = layer calls (graph capture / eager sites) that took the code object; fallback = {reason: n} of the calls that did not (only counted with the flag on)
 
 
+def _moe_v2_align(rs, fmt):
+    """None when the row strides and the base pointers meet the code object contract, else "stride_align" / "ptr_align". Q4_K blocks are 144 B and read as uint4: 16-byte rows and bases
+    for gate, up and down. Q3_K gate / up blocks are 110 B (2-byte aligned: q3_load aligns the dword read itself, moe_dec.cu), so 2-byte rows and bases are enough; down is Q4_K
+    (fd == 0, 16-byte). 22 of the 42 MoE layers of the Q3_K GGUF are Q3_K gate / up (row 660 B): the old rule (16 B for every stream) sent all of them to the stock kernels."""
+    ga = 16 if fmt == "q4_k" else 2
+    if rs.strides[0] % ga or rs.strides[1] % ga or rs.strides[2] % 16:
+        return "stride_align"
+    for n, a in (("gate", ga), ("up", ga), ("down", 16)):
+        b = rs.bufs.get(n)
+        if b is not None and b.data_ptr() % a:
+            return "ptr_align"
+    return None
+
+
 def _moe_v2(rs, T, K, S=16):
     """the MoeDec scratch holder for this layer shape, or None (flag off / code object missing / shape or alignment outside the kernels' contract)"""
     if not MOE_V2:
@@ -228,8 +242,7 @@ def _moe_v2(rs, T, K, S=16):
     md, cache = _MD[0], _MD[1]
     fmt = {0: "q4_k", 8: "q3_k"}.get(rs.fu)
     why = ("no_code_object" if md is None else "gate_up_fmt" if fmt is None else "down_fmt" if rs.fd != 0 else "nout!=K" if rs.nout != K
-           else "shape" if (K % 256 or rs.nff % 256 or K != 1536 or rs.nff != 1536) else "stride_align" if any(st % 16 for st in rs.strides)
-           else "ptr_align" if (rs.bufs["gate"].data_ptr() % 16) else None)
+           else "shape" if (K % 256 or rs.nff % 256 or K != 1536 or rs.nff != 1536) else _moe_v2_align(rs, fmt))
     if why is not None:
         MOE_V2_FIRES.miss(why)
         return None

@@ -191,7 +191,9 @@ def test_moe_v2_happy_path(moe):
     ((1, 1536, 16), {"nout": 1024}, "nout!=K"),
     ((1, 1024, 16), {"nout": 1024}, "shape"),
     ((1, 1536, 16), {"nff": 2048}, "shape"),
-    ((1, 1536, 16), {"strides": (1536, 2050, 4096)}, "stride_align"),
+    ((1, 1536, 16), {"strides": (1536, 2051, 4096)}, "stride_align"),             # Q3_K gate / up need 2-byte rows: an odd row is refused
+    ((1, 1536, 16), {"strides": (1536, 2048, 4098)}, "stride_align"),             # down is Q4_K: 16-byte rows
+    ((1, 1536, 16), {"fu": 0, "strides": (1536, 2050, 4096)}, "stride_align"),    # Q4_K gate / up: 16-byte rows
 ])
 def test_moe_v2_fallback_reasons(moe, args, rs, reason):
     T, K, S = args
@@ -202,7 +204,7 @@ def test_moe_v2_fallback_reasons(moe, args, rs, reason):
 def test_moe_v2_pointer_alignment_and_missing_code_object(moe, monkeypatch):
     t = torch.zeros(64)
     odd = t[1:]                                       # 4-byte offset: not 16-byte aligned
-    assert moe._moe_v2(_rs(bufs={"gate": odd}), 1, 1536) is None
+    assert moe._moe_v2(_rs(fu=0, bufs={"gate": odd}), 1, 1536) is None            # Q4_K gate: uint4 loads need 16 bytes
     monkeypatch.setattr(moe, "_MD", [None, {}])
     assert moe._moe_v2(_rs(), 1, 1536) is None
     assert moe.MOE_V2_FIRES.snapshot()["fallback"] == {"ptr_align": 1, "no_code_object": 1}
@@ -266,11 +268,14 @@ def test_mmw_with_gv_takes_the_matvec(mods, monkeypatch):
     SG = mods.step_graph
     a, w = torch.randn(1, 16), torch.randn(8, 16)
     ix = SimpleNamespace(w={"x": w}, gv=True)
-    monkeypatch.setattr(SG, "_RG", SimpleNamespace(usable=lambda a, w: True, logits=lambda a, w: "mv"))
+    monkeypatch.setattr(SG, "_RG", SimpleNamespace(usable=lambda a, w: True, logits=lambda a, w: "mv", MAXT=8))
     assert SG._mmw(ix, a, "x") == "mv"
-    monkeypatch.setattr(SG, "_RG", SimpleNamespace(usable=lambda a, w: False, logits=lambda a, w: "mv"))
+    monkeypatch.setattr(SG, "_RG", SimpleNamespace(usable=lambda a, w: False, logits=lambda a, w: "mv", MAXT=8))
     assert torch.equal(SG._mmw(ix, a, "x"), a @ w.T)
     assert SG.IX_GV_FIRES.snapshot() == {"gv": 1, "gemm": {"unusable_shape": 1}}
+    a9 = torch.randn(9, 16)                                                      # more rows than the mat-vec takes (draft-cache fill chunks): counted as the natural reason
+    assert torch.equal(SG._mmw(ix, a9, "x"), a9 @ w.T)
+    assert SG.IX_GV_FIRES.snapshot() == {"gv": 1, "gemm": {"unusable_shape": 1, "rows>maxt": 1}}
 
 
 def test_indexer_keys_static_keeps_no_grad(mods):
@@ -291,3 +296,18 @@ def test_fires_line(mods):
     mods.moe_i8.FIRES.hit()
     ln = LF.line()
     assert "FIRES dense_v2 {'v2': 1, 'stock': {'rows<2': 1}}" in ln and "FIRES draft_moe_tiles {'calls': 1, 'fallback': {}}" in ln
+
+
+# ---- MOE_V2 alignment contract (22 of 42 MoE layers of the Q3_K GGUF have 660-byte Q3_K gate / up rows) ------------------------------------------------------------------
+
+def test_moe_v2_q3k_660_byte_rows_take_the_code_object(moe):
+    strides = (660 * 1, 660, 864)                                                  # real Q3_K gate / up (K 1536: 6 blocks x 110 B) with Q4_K down (6 x 144 B)
+    assert 660 % 16 != 0 and 864 % 16 == 0
+    assert moe._moe_v2(_rs(fu=8, strides=strides, bufs={"gate": torch.zeros(64), "up": torch.zeros(64), "down": torch.zeros(64)}), 1, 1536) is not None
+    assert moe.MOE_V2_FIRES.snapshot() == {"calls": 1, "fallback": {}}
+
+
+def test_moe_v2_q4k_layers_keep_the_16_byte_rule(moe):
+    assert moe._moe_v2(_rs(fu=0, strides=(864, 864, 864)), 1, 1536) is not None
+    assert moe._moe_v2(_rs(fu=0, strides=(660, 864, 864)), 1, 1536) is None
+    assert moe.MOE_V2_FIRES.snapshot() == {"calls": 1, "fallback": {"stride_align": 1}}

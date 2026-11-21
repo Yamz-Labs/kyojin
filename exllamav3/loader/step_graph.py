@@ -96,7 +96,7 @@ def _mmw(ix, a, name):
     if gv and _RG.usable(a, w):
         IX_GV_FIRES.hit()
         return _RG.logits(a, w)
-    IX_GV_FIRES.miss("flag_off" if not gv else "unusable_shape")
+    IX_GV_FIRES.miss("flag_off" if not gv else "rows>maxt" if (a.dim() == 2 and a.shape[0] > _RG.MAXT) else "unusable_shape")      # rows>maxt: draft-cache fill / prefill chunks (natural); unusable_shape: any other refusal
     return a @ w.T
 
 
