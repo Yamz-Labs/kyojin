@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.9.3
+
+Hy4-flash on the Strix Halo box: faster speculative decode, a fix that gives the new MoE kernel path back to the Q3_K file, the client fixes of issue #222, and a client smoke gate that ships in the tree.
+
+- Speed (served, speculative decode, 12K context, two prompts per class, median of 4 to 9 server boots, Strix Halo box, tok/s):
+
+  | step | code | prose | chat | mean |
+  |---|---|---|---|---|
+  | 1.9.2 | 24.4 | 20.2 | 20.5 | |
+  | + five decode levers | 25.7 (+5.4 %) | 22.3 (+10.7 %) | 21.5 (+4.9 %) | +7.0 % |
+  | + depth gate (learn) | 26.3 (+0.9 %) | 23.7 (+6.1 %) | 22.8 (+4.6 %) | +3.9 % |
+  | + row-batched MLA attention | 29.6 (+12.8 %) | 26.4 (+11.5 %) | 25.1 (+10.2 %) | +11.5 % |
+
+  Each row is a paired A/B against the row above it. The first row pair comes from one run and the last two rows from a second run (the reference arm of that run was voided: one prose prompt spread 6.2 % over its reps), so the steps are not one continuous measurement. Greedy outputs differ from 1.9.2 at near ties only. GSM8K 20/20 on every arm, memory footprint unchanged (about 98.8 GiB GTT).
+- On by default (set in `SHIPPED_ENV`; `HY4_<FLAG>=0` restores the 1.9.2 path of that lever): `HY4_DENSE_V2`, `HY4_MOE_V2`, `HY4_DRAFT_MOE_TILES`, `HY4_DRAFT_MLA_BG`, `HY4_DRAFT_IX_GV`, `HY4_SPEC2_GATE` (with `HY4_SPEC2_MODE=learn`) and `HY4_MLA_ROWS2`. Rebuild the kernels with `bash tools/hy4/install_strix.sh` after the update; without the rebuilt library `HY4_DENSE_V2` and `HY4_MOE_V2` fall back and the `FIRES` line names the reason.
+- Where the new defaults step aside: the depth gate is off with `--slots > 1`, with `--num-draft` other than 3, and when `HY4_DRAFT_POLICY` is set. Row-batched MLA attention is off with `--slots > 1`, and a decode call outside its shape support runs the 1.9.2 attention path (counted in the `mla2` fires line). Setting either flag by hand in those cases is refused at load.
+- Fix: on the Q3_K GGUF, 22 of the 42 MoE layers never took the V2 expert path (`stride_align`: Q3_K gate / up rows need 2-byte alignment, not 16). All layers do now.
+- Server fixes of issue #222, released earlier as 1.9.2.1 and 1.9.2.2 and carried here: a refused request never stops the server, named part errors, `KYOJIN_IMAGE_PARTS`, a request without `max_tokens` gets the room left in the context window and a larger `max_tokens` is clipped instead of refused.
+- Client smoke gate: `python tools/hy4/client_smoke.py --base http://localhost:8300 --ctx 16384` runs OpenAI SDK chat and completions (streamed and not), tool calls (auto, required, named, multi-turn), image / audio / file parts, a client that drops the stream, a long prompt without `max_tokens`, an oversized `max_tokens`, 4 concurrent requests and replayed agent-client requests, then a normal request after each error. 1.9.3 passes it: 172/172 checks on the built release-candidate tree, against the real model.
+
+### Details
+
+- Decode levers, shipped on in `SHIPPED_ENV` (`HY4_<FLAG>=0` restores 1.9.2; code default `0`), each with a fires counter printed after the load warm-up (`FIRES <name> {...}`, `loader/lever_fires.py`) and a CPU test (`tests/test_hy4_seta_levers_cpu.py`):
+  `HY4_DENSE_V2` (column-tiled few-row Q8_0 dense GEMV, `gm_dense_q8`, bit-identical to the stock kernel; rebuild `exl3_gm_ext` with `tools/hy4/install_strix.sh`),
+  `HY4_MOE_V2` (routed experts through the HIP code object `moe_dec.co`, built by `install_strix.sh` step 2b, `MOE_DEC_CO` overrides the path),
+  `HY4_DRAFT_MOE_TILES`, `HY4_DRAFT_MLA_BG`, `HY4_DRAFT_IX_GV` (draft MTP layer: int8 expert tile retune, Q8 absorb matrices, indexer mat-vec).
+- New tools: `tools/hy4/step/opbench.py` (per-op decode microbench, no server boot) and the paired A/B drivers `ab_dend.py`, `ab_exp.py`, `mtp_items.py`, `mtp_micro.py`, `mtp_arms.sh`; model and data paths come from `GGUF` / `WIKI` (no default path).
+- KV footprint: `HY4_KV_FP8_MTP=1` keeps the draft layer's K cache in fp8 too (needs `HY4_KV_FP8=1`), `HY4_KV_COMPACT=1` sets fp8 trunk + draft cache + the 1024-row window ring in one switch (about 11 KB per token instead of 113 KB); all off by default. `tools/hy4/kv_bytes.py` prints the per-component table, `tools/hy4/kv_bytes_probe.py` measures it. CPU tests: `tests/test_kv_bytes.py`.
+- KV footprint 2: `HY4_IX_POOL16=1` (fp16 indexer pool, -832 bytes per token) and `HY4_ROPE_POS=1` (rope cos / sin rows evaluated from the positions of a call, no tables to the full context, -1280 bytes per token), both part of `HY4_KV_COMPACT=1` now: 9220 bytes per token (9.0 KB, 9.1 KB at 1M) instead of 11332. Off by default. CPU tests (including the Triton interpreter): `tests/test_kv10.py`; GPU gate: `tools/hy4/step/kv10_driver.py`.
+- Long context: opt-in fp8 e4m3 latent K cache for the full-attention layers (`HY4_KV_FP8=1`, off by default; 644 bytes per token and layer instead of 2304) and the head-blocked split-K sparse attend that reads it (`HY4_LC_HB`, `HY4_LC_HB_SPLIT`; only runs on the fp8 cache). `-c 65536` keeps the fp32 cache. Guide: `doc/hy4.md`, "Long context option". CPU tests: `tests/test_kv_fp8.py`, `tests/test_hy4_shipped_flags.py`.
+- Hy4 decode graphs: context buckets can grow with the context (1/32 of the octave above 16K rows) instead of a fixed 512 rows, so a 256K prompt lists 225 buckets instead of 2049. `HY4_GRAPH_BUCKET_REL` (default 0 = fixed 512-row buckets, as in 1.9.2; 1 = growing buckets). CPU test: `tests/test_graph_bucket.py`.
+- Hy4 MLA2 (`HY4_MLA_ROWS2`, shipped on in 1.9.3; `HY4_MLA_ROWS2=0` restores the 1.9.2 attention path): row-batched split-K decode attention. One pass over the K rows serves all verify rows, q is streamed in chunks, the output has 4 quarters. Tunables `HY4_MLA_ROWS2_BH` 16, `_RG` 1, `_BN` 32, `_BK` 64, `_NW` 4, `_PROG` 64, `_SPLIT` 0 (auto), `_RS` 8, `_MINB` 2. `HY4_MLA_ROWS2_PRECOMPILE=1` (default 0) compiles and loads every (T, S) specialisation at the end of load, outside any graph capture. `HY4_MLA_ROWS2_TRACE=1` prints the first sighting of each launch key and flags a JIT inside a capture. Fires counter: `HY4_MLA_ROWS2_FIRES=<file>` holds one line `FIRES mla2 <n> trunk <a> draft <b> fallback {reason: n} fallback_trunk {...} fallback_draft {...}`; an A/B arm with the flag on must show n > 0 and no fallback. Measured on the Strix Halo box (Hy4-flash): precision equal to the deployed head-blocked fp16-dot kernel (1152 calls, mean abs error 2.66e-05 for both); served hang matrix 12/12 boots clean, including an empty Triton cache. Paired served A/B in 1.9.3: mean +11.5 % decode, every prompt class above 0, GSM8K 20/20, no trunk fallback; shipped on. CPU tests (no GPU): `tools/hy4/step/mla2_precompile_cpu_test.py`, `mla2_engine_hook_test.py`, `mla2_fires_cpu_test.py`; micro `tools/hy4/step/mla2_micro.py` (`MLA_CPU=1` for a CPU smoke run).
+- Hy4-flash: online speculative draft-depth gate, `HY4_SPEC2_GATE=1` (shipped on in 1.9.3, set `HY4_SPEC2_GATE=0` to turn it off), mode `HY4_SPEC2_MODE=learn` (default, the measured S7 arm O), KB 2, THETA 0.6 for the `static` mode.
+  Base draft graph of 2 steps plus a confidence-gated third step. Fires counter per request: depth chosen per round and rounds where the gate changed the depth.
+  The gate's tail graph uses the same bucket helper as `HY4_GRAPH_BUCKET_REL`. See `doc/env_vars.md`.
+- Hy4-flash server fixes of issue #222, also released as 1.9.2.1: see the 1.9.2.1 section below (no hang after a refused request, named part errors, harmless parts accepted, `KYOJIN_IMAGE_PARTS` default `note`).
+- Hy4-flash server reply budget (issue #222), also released as 1.9.2.2: see the 1.9.2.2 section below (`--default-max-tokens 0` = all the room left is the new default; a larger `max_tokens` is clipped, not a 400).
+
 ## 1.9.2.2
 
 Hy4-flash server: a request without `max_tokens` is no longer cut at 1024 tokens, and a `max_tokens` larger than the context window can hold is clipped, not refused (issue #222: an agent client's context compaction ended with stop reason `length`).

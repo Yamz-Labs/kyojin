@@ -23,9 +23,12 @@ import torch
 from . import step_nosync as _ns
 from .engram_rows import QB, E4M3, E8M0
 from . import attn_eager as _ae
+from . import router_gemv as _RG
+from . import lever_fires as _LVF
 from .engram_stage import EngramStager
 
-BUCKET = int(os.environ.get("HY4_GRAPH_BUCKET", "512"))
+from . import graph_bucket as _gb
+BUCKET = _gb.BASE
 TM = int(os.environ.get("HY4_GRAPH_TM", "8"))          # max rows of one graph step (verify rows)
 MASK64 = (1 << 64) - 1
 PERT = None                      # [cap, D] fp32 noise table (measurement arms only)
@@ -51,6 +54,10 @@ def _rms(x, w, eps):
 from . import pool_fused as _PF
 from . import lc_sparse as _LS
 _PF.ENABLED = os.environ.get("HY4_IDX_POOLK", "0") == "1"
+from . import kv_fp8 as _KV8
+from . import rope_rows as _RR
+POOL16 = os.environ.get("HY4_IX_POOL16", "0") == "1"      # indexer pooled keys stored in fp16 (half the bytes; the prefill scorer already scores with the fp16 copy; selection reads fp16, top-k set overlap gate in tests/test_kv10.py)
+KV_FP8 = os.environ.get("HY4_KV_FP8", "0") == "1"      # latent K cache of the full-attention layers in fp8 e4m3 + per-token scale (+ bf16 rope dims)
 
 
 def indexer_static_init(ix, cap):
@@ -58,26 +65,47 @@ def indexer_static_init(ix, cap):
     k, d = ix.k, ix.d
     rows = cap // k
     if ix.pool.shape[0] < rows:
-        big = torch.zeros(rows, d, device=ix.dev)
+        big = torch.zeros(rows, d, device=ix.dev, dtype=torch.float16 if POOL16 else ix.pool.dtype)
         big[:ix.P] = ix.pool[:ix.P]
         ix.pool = big
+    elif POOL16 and ix.pool.dtype != torch.float16:
+        ix.pool = ix.pool.half()
     vgb = getattr(ix, "vgb", None)             # per-position (value | gate) rows [cap, 2d]: a rejected / re-run position just overwrites its row
     if vgb is None:
         ix.vg_ring = VG_RING if (VG_RING and VG_RING < cap) else 0       # HY4_SWA_RING: only the open group (+ the rows of one batch call) is ever read: slot = position % VG_RING
         vgb = ix.vgb = torch.zeros(ix.vg_ring or cap, 2 * d, device=ix.dev)
+    elif not hasattr(ix, "vg_ring"):
+        ix.vg_ring = 0                         # a buffer bound from outside (multi-session slab view [cap, 2d]) is full length: positions index it directly, never a ring
     if ix.vg is not None:                      # open group of an eager prefill (< k rows)
         m = ix.vg.shape[0]
         vgb[(torch.arange(ix.n - m, ix.n, device=ix.dev) % ix.vg_ring) if ix.vg_ring else slice(ix.n - m, ix.n)] = ix.vg
     ix._max_pos = cap
-    ix._table(cap)
+    if not _RR.ENABLED:             # HY4_ROPE_POS: the rope rows of a call come from its positions, no table to the full context
+        ix._table(cap)
+
+
+IX_GV_FIRES = _LVF.Fires("draft_ix_gv", hit="gv", miss="gemm")      # draft indexer matrices (ix has the gv attribute): gv = mat-vec calls, gemm = {reason: n} of the calls that kept the GEMM (the trunk's indexer has no gv attribute and is not counted)
+
+
+def _mmw(ix, a, name):
+    """a @ ix.w[name].T; the draft layer's indexer (ix.gv, HY4_DRAFT_IX_GV=1) runs its small fp32 matrices through the router mat-vec (rocBLAS SGEMM at M = 1 runs these at 12-60 GB/s)"""
+    w = ix.w[name]
+    gv = getattr(ix, "gv", None)
+    if gv is None:
+        return a @ w.T
+    if gv and _RG.usable(a, w):
+        IX_GV_FIRES.hit()
+        return _RG.logits(a, w)
+    IX_GV_FIRES.miss("flag_off" if not gv else "rows>maxt" if (a.dim() == 2 and a.shape[0] > _RG.MAXT) else "unusable_shape")      # rows>maxt: draft-cache fill / prefill chunks (natural); unusable_shape: any other refusal
+    return a @ w.T
 
 
 @torch.no_grad()
 def indexer_keys_static(ix, x, pos, ar):
     """key side of indexer_forward_static: the per-position (value | gate) rows and the pool groups they complete (x [T, E], pos [T] long device, ascending). Needs no query and no selection."""
     k, d = ix.k, ix.d
-    ik = _rms(x @ ix.w["attn_k"].T, ix.w["k_norm"], ix.eps)
-    vg_new = torch.cat([ik @ ix.w["value"].T, ik @ ix.w["gate"].T], -1)
+    ik = _rms(_mmw(ix, x, "attn_k"), ix.w["k_norm"], ix.eps)
+    vg_new = torch.cat([_mmw(ix, ik, "value"), _mmw(ix, ik, "gate")], -1)
     vr = getattr(ix, "vg_ring", 0)
     assert not vr or x.shape[0] + k <= vr, "vg ring smaller than one call"
     ix.vgb.index_copy_(0, pos % vr if vr else pos, vg_new)
@@ -90,7 +118,7 @@ def indexer_keys_static(ix, x, pos, ar):
         v, g = rows[..., :d].reshape(-1, k, d), rows[..., d:].reshape(-1, k, d)
         p = (torch.softmax(g + ix.w["ape"][None], dim=1) * v).sum(1)
         pooled = ix._rope(_rms(p, ix.w["pool_norm"], ix.eps), g0)
-        ix.pool.index_copy_(0, pos // k, pooled)            # a group still open holds partial data here; it stays masked until it is complete
+        ix.pool.index_copy_(0, pos // k, pooled.to(ix.pool.dtype))            # a group still open holds partial data here; it stays masked until it is complete
 
 
 @torch.no_grad()
@@ -103,8 +131,8 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
     if Nb <= (ix.n_top + 1) * k:        # every position of this bucket sees <= n_top groups: the selection is all-causal (the eager path returns None)
         return None
     T = x.shape[0]
-    iq = ix._rope((qr @ ix.w["q_b"].T).reshape(T, H, d), pos)
-    wt = (x.float() @ ix.w["proj"].T) / math.sqrt(d * H)
+    iq = ix._rope(_mmw(ix, qr, "q_b").reshape(T, H, d), pos)
+    wt = _mmw(ix, x.float(), "proj") / math.sqrt(d * H)
     Pb = Nb // k
     if PRIME_IX and T > 16 and ix.tail and iq.is_cuda:       # draft-cache fill of a long prompt (T up to 2048 rows): fused fp16 scorer + exact select instead of the fp32 [T, 16, Pb] einsum
         off = (pos.data_ptr() - ar.data_ptr()) // ar.element_size()
@@ -121,7 +149,7 @@ def indexer_forward_static(ix, x, qr, pos, Nb, ar):
         if _LS.CHECK and not torch.cuda.is_current_stream_capturing():
             _LS.check_rows(iq, wt, ix.pool, pos, Pb, ix.n_top, k, sel)
         return sel
-    kq = torch.relu(torch.einsum("nhd,pd->nhp", iq, ix.pool[:Pb]))
+    kq = torch.relu(torch.einsum("nhd,pd->nhp", iq, ix.pool[:Pb].to(iq.dtype)))
     sc = (kq * wt[:, :, None]).sum(1)
     gend = ar[:Pb] * k + (k - 1)
     vis = (gend[None] < pos[:, None]) if ix.tail else (gend[None] <= pos[:, None])
@@ -174,6 +202,7 @@ class _GS:
         self.inp = torch.zeros(2, TM, dtype=torch.long, device=dev)     # row 0 tokens, row 1 positions (first T columns used)
         self.ar = torch.arange(cap, device=dev)
         self.eng_raw = self.eng_valid = None
+        self._pv = None
 
     @property
     def tok(self):
@@ -181,7 +210,14 @@ class _GS:
 
     @property
     def pos(self):
-        return self.inp[1, :self.T]
+        """the position row of this step: ONE view object per segment body (new_pos() starts a new one), so the rope rows computed from it (HY4_ROPE_POS, memo on the object) are shared by the layers"""
+        if self._pv is None or self._pv.shape[0] != self.T:
+            self._pv = self.inp[1, :self.T]
+            self._pv._rope_ok = True
+        return self._pv
+
+    def new_pos(self):
+        self._pv = None
 
     # -- Engram: rows are staged on the host before the replay, decoded + applied inside the graph
     def engram(self, fw, i, x):
@@ -203,6 +239,9 @@ class _GS:
         if ring:                                  # window layer: ring buffer, slot = position % ring; attention reads the whole ring through absolute positions
             b.index_copy_(0, self.pos % ring, kn)
             return b
+        if b.__class__.__name__ == "Fp8KV":           # HY4_KV_FP8: quantise + scatter the rows
+            b.write_pos(self.pos, kn)
+            return b[:self.Nb]
         b.index_copy_(0, self.pos, kn)
         return b[:self.Nb]
 
@@ -211,9 +250,9 @@ class _GS:
         from . import attn_eager as AE, kv_fused as KVF
         b = _ns.state(self.fw).kv[i]
         c = mla._q(cur, "wkv_a") @ mla.wkv_a.T
-        tab = AE.table(mla.rope_dim, mla.theta, self.fw.dev, pos)
+        tab, per_row = AE.table_rows(mla.rope_dim, mla.theta, self.fw.dev, pos)
         ring = getattr(mla, "kv_ring", 0)
-        KVF.write_row(c, mla.kv_a_norm, tab, pos, b, mla.R, mla.rope_dim, mla.eps, ring=ring)
+        KVF.write_row(c, mla.kv_a_norm, tab, pos, b, mla.R, mla.rope_dim, mla.eps, ring=ring, per_row=per_row)
         return b if ring else b[:self.Nb]
 
     def indexer(self, fw, i, cur, qr, N):
@@ -272,6 +311,12 @@ class GraphDecoder:
             if getattr(m, "kv_ring", 0):
                 if b is None or b.shape[0] != m.kv_ring:
                     st.kv[i] = torch.zeros(m.kv_ring, 512 + 64, dtype=torch.float32, device=fw.dev)
+                continue
+            if KV_FP8 and not m.swa and fw._layer(i).ix and not isinstance(b, _KV8.Fp8KV):          # full-attention layer: fp8 latent cache
+                nb = _KV8.Fp8KV(self.cap, 512, 64, fw.dev)
+                if b is not None:
+                    nb.write(0, b[:min(b.shape[0], self.cap)])
+                st.kv[i] = nb
                 continue
             if b is None or b.shape[0] < self.cap:
                 nb = torch.zeros(self.cap, 512 + 64, dtype=torch.float32, device=fw.dev) if b is None else torch.zeros(self.cap, b.shape[1], dtype=b.dtype, device=fw.dev)
@@ -343,6 +388,7 @@ class GraphDecoder:
     def body_seg(self, si, x, bnds):
         fw, gs = self.fw, self.gs
         lo, hi = bnds[si]
+        gs.new_pos()                  # every segment body (eager warm-up, graph capture) starts its own position view: no rope rows memo outlives a capture
         if si == 0:
             e = _ns.gather_dequant_q8_0(self.st.table, gs.tok)
             if PERT is not None:                      # noise-ensemble null arm: 1e-6 fixed-seed perturbation of the embedding output (quality gate, never in production)
@@ -368,7 +414,7 @@ class GraphDecoder:
 
     def bucket(self, start, T=1):
         """context bucket Nb of a step of T rows at positions start .. start + T - 1 (rows past the last position are masked inside the graph)"""
-        return min(self.cap, ((start + T - 1) // BUCKET + 1) * BUCKET)
+        return _gb.bucket(start + T, self.cap)
 
     def graph(self, Nb, T=1):
         """the captured (graph, outputs) of a T-row step at context bucket Nb (captured now if not yet). Row-generic: T = rows of ONE sequence (verify) or any
@@ -380,7 +426,7 @@ class GraphDecoder:
         nbs: iterable of buckets (default every bucket up to the cap), ts: row counts (default 1 .. TM). Returns [(Nb, T, ms)] of the graphs built. The static
         inputs keep their last values: call it between requests (the K / indexer rows it rewrites are the same ones the last step wrote) and reset() after."""
         import time
-        nbs = sorted(set(nbs)) if nbs is not None else list(range(BUCKET, self.cap + 1, BUCKET))
+        nbs = sorted(set(nbs)) if nbs is not None else _gb.buckets(self.cap)
         ts = sorted(set(ts)) if ts is not None else list(range(1, TM + 1))
         if not self.prepared:
             self.prepare()
@@ -425,6 +471,7 @@ class GraphDecoder:
                 cgs.append(cg)
         finally:
             fw._gs = None
+            gs.new_pos()
         g = self.graphs[key] = (cgs, x)
         self.stats["captures"] += 1
         self.stats["capture_s"] += time.perf_counter() - t_cap

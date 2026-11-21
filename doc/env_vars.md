@@ -1063,6 +1063,23 @@ weights. `on` (also `1`, `preset`, `true`, `yes`) loads the preset bundled in th
 spec. Unset, empty, `0`, `off`, `false`, `no` and `none`: no edit is installed. A malformed spec or a missing file stops
 the load. The preset is in `presets/hy4-uncensor/`. See [hy4.md](hy4.md).
 
+#### `HY4_SPEC2_GATE` (default `1` since 1.9.3, `0` = off)
+
+Hy4-flash server only. `1` (the shipped default, set in `SHIPPED_ENV`) turns on the online draft-depth gate: the base draft graph runs `HY4_SPEC2_KB` steps (default `2`), and a tail graph
+runs one more step (plus its verify row) only when the gate says it pays. `--num-draft` must equal `HY4_SPEC2_KB + 1` (the shipped 3). It is exclusive with
+`HY4_DRAFT_POLICY`, and the gate turns `HY4_DRAFT_CONF` on by itself. Speculation stays lossless: the gate only changes how many drafts are verified.
+`HY4_SPEC2_MODE` picks the rule: `learn` (default, the measured S7 arm O: an online rule that learns the chance that the extension is accepted per confidence bin,
+reset at every request, so a repeated request repeats its decisions), `static` (extend when the product of the two base confidences is at least
+`HY4_SPEC2_THETA`, default `0.6`, no state), `carry` (the `learn` rule without the per-request reset, a negative control only). Other knobs of the learn rule:
+`HY4_SPEC2_STEP_MS`, `HY4_SPEC2_GAP_MS`, `HY4_SPEC2_PRIOR_N`, `HY4_SPEC2_PRIOR_Q`, `HY4_SPEC2_PROBE` (every N-th round extends whatever the bin says, default 16), `HY4_ROW_MS`
+(verify ms per row count). Fires counter: each request prints `FIRES gate mode=... depth_hist={2: n, 3: m} changed=a/b req_depth_hist=... req_changed=a/b`
+(depth chosen per round; `changed` = rounds where the gate cut the chain below the shipped depth; 0 means the gate did not fire) and `fires {...}` (rounds, depth2, gate_skip, gate_run).
+The server turns it off by itself with `--slots > 1`, with `--num-draft` other than 3 and when `HY4_DRAFT_POLICY` is set. Rollback: `HY4_SPEC2_GATE=0`. See `tools/hy4/depth_gate.py`.
+
+#### `HY4_MLA_ROWS2` (default `1` since 1.9.3, `0` = off)
+
+Hy4-flash server only. Row-batched split-K decode attention: one pass over the K rows serves all verify rows of a round, q is streamed in chunks. Shipped on in `SHIPPED_ENV`; off by itself with `--slots > 1`; a decode call outside its shape support runs the 1.9.2 attention path. Fires counter: `HY4_MLA_ROWS2_FIRES=<file>` holds `FIRES mla2 <n> trunk <a> draft <b> fallback {...}`. Tunables `HY4_MLA_ROWS2_BH`, `_RG`, `_BN`, `_BK`, `_NW`, `_PROG`, `_SPLIT`, `_RS`, `_MINB`; `HY4_MLA_ROWS2_PRECOMPILE=1` (default `0`) compiles every specialisation at the end of load; `HY4_MLA_ROWS2_TRACE=1` prints the first launch of each key. Rollback: `HY4_MLA_ROWS2=0`.
+
 #### `KYOJIN_IMAGE_PARTS` (default `note`)
 
 Hy4-flash server only. The model reads text only. `note` (default) replaces each image part (`image_url`, `input_image`, `image`), audio part (`input_audio`, `audio`) and
@@ -1088,6 +1105,16 @@ Hy4-flash server only. `tools/hy4/serve.py` sets these in `SHIPPED_ENV` without 
 | `HY4_GRAPH_FORK` | `1` | decode: the shared-expert branch runs on a second capture stream inside the HIP graph | `HY4_GRAPH_FORK=0` |
 | `HY4_RG_TUNE` | `1` | decode: router mat-vec with K block 1024 (was 256) | `HY4_RG_TUNE=0` |
 | `HY4_BG_V2` | `1` | decode: block-wise absorb kernels (absorb v2) | `HY4_BG_V2=0` |
+
+Hy4-flash 1.9.3 decode levers: all five are shipped on in `SHIPPED_ENV` (the code default of each module stays `0`; `HY4_<FLAG>=0` restores 1.9.2). `HY4_DENSE_V2` and `HY4_MOE_V2` need the rebuilt kernels (`install_strix.sh`), else they fall back and the fires line shows why. Each one has a fires counter (`loader/lever_fires.py`), printed as one `FIRES <name> {...}` line after the load warm-up; a flagged lever that shows no hit, or any fallback reason, is not in effect (counters are python-side: they count graph capture and eager call sites).
+
+| Flag | Default | Effect | Fires counter |
+|---|---|---|---|
+| `HY4_DENSE_V2` | `1` | decode: 2..16 rows with K <= 8192 through the column-tiled Q8_0 GEMV `gm_dense_q8` (bit-identical to `fq_gemv_q8_0`); needs `exl3_gm_ext.so` rebuilt by `tools/hy4/install_strix.sh` | `dense_v2 {v2, stock: {reason: n}}` |
+| `HY4_MOE_V2` | `1` | decode: routed experts (16 per row, K = 1536, Q3_K / Q4_K gate-up) through the HIP code object `moe_dec.co` (bit-equal to the shipped grouped kernels); built by `install_strix.sh` step 2b, path override `MOE_DEC_CO` | `moe_v2 {calls, fallback: {reason: n}}` |
+| `HY4_DRAFT_MOE_TILES` | `1` | draft layer: int8 expert tile retune (gate-up 8 x 512, 8 warps; down 16 x 512, 4 warps) | `draft_moe_tiles {calls}` |
+| `HY4_DRAFT_MLA_BG` | `1` | draft layer: absorb matrices `wk_b` / `wv_b` as int8 + fp16 block scales on the batched mat-vec (needs `HY4_MLA_BG=1` and `HY4_MTP_FAST=1`, both shipped on) | `draft_mla_bg {calls}` |
+| `HY4_DRAFT_IX_GV` | `1` | draft layer: indexer fp32 matrices on the router mat-vec (needs `HY4_MTP_FAST=1`) | `draft_ix_gv {gv, gemm: {reason: n}}` |
 
 The warm-up clamp has no switch. The start-up warm-up prompt (`HY4_WARMUP_TOKENS`, default the smaller of 8493 and `-c` minus 128, also when you set it) is cut to what the context window accepts, and skipped with one log line when that is under 256 tokens. `HY4_WARMUP_TOKENS=0` skips the warm-up.
 

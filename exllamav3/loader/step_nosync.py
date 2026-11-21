@@ -89,6 +89,9 @@ def append_kv(fw, i, kn, start):
     T = kn.shape[0]
     need = start + T
     b = st.kv.get(i)
+    if b is not None and b.__class__.__name__ == "Fp8KV" and b.shape[0] >= need:      # HY4_KV_FP8
+        b.write(start, kn)
+        return b[:need]
     if b is None or b.shape[0] < need:
         nb = torch.zeros(max(st.cap, need, 2 * (b.shape[0] if b is not None else 0)), kn.shape[1], dtype=kn.dtype, device=kn.device)
         if b is not None:

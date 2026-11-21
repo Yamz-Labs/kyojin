@@ -56,10 +56,12 @@ SHIPPED_ENV = {
     "HY4_LC_SPARSE": "1", "HY4_LC_PRIME": "1",                             # long context: exact top-k sparse decode attend (NLL inside the dense-vs-null band at 8K / 16K), draft-cache fill selects with the prefill scorer
     "HY4_PF_SPARSE": "1", "HY4_PF_SPARSE_MINN": "2048",            # sparse prefill attention (HIP kernel via SP_SO, Triton fallback) from 2048 keys (first measured from 16K keys): 33K prefill 60.6 -> 42 s, 128K flat ~790 tok/s; NLL 32K 4.5226 vs dense 4.5231 (nulls 4.511-4.515); below 16K dense CK (KL at 4096 with sparse 0.1089 vs nulls 0.0988-0.1054)
     "HY4_ENGRAM_NPHASH": "1", "HY4_ENGRAM_NATIVE_IO": "1", "HY4_ENGRAM_PF_WORKERS": "1", "HY4_PF_G_SWIGLU": "1", "HY4_PF_G_ADD": "1", "HY4_PF_MM_FINE": "1",   # prefill levers (box A/B 20/11 pf2_A / pf2_B: prefill +11 / +7.6 / +6.5 % at 8K / 32K / 64K, passkey 3/3, KL 0.108 vs noise nulls 0.103-0.108)
+    "HY4_SPEC2_GATE": "1", "HY4_SPEC2_MODE": "learn", "HY4_MLA_ROWS2": "1",   # 1.9.3: depth gate (learn mode) + row-batched MLA decode attention, paired A/B wins (51b: B2 +3.9 %, B4 +11.5 %, every class > 0)
     "HY4_MLA_HB": "1", "HY4_BG_DOT": "1", "HY4_HEAD_DOT": "1", "HY4_RG_F16": "1",   # decode levers (box A/B 20/11, 256 tok x2: verify round -7 % at 4K, -4 % at 32K, plain flat; qual6 KL 0.94 x noise null)
     "HY4_PF_KV_HM": "1", "HY4_PF_QO_HM": "1", "HY4_PF_HC2": "1", "HY4_PF_ROUTER16": "1",   # prefill set 3 (1.9.1): head-major CK attention operands, lazy layer residual (3 stream passes per layer), fp16 router logits of prefill rows (only on the HY4_REF_FUSED=0 router path)
     "HY4_PF_Q3K_V2": "1",   # Q3_K prefill gate-up kernel with packed fp16 decode + aligned dword loads (bit-identical to the old kernel, -0.26 s per 8K chunk; needs the rebuilt gm_ext, else falls back; old kernel when K / 256 is odd)
     "HY4_HEAD_Q8": "1", "HY4_GRAPH_FORK": "1", "HY4_RG_TUNE": "1", "HY4_BG_V2": "1",   # decode bundle 1 (1.9.1): Q8_0 output head (one resident copy, bf16 freed: -1.8 ms per step), shared-expert branch on a second capture stream (-1.7 ms per round), router mat-vec K block 1024, block-wise absorb kernels; quality gate: full bundle dNLL -0.0029 +- 0.011 vs noise null 0.0156
+    "HY4_DENSE_V2": "1", "HY4_MOE_V2": "1", "HY4_DRAFT_MOE_TILES": "1", "HY4_DRAFT_MLA_BG": "1", "HY4_DRAFT_IX_GV": "1",   # decode levers (1.9.3, the Strix lane set; =0 restores 1.9.2): few-row dense Q8_0 GEMV, HIP code object for the routed experts (needs moe_dec.co, else falls back and the FIRES line says so), draft layer int8 tiles / Q8 absorb / indexer mat-vec
     "HY4_PF_WOT": "0", "HY4_MOE_HIP": "2", "HY4_PF_CK": "1", "HY4_PF_FUSE": "1",      # prefill set 2: shared gm_ext WMMA experts (HY4_GM_EXT), CK MLA core (EXL3_CKMLA_SO), one-pass hc / norm / indexer kernels
 }
 
@@ -86,12 +88,16 @@ def check_kernels() -> None:
         print(f"hy4 serve: WARNING {m}: slow path (HY4_ALLOW_SLOW=1)", file=sys.stderr, flush=True)
 
 
-SLOTS_OFF = ("HY4_LC_SPARSE",)     # shipped long-context levers that act on the single-session K / indexer buffers: mu_engine.MuEngine refuses them with --slots > 1
+SLOTS_OFF = ("HY4_LC_SPARSE", "HY4_SPEC2_GATE", "HY4_MLA_ROWS2")     # shipped long-context levers that act on the single-session K / indexer buffers: mu_engine.MuEngine refuses them with --slots > 1
 
 
-def apply_env(ctx: int, model: str = "", slots: int = 1) -> None:
+def apply_env(ctx: int, model: str = "", slots: int = 1, num_draft: int = 3) -> None:
+    if os.environ.get("HY4_KV_COMPACT", "0") == "1":      # long lane footprint (about 9 KB per token, doc/hy4.md): fp8 latent K for the trunk and the draft layer, window layers in a 1024-row ring, fp16 indexer pool, rope rows from the positions (no per-token tables); each can still be set by hand
+        for k, v in (("HY4_KV_FP8", "1"), ("HY4_KV_FP8_MTP", "1"), ("HY4_SWA_RING", "1024"), ("HY4_IX_POOL16", "1"), ("HY4_ROPE_POS", "1")):
+            os.environ.setdefault(k, v)
     for k, v in SHIPPED_ENV.items():
-        os.environ.setdefault(k, "0" if slots > 1 and k in SLOTS_OFF else v)      # an explicit value still wins (and MuEngine refuses it)
+        off = (slots > 1 and k in SLOTS_OFF) or (k == "HY4_SPEC2_GATE" and (num_draft != 3 or os.environ.get("HY4_DRAFT_POLICY")))   # the depth gate drafts 2 steps + 1 tail (num-draft 3) and excludes the draft policy
+        os.environ.setdefault(k, "0" if off else v)      # an explicit value still wins (and MuEngine refuses it)
     os.environ.setdefault("HY4_NOSYNC_CAP", str(((ctx + 64 + 511) // 512) * 512))   # K buffers / token history: fixed for the life of the process
     # the measured line also runs with frozen TunableOp results for the prefill GEMMs and a start-up request that compiles the prefill kernels and captures the decode graphs
     tune = os.path.join(TREE, "tools", "hy4", "tunableop_gfx1151.csv")
@@ -283,8 +289,13 @@ def build_app(st: State):
         pf, dc = stats["prefill_s"], stats["decode_s"]
         print(f"req {st.served}: prompt {stats['prompt_tokens']} tok prefill {pf:.2f} s ({stats['prompt_tokens'] / pf:.0f} tok/s; trunk {stats.get('prefill_trunk_s', 0):.2f} s, "
               f"draft fill {stats.get('prime_s', 0):.2f} s {stats.get('prime_mode')}) | decode {stats['decode_tokens']} tok {dc:.2f} s = "
-              f"{stats['decode_tokens'] / dc if dc else 0:.2f} tok/s spec={stats['speculative']} rounds {stats['rounds']} tau {stats['tau']} hist {stats['accept_hist']} | {finish}",
+              f"{stats['decode_tokens'] / dc if dc else 0:.2f} tok/s spec={stats['speculative']} rounds {stats['rounds']} tau {stats['tau']} hist {stats['accept_hist']} | {finish}"
+              + (f" | gate {stats['gate']}" if stats.get("gate") else "") + (f" | fires {stats['fires']}" if stats.get("fires") and (stats.get("gate") or os.environ.get("HY4_REQ_ROUNDLOG", "0") == "1") else "")
+              + (f" | round_ms {[round(x, 1) for x in stats['round_ms']]} gap_ms {[round(x, 1) for x in stats['gap_ms']]} busy_ms {stats['busy_ms']:.1f} ngram {stats['ngram']}"
+                 if os.environ.get("HY4_REQ_ROUNDLOG", "0") == "1" and "round_ms" in stats and "ngram" in stats else ""),
               flush=True)
+        if stats.get("gate") and st.engine.gate is not None:
+            print(st.engine.gate.fires_line(), flush=True)
         yield ("end", stats, finish, n_gen)
 
     def timings(stats):
@@ -476,6 +487,9 @@ def load_in_background(st: State):
                 if os.environ.get("HY4_WARMUP_TOKENS", "0") != "0":
                     st.stage = "warm-up"
                     mu_engine.warmup(st.sched, int(os.environ["HY4_WARMUP_TOKENS"]))
+                if os.environ.get("HY4_MU_PRECAP", "0") not in ("", "0"):      # HY4_MU_PRECAP=512,1024: every (bucket, rows) trunk graph + every (slot, bucket) draft graph before the first request
+                    st.stage = "precapture"
+                    mu_engine.precapture(st.sched)
             elif os.environ.get("HY4_WARMUP_TOKENS", "0") != "0":
                 st.stage = "warm-up"
                 print("load: warm-up", flush=True)
@@ -509,7 +523,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.default_max_tokens < 0:
         ap.error("--default-max-tokens must be 0 (all the room left in the context window) or a positive number of tokens")
-    apply_env(args.max_ctx, args.model, args.slots)
+    apply_env(args.max_ctx, args.model, args.slots, args.num_draft)
     check_kernels()
     st = State(args)
     app = build_app(st)

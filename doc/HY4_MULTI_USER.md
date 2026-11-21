@@ -27,3 +27,16 @@ Slab per session ~ n_layers * cap * 2304 B (K) + 13 indexer layers * cap * 1.3 K
 - `tests/test_hy4_mu_slots.py` (CPU, Triton interpreter, and MU_DEV=cuda): indexer batched rows == solo per session (allow masks, vgb rows, pooled keys; past the all-causal bound), staggered
   sessions, scrambled neighbours, sentinel slots never written (last slab, last position), MLA core reference == per-row solo reference, other slabs / future rows never read, Triton kernel == reference.
 - GPU (`tools/hy4/mu_bench.py`): solo legacy reference vs batched streams (first divergence index), logits of a row alone vs inside a 2-row step, aggregate / per-session tok/s, memory, ttft + gaps.
+
+## Host path and TM (HY4_MU_HOSTFAST, HY4_GRAPH_TM, HY4_MU_PRECAP; all default OFF)
+- Per decode round the host did, per session: argmax readback (already ONE `.tolist()` for all rows), `hcur` clone (N tiny launches), n-gram append, `GR.bind` before every draft chain
+  (about 2 x layers slice ops), one `.tolist()` per session for the drafts; per step in `step_slots`: three `torch.tensor` input builds and the per-row, per-layer python Engram hash with
+  every pread finished BEFORE the first replay (the solo path stages each layer group while the previous graph segment runs). `HY4_MU_HOSTFAST=1`: numpy `EngramStager` hash per session,
+  each group staged just before its own segment, inputs through a numpy view of the pinned buffer, one indexed copy into a preallocated `[slots, D]` hcur buffer, one `torch.cat` + `.tolist()`
+  for all drafts, no `bind` when the (slot, bucket) draft graph exists, n-gram appends deferred to the next round's GPU window. Same tokens as the baseline (CPU test).
+- `HY4_MU_HOSTPROF=1`: one `MUFAST` line per 100 rounds and when the scheduler goes idle: path counters (plain, spec, hcur_idx, bind_skip, draft_cat, stage_vec, stage_ov, inp_np, rows_gt8)
+  and ms per round for round / inputs / stage / launch / draft / wait / post / emit.
+- `HY4_MU_PRECAP=512,1024`: before the server is ready, capture every (bucket, rows) trunk graph for rows 1..TM and every (slot, bucket) draft graph, and print `MUCURVE Nb T ms`.
+- TM limit: `HY4_GRAPH_TM` up to 16. mu_slots `MAX_T = 16` (reference path above), `MMVQ_MAXR = 16` (MoE row kernels), engram staging and inputs are sized by TM. Rows 9..16 leave the
+  8-row fast paths: `mla_bgemv` / `router_gemv` (MAXT = 8: fp32 einsum / matmul), MLA absorb / unfold VALU kernels (R <= 8), DSA split decode (n_splits = 1 above 8 rows), `gm_moe_kq_decode`
+  (R <= 8, off by default) so a 16-row round can cost more than two 8-row rounds; the `MUCURVE` line measures it. Above 16 rows nothing is supported.

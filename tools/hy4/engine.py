@@ -47,6 +47,8 @@ def _stub_package(tree: str):
 
 
 class Hy4Engine:
+    LF = None           # loader.lever_fires, set by load()
+
     def __init__(self, tree: str, gguf: str, ctx: int = 16384, k: int = 3, chunk: int = CHUNK_DEFAULT, prime_rows: int = 0):
         self.tree, self.gguf, self.k, self.chunk = tree, gguf, k, chunk
         self.ctx = ctx
@@ -64,6 +66,15 @@ class Hy4Engine:
             from draft_policy import CostPolicy
             os.environ["HY4_DRAFT_CONF"] = "1"        # the draft graph appends the confidences (read at the import of mtp_head, i.e. in load())
             self.policy = CostPolicy.from_env()
+        self.fires = {"rounds": 0, "depth2": 0, "gate_skip": 0, "gate_run": 0}     # python-side lever counters (cumulative over the server life): rounds drafted, rounds with 2 draft rows, gate tail skipped / run
+        self.gate = None                          # HY4_SPEC2_GATE=1: draft kb steps, then a tail step only when the confidence gate says it pays (tools/hy4/depth_gate.py); single session only
+        if os.environ.get("HY4_SPEC2_GATE", "0") == "1":
+            from depth_gate import DepthGate
+            assert self.policy is None, "HY4_SPEC2_GATE and HY4_DRAFT_POLICY are exclusive"
+            self.gate_kb = int(os.environ.get("HY4_SPEC2_KB", "2"))
+            assert 1 <= self.gate_kb and self.k == self.gate_kb + 1, "HY4_SPEC2_GATE: num-draft must be HY4_SPEC2_KB + 1 (one tail step)"
+            os.environ["HY4_DRAFT_CONF"] = "1"        # the draft graphs append the confidences (read at the import of mtp_head, i.e. in load())
+            self.gate = DepthGate.from_env(self.gate_kb, self.k - self.gate_kb)
         self.ready = False
         self.meta = None
         self.last_stats: dict = {}
@@ -95,7 +106,9 @@ class Hy4Engine:
         from exllamav3.loader import mla_hy4 as mh
         from exllamav3.loader import step_graph as SG
         from exllamav3.loader import mtp_head as MH
-        self.hf, self.mh, self.SG, self.MH = hf, mh, SG, MH
+        from exllamav3.loader import lever_fires as LF
+        from exllamav3.loader import moe_i8, mla_bgemv      # noqa: F401  (register their counters)
+        self.hf, self.mh, self.SG, self.MH, self.LF = hf, mh, SG, MH, LF
         self._decode_flags()
         self.phase("prefill")                     # the prefill kernels are selected at layer load time too (as in the prefill harness)
         t0 = time.time()
@@ -114,6 +127,7 @@ class Hy4Engine:
         self.GR.prepare()                          # static K / indexer / Engram buffers at the full context size: addresses never change after this
         self.MT = MH.Hy4MTP(M)
         self.MG = self._mtp_graph()
+        self._mla2_precompile()
         MH._STAGE_OV[0] = os.environ.get("HY4_SERVE_STAGE_OV", "1") == "1"     # Engram row 0 of the next verify staged during the draft chain
         torch.cuda.synchronize()
         self.load_s = time.time() - t0
@@ -124,6 +138,9 @@ class Hy4Engine:
         return self.SG.GraphDecoder(M)
 
     def _mtp_graph(self):
+        if self.gate is not None:
+            import importlib
+            return importlib.import_module(f"{self.SG.__name__.rsplit('.', 1)[0]}.mtp_gate").MTPGraphGate(self.MT, self.gate_kb, self.k - self.gate_kb)
         return self.MH.MTPGraph(self.MT, self.k)
 
     def _decode_flags(self):
@@ -149,6 +166,21 @@ class Hy4Engine:
         hf.PF_MOE_I8 = hf.PF_MOE_REF = hf.PF_DENSE_I8 = hf.PF_ROUTER = hf.PF_DIAG = False
         mh.PF_ATTN, mh.PF_ATTN_FLASH = True, False          # (rows <= 16 never take the prefill branches)
 
+    def _mla2_precompile(self):
+        """HY4_MLA_ROWS2=1 + HY4_MLA_ROWS2_PRECOMPILE=1: compile + load every mla2 kernel specialisation of the decode graphs now (a first launch inside a graph capture would JIT / hipModuleLoad there)"""
+        rf = self.hf._rf
+        if not (rf.ROWS2 and rf.R2_PRECOMPILE):
+            return
+        from exllamav3.loader import graph_bucket as gb
+        kinds = set()
+        for i in range(self.M.n_layers):
+            m = self.M._layer(i).mla
+            kinds.add((int(m.H), int(m.R), int(m.rope_dim), int(m.window), int(getattr(m, "kv_ring", 0))))
+        mt = self.MT.mla
+        kinds.add((int(mt.H), int(mt.R), int(mt.rope_dim), int(mt.window), 0))
+        ns = set(gb.buckets(self.GR.cap)) | set(gb.buckets(self.MG.mt.cap, self.MG.BUCKET))
+        rf.mla2_precompile(kinds, range(1, self.SG.TM + 1), sorted(ns), str(self.dev), log=lambda s: print("load:", s, flush=True))
+
     def warmup(self, n: int):
         """one synthetic request of n prompt tokens + 8 decode tokens: compiles the Triton prefill kernels (they would land in the first user chunk, about 0.3 s) and captures the decode graphs"""
         n = warmup_clamp(n, self.ctx, self.k)
@@ -171,6 +203,8 @@ class Hy4Engine:
                 self.SG.PRIME_IX_BLK = old
         self.reset()
         print(f"warm-up {n} tokens: {time.perf_counter() - t0:.1f} s", flush=True)
+        if self.LF is not None:
+            print(self.LF.line(), flush=True)         # lever fires after the warm-up captured every graph: an arm whose flagged lever shows no hit (or a fallback reason) fails
         if os.environ.get("HY4_WARMUP_TAILS", "1") == "1":
             self.warmup_tails()
 
@@ -298,6 +332,10 @@ class Hy4Engine:
         tdec = time.perf_counter()
         if speculative:
             k = self.k
+            kd0 = self.gate_kb if self.gate is not None else k          # drafts read from the first draft graph
+            if self.gate is not None:
+                from depth_gate import draft_with_gate
+                self.gate.reset()                     # decisions depend on this request only (HY4_SPEC2_MODE=carry keeps the old carried state: negative control)
             pc = time.perf_counter
             tm = [0.0, 0.0, 0.0]
             ng = None
@@ -339,21 +377,28 @@ class Hy4Engine:
                 planned = False
                 if td_prev is not None and not skip:
                     gap[0] += lt[0] - td_prev
+                gb = None
                 if skip:
                     d, ext = [], cl
                     tb = pc()
                 else:
                     d = dd.tolist()
                     confs = None
-                    if self.MH.CONF:                      # the draft graph appended the k confidences (fixed point 2^-20)
+                    if self.gate is not None:
+                        d, gext, gb = draft_with_gate(self.gate, self.MG, d, kd0, j)
+                    elif self.MH.CONF:                      # the draft graph appended the k confidences (fixed point 2^-20)
                         confs = [c / 1048576.0 for c in d[k:]]
                         d = d[:k]
                     if self.policy is not None:
                         d = d[:self.policy.choose(confs, 1 if ng is not None else 0)]
+                    self.fires["rounds"] += 1
+                    self.fires["depth2"] += len(d) == 2
+                    if gb is not None:
+                        self.fires["gate_run" if gext else "gate_skip"] += 1
                     tb = pc()
                     ext = []
                 if ng is not None and not skip:
-                    lim = min(self.ngram_ext, self.SG.TM - 1 - k)
+                    lim = min(self.ngram_ext, self.SG.TM - 1 - (len(d) if self.gate is not None else k))
                     if self.ngram_gate:
                         since += 1
                         lim = lim if rate >= 0.6 else (2 if rate >= 0.4 else (lim if since >= 8 else 0))
@@ -381,6 +426,8 @@ class Hy4Engine:
                 while acc < nd and toks[acc + 1] == amh[acc]:
                     acc += 1
                 kk = len(toks) - 1 - len(ext)             # drafted rows of this round (the policy may cut the chain below k)
+                if gb is not None:
+                    self.gate.update(gb, gext, min(acc, kk))
                 if skip:
                     pass
                 elif self.policy is not None and confs is not None:
@@ -422,6 +469,9 @@ class Hy4Engine:
             st["capture_s"] = GR.stats["capture_s"] - caps0
             if self.policy is not None:
                 st["policy"] = self.policy.stats()
+            if self.gate is not None:
+                st["gate"] = self.gate.stats()
+            st["fires"] = dict(self.fires)
             st["ngram"] = {"ext": self.ngram_ext, "min": self.ngram_min, "fill": self.ngram_fill, "hit_rounds": n_hit, "ext_rows": n_ext, "ext_accepted": n_extacc, "long": self.ngram_long, "long_rounds": n_long}
         else:
             while out_n < max_new and not stop and not cancel():

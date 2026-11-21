@@ -15,13 +15,18 @@ import time
 
 import torch
 
+from . import kv_fp8 as _KV8
 from . import moe_i8 as MI
 from . import step_graph as SG
+from . import graph_bucket as _gb
+from . import ref_fused as _rf
 from . import step_nosync as _ns
 from .engram_rows import load_dense, rms
 from .hy4_forward import _mv, head_gemm, QLinear, GG_DENSE, dense_fn
 from .indexer_fused import FusedKPoolIndexer
 from .mla_hy4 import Hy4MLA
+
+KV_FP8_MTP = os.environ.get("HY4_KV_FP8_MTP", "0") == "1" and os.environ.get("HY4_KV_FP8", "0") == "1"     # draft layer K cache in fp8 like the trunk (644 B per token instead of 2304); needs HY4_KV_FP8=1
 
 
 def q8_0_pack(W):
@@ -61,6 +66,9 @@ class Hy4MTP:
         mla = Hy4MLA(g, il, lin=(lambda n: dl(n)) if self.fast else (lambda n: load_dense(g, n)))
         _mv(mla, dev, torch.float32)
         mla.post_norm, mla.sinks = mla.post_norm.to(dev), mla.sinks.to(dev)
+        if self.fast and os.environ.get("HY4_DRAFT_MLA_BG", "0") == "1":         # absorb matrices wk_b / wv_b (fp32 einsum = rocBLAS SGEMM at 80-135 us each) as int8 + fp16 block scales on the trunk's batched mat-vec
+            from . import mla_bgemv as _BGM
+            mla.bg_kb, mla.bg_vb = _BGM.Q8Batched.from_float(mla.wk_b), _BGM.Q8Batched.from_float(mla.wv_b)
         mla.kpos_arange = True
         mla.tm = fw.tm
         self.mla = mla
@@ -97,8 +105,10 @@ class Hy4MTP:
         st = _ns.state(fw)
         self.cap = cap or st.cap
         self.ar = st.ar if st.ar.shape[0] >= self.cap else torch.arange(self.cap, device=dev)
-        self.kbuf = torch.zeros(self.cap, mla.R + mla.rope_dim, device=dev)
+        self.kbuf = _KV8.Fp8KV(self.cap, mla.R, mla.rope_dim, dev) if KV_FP8_MTP else torch.zeros(self.cap, mla.R + mla.rope_dim, device=dev)
         SG.indexer_static_init(self.ix, self.cap)
+        self.ix.gv = self.fast and os.environ.get("HY4_DRAFT_IX_GV", "0") == "1"      # indexer fp32 matrices on the mat-vec
+        print(f"mtp_head: draft cfg fast={self.fast} moe_tiles={MI.GU_T}/{MI.DN_T} (flag {int(MI.TILES)}) mla_bg={getattr(mla, 'bg_kb', None) is not None and getattr(mla.bg_kb, 'draft', False)} (wk_b/wv_b int8) ix_gv={self.ix.gv}", flush=True)
         try:
             from . import attn_eager as _AE
             _AE.ensure(self.cap)
@@ -106,6 +116,13 @@ class Hy4MTP:
             pass
         if hasattr(fw, "free_bf16_head"):
             fw.free_bf16_head()              # HY4_HEAD_Q8=1: every consumer of the bf16 head values (draft head copies) has been built
+
+    def _kput(self, pos, kn):
+        """K rows by position (graph-capturable): fp32 index_copy_, or quantise on write when the draft cache is fp8"""
+        if isinstance(self.kbuf, _KV8.Fp8KV):
+            self.kbuf.write_pos(pos, kn)
+        else:
+            self.kbuf.index_copy_(0, pos, kn)
 
     def reset(self):
         self.kbuf.zero_()
@@ -143,7 +160,7 @@ class Hy4MTP:
         e = _ns.embed(fw, tok)
         x = torch.cat([nm(e, self.enorm), nm(h, self.hnorm)], -1) @ self.eh.T
         cur = nm(x, self.attn_norm)
-        self.kbuf.index_copy_(0, pos, mla.kv(cur, pos))
+        self._kput(pos, mla.kv(cur, pos))
         qr = nm(mla._q(cur, "wq_a") @ mla.wq_a.T, mla.q_a_norm)
         allow = SG.indexer_forward_static(self.ix, cur, qr, pos, N, self.ar)
         if self.fast:
@@ -176,7 +193,7 @@ class Hy4MTP:
         e = _ns.embed(self.fw, tok)
         x = torch.cat([nm(e, self.enorm), nm(h, self.hnorm)], -1) @ self.eh.T
         cur = nm(x, self.attn_norm)
-        self.kbuf.index_copy_(0, pos, self.mla.kv(cur, pos))
+        self._kput(pos, self.mla.kv(cur, pos))
         SG.indexer_keys_static(self.ix, cur, pos, self.ar)
 
     def prime(self, tok, h, pos, N):
@@ -227,7 +244,7 @@ class MTPGraph:
     """the draft chain of k head steps as ONE HIP graph per context bucket: static inputs (token, trunk state, head position), greedy argmax feeds the next
     step on the device, output = the k drafted tokens [k] (device). No host work between the steps."""
 
-    BUCKET = 512
+    BUCKET = 512          # base granule; the bucket of a long context is coarser (graph_bucket)
 
     def __init__(self, mt, k):
         self.mt, self.k = mt, k
@@ -256,6 +273,7 @@ class MTPGraph:
             h = y
         return torch.cat(outs + confs)
 
+    @_rf.r2_draft
     def _graph(self, N):
         g = self.graphs.get(N)
         if g is not None:
@@ -276,7 +294,7 @@ class MTPGraph:
     def precapture(self, ns=None):
         """capture the draft graph of every context bucket now (default: every bucket up to the cap); -> number built"""
         mt = self.mt
-        ns = sorted(set(ns)) if ns is not None else list(range(self.BUCKET, mt.cap + 1, self.BUCKET))
+        ns = sorted(set(ns)) if ns is not None else _gb.buckets(mt.cap, self.BUCKET)
         built = 0
         for N in ns:
             if N not in self.graphs:
@@ -287,7 +305,7 @@ class MTPGraph:
     def run(self, tok, h, j):
         """tok: host int (the token of the pair, x_{j+1}), h: device [1, D] trunk state h_j, j: head position -> device tensor [k] of drafts"""
         mt = self.mt
-        N = min(mt.cap, ((j + self.k) // self.BUCKET + 1) * self.BUCKET)
+        N = _gb.bucket(j + self.k + 1, mt.cap, self.BUCKET)
         if self.ev_set:
             self.ev.synchronize()
         self.hin[0], self.hin[1] = int(tok), int(j)
@@ -326,6 +344,7 @@ class MTPGraphCU(MTPGraph):
             h = y
         return torch.cat(outs)
 
+    @_rf.r2_draft
     def _graph(self, N, a):
         g = self.graphs.get((N, a))
         if g is not None:
@@ -347,7 +366,7 @@ class MTPGraphCU(MTPGraph):
         """toks: host ints [a + 1] (accepted drafts then the new token), h_rows [a + 1, D] device (trunk hidden of the positions pos0 .. pos0 + a),
         pos0: first head position -> device [k] drafts"""
         mt, a = self.mt, len(toks) - 1
-        N = min(mt.cap, ((pos0 + a + self.k) // self.BUCKET + 1) * self.BUCKET)
+        N = _gb.bucket(pos0 + a + self.k + 1, mt.cap, self.BUCKET)
         if self.ev_set:
             self.ev.synchronize()
         self.hin[:a + 1] = torch.tensor([int(t) for t in toks])

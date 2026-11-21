@@ -11,7 +11,13 @@ Ties at the top-k boundary: torch.topk order is unspecified (the CPU reference t
 """
 from __future__ import annotations
 import math
+import os
 import torch
+
+from . import rope_rows as _RR
+
+POOL16 = os.environ.get("HY4_IX_POOL16", "0") == "1"      # pooled keys stored in fp16 (half the bytes; the prefill scorer already scores with the fp16 copy); selection reads fp16 either way
+POOL_DT = torch.float16 if POOL16 else torch.float32
 
 
 def _rms(x, w, eps):
@@ -33,7 +39,7 @@ class FusedKPoolIndexer:
         self.n_top = top_k // kpool - self.tail
         self.n = 0                                                  # tokens seen (host int)
         self.P = 0                                                  # pooled groups stored (host int)
-        self.pool = torch.zeros(max(cap // kpool, 16), head_dim, device=self.dev)
+        self.pool = torch.zeros(max(cap // kpool, 16), head_dim, device=self.dev, dtype=POOL_DT)
         self.vg = None                                              # [<kpool, 2d] tokens of the open group
         self._cs = None                                             # (cos, sin) [Lpos, rope_dim/2] fp32
         self.last_scores = None
@@ -55,8 +61,11 @@ class FusedKPoolIndexer:
 
     def _rope(self, x, pos):
         """x [n, (H,) d], pos [n] long (device). Rotates the trailing rope_dim (NORM pairs)."""
-        c, s = self._table(self._max_pos)
-        c, s = c[pos], s[pos]
+        if _RR.ENABLED:                 # HY4_ROPE_POS: rows of these positions, no table to the full context
+            c, s = _RR.ix_rows(self.base, self.rope_dim, pos)
+        else:
+            c, s = self._table(self._max_pos)
+            c, s = c[pos], s[pos]
         sh = [x.shape[0]] + [1] * (x.dim() - 2) + [self.rope_dim // 2]
         c, s = c.reshape(sh), s.reshape(sh)
         d = x.shape[-1]
@@ -88,7 +97,7 @@ class FusedKPoolIndexer:
         m = buf.shape[0] // k
         if m:
             if self.P + m > self.pool.shape[0]:
-                big = torch.empty(max(2 * self.pool.shape[0], self.P + m), d, device=self.dev)
+                big = torch.empty(max(2 * self.pool.shape[0], self.P + m), d, device=self.dev, dtype=self.pool.dtype)
                 big[:self.P] = self.pool[:self.P]
                 self.pool = big
             self.pool[self.P:self.P + m] = self._pool_groups(buf[:m * k], self.P)
@@ -98,7 +107,7 @@ class FusedKPoolIndexer:
         iq = self._rope((qr @ self.w["q_b"].T).reshape(T, H, d), pos)
         wt = (x.float() @ self.w["proj"].T) / math.sqrt(d * H)
         P = self.P
-        pk = self.pool[:P]
+        pk = self.pool[:P].to(iq.dtype)
         kq = torch.relu(torch.einsum("nhd,pd->nhp", iq, pk))
         sc = (kq * wt[:, :, None]).sum(1)                                   # [T, P]
         gend = torch.arange(P, device=self.dev) * k + (k - 1)
