@@ -51,9 +51,7 @@ def bad_cases():
         ("bad_stop", chat, {"messages": [USER], "stop": 5}),
         ("json_format", chat, {"messages": [USER], "response_format": {"type": "json_object"}}),
         ("oversize_prompt", chat, {"messages": [{"role": "user", "content": "x " * 20000}], "reasoning_effort": "no_think"}),
-        ("oversize_max_tokens", chat, {"messages": [USER], "max_tokens": 999999}),
         ("completion_empty", "/v1/completions", {"prompt": ""}),
-        ("completion_oversize", "/v1/completions", {"prompt": "x", "max_tokens": 99999}),
     ]
     out = []
     for name, path, body in cases:

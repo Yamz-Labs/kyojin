@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.9.2.2
+
+Hy4-flash server: a request without `max_tokens` is no longer cut at 1024 tokens, and a `max_tokens` larger than the context window can hold is clipped, not refused (issue #222: an agent client's context compaction ended with stop reason `length`).
+
+- `--default-max-tokens 0` is the new default: a request with no `max_tokens` / `max_completion_tokens` may use all the room left in the context window (`-c` minus the prompt tokens, the draft rows and 2), like vLLM. A positive value keeps the old cap behaviour (the old default was `1024`). A negative value stops the start-up with a message.
+- A `max_tokens` (or the positive default) larger than the room left is clipped to the room; the reply ends with `finish_reason: "length"` when the clipped budget is used. It was a 400 (`prompt (N tokens) + max_tokens (M) exceeds the context window`). A prompt that leaves no room for one token is still a 400, with a message that says so. Same on `/v1/chat/completions` and `/v1/completions`, streamed or not.
+- New CPU tests: `tests/test_hy4_max_tokens.py`.
+
 ## 1.9.2.1
 
 Hy4-flash server: a refused request must never stop the server, and fewer harmless content parts are refused (issue #222).
