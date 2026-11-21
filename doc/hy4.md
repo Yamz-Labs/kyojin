@@ -80,6 +80,8 @@ Native Engram IO: `exllamav3/loader/engram_io.c` is compiled with `gcc` at first
 
 `--num-draft` is the number of MTP drafts per round (3 by default). Memory: the K buffers are sized by `-c` (about 0.1 MB per position); see Supported context for the measured totals.
 
+`--default-max-tokens` is the reply budget of a request that sends no `max_tokens` / `max_completion_tokens`. `0` (the default since 1.9.2.2) means all the room left in the context window (`-c` minus the prompt, the draft rows and 2), so a long reasoning is not cut at 1024 tokens and a client that sets no limit (a compaction call, for example) gets a full answer. A positive value is a cap (1.9.2.1 and earlier: `1024`). A `max_tokens` (asked or defaulted) larger than the room left is clipped to the room, and the reply ends with `finish_reason: "length"` if it uses all of it; it is not a 400 any more. Only a prompt that leaves no room for one token is a 400. This holds for `/v1/chat/completions` and `/v1/completions`, streamed or not.
+
 The start-up warm-up prompt is clamped to the context window (and skipped with one log line when the window is too small), so a small `-c` starts normally.
 
 ## Supported context

@@ -246,7 +246,8 @@ def _common(body: dict, default_max: int) -> dict:
     mt = body.get("max_completion_tokens")          # the newer name wins; an explicit null falls back to max_tokens
     if mt is None:
         mt = body.get("max_tokens")
-    max_tokens = default_max if mt is None else _as_int({"max_tokens": mt}, "max_tokens", default_max, 1)
+    # None = the request names no budget and the server has no cap (--default-max-tokens 0): the server then gives the whole room left in the context window
+    max_tokens = (default_max if default_max > 0 else None) if mt is None else _as_int({"max_tokens": mt}, "max_tokens", default_max, 1)
     for k in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
         v = body.get(k)
         if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))):
