@@ -276,10 +276,20 @@ def parse_effort(body: dict) -> str:
 
 
 TEXT_PARTS = ("text", "input_text", "output_text")
+IMAGE_PARTS = ("image_url", "input_image", "image")
+AUDIO_PARTS = ("input_audio", "audio")
+IMAGE_NOTE = "[an image was attached; this model cannot see images]"
+AUDIO_NOTE = "[audio was attached; this model cannot hear audio]"
+
+
+def _image_parts_note() -> bool:
+    """KYOJIN_IMAGE_PARTS=note: image / audio parts become a short text note. Anything else (unset, `reject`, a typo) keeps the 400. Read per call."""
+    return os.environ.get("KYOJIN_IMAGE_PARTS", "").strip().lower() == "note"
 
 
 def _content_text(c: Any) -> str:
-    """OpenAI content (a string, null, or a list of {type: text} parts) -> text. Null parts and null / empty text are empty text."""
+    """OpenAI content (a string, null, or a list of {type: text} parts) -> text. Null parts and null / empty text are empty text.
+    Image and audio parts are a 400, or with KYOJIN_IMAGE_PARTS=note one short text note each (every role: user, assistant, tool)."""
     if c is None:
         return ""
     if isinstance(c, str):
@@ -293,6 +303,8 @@ def _content_text(c: Any) -> str:
                 out.append(p)
             elif isinstance(p, dict) and (p.get("type") in TEXT_PARTS or (p.get("type") is None and "text" in p)) and (p.get("text") is None or isinstance(p["text"], str)):
                 out.append(p.get("text") or "")
+            elif isinstance(p, dict) and p.get("type") in IMAGE_PARTS + AUDIO_PARTS and _image_parts_note():
+                out.append(IMAGE_NOTE if p["type"] in IMAGE_PARTS else AUDIO_NOTE)
             else:
                 raise RequestError("only text content parts are supported (no images / audio)")
         return "".join(out)

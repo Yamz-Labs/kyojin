@@ -1076,6 +1076,13 @@ reset at every request, so a repeated request repeats its decisions), `static` (
 (depth chosen per round; `changed` = rounds where the gate cut the chain below the shipped depth; 0 means the gate did not fire) and `fires {...}` (rounds, depth2, gate_skip, gate_run).
 Rollback: unset the flag. See `tools/hy4/depth_gate.py`.
 
+#### `KYOJIN_IMAGE_PARTS` (default `reject`)
+
+Hy4-flash server only. The model reads text only. `reject` answers a chat request that has an image part (`image_url`, `input_image`, `image`) or an audio part
+(`input_audio`, `audio`) with a 400, as in 1.9.2. `note` replaces each such part by one line of text and serves the request: `[an image was attached; this model cannot see images]`
+or `[audio was attached; this model cannot hear audio]`. The text parts stay in order. It applies to every role, including `tool` results and assistant messages.
+Other part types (video, file) are still a 400. Any other value keeps `reject`. Read at each request. For agents that attach screenshots to tool results and must not stop.
+
 #### Hy4-flash 1.9.1 levers (all on by default; `=0` restores 1.9.0)
 
 Hy4-flash server only. `tools/hy4/serve.py` sets these in `SHIPPED_ENV` without overriding a value you set, so `HY4_<FLAG>=0 python tools/hy4/serve.py ...` is the rollback of one lever to the 1.9.0 behaviour. The levers are independent of each other. Guide: [hy4.md](hy4.md).

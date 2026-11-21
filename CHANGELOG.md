@@ -15,6 +15,7 @@
 - Hy4-flash: online speculative draft-depth gate, `HY4_SPEC2_GATE=1` (default off), mode `HY4_SPEC2_MODE=learn` (default, the measured S7 arm O), KB 2, THETA 0.6 for the `static` mode.
   Base draft graph of 2 steps plus a confidence-gated third step. Fires counter per request: depth chosen per round and rounds where the gate changed the depth.
   The gate's tail graph uses the same bucket helper as `HY4_GRAPH_BUCKET_REL`. See `doc/env_vars.md`.
+- Hy4-flash server: `KYOJIN_IMAGE_PARTS=reject|note` (default `reject`, the 400 of 1.9.2 is unchanged). With `note`, each image part (`image_url`, `input_image`, `image`) and audio part (`input_audio`, `audio`) of a message of any role (user, assistant, `tool`) becomes a one-line text note, so an agent that attaches a screenshot to a tool result does not stop on a 400 (issue #222); text parts keep their order, other part types are still a 400. CPU tests: `tests/test_hy4_image_parts.py`. See `doc/env_vars.md`.
 
 ## 1.9.2
 
