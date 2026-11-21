@@ -1076,12 +1076,15 @@ reset at every request, so a repeated request repeats its decisions), `static` (
 (depth chosen per round; `changed` = rounds where the gate cut the chain below the shipped depth; 0 means the gate did not fire) and `fires {...}` (rounds, depth2, gate_skip, gate_run).
 Rollback: unset the flag. See `tools/hy4/depth_gate.py`.
 
-#### `KYOJIN_IMAGE_PARTS` (default `reject`)
+#### `KYOJIN_IMAGE_PARTS` (default `note`)
 
-Hy4-flash server only. The model reads text only. `reject` answers a chat request that has an image part (`image_url`, `input_image`, `image`) or an audio part
-(`input_audio`, `audio`) with a 400, as in 1.9.2. `note` replaces each such part by one line of text and serves the request: `[an image was attached; this model cannot see images]`
-or `[audio was attached; this model cannot hear audio]`. The text parts stay in order. It applies to every role, including `tool` results and assistant messages.
-Other part types (video, file) are still a 400. Any other value keeps `reject`. Read at each request. For agents that attach screenshots to tool results and must not stop.
+Hy4-flash server only. The model reads text only. `note` (default) replaces each image part (`image_url`, `input_image`, `image`), audio part (`input_audio`, `audio`) and
+file part (`file`, `input_file`) of a chat message by one line of text and serves the request: `[an image was attached; this model cannot see images]`,
+`[audio was attached; this model cannot hear audio]` or `[a file was attached; this model cannot read files]`. The text parts stay in order. It applies to every role,
+including `tool` results and assistant messages, so an agent client that keeps screenshots in its history keeps working. `reject` is the strict mode: such a part is a 400
+that names the message and the part (`message 3, part 1: type 'image_url' is not supported ...`). Any other value is `note` (one warning line in the log). Read at each
+request. Other part types: `text`, `input_text`, `output_text` and `refusal` are text; `reasoning`, `thinking` and `reasoning_content` parts of an assistant message become
+its `reasoning_content`; `redacted_thinking` is dropped; extra keys such as `cache_control` are ignored; unknown types are a 400 (table `PART_ACTIONS` in `tools/hy4/serve_core.py`).
 
 #### Hy4-flash 1.9.1 levers (all on by default; `=0` restores 1.9.0)
 
