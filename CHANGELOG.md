@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (1.9.2.2)
+## 1.9.2.2
 
 Hy4-flash server: a request without `max_tokens` is no longer cut at 1024 tokens, and a `max_tokens` larger than the context window can hold is clipped, not refused (issue #222: an agent client's context compaction ended with stop reason `length`).
 
