@@ -724,8 +724,9 @@
           # hipcc; a runtime-lib subset would break that. A later diet to a
           # runtime subset is possible once the first-launch compile set is
           # characterized.
-          # Model packs are NEVER baked in: the entrypoint downloads the
-          # configured repo into /models (a volume) on first start.
+          # Model packs are NEVER baked in: the entrypoint reconciles the
+          # configured repo (and optional revision) into /models (a volume)
+          # on every start.
           kyojinEntryPoint = pkgs.writeShellScript "kyojin-entrypoint" ''
             set -euo pipefail
             flavor="''${KYOJIN_FLAVOR:-}"
@@ -741,27 +742,52 @@
               echo "kyojin-entrypoint: set KYOJIN_MODEL_REPO (e.g. yamz-labs/GLM-5.3-Flash-EXL3-Yamz)" >&2
               exit 2
             fi
+            # Some packs keep each quantisation in its own git branch or tag,
+            # so the default branch holds no weights at all and a revision is
+            # the only way to fetch one.
+            revision="''${KYOJIN_MODEL_REVISION:-}"
             model_dir="''${KYOJIN_MODEL_DIR:-/models/$flavor}"
             # Tuning cache (e.g. GLM's dense GEMM tune, ~8 min first launch)
             # must survive container replacement: keep HOME on the volume.
             export HOME="''${KYOJIN_HOME:-/models/home}"
             mkdir -p "$HOME" "$model_dir"
-            # One slot per flavor; the marker records which repo filled it so
-            # switching repos under the same flavor fails loudly instead of
-            # serving a stale pack.
+            # One slot per flavor; the marker records repo@revision (repo alone
+            # when no revision is asked for) so a pack cannot outlive the
+            # revision it was fetched from: changing either under the same
+            # flavor fails loudly instead of serving what is already on disk.
             marker="$model_dir/.kyojin-repo"
-            if [ -f "$model_dir/config.json" ]; then
-              if [ -f "$marker" ] && [ "$(cat "$marker")" != "$repo" ]; then
-                echo "kyojin-entrypoint: $model_dir holds $(cat "$marker"), not $repo;" >&2
-                echo "  set KYOJIN_MODEL_DIR or empty the directory" >&2
-                exit 2
-              fi
-              echo "kyojin-entrypoint: model present at $model_dir, skipping download" >&2
-            else
-              echo "kyojin-entrypoint: downloading $repo into $model_dir (first start is slow)" >&2
-              hf download "$repo" --local-dir "$model_dir"
-              printf '%s' "$repo" > "$marker"
+            want="$repo"
+            if [ -n "$revision" ]; then
+              want="$repo@$revision"
             fi
+            if [ -f "$marker" ] && [ "$(cat "$marker")" != "$want" ]; then
+              echo "kyojin-entrypoint: $model_dir holds $(cat "$marker"), not $want;" >&2
+              echo "  set KYOJIN_MODEL_DIR or empty the directory" >&2
+              exit 2
+            fi
+            # Reconcile on every start instead of skipping when config.json is
+            # there: a pack fetched once keeps whatever layout the repo had at
+            # the time, and anything added upstream later (a directory a serve
+            # flag points into, say) is missing from it. hf download against
+            # --local-dir is idempotent -- unchanged files are skipped, files
+            # new to the repo are added, an interrupted transfer is retried --
+            # so a start costs a listing, not the pack.
+            echo "kyojin-entrypoint: syncing $want into $model_dir (unchanged files are skipped)" >&2
+            if [ -n "$revision" ]; then
+              hf download "$repo" --revision "$revision" --local-dir "$model_dir"
+            else
+              hf download "$repo" --local-dir "$model_dir"
+            fi
+            # A revision that matches nothing, or the default branch of a
+            # branch-quantised repo, downloads no files and still exits 0; the
+            # marker would then pin an empty slot and the server would die in
+            # load(). Refuse to serve a directory that cannot be a pack.
+            if [ ! -f "$model_dir/config.json" ]; then
+              echo "kyojin-entrypoint: $want left no config.json in $model_dir;" >&2
+              echo "  check the repo, and set KYOJIN_MODEL_REVISION if the weights live on a branch or tag" >&2
+              exit 2
+            fi
+            printf '%s' "$want" > "$marker"
             echo "kyojin-entrypoint: serving $flavor from $model_dir" >&2
             exec "''${KYOJIN_BIN:-/bin/kyojin-serve-$flavor}" --host 0.0.0.0 --model "$model_dir" "$@"
           '';
