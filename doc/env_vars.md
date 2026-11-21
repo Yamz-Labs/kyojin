@@ -1063,9 +1063,9 @@ weights. `on` (also `1`, `preset`, `true`, `yes`) loads the preset bundled in th
 spec. Unset, empty, `0`, `off`, `false`, `no` and `none`: no edit is installed. A malformed spec or a missing file stops
 the load. The preset is in `presets/hy4-uncensor/`. See [hy4.md](hy4.md).
 
-#### `HY4_SPEC2_GATE` (default `0`, off)
+#### `HY4_SPEC2_GATE` (default `1` since 1.9.3, `0` = off)
 
-Hy4-flash server only. `1` turns on the online draft-depth gate: the base draft graph runs `HY4_SPEC2_KB` steps (default `2`), and a tail graph
+Hy4-flash server only. `1` (the shipped default, set in `SHIPPED_ENV`) turns on the online draft-depth gate: the base draft graph runs `HY4_SPEC2_KB` steps (default `2`), and a tail graph
 runs one more step (plus its verify row) only when the gate says it pays. `--num-draft` must equal `HY4_SPEC2_KB + 1` (the shipped 3). It is exclusive with
 `HY4_DRAFT_POLICY`, and the gate turns `HY4_DRAFT_CONF` on by itself. Speculation stays lossless: the gate only changes how many drafts are verified.
 `HY4_SPEC2_MODE` picks the rule: `learn` (default, the measured S7 arm O: an online rule that learns the chance that the extension is accepted per confidence bin,
@@ -1074,7 +1074,11 @@ reset at every request, so a repeated request repeats its decisions), `static` (
 `HY4_SPEC2_STEP_MS`, `HY4_SPEC2_GAP_MS`, `HY4_SPEC2_PRIOR_N`, `HY4_SPEC2_PRIOR_Q`, `HY4_SPEC2_PROBE` (every N-th round extends whatever the bin says, default 16), `HY4_ROW_MS`
 (verify ms per row count). Fires counter: each request prints `FIRES gate mode=... depth_hist={2: n, 3: m} changed=a/b req_depth_hist=... req_changed=a/b`
 (depth chosen per round; `changed` = rounds where the gate cut the chain below the shipped depth; 0 means the gate did not fire) and `fires {...}` (rounds, depth2, gate_skip, gate_run).
-Rollback: unset the flag. See `tools/hy4/depth_gate.py`.
+The server turns it off by itself with `--slots > 1`, with `--num-draft` other than 3 and when `HY4_DRAFT_POLICY` is set. Rollback: `HY4_SPEC2_GATE=0`. See `tools/hy4/depth_gate.py`.
+
+#### `HY4_MLA_ROWS2` (default `1` since 1.9.3, `0` = off)
+
+Hy4-flash server only. Row-batched split-K decode attention: one pass over the K rows serves all verify rows of a round, q is streamed in chunks. Shipped on in `SHIPPED_ENV`; off by itself with `--slots > 1`; a decode call outside its shape support runs the 1.9.2 attention path. Fires counter: `HY4_MLA_ROWS2_FIRES=<file>` holds `FIRES mla2 <n> trunk <a> draft <b> fallback {...}`. Tunables `HY4_MLA_ROWS2_BH`, `_RG`, `_BN`, `_BK`, `_NW`, `_PROG`, `_SPLIT`, `_RS`, `_MINB`; `HY4_MLA_ROWS2_PRECOMPILE=1` (default `0`) compiles every specialisation at the end of load; `HY4_MLA_ROWS2_TRACE=1` prints the first launch of each key. Rollback: `HY4_MLA_ROWS2=0`.
 
 #### `KYOJIN_IMAGE_PARTS` (default `note`)
 

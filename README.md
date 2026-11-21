@@ -41,6 +41,13 @@ python tools/hy4/serve.py --model ./hy4/Hy4-flash-Q3_K-00001-of-00002.gguf --por
 
 At this setting, on a 128 GB machine with nothing else large resident, the server peaked at 102.7 GiB of GTT and kept about 16 GiB of memory free (15 GiB during a 64K prefill); a smaller `-c` leaves more ([doc/hy4.md](doc/hy4.md)). Close other GPU or memory-heavy apps first.
 
+### New in 1.9.3 (Hy4-flash)
+
+- Decode: seven levers on by default (five decode levers, the speculative depth gate, row-batched MLA attention). Served speculative decode at 12K on a Strix Halo box: about +7 % from the five levers, then +3.9 % from the depth gate and +11.5 % from the attention kernel in a second paired run (24.4 / 20.2 / 20.5 tok/s on 1.9.2 for code / prose / chat, 29.6 / 26.4 / 25.1 at the end). Details: [changelog](CHANGELOG.md).
+- Each lever has a switch: `HY4_<FLAG>=0` restores the 1.9.2 path ([flag table](doc/env_vars.md)). Rebuild the kernels with `bash tools/hy4/install_strix.sh` after the update. The gate and the attention kernel step aside with `--slots > 1`.
+- Fix: 22 of 42 MoE layers of the Q3_K file never took the new expert path; they do now.
+- Server: a refused request never stops the server; a request without `max_tokens` gets the room left in the context window. Client smoke gate: `tools/hy4/client_smoke.py`.
+
 ### New in 1.9.1 (Hy4-flash)
 
 - Prefill: lazy layer residual, head-major attention operands, Q3_K gate-up kernel V2. Decode: Q8_0 output head, shared-expert branch forked inside the HIP graph, router launch tuning, absorb v2.
