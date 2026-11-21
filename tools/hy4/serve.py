@@ -177,9 +177,16 @@ def build_app(st: State):
         r["in_think"] = not r["prefill"] and r["effort"] != "no_think" and bool(v.think_begin) and text.rstrip().endswith(v.think_begin)
         return r, ids
 
-    def check_len(n, max_new):
-        if n + max_new + args.num_draft + 2 > args.max_ctx:
-            raise C.RequestError(f"prompt ({n} tokens) + max_tokens ({max_new}) exceeds the context window ({args.max_ctx})", 400, "context_length_exceeded")
+    def fit_budget(n, r):
+        """Set r["max_tokens"] to the reply budget the context window allows for an n-token prompt. A request without max_tokens (and --default-max-tokens 0)
+        gets all the room left; a larger budget (asked or defaulted) is clipped to the room, and the reply ends with finish_reason `length` if it uses it.
+        Only a prompt that leaves no room for one token is a 400."""
+        room = args.max_ctx - n - args.num_draft - 2
+        if room < 1:
+            raise C.RequestError(f"prompt ({n} tokens) does not fit the context window ({args.max_ctx}): no room left to reply; shorten the prompt or start the server with a larger -c",
+                                 400, "context_length_exceeded")
+        want = r["max_tokens"]
+        r["max_tokens"] = room if want is None else min(want, room)
 
     async def run_job_mu(ids, r, in_think, request):
         """--slots > 1: the request joins the scheduler (own slot, batched decode with the other sessions); same events as run_job"""
@@ -327,7 +334,7 @@ def build_app(st: State):
         try:
             need_ready()
             r, ids = prompt_for_chat(await read_body(request))
-            check_len(len(ids), r["max_tokens"])
+            fit_budget(len(ids), r)
             rid, created = C.new_id("chatcmpl"), int(time.time())
             m = args.model_id
             if not r["stream"]:
@@ -377,7 +384,7 @@ def build_app(st: State):
             need_ready()
             r = C.parse_completion(await read_body(request), st.vocab.size, args.default_max_tokens)
             ids = r["prompt_ids"] if r["prompt_ids"] is not None else st.vocab.encode(r["prompt"])
-            check_len(len(ids), r["max_tokens"])
+            fit_budget(len(ids), r)
             rid, created, m = C.new_id("cmpl"), int(time.time()), args.model_id
             if not r["stream"]:
                 text, stats, finish, n_gen = [], None, "length", 0
@@ -506,10 +513,14 @@ def main(argv=None):
     ap.add_argument("--num-draft", type=int, default=3, help="MTP draft tokens per round (verify T = k + 1 rows)")
     ap.add_argument("--prefill-chunk", type=int, default=8192)
     ap.add_argument("--draft-fill-rows", type=int, default=0, help="fill the draft head's cache for the last N prompt rows only (0 = the whole prompt)")
-    ap.add_argument("--default-max-tokens", type=int, default=1024)
+    ap.add_argument("--default-max-tokens", type=int, default=0,
+                    help="reply budget of a request without max_tokens: 0 (default) = all the room left in the context window (-c minus the prompt); N > 0 = at most N tokens. "
+                         "A max_tokens larger than the room left is clipped to it (finish_reason length), never refused")
     ap.add_argument("--slots", type=int, default=1, help="concurrent sessions decoded in ONE batched step (1 = the single-request engine behind the lock)")
     ap.add_argument("--sched-chunk", type=int, default=1024, help="prefill rows per scheduler turn with --slots > 1 (a decode round of the other sessions runs between chunks)")
     args = ap.parse_args(argv)
+    if args.default_max_tokens < 0:
+        ap.error("--default-max-tokens must be 0 (all the room left in the context window) or a positive number of tokens")
     apply_env(args.max_ctx, args.model, args.slots)
     check_kernels()
     st = State(args)

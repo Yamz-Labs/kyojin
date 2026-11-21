@@ -119,7 +119,7 @@ class Http(unittest.IsolatedAsyncioTestCase):
 
     async def test_errors(self):
         for path, body, status in (("/v1/chat/completions", {"messages": []}, 400), ("/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}], "tools": [1]}, 400),
-                                   ("/v1/completions", {"prompt": ""}, 400), ("/v1/completions", {"prompt": "x", "max_tokens": 99999}, 400)):
+                                   ("/v1/completions", {"prompt": ""}, 400)):
             r = await self.client.post(path, json=body)
             j = await r.json()
             self.assertEqual(r.status, status, j)

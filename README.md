@@ -85,7 +85,7 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
   -d '{"messages": [{"role": "user", "content": "Say hello in five words."}]}'
 ```
 
-Hy4-flash thinks before it answers: the reasoning comes back in `reasoning_content` and the answer in `content`, so a small `max_tokens` can end inside the reasoning and leave `content` empty. For a direct answer add `"reasoning_effort": "no_think"` (or `"chat_template_kwargs": {"reasoning_effort": "no_think"}`), or leave room for the reasoning with a larger `max_tokens`:
+Hy4-flash thinks before it answers: the reasoning comes back in `reasoning_content` and the answer in `content`, so a small `max_tokens` can end inside the reasoning and leave `content` empty. For a direct answer add `"reasoning_effort": "no_think"` (or `"chat_template_kwargs": {"reasoning_effort": "no_think"}`), or leave room for the reasoning with a larger `max_tokens`. A request without `max_tokens` may use all the room left in the context window (`--default-max-tokens 0`, the default; a positive value caps it), and a `max_tokens` larger than that room is clipped to it, not refused:
 
 ```bash
 curl http://localhost:8300/v1/chat/completions -H "Content-Type: application/json" \
