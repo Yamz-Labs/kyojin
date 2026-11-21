@@ -1063,6 +1063,16 @@ weights. `on` (also `1`, `preset`, `true`, `yes`) loads the preset bundled in th
 spec. Unset, empty, `0`, `off`, `false`, `no` and `none`: no edit is installed. A malformed spec or a missing file stops
 the load. The preset is in `presets/hy4-uncensor/`. See [hy4.md](hy4.md).
 
+#### `KYOJIN_IMAGE_PARTS` (default `note`)
+
+Hy4-flash server only. The model reads text only. `note` (default) replaces each image part (`image_url`, `input_image`, `image`), audio part (`input_audio`, `audio`) and
+file part (`file`, `input_file`) of a chat message by one line of text and serves the request: `[an image was attached; this model cannot see images]`,
+`[audio was attached; this model cannot hear audio]` or `[a file was attached; this model cannot read files]`. The text parts stay in order. It applies to every role,
+including `tool` results and assistant messages, so an agent client that keeps screenshots in its history keeps working. `reject` is the strict mode: such a part is a 400
+that names the message and the part (`message 3, part 1: type 'image_url' is not supported ...`). Any other value is `note` (one warning line in the log). Read at each
+request. Other part types: `text`, `input_text`, `output_text` and `refusal` are text; `reasoning`, `thinking` and `reasoning_content` parts of an assistant message become
+its `reasoning_content`; `redacted_thinking` is dropped; extra keys such as `cache_control` are ignored; unknown types are a 400 (table `PART_ACTIONS` in `tools/hy4/serve_core.py`).
+
 #### Hy4-flash 1.9.1 levers (all on by default; `=0` restores 1.9.0)
 
 Hy4-flash server only. `tools/hy4/serve.py` sets these in `SHIPPED_ENV` without overriding a value you set, so `HY4_<FLAG>=0 python tools/hy4/serve.py ...` is the rollback of one lever to the 1.9.0 behaviour. The levers are independent of each other. Guide: [hy4.md](hy4.md).

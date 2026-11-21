@@ -275,28 +275,90 @@ def parse_effort(body: dict) -> str:
     return EFFORT_MAP[v]
 
 
-TEXT_PARTS = ("text", "input_text", "output_text")
+# Content part types a chat message may carry -> what the server does with them. One line adds a type.
+#   text       the part's text is kept, in order (any other key of the part, such as cache_control, is ignored)
+#   reasoning  prior reasoning of an assistant message: it becomes the message's reasoning_content (the template decides what it shows); in other roles it is dropped
+#   drop       ignored
+# Image / audio / file parts (MEDIA_PARTS) cannot be read by the model: each becomes one line of text (KYOJIN_IMAGE_PARTS=note, the default) or a 400 that names the part (reject). A type that is in neither table is a 400 too.
+PART_ACTIONS = {"text": "text", "input_text": "text", "output_text": "text", "refusal": "text",
+                "reasoning": "reasoning", "thinking": "reasoning", "reasoning_content": "reasoning", "redacted_thinking": "drop"}
+MEDIA_PARTS = {"image_url": "image", "input_image": "image", "image": "image", "input_audio": "audio", "audio": "audio", "file": "file", "input_file": "file"}
+PART_TEXT_KEYS = ("text", "refusal", "thinking", "reasoning", "reasoning_content", "content")
 
 
-def _content_text(c: Any) -> str:
-    """OpenAI content (a string, null, or a list of {type: text} parts) -> text. Null parts and null / empty text are empty text."""
+def _part_text(p: dict) -> str:
+    """the text of a text / refusal / reasoning part: the first string among its text-like keys (null or missing = empty text)"""
+    for k in PART_TEXT_KEYS:
+        if isinstance(p.get(k), str):
+            return p[k]
+    return ""
+
+
+MEDIA_NOTES = {"image": "[an image was attached; this model cannot see images]",
+               "audio": "[audio was attached; this model cannot hear audio]",
+               "file": "[a file was attached; this model cannot read files]"}
+_WARNED_IMAGE_PARTS: set = set()
+
+
+def image_parts_mode() -> str:
+    """KYOJIN_IMAGE_PARTS: `note` (default) replaces each image / audio / file part by one line of text; `reject` is the strict 400. Any other value is `note`
+    (one warning line per value). Read at each request."""
+    v = os.environ.get("KYOJIN_IMAGE_PARTS", "").strip().lower()
+    if v in ("", "note", "reject"):
+        return v or "note"
+    if v not in _WARNED_IMAGE_PARTS:
+        _WARNED_IMAGE_PARTS.add(v)
+        print(f"warning: KYOJIN_IMAGE_PARTS={v!r} is not note or reject: using note", flush=True)
+    return "note"
+
+
+def _media_part(kind: str) -> str | None:
+    """the text a media part of this kind (image, audio, file) is replaced by, or None to refuse it (KYOJIN_IMAGE_PARTS=reject)"""
+    return MEDIA_NOTES[kind] if image_parts_mode() == "note" else None
+
+
+def _content(c: Any, where: str = "content") -> tuple[str, str]:
+    """OpenAI content (a string, null, or a list of parts) -> (text, reasoning). `where` names the message in errors ("message 7").
+    A part is a bare string, or a dict whose `type` is a PART_ACTIONS key (no type and a `text` key = text). Null parts are skipped. Null / empty text is empty text.
+    A part that cannot be used is a RequestError naming the message and the part: "message 7, part 2: type 'video' is not supported"."""
     if c is None:
-        return ""
+        return "", ""
     if isinstance(c, str):
-        return c
-    if isinstance(c, list):
-        out = []
-        for p in c:
-            if p is None:
-                continue
-            if isinstance(p, str):
-                out.append(p)
-            elif isinstance(p, dict) and (p.get("type") in TEXT_PARTS or (p.get("type") is None and "text" in p)) and (p.get("text") is None or isinstance(p["text"], str)):
-                out.append(p.get("text") or "")
-            else:
-                raise RequestError("only text content parts are supported (no images / audio)")
-        return "".join(out)
-    raise RequestError("message content must be a string or a list of text parts")
+        return c, ""
+    if not isinstance(c, list):
+        raise RequestError(f"{where}: content must be a string or a list of parts")
+    text, reasoning = [], []
+    for j, p in enumerate(c):
+        if p is None:
+            continue
+        if isinstance(p, str):
+            text.append(p)
+            continue
+        if not isinstance(p, dict):
+            raise RequestError(f"{where}, part {j}: a part must be a string or an object")
+        kind = p.get("type")
+        if kind is None and "text" in p:
+            kind = "text"
+        action = PART_ACTIONS.get(kind) if isinstance(kind, str) else None
+        if action == "text" and any(p.get(k) is not None and not isinstance(p[k], str) for k in PART_TEXT_KEYS[:2]):
+            raise RequestError(f"{where}, part {j}: the text of a {kind!r} part must be a string")
+        if action == "text":
+            text.append(_part_text(p))
+        elif action == "reasoning":
+            reasoning.append(_part_text(p))
+        elif action == "drop":
+            continue
+        elif isinstance(kind, str) and kind in MEDIA_PARTS and _media_part(MEDIA_PARTS[kind]) is not None:
+            text.append(_media_part(MEDIA_PARTS[kind]))
+        elif isinstance(kind, str) and kind in MEDIA_PARTS:
+            raise RequestError(f"{where}, part {j}: type {kind!r} is not supported (this model reads text only: no {MEDIA_PARTS[kind]} parts)")
+        else:
+            raise RequestError(f"{where}, part {j}: type {kind!r} is not supported")
+    return "".join(text), "".join(reasoning)
+
+
+def _content_text(c: Any, where: str = "content") -> str:
+    return _content(c, where)[0]
 
 
 def _function_tool(t: Any, where: str) -> dict:
@@ -424,8 +486,11 @@ def parse_chat(body: dict, default_max: int = 1024) -> dict:
         if not isinstance(m, dict) or m.get("role") not in CHAT_ROLES:
             raise RequestError(f"messages[{i}]: role must be system, user, assistant or tool")
         role = CHAT_ROLES[m["role"]]          # developer = system
-        item = {"role": role, "content": _content_text(m.get("content"))}
+        content, part_reasoning = _content(m.get("content"), f"message {i}")
+        item = {"role": role, "content": content}
         rc = m.get("reasoning_content", m.get("reasoning"))
+        if not (isinstance(rc, str) and rc) and role == "assistant":
+            rc = part_reasoning                     # reasoning parts of the content (an explicit reasoning_content field wins)
         if role == "system":
             if item["content"]:
                 system.append(item["content"])

@@ -235,18 +235,25 @@ def build_app(st: State):
             return out.done
 
         def work():
+            # the ("end",) event MUST reach the queue whatever happens here (the engine raises, the output flush raises): the handler holds st.lock until it reads it
             try:
-                res["stats"] = st.engine.generate(ids, r["max_tokens"], on_tokens, speculative=r["speculative"], cancel=cancel.is_set)
+                try:
+                    res["stats"] = st.engine.generate(ids, r["max_tokens"], on_tokens, speculative=r["speculative"], cancel=cancel.is_set)
+                except Exception as e:      # noqa: BLE001
+                    traceback.print_exc()
+                    res["error"] = f"{type(e).__name__}: {e}"
+                finally:
+                    for ch, tx in out.finish():
+                        loop.call_soon_threadsafe(q.put_nowait, ("delta", ch, tx))
             except Exception as e:      # noqa: BLE001
                 traceback.print_exc()
-                res["error"] = f"{type(e).__name__}: {e}"
+                res.setdefault("error", f"{type(e).__name__}: {e}")
             finally:
-                for ch, tx in out.finish():
-                    loop.call_soon_threadsafe(q.put_nowait, ("delta", ch, tx))
                 loop.call_soon_threadsafe(q.put_nowait, ("end",))
 
         async with st.lock:
             fut = loop.run_in_executor(None, work)
+            fut.add_done_callback(lambda _f: q.put_nowait(("end",)))      # belt and braces: a worker that died without its own end event still frees the handler
             watcher = watch_client(request, q)
             try:
                 while True:
@@ -352,6 +359,9 @@ def build_app(st: State):
             return web.Response(status=499)
         except RuntimeError as e:
             return _err(500, str(e), "server_error")
+        except Exception as e:      # noqa: BLE001  (a bug in a parser or a template: one 500, the server keeps answering)
+            traceback.print_exc()
+            return _err(500, f"{type(e).__name__}: {e}", "server_error")
 
     async def completions(request):
         try:
@@ -390,6 +400,9 @@ def build_app(st: State):
             return web.Response(status=499)
         except RuntimeError as e:
             return _err(500, str(e), "server_error")
+        except Exception as e:      # noqa: BLE001  (a bug in a parser or a template: one 500, the server keeps answering)
+            traceback.print_exc()
+            return _err(500, f"{type(e).__name__}: {e}", "server_error")
 
     async def tokenize(request):
         try:
@@ -402,6 +415,9 @@ def build_app(st: State):
             return web.json_response(serve_compat.tokenize_reply(ids, args.max_ctx))
         except C.RequestError as e:
             return _err(e.status, str(e), e.code)
+        except Exception as e:      # noqa: BLE001
+            traceback.print_exc()
+            return _err(500, f"{type(e).__name__}: {e}", "server_error")
 
     async def apply_template(request):
         try:
@@ -410,6 +426,9 @@ def build_app(st: State):
             return web.json_response({"prompt": st.vocab.chat_prompt(r)[0]})
         except C.RequestError as e:
             return _err(e.status, str(e), e.code)
+        except Exception as e:      # noqa: BLE001
+            traceback.print_exc()
+            return _err(500, f"{type(e).__name__}: {e}", "server_error")
 
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app.router.add_get("/health", health)

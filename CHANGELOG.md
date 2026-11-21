@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.2.1
+
+Hy4-flash server: a refused request must never stop the server, and fewer harmless content parts are refused (issue #222).
+
+- A worker that fails while it flushes its output (or dies without its end event) no longer leaves the request handler waiting with the generation lock held: the end event is always sent, the lock is released, and the client gets a 500 (or an SSE error event followed by `[DONE]`). An unexpected exception in a request parser or the chat template is one JSON 500 and the server keeps answering. Every request check (content parts, tools, effort, `max_tokens`, `stop`, context size, JSON) runs before the lock and before the SSE response starts.
+- Content parts: the 400 names the message and the part (`message 7, part 2: type 'video' is not supported`; indexes start at 0). Accepted now: `refusal` (as text), `reasoning` / `thinking` / `reasoning_content` parts of an assistant message (they become its `reasoning_content`; dropped in other roles), `redacted_thinking` (dropped), bare string parts, empty text, extra keys such as `cache_control`. Unknown types are still a 400. One table (`PART_ACTIONS` in `tools/hy4/serve_core.py`) adds a type.
+- New `KYOJIN_IMAGE_PARTS=note|reject` (default `note`): each image, audio or file part of any message (user, assistant, tool) becomes one line of text such as `[an image was attached; this model cannot see images]` and the request is served, so agent clients that keep screenshots in their history keep working. `reject` is the strict 400 of 1.9.2. Any other value is `note` with one warning line. See `doc/env_vars.md`.
+- New CPU tests: `tests/test_hy4_request_error.py` (every refused request, then a normal one answers, streamed or not), `tests/test_hy4_content_parts.py`.
+
 ## 1.9.2
 
 Hy4-flash server hotfix: tool calling, a quiet exit when the client leaves, request-parser fixes, Strix install fixes, docs.
