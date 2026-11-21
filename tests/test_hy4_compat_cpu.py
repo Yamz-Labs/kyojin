@@ -86,7 +86,8 @@ class Parser(unittest.TestCase):
         self.assertEqual(text([None, {"type": "text", "text": ""}, {"type": "text", "text": None}, {"type": "text"}]), "")
         self.assertEqual(text([{"type": "text", "text": "a"}, None, {"type": "text", "text": "b"}, "c"]), "abc")
         self.assertEqual(text([{"type": "input_text", "text": "a"}, {"type": "output_text", "text": "b"}, {"text": "c"}]), "abc")
-        for bad in ([{"type": "image_url", "image_url": {"url": "x"}}], [{"type": "audio"}], [{"type": "text", "text": 5}], [{}], 5, {"type": "text", "text": "x"}):
+        self.assertIn("an image was attached", text([{"type": "image_url", "image_url": {"url": "x"}}]))        # KYOJIN_IMAGE_PARTS default: note
+        for bad in ([{"type": "video"}], [{"type": "text", "text": 5}], [{}], 5, {"type": "text", "text": "x"}):
             with self.assertRaises(C.RequestError, msg=str(bad)):
                 text(bad)
 
