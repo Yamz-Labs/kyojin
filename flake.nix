@@ -4,11 +4,25 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
-    flake-parts.url = "github:hercules-ci/flake-parts";
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      # One nixpkgs, not two: flake-parts' own nixpkgs-lib otherwise rides its
+      # own pin and the module-system lib can disagree with the packages below.
+      inputs.nixpkgs-lib.follows = "nixpkgs";
+    };
+
+    # Entry points for non-flake users (default.nix / shell.nix). flake = false
+    # keeps it a plain source input; git-hooks.nix follows this node so the
+    # lock carries exactly one flake-compat.
+    flake-compat = {
+      url = "github:NixOS/flake-compat";
+      flake = false;
+    };
 
     git-hooks-nix = {
       url = "github:cachix/git-hooks.nix";
       inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-compat.follows = "flake-compat";
     };
 
     pyproject-nix = {
