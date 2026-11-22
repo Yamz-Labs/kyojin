@@ -26,6 +26,70 @@ if os.environ.get("INK_GUARD_DIR"):
 import drv_guard as guard  # noqa: E402
 
 
+def warm_spin(m, tok, secs=3.0):
+    """clock-ramp warm decode: keep the GPU busy for `secs` (one decode step is ~20 ms; the clocks need ~1 s of load to settle: reps drifted 18.2 -> 16.3 ms without it)"""
+    t0 = time.time()
+    while time.time() - t0 < secs:
+        tok = int(torch.argmax(m.step([tok])))
+    return tok
+
+
+def kernel_profile(m, tok, n=3, top=28):
+    """GPU time per kernel name over n steps (torch.profiler / CUPTI, works on graph replays): the step split under graphs, where the python methods are not called"""
+    from torch.profiler import profile, ProfilerActivity
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(n):
+            tok = int(torch.argmax(m.step([tok])))
+        torch.cuda.synchronize()
+    rows = {}
+    for e in prof.key_averages():
+        us = getattr(e, "device_time_total", None)
+        if us is None:
+            us = getattr(e, "cuda_time_total", 0)
+        if us > 0 and e.key and not e.key.startswith(("cuda", "Memcpy", "Memset")):
+            rows[e.key] = (us / n / 1e3, e.count / n)
+    tot = sum(v[0] for v in rows.values())
+    out = {"total_kernel_ms_per_token": round(tot, 2), "n_kernels_per_token": round(sum(v[1] for v in rows.values()))}
+    out["top"] = [(k[:90], round(v[0], 3), round(v[1], 1)) for k, v in sorted(rows.items(), key=lambda kv: -kv[1][0])[:top]]
+    return out
+
+
+def step_split(F, m, dev, tok, n):
+    """ms per decoded token by kernel class (a separate arm AFTER the timed one: every wrapped call syncs, so the sum is longer than the plain step): the methods of the step are wrapped, the rest = glue / small torch ops"""
+    acc = {}
+
+    def wrap(name):
+        fn = getattr(F.Inkling2Forward, name)
+
+        def w(self, *a, **k):
+            torch.cuda.synchronize()
+            t0 = time.time()
+            r = fn(self, *a, **k)
+            torch.cuda.synchronize()
+            acc[name] = acc.get(name, 0.0) + time.time() - t0
+            return r
+        setattr(F.Inkling2Forward, name, w)
+        return fn
+    names = [nm for nm in ["_moe", "_moe_kernel", "_attend", "_attend_rtx", "mm", "head", "mix", "control", "conv"] if hasattr(F.Inkling2Forward, nm)]
+    orig = {nm: wrap(nm) for nm in names}
+    try:
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(n):
+            tok = int(torch.argmax(m.step([tok])))
+        torch.cuda.synchronize()
+        tot = time.time() - t0
+    finally:
+        for nm, fn in orig.items():
+            setattr(F.Inkling2Forward, nm, fn)
+    out = {nm.strip("_"): round(acc.get(nm, 0.0) / n * 1e3, 1) for nm in names}
+    out["total_synced"] = round(tot / n * 1e3, 1)
+    out["other_glue_ms"] = round(out["total_synced"] - sum(out[k] for k in ("moe", "attend", "attend_rtx", "head", "mix", "control", "conv") if k in out), 1)
+    out["note"] = "every wrapped call syncs (~20 us each, ~700 calls: ~10-15 ms of the total is sync cost); moe_kernel is a subset of moe (rest of moe = router + torch ops), attend_rtx = rel + append + attend launches; other_glue = dense projections (W dequant + matmul), norms, embedding"
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
@@ -50,6 +114,8 @@ def main():
             counts["apps"] += 1
     m = F.Inkling2Forward(GGUFCollection(a.gguf), device=a.device, hook=hook)
     dev = torch.device(a.device)
+    if os.environ.get("INK_GRAPH") == "1":
+        m.capture_graphs()
     res = []
     g = torch.Generator(device="cpu").manual_seed(7)
     for depth in [int(x) for x in a.depths.split(",")]:
@@ -58,35 +124,79 @@ def main():
             n = min(depth, m.window) if m.pattern[il] else depth
             k = torch.randn(m.n_kv, n, m.hd, generator=g)
             k = (k / k.norm(dim=-1, keepdim=True) * 8.0).to(dev)
-            slot.k, slot.v = k, torch.randn(m.n_kv, n, m.hd, generator=g).to(dev)
-            slot.start = depth - n
+            m.seed_kv(il, k, torch.randn(m.n_kv, n, m.hd, generator=g).to(dev), depth - n)
             slot.hist = torch.zeros(m.n_conv - 1, m.n_chan, device=dev)
         m.n = depth
         tok = 1000
         for _ in range(2):                                          # warm-up: first use dequantises + caches the dense weights
             tok = int(torch.argmax(m.step([tok])))
-        counts.update(apps=0, experts=0, experts_nvfp4=0)
-        ts = []
-        for _ in range(a.steps):
+        REPS = 3
+        void = False
+        for attempt in range(2):                                    # measuring rule: 20 s idle + warm decode before the arm; reps spread > 5 % = VOID, rerun once after a new settle + warm
             if dev.type == "cuda":
-                torch.cuda.synchronize()
-            t0 = time.time()
-            tok = int(torch.argmax(m.step([tok])))
-            if dev.type == "cuda":
-                torch.cuda.synchronize()
-            ts.append(time.time() - t0)
-        ms = statistics.median(ts) * 1e3
-        r = dict(depth=depth, ms_per_token=round(ms, 1), tok_s=round(1e3 / ms, 3), steps=a.steps, apps_per_step=counts["apps"] / a.steps,
-                 experts_per_step=counts["experts"] / a.steps, nvfp4_experts_per_step=counts["experts_nvfp4"] / a.steps, path="torch reference (per-expert dequant, eager attention), synthetic KV")
+                guard.settle_and_warm(lambda: warm_spin(m, tok), label=f"depth {depth} try {attempt + 1}")
+            counts.update(apps=0, experts=0, experts_nvfp4=0)
+            rep_ms = []
+            for _ in range(REPS):
+                ts = []
+                for _ in range(a.steps):
+                    if dev.type == "cuda":
+                        torch.cuda.synchronize()
+                    t0 = time.time()
+                    tok = int(torch.argmax(m.step([tok])))
+                    if dev.type == "cuda":
+                        torch.cuda.synchronize()
+                    ts.append(time.time() - t0)
+                rep_ms.append(statistics.median(ts) * 1e3)
+            sp = (max(rep_ms) - min(rep_ms)) / statistics.median(rep_ms)
+            void = sp > 0.05
+            print(f"MEASURE_RULE depth {depth} try {attempt + 1}: reps {[round(x, 1) for x in rep_ms]} spread {sp * 100:.1f} %{' VOID' if void else ''}", flush=True)
+            if not void:
+                break
+        if void:
+            print(f"FIRES-CHECK FAILED: depth {depth} arm VOID twice (spread {sp * 100:.1f} %): no number reported", flush=True)
+            sys.exit(7)
+        ms = statistics.median(rep_ms)
+        a_steps = a.steps * REPS
+        r = dict(depth=depth, ms_per_token=round(ms, 1), tok_s=round(1e3 / ms, 3), steps=a.steps, reps=rep_ms and [round(x, 1) for x in rep_ms], spread_pct=round(sp * 100, 1), apps_per_step=counts["apps"] / a_steps,
+                 experts_per_step=counts["experts"] / a_steps, nvfp4_experts_per_step=counts["experts_nvfp4"] / a_steps, path=f"{'CUDA graph' if m.graphs else 'eager'} step, INK_RTX={','.join(sorted(F.RTX)) or 'none'} (torch for the rest), synthetic KV")
+        if os.environ.get("INK_SPLIT", "1") == "1" and not m.graphs:              # AFTER the counters of the timed arm are read: the split arm runs more (synced) steps
+            r["split_ms"] = step_split(F, m, dev, tok, 3)
+        if os.environ.get("INK_PROFILE") == "1":
+            r["kernel_profile"] = kernel_profile(m, tok)
         print("ROW", json.dumps(r), flush=True)
         res.append(r)
     os.makedirs(a.out, exist_ok=True)
     json.dump(dict(gguf=os.path.basename(a.gguf), device=a.device, rows=res), open(os.path.join(a.out, f"decode_{os.path.basename(a.gguf)[:-5]}.json"), "w"), indent=1)
     print(f"FIRES decode {len(res)}")
-    bad = [r for r in res if r["tok_s"] <= 0 or r["apps_per_step"] != m.n_app]
-    nv = any(r["nvfp4_experts_per_step"] > 0 for r in res)
+    bad = [r for r in res if r["tok_s"] <= 0 or (r["apps_per_step"] != m.n_app and not m.graphs)]
+    df = m.dev_fires()
     print("KSTATS", json.dumps(m.kstats), flush=True)
-    kern = m.dev.type != "cuda" or (m.kstats["nvfp4_gap"] > 0 and m.kstats["expert_fallback"] == 0)
+    nv = any(r["nvfp4_experts_per_step"] > 0 for r in res) or m.kstats["nvfp4_gap"] > 0 or m.kstats.get("xk_nvfp4", 0) > 0      # the kernel path never calls read_expert: the kernel counter is the evidence
+    if "experts" in F.RTX:         # our kernels: fired, and the torch path never did
+        kern = m.dev.type != "cuda" or (m.kstats["xk_nvfp4"] > 0 and m.kstats["torch_moe"] == 0 and m.kstats["nvfp4_gap"] == 0 and m.kstats["expert_fallback"] == 0)
+    else:
+        kern = m.dev.type != "cuda" or (m.kstats["nvfp4_gap"] > 0 and m.kstats["expert_fallback"] == 0)
+    if "experts" in F.RTX and m.dev.type == "cuda":
+        kern = kern and min(df["xk_gate_up_entries_down_blocks"]) > 0
+    if "conv" in F.FUSE and m.dev.type == "cuda":     # the fused conv kernel ran at every call site and the torch conv never did
+        import ink2_glue_conv as _G
+        kern = kern and m.kstats["conv_fused"] > 0 and m.kstats["conv_torch"] == 0 and _G.FIRES["conv"] > 0
+        print("CONV_FIRES", _G.FIRES, flush=True)
+    if m.dev.type == "cuda" and {"mix", "control", "norm"} & F.FUSE:      # the Triton glue fusions fired (python counters advance while capturing / in eager)
+        import ink2_glue_misc as _M
+        for _f, _k in (("mix", "mix"), ("control", "control"), ("norm", "rmsw")):
+            if _f in F.FUSE:
+                kern = kern and _M.FIRES[_k] > 0
+        print("MISC_FIRES", _M.FIRES, flush=True)
+    if m.graphs:      # graph arm: every timed step was a replay (python counters only advance while capturing: the device counters are the evidence)
+        kern = kern and m.kstats["graph_replays"] > 0 and m.kstats["graph_eager"] == 0
+    if "router" in F.RTX and m.dev.type == "cuda":
+        kern = kern and m.kstats["router_k"] > 0 and m.kstats["torch_router"] == 0 and df["router_blocks"] > 0
+    if "dense" in F.RTX and m.dev.type == "cuda":     # the Q8_0 GEMV kernel took the dense projections + the head
+        kern = kern and m.kstats["dense_q8"] > 0
+    if "attn" in F.RTX and m.dev.type == "cuda":     # the attention kernels fired (device counters: attend / combine / append / rel blocks) and the torch attention did not
+        kern = kern and m.kstats["ak_gkv"] > 0 and m.kstats["ak_lattn"] > 0 and m.kstats["torch_attn"] == 0 and min(df["ak_gkv_lattn_combine_append_rel_blocks"][:2] + df["ak_gkv_lattn_combine_append_rel_blocks"][3:]) > 0
     if bad or not nv or not kern:
         print("FIRES-CHECK FAILED", bad, "nvfp4 experts seen:", nv, "kernel path (gap calls > 0, fallbacks 0):", kern)
         sys.exit(7)

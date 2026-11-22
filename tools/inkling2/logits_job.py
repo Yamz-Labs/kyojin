@@ -38,6 +38,9 @@ def main():
     ap.add_argument("--cos", type=float, default=0.99)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--tag", default="")
+    ap.add_argument("--save", default="", help="save every application's l_out + the logits of THIS run (the torch reference path of the same GGUF) to this .npz")
+    ap.add_argument("--vs", default="", help="compare this run to a --save file of the torch path: cosine per application >= --vs-cos and top-1 equal = kernel parity")
+    ap.add_argument("--vs-cos", type=float, default=0.999)
     a = ap.parse_args()
     torch.set_num_threads(a.threads)
     F = cpu_env.install(TREE)
@@ -67,6 +70,19 @@ def main():
         bad += not ok
         rows.append(dict(app=il, cos=round(c, 6), maxrel=round(rel, 4), expert_overlap=None if ov is None else round(ov, 3), ok=ok))
         print(f"app {il:2d}: cos {c:.6f} maxrel {rel:.3e} experts {ov if ov is None else round(ov, 3)}{'' if ok else '  <-- FAIL'}", flush=True)
+    vbad = 0
+    if a.save:
+        np.savez(a.save, **{f"l{il}": rec[("l_out", il)] for il in range(m.n_app)}, logits=lg)
+    if a.vs:
+        sv = np.load(a.vs)
+        for il in range(m.n_app):
+            c = cos(rec[("l_out", il)], sv[f"l{il}"])
+            rows[il]["cos_vs_torch"] = round(c, 6)
+            vbad += c < a.vs_cos
+            print(f"app {il:2d}: cos vs torch path {c:.6f}{'' if c >= a.vs_cos else '  <-- FAIL'}", flush=True)
+        t1 = sum(int(np.argmax(lg[t])) == int(np.argmax(sv["logits"][t])) for t in range(len(toks)))
+        vbad += t1 != len(toks)
+        print(f"top-1 equal to the torch path: {t1}/{len(toks)}  logits cos {[round(cos(lg[t], sv['logits'][t]), 6) for t in range(len(toks))]}", flush=True)
     top1 = [int(np.argmax(lg[t])) == int(np.argmax(ref_logits[t])) for t in range(len(toks))]
     lrows = []
     for t in range(len(toks)):
@@ -77,13 +93,31 @@ def main():
     res = dict(kstats=m.kstats, gguf=os.path.basename(a.gguf), device=a.device, seconds=round(dt, 1), apps=rows, logits=lrows, bad_apps=bad, bad_logits=int(lbad))
     os.makedirs(a.out, exist_ok=True)
     json.dump(res, open(os.path.join(a.out, f"logits_{a.tag or os.path.basename(a.gguf)[:-5]}.json"), "w"), indent=1)
+    df = m.dev_fires()
     print("KSTATS", json.dumps(m.kstats), flush=True)
-    kern_ok = a.device != "cuda" or m.kstats["nvfp4_gap"] > 0 or not any(t == 40 for t, _d, _o in m.g.infos.values())
+    kern_ok = a.device != "cuda" or m.kstats["nvfp4_gap"] > 0 or m.kstats.get("xk_nvfp4", 0) > 0 or not any(t == 40 for t, _d, _o in m.g.infos.values())
+    if "conv" in F.FUSE and a.device == "cuda":
+        import ink2_glue_conv as _G
+        kern_ok = kern_ok and m.kstats["conv_fused"] > 0 and m.kstats["conv_torch"] == 0 and _G.FIRES["conv"] > 0
+    if "router" in F.RTX and a.device == "cuda":
+        kern_ok = kern_ok and m.kstats["router_k"] > 0 and m.kstats["torch_router"] == 0 and df["router_blocks"] > 0
+    if a.device == "cuda" and {"mix", "control", "norm"} & F.FUSE:      # the Triton glue fusions fired (python counters advance while capturing / in eager)
+        import ink2_glue_misc as _M
+        for _f, _k in (("mix", "mix"), ("control", "control"), ("norm", "rmsw")):
+            if _f in F.FUSE:
+                kern_ok = kern_ok and _M.FIRES[_k] > 0
+        print("MISC_FIRES", _M.FIRES, flush=True)
+    if "dense" in F.RTX and a.device == "cuda":
+        kern_ok = kern_ok and m.kstats["dense_q8"] > 0
+    if "attn" in F.RTX and a.device == "cuda":
+        kern_ok = kern_ok and m.kstats["ak_gkv"] > 0 and m.kstats["ak_lattn"] > 0 and m.kstats["torch_attn"] == 0
+    if "experts" in F.RTX and a.device == "cuda":      # our kernels wired: they fired, the torch MoE path did not (T <= 8 positions)
+        kern_ok = kern_ok and m.kstats["xk_nvfp4"] > 0 and m.kstats["torch_moe"] == 0 and min(df["xk_gate_up_entries_down_blocks"]) > 0
     if not kern_ok:
         print("FIRES-CHECK FAILED: no NVFP4 kernel call on the GPU")
     print(f"FIRES logits {len(rows) + len(lrows)}")
-    print(f"VERDICT apps below cos {a.cos}: {bad}, logits bars failed: {int(lbad)} -> {'PASS' if bad == 0 and lbad == 0 else 'FAIL'}")
-    sys.exit(0 if bad == 0 and lbad == 0 and kern_ok else 7)
+    print(f"VERDICT apps below cos {a.cos}: {bad}, logits bars failed: {int(lbad)}, parity vs torch path failed: {int(vbad)} -> {'PASS' if bad == 0 and lbad == 0 and vbad == 0 else 'FAIL'}")
+    sys.exit(0 if bad == 0 and lbad == 0 and vbad == 0 and kern_ok else 7)
 
 
 if __name__ == "__main__":
