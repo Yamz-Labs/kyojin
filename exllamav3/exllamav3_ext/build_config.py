@@ -57,7 +57,7 @@ def get_sources(sources_dir, is_rocm, base_dir=None):
             norm_rel = rel_path.replace('\\', '/')
             # rocm/ contains HIP-only translation units (for example the RDNA fdot2
             # GEMV); a CUDA build must not see them.
-            if not is_rocm and norm_rel.startswith('rocm/'):
+            if not is_rocm and norm_rel.startswith(('rocm/', 'hip_kq/')):      # hip_kq/: gfx1151 device-only code objects (own build_moe.sh)
                 continue
             if is_rocm and not norm_rel.startswith(ROCM_ALLOW_PREFIXES):
                 parts = norm_rel.split('/')
