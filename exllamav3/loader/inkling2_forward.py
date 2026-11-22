@@ -1,4 +1,10 @@
-"""Inkling 2 Mini WHOLE-MODEL forward from a GGUF (llama.cpp #32695 convention), slow but exact: torch only, CPU or any torch device.
+"""Inkling 2 Mini WHOLE-MODEL forward from a GGUF (llama.cpp #32695 convention).
+
+One step over the 48 applications; the op kernels are picked by the DEVICE at load time: the CUDA kernels (tools/inkling2/ink2_*_cuda.cu,
+INK_RTX) on NVIDIA, the HIP kernels + Triton glue (tools/inkling2/ink2_*.hip, ink2_glue.py, INK_GLUE) on AMD (ROCm), the plain tensor /
+dequant path on CPU or any other device. A HIP build is never loaded on an NVIDIA device and vice versa (torch reports both as device
+type "cuda": the discriminator is torch.version.hip). INK_BACKEND=cuda|hip|torch forces one, INK_AUTO=0 keeps the old behaviour (only the
+kernels named by INK_RTX / INK_GLUE). Both kernel sets are opt-out per stage through the same env flags as before.
 
 GGUF convention (arch `inkling2`): block_count = 48 = one layer index per APPLICATION; `num_loops` (3), `loop.core_start/end` (6 / 18),
 `loop.gate_rank` (64). Tensors are stored once per PHYSICAL layer (blk.0 .. blk.23); the looped core (physical 6..17) runs `num_loops`
@@ -28,6 +34,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 
 import numpy as np
@@ -54,6 +61,17 @@ def _misc():
 RTX = set(x for x in os.environ.get("INK_RTX", "").split(",") if x)   # our CUDA kernels wired into the eager step: experts (ink2_experts_cuda.cu), attn (ink2_attn_cuda.cu); empty = the torch reference path
 CFG_NV = tuple(int(v) for v in os.environ.get("INK_X_CFG_NV", "100:100").split(":"))   # (gate_up, down) launch cfgs of the NVFP4 experts kernel (100 = auto: best measured cfg per format and T, tip 8b3473c65)
 CFG_Q8 = tuple(int(v) for v in os.environ.get("INK_X_CFG_Q8", "100:100").split(":"))      # Q8_0 layers (4 of 24)
+
+RTX_ALL = {"experts", "attn", "dense", "router"}              # every CUDA kernel of the step (what an NVIDIA device picks by default)
+FUSE_CUDA_ALL = ("conv", "control", "mix", "norm")            # every Triton fusion of the NVIDIA step (ink2_glue_conv / ink2_glue_misc); the HIP set is ink2_glue.FUSE_ALL
+AUTO = os.environ.get("INK_AUTO", "1") != "0"                 # device-picked kernels: on unless INK_AUTO=0 (then only INK_RTX / INK_GLUE name them)
+
+
+def device_kind(dev):
+    """the kernel family a device can run: "hip" = AMD (ROCm; torch also calls it "cuda"), "cuda" = NVIDIA, "torch" = CPU / anything else"""
+    if dev.type != "cuda":
+        return "torch"
+    return "hip" if torch.version.hip else "cuda"
 
 
 def _gap():
@@ -129,6 +147,34 @@ def read_expert(g, name, e, dev=None):
     K, N = dims[0], dims[1]
     nb = N * row_bytes(ty, K)
     return dq_bytes(_u8(g, off + e * nb, nb, dev), ty, N, K)
+
+
+_AFQ = None
+
+
+def _attn_fq(name, t):
+    """whole-model quality arm of the attention bytes lever (env INK2_ATTN_FQ = "FMT[,proj=FMT...]", FMT in q8 | nvfp4 | none, proj in q gate rel k v output):
+    the dense attention projection becomes the weight the fused kernel reads (ink2_attnquant.fake_quant of the BF16 tensor). Small tensors (sink_proj, conv_proj) stay as stored."""
+    global _AFQ
+    if _AFQ is None:
+        spec = os.environ.get("INK2_ATTN_FQ", "")
+        _AFQ = {}
+        for i, tok in enumerate(x for x in spec.split(",") if x):
+            if "=" in tok:
+                k, v = tok.split("=")
+                _AFQ[k] = v
+            elif i == 0:
+                _AFQ["*"] = tok
+    if not _AFQ or t.dim() != 2 or t.shape[1] % 64 or t.numel() < 50_000:
+        return t
+    for p in ("q", "gate", "rel", "k", "v", "output"):
+        if name.endswith(f".attn_{p}.weight"):
+            fmt = _AFQ.get(p, _AFQ.get("*", "none"))
+            if fmt in ("none", ""):
+                return t
+            from . import ink2_attnquant as AQ
+            return AQ.fake_quant(t.cpu(), fmt).to(t.device)
+    return t
 
 
 def rms(x, eps=EPS_MIX):
@@ -210,7 +256,8 @@ class Inkling2Forward:
         self.n = 0                     # tokens processed
         self._il = -1
         self._k = None                 # GPU kernels (triton_gap nvfp4_gguf GEMV, fq_gemv_q8_0), resolved on first use; cpu devices never use them
-        self.kstats = {"nvfp4_gap": 0, "q8_gemv": 0, "expert_fallback": 0, "expert_fallback_other": 0, "expert_cpu": 0, "xk_calls": 0, "xk_nvfp4": 0, "xk_q8": 0, "torch_moe": 0, "ak_gkv": 0, "ak_lattn": 0, "torch_attn": 0, "dense_q8": 0, "dense_torch": 0, "conv_fused": 0, "conv_torch": 0, "graph_replays": 0, "graph_eager": 0, "router_k": 0, "torch_router": 0}
+        self.kstats = {"nvfp4_gap": 0, "q8_gemv": 0, "expert_fallback": 0, "expert_fallback_other": 0, "expert_cpu": 0, "xk_calls": 0, "xk_nvfp4": 0, "xk_q8": 0, "torch_moe": 0, "ak_gkv": 0, "ak_lattn": 0, "torch_attn": 0, "dense_q8": 0, "dense_torch": 0, "conv_fused": 0, "conv_torch": 0, "graph_replays": 0, "graph_eager": 0, "router_k": 0, "torch_router": 0,
+                       "torch_head": 0, "torch_experts": 0, "torch_attn": 0, "torch_attn_global": 0, "torch_attn_local": 0, "torch_attnproj": 0}
         self._q8p = {}                 # dense Q8_0 matrices resident as the stored bytes [N, K/32, 34] (INK_RTX=dense: ext.fq_gemv_q8_0 reads them once, no fp32 dequant)
         self.graphs = {}               # T -> (CUDAGraph, static input [T, D], (hidden [T, D], logits [T, vocab])): INK_GRAPH=1, capture_graphs()
         self._ar, self._gin = {}, {}
@@ -224,6 +271,71 @@ class Inkling2Forward:
         self._xl = {}                  # physical layer -> (gu bytes [E, N, rb], dn bytes, s_gu, s_dn, is_q8): the whole layer resident on the device
         self.stats = {"layer_s": 0.0}
         self.tok_embd_name = "token_embd.weight"
+        self.gl = None                 # HIP glue (tools/inkling2/ink2_glue.py), off unless the device is AMD or INK_GLUE names stages
+        self.last_h = None
+        self.backend = self._pick_backend()
+
+    # ---------------------------------------------------------------- backend pick (at load time, from the device)
+    def _pick_backend(self):
+        """hip = AMD (ROCm), cuda = NVIDIA, torch = everything else. A HIP build is never loaded on an NVIDIA device and the CUDA
+        kernels never on an AMD one (both are device type "cuda": torch.version.hip tells them apart). INK_BACKEND forces one, and the
+        named stages stay the per-stage switches (INK_RTX / INK_GLUE); with INK_AUTO=0 nothing is picked by the device."""
+        kind = device_kind(self.dev)
+        forced = os.environ.get("INK_BACKEND", "").strip()
+        if forced:
+            assert forced in ("hip", "cuda", "torch"), f"INK_BACKEND={forced}: expected hip, cuda or torch"
+            kind = forced
+        self.backend = kind                      # set before the kernels wire themselves (Glue / graph capture read it)
+        if kind == "hip":
+            spec = os.environ.get("INK_GLUE") or ("all" if AUTO else "")
+            if spec:
+                self.enable_glue(spec)
+        elif kind == "cuda":
+            if AUTO and not RTX and not self._cuda_kernels_built():
+                print("inkling2: CUDA kernels not built for this tree: torch path", flush=True)
+            elif AUTO and not RTX:
+                RTX.update(RTX_ALL)
+                FUSE.update(FUSE_CUDA_ALL)
+            if "clip" in FUSE:
+                print("inkling2: INK_GLUE_FUSE=clip is the HIP launch: dropped on this NVIDIA device", flush=True)
+                FUSE.discard("clip")
+            if RTX and not self._cuda_kernels_built():
+                print("inkling2: INK_RTX set but the CUDA kernels are not built: torch path", flush=True)
+                RTX.clear()
+        return kind
+
+    def _cuda_kernels_built(self):
+        """the three .so files the CUDA kernels of the step load at first use"""
+        import importlib
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools", "inkling2")
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        try:
+            for mod, cls, so in (("ink2_experts_cuda", "Ink2ExpertsCuda", "INK2_SO"), ("ink2_attn_glue", "Ink2AttnCuda", "INK2_ATTN_SO")):
+                c = getattr(importlib.import_module(mod), cls)
+                so_file = os.environ.get(so) or os.path.join(d, f"libink2_{'experts' if mod.endswith('experts_cuda') else 'attn'}_cuda.so")
+                if not os.path.exists(so_file):
+                    return False
+                c(so=so_file)
+            return True
+        except Exception as e:      # noqa: BLE001
+            print("inkling2: CUDA kernel probe failed:", repr(e)[:200], flush=True)
+            return False
+
+    def enable_glue(self, spec, **kw):
+        """wire the HIP op kernels into the eager step: spec = comma list of router, head, experts, gkv, lattn, attn, or `all`.
+        Kernels take T <= 8 rows, so the chunk shrinks to 8. Never on an NVIDIA device: those kernels are HIP builds."""
+        if device_kind(self.dev) != "hip":
+            raise RuntimeError(f"the glue kernels are HIP builds (ink2_glue.py): not loadable on device {self.dev}")
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools", "inkling2")
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import ink2_glue
+        self.gl = ink2_glue.Glue(self, spec, **kw)
+        self.chunk = min(self.chunk, 8)
+        if os.environ.get("INK_GLUE_GRAPH") == "1":
+            self.capture_graphs()
+        return self.gl
 
     @staticmethod
     def _scalar(v):
@@ -242,11 +354,12 @@ class Inkling2Forward:
 
     # ---------------------------------------------------------------- weights
     def W(self, name):
-        if RESIDENT and self.dev.type == "cuda":
+        if RESIDENT and self.backend == "cuda":
             return self._w_resident(name)
         t = self._w.get(name)
         if t is None:
             t = read_dense(self.g, name, self.dev)
+            t = _attn_fq(name, t)
             if self.cache_weights:
                 self._w[name] = t
         return t
@@ -270,18 +383,21 @@ class Inkling2Forward:
         return name in self.g.infos
 
     def fuse_conv(self, T):
-        return "conv" in FUSE and self.dev.type == "cuda" and T <= 8
+        """the CUDA fused conv (Triton short-conv + residual / clip / rms epilogue): NVIDIA only, the HIP side has gl.conv_kv"""
+        return "conv" in FUSE and self.backend == "cuda" and T <= 8
 
     def _glue_begin(self, T, start):
         """device pos0 (shared by the attention kernels and the fused conv; set OUTSIDE any captured graph) + lazy ConvFuse"""
-        if self.dev.type != "cuda" or not ("conv" in FUSE or "attn" in RTX):
+        if self.gl is not None:
+            self.gl.begin(start, T)                                              # HIP glue: its own device pos0 + KV / ring state
+            return
+        if self.backend != "cuda" or not ("conv" in FUSE or "attn" in RTX):
             return
         if T > 8:
             raise RuntimeError("INK_GLUE_FUSE=conv / INK_RTX=attn: T <= 8 rows per chunk only")
         if self._pos0 is None:
             self._pos0 = torch.zeros(1, dtype=torch.int32, device=self.dev)
         if "conv" in FUSE and self._cf is None:
-            import sys
             d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools", "inkling2")
             if d not in sys.path:
                 sys.path.insert(0, d)
@@ -290,15 +406,22 @@ class Inkling2Forward:
         self._pos0.fill_(int(start))
 
     def reset(self):
+        """new context. The conv history tensors are zeroed IN PLACE (captured graphs hold their addresses)"""
         if self._cf is not None:
             self._cf.reset()
+        old = self.slots
         self.slots = [_Slot() for _ in range(self.n_app)]
+        for s, o in zip(self.slots, old):
+            if o.hist is not None:
+                s.hist = o.hist.zero_()
         self.n = 0
+        if self.gl is not None:
+            self.gl.reset()
 
     # ---------------------------------------------------------------- pieces
     def mix(self, blocks, cur, query):
         """block depth attention. blocks: list of [T, D]; cur [T, D]; query [Q, D] -> [Q, T, D]"""
-        if "mix" in FUSE and self.dev.type == "cuda" and cur.shape[0] <= 8 and query.shape[0] <= 3:
+        if "mix" in FUSE and self.backend == "cuda" and cur.shape[0] <= 8 and query.shape[0] <= 3:
             return _misc().mix(torch.stack(list(blocks) + [cur], 0).contiguous(), query.contiguous(), EPS_MIX)       # rms + scores + softmax + weighted sum: 2 launches
         states = rms(torch.stack(list(blocks) + [cur], 0))                       # [S, T, D]
         scores = torch.einsum("qd,std->qts", query, states) / math.sqrt(self.D)
@@ -307,7 +430,7 @@ class Inkling2Forward:
     def control(self, cur, msg, L, m):
         """(1 - tanh(F h)) cur + tanh(G h) msg, h = D [rms(cur); rms(msg)]; m: 0 attn(q), 1 k, 2 v, 3 mlp"""
         nm = ("attn", "k", "v", "mlp")[m]
-        if "control" in FUSE and self.dev.type == "cuda" and cur.shape[0] <= 8:
+        if "control" in FUSE and self.backend == "cuda" and cur.shape[0] <= 8:
             return _misc().control(cur, msg, self.W(f"{L}.loop_{nm}_down.weight").contiguous(), self.W(f"{L}.loop_{nm}_gain.weight").contiguous(),
                                    self.W(f"{L}.loop_{nm}_forget.weight").contiguous(), EPS_MIX)
         h = torch.cat([rms(cur), rms(msg)], -1) @ self.W(f"{L}.loop_{nm}_down.weight").T
@@ -344,40 +467,43 @@ class Inkling2Forward:
             slot.k, slot.v = torch.cat([slot.k, kn], 1), torch.cat([slot.v, vn], 1)
         N = slot.k.shape[1]
         kpos = slot.start + torch.arange(N, device=q.device)
-        g = self.n_head // self.n_kv
-        kk = slot.k.repeat_interleave(g, 0)                                      # [nh, N, hd]
-        vv = slot.v.repeat_interleave(g, 0)
         QB = int(os.environ.get("INK_ATTN_QB", "256"))                           # query blocks: the [nh, QB, N] score / bias temporaries stay small at T = 1-2K prefill chunks (bit-identical per row)
         outs = []
         for t0 in range(0, T, QB):
             sl = slice(t0, min(T, t0 + QB))
-            qb, pb, tb, sb_ = q[sl], pos[sl], bias_tab[sl], sinks[sl]
-            Tb = qb.shape[0]
-            dist = pb[:, None] - kpos[None, :]                                   # [Tb, N]
-            valid = dist >= 0
-            if swa:
-                valid = valid & (dist < self.window)
-            s = torch.einsum("thd,hnd->htn", qb, kk) / math.sqrt(self.hd)
-            inb = (dist >= 0) & (dist < self.rel_extent)
-            idx = dist.clamp(0, self.rel_extent - 1)                             # [Tb, N]
-            b = torch.gather(tb, 2, idx[:, None, :].expand(Tb, self.n_head, N))  # [Tb, nh, N]
-            b = torch.where(inb[:, None, :], b, torch.zeros_like(b)).permute(1, 0, 2)
-            s = s + b
-            s = s.masked_fill(~valid[None], float("-inf"))
-            s = torch.cat([s, sb_.T[:, :, None]], 2)                             # sink logit: unscaled, zero value
-            p_ = torch.softmax(s, -1)[:, :, :-1]
-            outs.append(torch.einsum("htn,hnd->thd", p_, vv))
+            outs.append(self._attend_core(q[sl], slot.k, slot.v, kpos, bias_tab[sl], sinks[sl], swa, pos[sl]))
         o = outs[0] if len(outs) == 1 else torch.cat(outs, 0)
         if swa and N > self.window:                                              # later chunks only need the last `window` keys
             slot.k, slot.v = slot.k[:, -self.window:].contiguous(), slot.v[:, -self.window:].contiguous()
             slot.start += N - self.window
         return o
 
+    def _attend_core(self, q, kk_, vv_, kpos, bias_tab, sinks, swa, pos):
+        """the attention maths over explicit keys: kk_ / vv_ [nkv, N, hd] at absolute positions kpos [N]; q [T, nh, hd]; pos [T]"""
+        T, N = q.shape[0], kk_.shape[1]
+        dist = pos[:, None] - kpos[None, :]                                      # [T, N]
+        valid = dist >= 0
+        if swa:
+            valid = valid & (dist < self.window)
+        g = self.n_head // self.n_kv
+        kk = kk_.repeat_interleave(g, 0)                                         # [nh, N, hd]
+        vv = vv_.repeat_interleave(g, 0)
+        s = torch.einsum("thd,hnd->htn", q, kk) / math.sqrt(self.hd)
+        inb = (dist >= 0) & (dist < self.rel_extent)
+        idx = dist.clamp(0, self.rel_extent - 1)                                 # [T, N]
+        b = torch.gather(bias_tab, 2, idx[:, None, :].expand(T, self.n_head, N)) # [T, nh, N]
+        b = torch.where(inb[:, None, :], b, torch.zeros_like(b)).permute(1, 0, 2)
+        s = s + b
+        s = s.masked_fill(~valid[None], float("-inf"))
+        s = torch.cat([s, sinks.T[:, :, None]], 2)                               # sink logit: unscaled, zero value
+        p_ = torch.softmax(s, -1)[:, :, :-1]
+        return torch.einsum("htn,hnd->thd", p_, vv)
+
     def _kern(self):
-        """{"ext": extension} on a cuda device, {} otherwise (torch dequant + matmul). triton_gap has NO nvfp4_gguf kernel (q4_0 / iq4_nl / mxfp4 / q5_x only)."""
+        """{"ext": extension} on an NVIDIA device, {} otherwise (torch dequant + matmul). triton_gap has NO nvfp4_gguf kernel (q4_0 / iq4_nl / mxfp4 / q5_x only)."""
         if self._k is None:
             self._k = {}
-            if self.dev.type == "cuda":
+            if self.backend == "cuda":
                 try:
                     from . import hy4_forward as HF
                     ext = HF._ext()
@@ -401,7 +527,7 @@ class Inkling2Forward:
         K, N = dims[0], dims[1]
         R = x.shape[0]
         k = self._kern()
-        if self.dev.type != "cuda":
+        if self.backend != "cuda":
             self.kstats["expert_cpu"] += 1
         elif ty == T_NVFP4 and "ext" in k and hasattr(k["ext"], "fq_gemv_nvfp4") and R <= 16 and K % 64 == 0:
             ck = (name, e)
@@ -431,14 +557,21 @@ class Inkling2Forward:
 
     def rmsw(self, x, w):
         """rms_norm(x, model eps) * w: one Triton launch with INK_GLUE_FUSE=norm (T <= 8), else torch"""
-        if "norm" in FUSE and self.dev.type == "cuda" and x.shape[0] <= 8:
+        if "norm" in FUSE and self.backend == "cuda" and x.shape[0] <= 8:
             return _misc().rmsw(x, w.float().contiguous(), self.eps)
         return rms(x, self.eps) * w
+
+    def _norm_w(self, x, w):
+        """rms_norm(eps) * w through the backend that owns a fused form: the HIP glue when its control / norm launch is on (it also
+        writes the controller's rms*w), the Triton norm kernel on NVIDIA, else torch"""
+        if self.gl is not None:
+            return self.gl.rmsw(x, w) if "control" in self.gl.fuse else rms(x, self.eps) * w
+        return self.rmsw(x, w)
 
     def mm(self, x, name):
         """x [T, K] @ W[name].T -> [T, N] fp32. INK_RTX=dense: Q8_0 matrices (T <= 16) go through ext.fq_gemv_q8_0 on the resident stored bytes (1.06 B / weight read once);
         anything else = torch matmul on the fp32 weight"""
-        if "dense" in RTX and self.dev.type == "cuda" and x.shape[0] <= 16:
+        if "dense" in RTX and self.backend == "cuda" and x.shape[0] <= 16:
             ty, dims, off = self.g.infos[name]
             k = self._kern()
             if ty == T_Q8_0 and len(dims) == 2 and dims[0] % 32 == 0 and "ext" in k:
@@ -454,12 +587,12 @@ class Inkling2Forward:
 
     def _akern(self):
         if self._ax is None:
-            import sys
             d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools", "inkling2")
             if d not in sys.path:
                 sys.path.insert(0, d)
             from ink2_attn_glue import Ink2AttnCuda
             assert (self.n_head, self.n_kv, self.hd, self.rel_extent, self.n_rel) == (24, 8, 128, 1024, 16), "the attention kernels are built for 24 / 8 heads, hd 128, rel 16 x 1024"
+            assert self.backend == "cuda", "ink2_attn_cuda.so is an NVIDIA build: the AMD attention is gl.attn (ink2_glue.py)"
             self._ax = Ink2AttnCuda()
             if self._pos0 is None:
                 self._pos0 = torch.zeros(1, dtype=torch.int32, device=self.dev)
@@ -485,11 +618,11 @@ class Inkling2Forward:
         return d
 
     def rtx_attn(self, T):
-        return "attn" in RTX and self.dev.type == "cuda" and T <= 8
+        return "attn" in RTX and self.backend == "cuda" and T <= 8
 
     def seed_kv(self, il, k, v, start):
         """synthetic KV for the decode bench: k / v [n_kv, n, hd] at absolute positions start .. start + n - 1 of application il"""
-        if "attn" in RTX and self.dev.type == "cuda":
+        if "attn" in RTX and self.backend == "cuda":
             self._akern().seed(self._kvcache(il), k, v, start, self.pattern[il])
         else:
             slot = self.slots[il]
@@ -555,37 +688,47 @@ class Inkling2Forward:
         return self._rk
 
     def _moe(self, L, x):
-        if "router" in RTX and "experts" in RTX and self.dev.type == "cuda" and x.shape[0] <= 8 and self.g.infos[f"{L}.ffn_gate_up_exps.weight"][0] in (T_NVFP4, T_Q8_0):
+        """router picks + the selected experts. The backend that owns both (HIP glue router / experts, CUDA router / grouped-expert
+        kernels) runs them as launches; the torch path (sigmoid + topk + per-expert dequant) is the reference of both."""
+        gl = self.gl
+        gu_n, dn_n = f"{L}.ffn_gate_up_exps.weight", f"{L}.ffn_down_exps.weight"
+        self._hk("router_in", self._il, x)
+        if gl is not None and gl.has("router"):
+            sel, w = gl.router(L, x)                                             # one launch: sigmoid + bias + top-8 + renorm x scale
+        elif "router" in RTX and "experts" in RTX and self.backend == "cuda" and x.shape[0] <= 8 and self.g.infos[gu_n][0] in (T_NVFP4, T_Q8_0):
             bn = f"{L}.exp_probs_b.bias"      # sigmoid + bias + top-8 + renorm in ONE launch (ink2_router_cuda.cu); the plan + experts kernels read its sel / wt
             sel, w = self._rkern().route(x.float().contiguous(), self.W(f"{L}.ffn_gate_inp.weight").float().contiguous(), self.W(bn).float().contiguous() if self.has(bn) else None, self.w_scale)
             self.kstats["router_k"] += 1
             self._hk("router_sel", self._il, sel)
-            return self._moe_kernel(L, x, sel, w, f"{L}.ffn_gate_up_exps.weight", f"{L}.ffn_down_exps.weight")
-        self.kstats["torch_router"] += 1
-        R = self.W(f"{L}.ffn_gate_inp.weight")                                   # [E, D] fp32
-        scores = torch.sigmoid(x @ R.T)
-        bias = self.W(f"{L}.exp_probs_b.bias") if self.has(f"{L}.exp_probs_b.bias") else 0.0
-        sel = torch.topk(scores + bias, self.topk, dim=-1, sorted=False).indices
-        w = scores.gather(1, sel)
-        w = w / (w.sum(-1, keepdim=True) + 1e-20) * self.w_scale
-        gu_n, dn_n = f"{L}.ffn_gate_up_exps.weight", f"{L}.ffn_down_exps.weight"
-        s_gu = self.W(gu_n[:-6] + "scale") if self.has(gu_n[:-6] + "scale") else None
-        s_dn = self.W(dn_n[:-6] + "scale") if self.has(dn_n[:-6] + "scale") else None
-        self._hk("router_sel", self._il, sel)
-        if "experts" in RTX and self.dev.type == "cuda" and x.shape[0] <= 8 and self.g.infos[gu_n][0] in (T_NVFP4, T_Q8_0):
             return self._moe_kernel(L, x, sel, w, gu_n, dn_n)
-        if "prefill" in RTX and self.dev.type == "cuda" and x.shape[0] > 8 and self.g.infos[gu_n][0] in (T_NVFP4, T_Q8_0):
+        else:
+            self.kstats["torch_router"] += 1
+            R = self.W(f"{L}.ffn_gate_inp.weight")                               # [E, D] fp32
+            scores = torch.sigmoid(x @ R.T)
+            bias = self.W(f"{L}.exp_probs_b.bias") if self.has(f"{L}.exp_probs_b.bias") else 0.0
+            sel = torch.topk(scores + bias, self.topk, dim=-1, sorted=False).indices
+            w = scores.gather(1, sel)
+            w = w / (w.sum(-1, keepdim=True) + 1e-20) * self.w_scale
+        self._hk("router_sel", self._il, sel)
+        if gl is not None and gl.has("experts"):
+            return gl.experts(L, x, sel, w)                                      # grouped expert kernels on the resident bytes
+        if "experts" in RTX and self.backend == "cuda" and x.shape[0] <= 8 and self.g.infos[gu_n][0] in (T_NVFP4, T_Q8_0):
+            return self._moe_kernel(L, x, sel, w, gu_n, dn_n)
+        if "prefill" in RTX and self.backend == "cuda" and x.shape[0] > 8 and self.g.infos[gu_n][0] in (T_NVFP4, T_Q8_0):
             out = self._moe_prefill(L, x, sel, w, gu_n, dn_n)
             if os.environ.get("INK_PF_CHECK") == "1":      # parity probe: the torch loop on the same inputs, per-call numbers into kstats["pf_check"]
-                ref = self._moe_loop(x, sel, w, gu_n, dn_n, s_gu, s_dn, exact=True)
+                ref = self._moe_loop(L, x, sel, w, exact=True)
                 d = (out - ref).float()
                 self.kstats.setdefault("pf_check", []).append((self._il, round(float(torch.dot(out.flatten(), ref.flatten()) / (out.norm() * ref.norm())), 6), float(d.norm() / ref.norm()), float(ref.abs().max()), float(out.abs().max())))
             return out
-        self.kstats["torch_moe"] += 1
-        return self._moe_loop(x, sel, w, gu_n, dn_n, s_gu, s_dn, exact=getattr(self, "pf_exact", False))
+        self.kstats["torch_moe" if gl is None else "torch_experts"] += 1
+        return self._moe_loop(L, x, sel, w, exact=getattr(self, "pf_exact", False))
 
-    def _moe_loop(self, x, sel, w, gu_n, dn_n, s_gu, s_dn, exact=False):
+    def _moe_loop(self, L, x, sel, w, exact=False):
         """the torch expert loop. exact = fp32 activations @ the dequantised expert (no gemv kernel: the kernels quantise activations to q8_1, ~1 % rel error): the reference of the prefill parity gate"""
+        gu_n, dn_n = f"{L}.ffn_gate_up_exps.weight", f"{L}.ffn_down_exps.weight"
+        s_gu = self.W(gu_n[:-6] + "scale") if self.has(gu_n[:-6] + "scale") else None
+        s_dn = self.W(dn_n[:-6] + "scale") if self.has(dn_n[:-6] + "scale") else None
         out = torch.zeros_like(x)
         ff = self.g.infos[dn_n][1][0]
         mmf = (lambda name, e, a: a.float() @ read_expert(self.g, name, e, self.dev).float().T) if exact else self._expert_mm
@@ -628,6 +771,12 @@ class Inkling2Forward:
             a = self._ar[T] = torch.arange(T, device=self.dev)
         return a
 
+    def alloc_state(self):
+        """conv history of every application, allocated once (graphs keep its address)"""
+        for slot in self.slots:
+            if slot.hist is None:
+                slot.hist = torch.zeros(self.n_conv - 1, self.n_chan, device=self.dev)
+
     def embed(self, ids):
         """token embedding rows (host pread) -> [T, D] fp32; never inside a captured graph"""
         cur = read_rows(self.g, self.tok_embd_name, ids, self.dev)
@@ -638,12 +787,20 @@ class Inkling2Forward:
         return self._body(self.embed(ids), len(ids), start)
 
     def _body(self, cur, T, start):
-        """the 48 applications over the embedded rows `cur` [T, D]. With a device pos0 (attn kernels / fused conv) positions are read from it: no host value is used, so one CUDA graph serves every position"""
+        """the 48 applications over the embedded rows `cur` [T, D]. Every site asks the backend that owns a fused form first: the HIP
+        glue (gl, picked on AMD), the CUDA kernels / Triton fusions (RTX / FUSE, picked on NVIDIA), else the torch maths. With a device
+        pos0 (attention kernels / fused conv of either backend) positions are read from it: no host value is used, so one captured
+        graph serves every position"""
         D, nh, nkv, hd = self.D, self.n_head, self.n_kv, self.hd
-        pos = (self._pos0.long() + self._arange(T)) if self._pos0 is not None else torch.arange(start, start + T, device=self.dev)
-        fz = self.fuse_conv(T)
+        gl = self.gl
+        pos = (self.gl.pos0.long() + self._arange(T)) if self.gl is not None else \
+              ((self._pos0.long() + self._arange(T)) if self._pos0 is not None else torch.arange(start, start + T, device=self.dev))
         tau = (1.0 + self.log_alpha * torch.log(((pos + 1).float() / self.log_floor).clamp(min=1.0)))[:, None, None]
+        fz = gl.fuse if gl is not None else frozenset()                         # HIP glue fusions
+        fc, fk, fm = "conv" in fz, "control" in fz, "mix" in fz
+        fz2 = self.fuse_conv(T)                                                 # CUDA fused conv (Triton)
         blocks, prelude_blocks, prelude_cur, bank, bank_last = [], None, None, [], None
+        nb = prelude_nb = n_msg = 0                                             # fused mix: block rows live in gl.bank [NBMAX, 8, D] (current pass) and gl.mbank (previous pass)
         for il in range(self.n_app):
             ip = self.loop_layer(il)
             L = f"blk.{ip}"
@@ -653,16 +810,26 @@ class Inkling2Forward:
                 pss = (il - self.core_start) // self.n_core
                 if ip == self.core_start:
                     if pss == 0:
-                        prelude_blocks, prelude_cur = list(blocks), cur
+                        prelude_blocks, prelude_cur, prelude_nb = list(blocks), cur, nb
                     else:
-                        bank, bank_last = blocks[len(prelude_blocks) + 1:], cur
-                        blocks, cur = list(prelude_blocks), prelude_cur
+                        if fm:
+                            n_msg = nb - (prelude_nb + 1)
+                            if n_msg > 0:
+                                gl.mbank[:n_msg, :T].copy_(gl.bank[prelude_nb + 1:nb, :T])
+                            bank_last, nb, cur = cur, prelude_nb, prelude_cur
+                        else:
+                            bank, bank_last = blocks[len(prelude_blocks) + 1:], cur
+                            blocks, cur = list(prelude_blocks), prelude_cur
                 if pss > 0:
                     row = 2 * (ip - self.core_start)
-                    qa = self.W("loop_res_query.weight")[row:row + 2]
-                    qk = self.W("loop_kv_res_query.weight")[row:row + 2]
-                    ma, mk = self.mix(bank, bank_last, qa), self.mix(bank, bank_last, qk)
-                    msgs = [ma[0], mk[0], mk[1], ma[1]]                          # q(attn), k, v, mlp
+                    if fm:
+                        mo = gl.mix_f(gl.mbank, max(n_msg, 0), bank_last, gl.msg_queries(row))      # [4, T, D]: attn, mlp, k, v queries in one launch
+                        msgs = [mo[0], mo[2], mo[3], mo[1]]                      # q(attn), k, v, mlp
+                    else:
+                        qa = self.W("loop_res_query.weight")[row:row + 2]
+                        qk = self.W("loop_kv_res_query.weight")[row:row + 2]
+                        ma, mk = self.mix(bank, bank_last, qa), self.mix(bank, bank_last, qk)
+                        msgs = [ma[0], mk[0], mk[1], ma[1]]                      # q(attn), k, v, mlp
             self._il = il
             slot = self.slots[il]
             if slot.hist is None:
@@ -670,77 +837,113 @@ class Inkling2Forward:
             self._hk("layer_inp", il, cur)
             inp_sa = cur
             inputs = [cur, cur, cur]
+            normed = False                                                       # True once the input norm (rms * w) is already applied
+            nws = [self.W(f"{L}.attn_norm.weight")] * 3 if swa else [self.W(f"{L}.attn_{c}_inp_norm.weight") for c in "qkv"]
             if self.has(f"{L}.attn_res_query.weight"):
                 q = self.W(f"{L}.attn_res_query.weight").reshape(-1, D)
-                mixed = self.mix(blocks, cur, q)
+                if fm:
+                    epi = None if msgs[0] is not None else (nws[0] if swa else gl.norm_stack(L))
+                    mixed = gl.mix_f(gl.bank, nb, cur, q, epi)               # depth mix + the input norm epilogue in one launch
+                    normed = epi is not None
+                else:
+                    mixed = self.mix(blocks, cur, q)
                 inputs = [mixed[0 if swa else j] for j in range(3)]
             if msgs[0] is not None:
-                inputs = [self.control(inputs[j], msgs[j], L, j) for j in range(3)]
-            if swa:
-                nw = self.W(f"{L}.attn_norm.weight")
-                if msgs[0] is not None:
-                    inputs = [self.rmsw(x, nw) for x in inputs]
+                if fk:
+                    inputs = [gl.control(inputs[j], msgs[j], L, j, nws[j]) for j in range(3)]      # controller + rms * w
+                    normed = True
                 else:
-                    inputs = [self.rmsw(inputs[0], nw)] * 3
-            else:
-                inputs = [self.rmsw(inputs[j], self.W(f"{L}.attn_{c}_inp_norm.weight")) for j, c in enumerate("qkv")]
+                    inputs = [self.control(inputs[j], msgs[j], L, j) for j in range(3)]
+            if not normed:
+                if swa and msgs[0] is None:
+                    inputs = [self._norm_w(inputs[0], nws[0])] * 3
+                else:
+                    inputs = [self._norm_w(inputs[j], nws[j]) for j in range(3)]
             xq, xk, xv = inputs
-            Q = self.mm(xq, f"{L}.attn_q.weight")
-            Kp = self.mm(xk, f"{L}.attn_k.weight")
-            Vp = self.mm(xv, f"{L}.attn_v.weight")
-            R = self.mm(xq, f"{L}.attn_rel.weight")
-            dk = dv = None
-            if not swa:
-                dk = (self.mm(xk, f"{L}.attn_k_conv_proj.weight")).reshape(T, nkv, self.n_conv)
-                dv = (self.mm(xv, f"{L}.attn_v_conv_proj.weight")).reshape(T, nkv, self.n_conv)
-            if fz:
+            use_ap = gl is not None and gl.has("attn") and gl.ap_ok(L, swa)
+            if use_ap:                                                           # one launch: q, gate, rel, sink_proj, k, v (+ conv_proj) from the resident planes
+                Q, Kp, Vp, R, sinks, gate, dk, dv = gl.proj(L, swa, xq, xk, xv)
+                if not swa:
+                    dk, dv = dk.reshape(T, nkv, self.n_conv), dv.reshape(T, nkv, self.n_conv)
+            else:
+                self.kstats["torch_attnproj"] += 1
+                Q = self.mm(xq, f"{L}.attn_q.weight")
+                Kp = self.mm(xk, f"{L}.attn_k.weight")
+                Vp = self.mm(xv, f"{L}.attn_v.weight")
+                R = self.mm(xq, f"{L}.attn_rel.weight")
+                dk = dv = None
+                if not swa:
+                    dk = (self.mm(xk, f"{L}.attn_k_conv_proj.weight")).reshape(T, nkv, self.n_conv)
+                    dv = (self.mm(xv, f"{L}.attn_v_conv_proj.weight")).reshape(T, nkv, self.n_conv)
+                sinks = self.mm(xq, f"{L}.attn_sink_proj.weight")              # [T, nh]
+                gate = self.mm(xq, f"{L}.attn_gate.weight")                    # [T, nh * hd] pre-sigmoid
+            if fc:                                                               # conv + l2 clip (K) / rms (V) in one launch each, on the position-indexed rings
+                Kc = gl.conv_kv(il, 0, Kp, self.W(f"{L}.attn_k_conv.weight"), dk, "k").reshape(T, nkv, hd)
+                Vc = gl.conv_kv(il, self.kvd, Vp, self.W(f"{L}.attn_v_conv.weight"), dv, "v").reshape(T, nkv, hd)
+            elif fz2:       # ONE launch per conv: taps + residual + l2 clip (K) / rms (V), position-indexed ring
                 self.kstats["conv_fused"] += 4       # K, V (here) + post-attn, post-ffn (below)
-            if fz:       # ONE launch per conv: taps + residual + l2 clip (K) / rms (V), position-indexed ring
                 Kc = self._cf.kv(il, 0, Kp.float().contiguous(), self.W(f"{L}.attn_k_conv.weight").float().contiguous(), dk, "k", torch.empty(T, self.kvd, device=self.dev))
                 Vc = self._cf.kv(il, self.kvd, Vp.float().contiguous(), self.W(f"{L}.attn_v_conv.weight").float().contiguous(), dv, "v", torch.empty(T, self.kvd, device=self.dev))
+                Kc, Vc = Kc.reshape(T, nkv, hd), Vc.reshape(T, nkv, hd)      # already clipped / normalised by the conv kernel
             else:
                 Kc = self.conv(Kp, self.W(f"{L}.attn_k_conv.weight"), dk, slot, 0)
                 Vc = self.conv(Vp, self.W(f"{L}.attn_v_conv.weight"), dv, slot, self.kvd)
-            Q = l2_clip(Q.reshape(T, nh, hd), self.W(f"{L}.attn_q_clip.weight"), self.qk_clip)
-            if fz:
-                Kc, Vc = Kc.reshape(T, nkv, hd), Vc.reshape(T, nkv, hd)      # already clipped / normalised by the conv kernel
-            else:
                 Kc = l2_clip(Kc.reshape(T, nkv, hd), None, self.qk_clip)
                 Vc = rms(Vc.reshape(T, nkv, hd), self.eps)
-            R = l2_clip(R.reshape(T, nh, self.n_rel), self.W(f"{L}.attn_rel_clip.weight"), self.rel_clip)
-            if not swa:
-                Q, R = Q * tau, R * tau
-            sinks = self.mm(xq, f"{L}.attn_sink_proj.weight")                  # [T, nh]
-            if self.rtx_attn(T):
-                o = self._attend_rtx(il, ip, Q, Kc, Vc, R, sinks, self.mm(xq, f"{L}.attn_gate.weight"), start)       # rel table, append, attend, sink, sigmoid gate: our kernels
+            if "clip" in fz:                                                     # Q / R l2 clip (+ tau on global layers) in one launch
+                Q, R = gl.qr_clip(Q, R, self.W(f"{L}.attn_q_clip.weight"), self.W(f"{L}.attn_rel_clip.weight"), None if swa else tau)
             else:
-                if "attn" in RTX and self.dev.type == "cuda":
+                Q = l2_clip(Q.reshape(T, nh, hd), self.W(f"{L}.attn_q_clip.weight"), self.qk_clip)
+                R = l2_clip(R.reshape(T, nh, self.n_rel), self.W(f"{L}.attn_rel_clip.weight"), self.rel_clip)
+                if not swa:
+                    Q, R = Q * tau, R * tau
+            if gl is not None and gl.has("lattn" if swa else "gkv"):
+                o = gl.attn(il, L, swa, Q, R, Kc, Vc, sinks, gate)               # cache append + split-K attention + sink + sigmoid gate, [T, nh * hd] fp32
+            elif self.rtx_attn(T):
+                o = self._attend_rtx(il, ip, Q, Kc, Vc, R, sinks, gate, start)   # rel table, append, attend, sink, sigmoid gate: our kernels
+            else:
+                if "attn" in RTX and self.backend == "cuda":
                     raise RuntimeError("INK_RTX=attn keeps the KV in the kernel cache: T <= 8 rows per chunk only (use INK_RTX=experts for prefill)")
                 self.kstats["torch_attn"] += 1
+                self.kstats["torch_attn_local" if swa else "torch_attn_global"] += 1
                 tab = R @ self.W(f"{L}.attn_rel_bias.weight").T                  # [T, nh, extent]
                 o = self._attend(Q, Kc, Vc, tab, sinks, slot, swa, pos).reshape(T, nh * hd)
-                o = o * torch.sigmoid(self.mm(xq, f"{L}.attn_gate.weight"))
-            o = self.mm(o, f"{L}.attn_output.weight")
-            if fz:       # conv + residual add (inside a block) in one launch; the attn_out hook then sees the post-residual value
-                opener = ip % self.blk == 0
+                o = o * torch.sigmoid(gate)
+            o = gl.out_proj(L, swa, o) if use_ap else self.mm(o, f"{L}.attn_output.weight")
+            opener = ip % self.blk == 0
+            if fc:                                                               # conv + the block residual in one launch (a block opener has no residual)
+                cur = gl.conv_post(il, 2 * self.kvd, o, self.W(f"{L}.attn_post_conv.weight"), None if opener else inp_sa)
+                self._hk("attn_out", il, cur)
+            elif fz2:       # conv + residual add (inside a block) in one launch; the attn_out hook then sees the post-residual value
                 cur = self._cf.post(il, 2 * self.kvd, o.float().contiguous(), self.W(f"{L}.attn_post_conv.weight").float().contiguous(), None if opener else inp_sa, torch.empty(T, D, device=self.dev))
                 self._hk("attn_out", il, cur)
-                if opener:
-                    blocks.append(inp_sa)
             else:
                 cur = self.conv(o, self.W(f"{L}.attn_post_conv.weight"), None, slot, 2 * self.kvd)
                 self._hk("attn_out", il, cur)
-                if ip % self.blk == 0:
-                    blocks.append(inp_sa)
-                else:
+                if not opener:
                     cur = inp_sa + cur
+            if opener:
+                if fm:
+                    gl.bank[nb, :T].copy_(inp_sa)
+                    nb += 1
+                else:
+                    blocks.append(inp_sa)
             ffn_inp = cur
-            cur = self.mix(blocks, cur, self.W(f"{L}.ffn_res_query.weight").reshape(1, D))[0]
+            qf = self.W(f"{L}.ffn_res_query.weight").reshape(1, D)
+            nwf = self.W(f"{L}.ffn_norm.weight")
+            if fm:
+                cur = gl.mix_f(gl.bank, nb, cur, qf, None if msgs[3] is not None else nwf)[0]
+            else:
+                cur = self.mix(blocks, cur, qf)[0]
             if msgs[3] is not None:
-                cur = self.control(cur, msgs[3], L, 3)
-            cur = self.rmsw(cur, self.W(f"{L}.ffn_norm.weight"))
+                cur = gl.control(cur, msgs[3], L, 3, nwf) if fk else self._norm_w(self.control(cur, msgs[3], L, 3), nwf)
+            elif not fm:
+                cur = self._norm_w(cur, nwf)
             cur = self._moe(L, cur)
-            if fz:
+            if fc:
+                cur = gl.conv_post(il, 2 * self.kvd + D, cur, self.W(f"{L}.ffn_post_conv.weight"), ffn_inp)
+                self._hk("ffn_out", il, cur)
+            elif fz2:
                 cur = self._cf.post(il, 2 * self.kvd + D, cur.float().contiguous(), self.W(f"{L}.ffn_post_conv.weight").float().contiguous(), ffn_inp, torch.empty(T, D, device=self.dev))
                 self._hk("ffn_out", il, cur)
             else:
@@ -748,8 +951,12 @@ class Inkling2Forward:
                 self._hk("ffn_out", il, cur)
                 cur = ffn_inp + cur
             self._hk("l_out", il, cur)
-        cur = self.mix(blocks, cur, self.W("output_res_query.weight").reshape(1, D))[0]
-        cur = self.rmsw(cur, self.W("output_norm.weight"))
+        qo, nwo = self.W("output_res_query.weight").reshape(1, D), self.W("output_norm.weight")
+        if fm:
+            cur = gl.mix_f(gl.bank, nb, cur, qo, nwo)[0]                         # depth mix + the output norm in one launch
+        else:
+            cur = self.mix(blocks, cur, qo)[0]
+            cur = self._norm_w(cur, nwo)
         self._hk("result_norm", -1, cur)
         return cur
 
@@ -764,7 +971,11 @@ class Inkling2Forward:
 
     def head(self, h):
         """h [T, D] -> logits [T, vocab] (softcapped, unpadded)"""
-        if "dense" in RTX and self.dev.type == "cuda" and self.g.infos["output.weight"][0] == T_Q8_0:
+        if self.gl is not None and self.gl.has("head"):
+            lg = self.gl.head(h)                                               # HIP head kernel (Q8_0 / BF16 rows, softcap inside)
+            if lg is not None:
+                return lg
+        if "dense" in RTX and self.backend == "cuda" and self.g.infos["output.weight"][0] == T_Q8_0:
             ty, dims, off = self.g.infos["output.weight"]
             pk = self._q8p.get("output.weight")
             if pk is None:        # only the unpadded vocab rows are read
@@ -777,7 +988,8 @@ class Inkling2Forward:
             if self.softcap:
                 logits = self.softcap * torch.tanh(logits / self.softcap)
             return logits
-        if RESIDENT and self.dev.type == "cuda":
+        self.kstats["torch_head"] += 1
+        if RESIDENT and self.backend == "cuda":
             W = self._w_resident("output.weight")
         else:
             W = self._w.get("output.weight")
@@ -790,21 +1002,34 @@ class Inkling2Forward:
             logits = self.softcap * torch.tanh(logits / self.softcap)
         return logits
 
-    # ---------------------------------------------------------------- CUDA graphs (INK_GRAPH=1): one captured step per T bucket
+    # ---------------------------------------------------------------- captured graphs (INK_GRAPH=1 / INK_GLUE_GRAPH=1): one step per T bucket
     GRAPH_BUCKETS = (1, 2, 4, 8)
 
     def _graph_body(self, T):
+        """what a graph records: the 48 applications + the head over ALL T rows, from the static input buffer; returns (hidden [T, D], logits [T, vocab])"""
         h = self._body(self._gin[T], T, 0)
-        return h, self.head(h)
+        lg = self.head(h)
+        assert lg.shape[0] == T and h.shape[0] == T
+        return h, lg
 
     @torch.no_grad()
     def capture_graphs(self, buckets=None, fill_id=1000, taps=()):
-        """capture the step (48 applications + head over all T rows) once per T bucket, from a static input buffer; needs INK_RTX=experts,attn,dense (no host value is read: device pos0, device plan).
-        Per bucket: eager warm-up on a side stream (loads weights, JIT-compiles Triton, creates every scratch), then torch.cuda.CUDAGraph capture. Hooks off while capturing; state is reset in place afterwards."""
-        assert self.dev.type == "cuda" and {"experts", "attn"} <= RTX and "conv" in FUSE, "graph capture needs INK_RTX=experts,attn[,dense] and INK_GLUE_FUSE=conv (the torch conv keeps per-slot host state)"
+        """capture the step once per T bucket (needs a backend that reads no host value: the device pos0, the device plan). On NVIDIA:
+        INK_RTX=experts,attn[/dense] and INK_GLUE_FUSE=conv; on AMD: INK_GLUE with all six stages. Per bucket: eager warm-up on a side
+        stream (loads weights, JIT-compiles, creates every scratch), then torch.cuda.CUDAGraph capture (a CPU stub re-runs the body).
+        Hooks and profile spans are off while capturing; state is reset in place afterwards."""
+        gl = self.gl
+        if gl is not None:
+            assert set(gl.STAGES_ALL) <= gl.on, "graph capture needs the six glue stages (INK_GLUE=all): the torch paths read host values"
+            prof, gl.prof = gl.prof, False
+        else:
+            assert self.backend == "cuda" and {"experts", "attn"} <= RTX and "conv" in FUSE, "graph capture needs INK_RTX=experts,attn[,dense] and INK_GLUE_FUSE=conv (the torch conv keeps per-slot host state)"
+            prof = None
         hook, self.hook = self.hook, None
         t0 = time.time()
         self.tap_layers = tuple(taps)
+        self.alloc_state()
+        cuda = self.dev.type == "cuda"
         try:
             for T in tuple(buckets or self.GRAPH_BUCKETS):
                 self._gin[T] = torch.zeros(T, self.D, device=self.dev)
@@ -818,22 +1043,30 @@ class Inkling2Forward:
                     self.hook = _w
                 self.reset()
                 self._glue_begin(T, 0)
-                side = torch.cuda.Stream()
-                side.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(side):
+                if cuda:
+                    side = torch.cuda.Stream()
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        self._gin[T].copy_(self.embed([fill_id] * T))
+                        for _ in range(2):
+                            self._graph_body(T)
+                    torch.cuda.current_stream().wait_stream(side)
+                    torch.cuda.synchronize()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, capture_error_mode="thread_local"):
+                        out = self._graph_body(T)
+                else:                                                            # CPU: a stub that re-runs the body into static buffers (tests the protocol, not the capture)
                     self._gin[T].copy_(self.embed([fill_id] * T))
-                    for _ in range(2):
-                        self._graph_body(T)
-                torch.cuda.current_stream().wait_stream(side)
-                torch.cuda.synchronize()
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, capture_error_mode="thread_local"):
                     out = self._graph_body(T)
+                    g = _StubGraph(self, T, out)
                 self.graphs[T] = (g, self._gin[T], out)
                 print(f"graph T={T} captured ({time.time() - t0:.1f} s)", flush=True)
         finally:
             self.hook = hook
             self.reset()
+            if gl is not None:
+                gl.prof = prof
+                gl.reset()
         return self.graphs
 
     @torch.no_grad()
@@ -842,7 +1075,7 @@ class Inkling2Forward:
         per-slot K / V; torch conv with slot.hist: INK_RTX=attn and INK_GLUE_FUSE=conv are switched off for the duration), then the K / V of every application are written into the
         kernel caches (seed_kv: global = all rows, SWA = the last window) and the last 3 pre-conv rows into the position-indexed rings. Returns (logits of the last row [vocab], taps [n, ntap + 1, D] or None).
         taps = layer indices whose layer_inp is returned, plus the final normed hidden."""
-        assert self.n == 0 and self.dev.type == "cuda"
+        assert self.n == 0 and self.backend == "cuda" and self.gl is None, "prefill_big seeds the CUDA kernel caches from a torch prefill: NVIDIA kernels only"
         ids = [int(i) for i in ids]
         n = len(ids)
         self._glue_begin(1, 0)                                    # creates ConvFuse / pos0 / attention kernels while the flags are still on
@@ -905,12 +1138,60 @@ class Inkling2Forward:
     def _step_graph(self, ids):
         T = len(ids)
         g, gin, (h, lg) = self.graphs[T]
+        if self.gl is not None:
+            assert self.n + T <= self.gl.cap, f"global KV cache full: {self.n + T} > cap {self.gl.cap} (INK_GLUE_CAP)"
         self._glue_begin(T, self.n)
         gin.copy_(self.embed(ids))
         g.replay()
         self.n += T
         self.kstats["graph_replays"] += 1
         return h, lg
+
+    def capture_check(self, T=1, allow=("_moe_loop", "head", "experts", "attn", "router")):
+        """DRY capture check (any device, torch emulation of the kernels): trace one `_graph_body(T)` with every host-sync entry point patched to RECORD (item, cpu, tolist, numpy, __bool__,
+        __int__, __float__, __index__, nonzero, unique, masked_select) plus host IO (`_u8`). Returns (events, bad): events = sorted unique (api, function, file:line); bad = those whose innermost
+        frame in this code is not in `allow` (the torch emulation of the experts / attention / head / router is not what a graph records: the kernels are). Run `step` once first: weights load lazily."""
+        ev = {}
+        here = ("inkling2_forward.py", "ink2_glue.py")
+        orig = {}
+
+        def hit(api):
+            f, names, first = sys._getframe(2), [], None
+            while f is not None:
+                if f.f_code.co_filename.split("/")[-1] in here:
+                    names.append(f.f_code.co_name)
+                    first = first or (f.f_code.co_name, f"{f.f_code.co_filename.split('/')[-1]}:{f.f_lineno}")
+                f = f.f_back
+            if first is not None:
+                ev[(api,) + first] = ev.get((api,) + first, False) or any(n in allow for n in names)
+
+        def wrap(owner, name, label=None):
+            o = getattr(owner, name)
+            orig[(owner, name)] = o
+
+            def w(*a, **k):
+                hit(label or name)
+                return o(*a, **k)
+            setattr(owner, name, w)
+        mod = sys.modules[type(self).__module__]
+        if T not in self._gin:
+            self._gin[T] = torch.zeros(T, self.D, device=self.dev)
+        self.alloc_state()
+        self._gin[T].copy_(self.embed([1000] * T))                                # the embedding is outside the graph: not traced
+        self._glue_begin(T, self.n)
+        for n in ("item", "cpu", "tolist", "numpy", "__bool__", "__int__", "__float__", "__index__", "nonzero"):
+            wrap(torch.Tensor, n)
+        wrap(torch, "unique")
+        wrap(torch, "nonzero")
+        wrap(mod, "_u8", "host_io(_u8)")
+        try:
+            with torch.no_grad():
+                self._graph_body(T)
+        finally:
+            for (owner, name), o in orig.items():
+                setattr(owner, name, o)
+        events = sorted(ev)
+        return events, [e for e in events if not ev[e]]
 
     @torch.no_grad()
     def step(self, ids, all_pos=False):
@@ -920,6 +1201,7 @@ class Inkling2Forward:
         if self.graphs:
             if len(ids) in self.graphs:
                 h, lg = self._step_graph(ids)
+                self.last_h = h
                 self.stats["layer_s"] += time.time() - t0
                 return lg if all_pos else lg[-1]               # static buffers: valid until the next replay
             self.kstats["graph_eager"] += 1
@@ -927,6 +1209,7 @@ class Inkling2Forward:
         for s in range(0, len(ids), self.chunk):
             outs.append(self._chunk(ids[s:s + self.chunk], self.n + s))
         h = torch.cat(outs, 0)
+        self.last_h = h
         self.n += len(ids)
         logits = self.head(h if all_pos else h[-1:])
         self._hk("result_output", -1, logits)
@@ -942,3 +1225,15 @@ class Inkling2Forward:
             out.append(t)
             lg = self.step([t])
         return out
+
+
+class _StubGraph:
+    """CPU stand-in of a CUDAGraph: replay() re-runs the body (reading only static buffers + the device pos0) and copies into the captured outputs"""
+
+    def __init__(self, fw, T, out):
+        self.fw, self.T, self.out = fw, T, out
+
+    def replay(self):
+        h, lg = self.fw._graph_body(self.T)
+        self.out[0].copy_(h)
+        self.out[1].copy_(lg)
