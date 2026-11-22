@@ -5,7 +5,10 @@ Two things matter here and nothing else:
   * the "q" part is not - only the cache is narrowed.
 
 The env var is exercised in a subprocess, because `step_graph` reads it at import time and
-reloading it in-process would leave a half-initialised module behind.
+reloading it in-process would leave a half-initialised module behind. The child's path is
+built from this process's `sys.path`, not from `PYTHONPATH`: in the nix build `PYTHONPATH` is
+how torch and the built extension are found, and overwriting it leaves the child with a bare
+interpreter.
 """
 import os
 import subprocess
@@ -53,33 +56,38 @@ def test_constructor_takes_the_flag():
     assert "kv_f16" in inspect.signature(mla_hy4.Hy4MLA.__init__).parameters
 
 
-def _cache_dtype_in_a_child(env_value):
-    """Run a child interpreter and report the dtype it picked for the K cache."""
+def _child_env(env_value):
+    """An environment for a child interpreter that can import the same packages as this one."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    parts = [root]
+    for p in sys.path:
+        if p and p not in parts and os.path.isdir(p):
+            parts.append(p)
+    env = dict(os.environ)
+    env["HY4_KV_DTYPE"] = env_value
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+    return env
+
+
+def _run_child(env_value, code):
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                          env=_child_env(env_value))
+
+
+def test_env_var_selects_the_cache_dtype():
     code = (
         "import torch\n"
         "from exllamav3.loader import step_graph\n"
         "print('fp16' if step_graph.K_CACHE_DTYPE == torch.float16 else 'fp32')\n"
     )
-    env = dict(os.environ)
-    env["HY4_KV_DTYPE"] = env_value
-    env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
-    assert r.returncode == 0, r.stderr[-600:]
-    return r.stdout.strip().splitlines()[-1]
-
-
-def test_env_var_selects_the_cache_dtype():
-    assert _cache_dtype_in_a_child("fp16") == "fp16"
-    assert _cache_dtype_in_a_child("fp32") == "fp32"
-    assert _cache_dtype_in_a_child("FP16") == "fp16"
+    for value in ("fp16", "fp32", "FP16"):
+        r = _run_child(value, code)
+        assert r.returncode == 0, r.stderr[-600:]
+        assert r.stdout.strip().splitlines()[-1] == ("fp16" if value.lower() == "fp16" else "fp32")
 
 
 def test_an_unknown_dtype_is_rejected():
-    code = "from exllamav3.loader import step_graph\n"
-    env = dict(os.environ)
-    env["HY4_KV_DTYPE"] = "int8"
-    env["PYTHONPATH"] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    r = _run_child("int8", "from exllamav3.loader import step_graph\n")
     assert r.returncode != 0
     assert "HY4_KV_DTYPE must be fp32 or fp16" in r.stderr
 
