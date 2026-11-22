@@ -890,7 +890,7 @@ class Inkling2Forward:
                 Vc = self.conv(Vp, self.W(f"{L}.attn_v_conv.weight"), dv, slot, self.kvd)
                 Kc = l2_clip(Kc.reshape(T, nkv, hd), None, self.qk_clip)
                 Vc = rms(Vc.reshape(T, nkv, hd), self.eps)
-            if "clip" in fz:                                                     # Q / R l2 clip (+ tau on global layers) in one launch
+            if gl is not None and "clip" in fz:                                  # Q / R l2 clip (+ tau on global layers) in one launch
                 Q, R = gl.qr_clip(Q, R, self.W(f"{L}.attn_q_clip.weight"), self.W(f"{L}.attn_rel_clip.weight"), None if swa else tau)
             else:
                 Q = l2_clip(Q.reshape(T, nh, hd), self.W(f"{L}.attn_q_clip.weight"), self.qk_clip)

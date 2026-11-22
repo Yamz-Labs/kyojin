@@ -13,6 +13,7 @@ Stages (one merge + wiring commit each, cumulative; each keeps a fires counter +
 On a CPU device (or INK_GLUE_EMU=1) every stage runs a torch emulation with the same buffers / call order, so the wiring is testable on the tiny twin GGUF."""
 import collections
 import contextlib
+import json
 import os
 import sys
 
@@ -24,7 +25,7 @@ if HERE not in sys.path:
 H = os.environ.get("INK_H", os.path.expanduser("~"))
 STAGES = ("router", "head", "experts", "gkv", "lattn", "attn")
 T_Q8_0, T_BF16 = 8, 30
-FUSE_ALL = ("conv", "control", "mix")        # G2a glue fusions (INK_GLUE_FUSE=conv,control,mix | all): ink2_glue_conv / ink2_glue_ctrl / ink2_glue_mix
+FUSE_ALL = ("conv", "control", "mix", "clip")        # G2a glue fusions, all on by default for the Strix decode path (INK_GLUE_FUSE=conv,control,mix,clip | all): ink2_glue_conv / ink2_glue_ctrl / ink2_glue_mix / ink2_glue_clip
 NBMAX = 9                                    # block states kept for the depth mixes (physical layers 0..23, block size 6: <= 5 per pass)
 HEAD_CFG = {1: 11, 2: 10, 4: 9, 8: 5}          # best head_q8 cfg per T (ops_routerhead.md); cfg 0 elsewhere
 
@@ -86,6 +87,9 @@ class Glue:
             import ink2_glue_ctrl as CT
             self.CT = CT
             self._cscr = torch.zeros(8, 64, device=dev)
+        if "clip" in self.fuse:
+            import ink2_glue_clip as CL
+            self.CL = CL
         if "mix" in self.fuse:
             import ink2_glue_mix as MX
             self.MX = MX
@@ -142,6 +146,22 @@ class Glue:
                 return out
             out2 = torch.empty_like(cur)
             return self.CT.rms_w(out, nw, out2, fw.eps)
+
+    def qr_clip(self, Q, R, sq, sr, tau=None):
+        """l2 clip of Q (T, nh, hd) and R (T, nh, n_rel) with per-dim scales, x tau on global layers, one launch"""
+        fw = self.fw
+        self.fires["clip"] += 1
+        tq = None if tau is None else tau.reshape(-1).float().contiguous()
+        if self.emu:
+            return self.CL.qr_clip_ref(Q, R, sq, sr, fw.qk_clip, fw.rel_clip, fw.n_head, fw.hd, fw.n_rel, tq)
+        with self.span("clip"):
+            q, r = self.CL.qr_clip(Q, R, sq, sr, fw.qk_clip, fw.rel_clip, fw.n_head, fw.hd, fw.n_rel, tq)
+        if os.environ.get("INK_CLIP_CHECK") and self.fires["clip"] % 7 == 1:      # parity vs the torch ops on the real weights / shapes (sampled, syncs: A/B arms run without it)
+            rq, rr = self.CL.qr_clip_ref(Q, R, sq, sr, fw.qk_clip, fw.rel_clip, fw.n_head, fw.hd, fw.n_rel, tq)
+            cs = lambda a, b: float(torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0))
+            print("CLIP_CHECK", self.fires["clip"], "shapes", tuple(Q.shape), tuple(R.shape), tuple(sq.shape), tuple(sr.shape), "tau", tq is not None,
+                  "cosQ %.8f cosR %.8f maxdQ %.2e maxdR %.2e" % (cs(q, rq), cs(r, rr), float((q - rq).abs().max()), float((r - rr).abs().max())), flush=True)
+        return q, r
 
     def rmsw(self, x, nw):
         """rms(x) * nw in one launch"""
@@ -588,17 +608,21 @@ def count_launches(fw, fn):
     from torch.utils._python_dispatch import TorchDispatchMode
     import triton.runtime.jit as tj
     n = {"aten": 0, "triton": 0}
+    import collections
+    ops, tks = collections.Counter(), collections.Counter()
 
     class Count(TorchDispatchMode):
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             rets = func._schema.returns
             if not any(r.alias_info is not None and not r.alias_info.is_write for r in rets):
                 n["aten"] += 1
+                ops[str(func)] += 1
             return func(*args, **(kwargs or {}))
     orig = tj.JITFunction.run
 
     def run(self, *a, **k):
         n["triton"] += 1
+        tks[getattr(self, "__name__", None) or getattr(getattr(self, "fn", None), "__name__", "?")] += 1
         return orig(self, *a, **k)
     gl = fw.gl
     f0 = dict(gl.fires)
@@ -609,6 +633,8 @@ def count_launches(fw, fn):
     finally:
         tj.JITFunction.run = orig
     d = {k: gl.fires[k] - f0.get(k, 0) for k in gl.fires}
+    print("ATEN_OPS", json.dumps(ops.most_common(40)), flush=True)
+    print("TRITON_KERNELS", json.dumps(tks.most_common(40)), flush=True)
     n["ctypes"] = d.get("router", 0) + d.get("head", 0) + 3 * d.get("experts", 0) + 2 * d.get("attn", 0) + 4 * d.get("gkv", 0)
     n["total"] = n["aten"] + n["triton"] + n["ctypes"]
     return n
