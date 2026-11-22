@@ -62,8 +62,8 @@
 #   EXL3_LOAD_DEVICE=cuda:0   single-device load, bypassing the autosplit budget
 #                         arithmetic (which reads MemFree, not MemAvailable).
 #                         Set to "" to restore stock autosplit.
-#   MEMGUARD=auto         auto | 1 | 0. `auto` enables util/memguard.py on Linux.
-#   MEMGUARD_FLOOR=8      SIGKILL the server below this MemAvailable, in GiB
+#   MEMGUARD=auto         auto | 1 | 0. `auto` enables exllamav3/guard.py on Linux.
+#   MEMGUARD_FLOOR=8      SIGKILL below this MemAvailable, in GiB
 #   MIN_AVAIL_GIB=12      refuse to start below this MemAvailable, in GiB
 #   FOREGROUND=1          0 backgrounds it and writes $LOG
 #
@@ -116,7 +116,6 @@ DYNAMIC_DRAFT="${DYNAMIC_DRAFT:-1}"
 DRAFT_CACHE_MODE="${DRAFT_CACHE_MODE:-FP16}"
 DRAFT_RING="${DRAFT_RING:-1}"
 MEMGUARD="${MEMGUARD:-auto}"
-MEMGUARD_FLOOR="${MEMGUARD_FLOOR:-8}"
 MIN_AVAIL_GIB="${MIN_AVAIL_GIB:-12}"
 FOREGROUND="${FOREGROUND:-1}"
 CONFIG_OUT="${CONFIG_OUT:-$TABBY_DIR/mimo-tabby-config.yml}"
@@ -239,17 +238,23 @@ export EXL3_DFLASH_RING="$DRAFT_RING"
 export EXL3_LOAD_DEVICE="${EXL3_LOAD_DEVICE-cuda:0}"
 [ -n "$EXL3_LOAD_DEVICE" ] && echo " -- EXL3_LOAD_DEVICE=$EXL3_LOAD_DEVICE (single-device load)"
 
-# memguard: SIGKILL the server's process group if MemAvailable falls below the floor,
-# and fadvise(DONTNEED) the shards every 5 s so the ~86 GiB of buffered-pread page
-# cache never shadows the same 86 GiB of weights in one unified pool.
+# memguard: SIGKILL the server's process group if host MemAvailable falls below
+# its floor, and fadvise(DONTNEED) the shards every 5 s so the ~86 GiB of
+# buffered-pread page cache never shadows the same weights in one pool.
 use_mg=0
 case "$MEMGUARD" in
     1) use_mg=1 ;;
-    auto) [ -r /proc/meminfo ] && use_mg=1 ;;
+    0) ;;
+    auto)
+        if [ -r /proc/meminfo ]; then use_mg=1; fi
+        ;;
 esac
-if [ "$use_mg" = "1" ] && [ -f "$REPO/util/memguard.py" ]; then
-    MG=(python "$REPO/util/memguard.py" --floor-gib "$MEMGUARD_FLOOR"
-        --fadvise-dir "$MODEL_DIR" --fadvise-every 5 --label tabbyapi --)
+if [ "$use_mg" = "1" ] && [ -f "$REPO/exllamav3/guard.py" ]; then
+    MG=(python "$REPO/exllamav3/guard.py"
+        --fadvise-dir "$MODEL_DIR" --fadvise-every 5 --label tabbyapi
+        --sample-every 5 --log "$TABBY_DIR/memguard.log")
+    MG+=(--)
+    echo " -- MEMGUARD=on (host floor MEMGUARD_FLOOR/default)"
 else
     MG=()
     [ "$use_mg" = "1" ] || echo " !! memguard disabled (MEMGUARD=$MEMGUARD)"

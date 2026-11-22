@@ -53,6 +53,7 @@ KYOJIN_PART1_DEVICE=gfx1151 \
 | `--part0-reserve-gb` | `KYOJIN_PART0_RESERVE_GB` | VRAM held as a load-time slab on `part0` for workspace (default 1.2) |
 | `--split-preset auto\|glm\|qwen\|ds41\|none` | `KYOJIN_SPLIT_PRESET` | per-model unsafe-environment preset; GLM needs none today |
 | `--split-graphs auto\|on\|off` | - | reserved for per-segment capture; split currently runs graphs off |
+| `--oom-guard auto\|off` | `KYOJIN_OOM_GUARD` | pre-flight memory guard (`auto` refuses, `off` disables) |
 
 `cuda:N` is the torch device index **after** `HIP_VISIBLE_DEVICES`, not the `rocm-smi`
 index. Explicit selectors win in either position: `part0=cuda:1/part1=cuda:0` and
@@ -85,8 +86,68 @@ Text endcaps are selected by a class/key allowlist, not by per-model placement i
   module. Size it to the part0 card.
 - Split mode runs eager. Whole-forward and per-block graphs are disabled; per-segment
   capture is not implemented yet.
-- Use `util/memguard.py` when loading near the limit.  It help save you from the dreaded OOM but slight adverse 
-  performance effects have been noted (to be investigated further.)
+
+### Pre-flight guard
+
+The guard estimates each device's footprint from actual bytes: weights, KV/recurrent cache,
+the part0 load slab and, on unified-memory devices only, a prefill workspace. The caps are:
+
+```text
+dedicated device_cap = min(mem_get_info().free, mem_get_info().total)
+unified device_cap   = min(total, max(mem_get_info().free, MemAvailable))
+host_cap             = MemAvailable - (host_floor + preflight_margin)
+```
+
+On unified devices, `MemAvailable` covers reclaimable page cache, which some runtimes report as
+used device memory; `total` bounds the visible aperture. A component added after the target load
+may also reuse the process's cached allocator blocks; treat that part as a planning estimate.
+
+Dedicated devices plan without a workspace: `auto` refuses only a hard overcommit of
+weights+cache+slab, and does not refuse a load that merely leaves less than the workspace
+estimate. A dedicated prefill allocation failure is a process-level error. Unified devices add
+the configurable workspace estimate and must also satisfy the host cap; only the unified
+footprints are summed against the host.
+
+There is **no GTT or VRAM reserve**. A dedicated-VRAM allocation failure is a process-level
+error; the host floor is what prevents a unified-memory box from starving. The only
+tunables are `MEMGUARD_FLOOR` (default 8), the planning margin (default 1)
+and the unified prefill workspace (default 2.0 GiB). The host floor is shared with the
+supervisor; the margin keeps the planner above the supervisor's kill threshold.
+
+`--oom-guard auto` refuses before allocating weights, cache or slabs, and prints a per-device
+table plus the chosen N/context and the largest N/context that fits. `off` disables it. The
+check is read-only. For MTP-on, use the guard's recommendation instead of hand-picking N:
+the drafter and its cache change the memory budget.
+
+The device caps and the host cap are checked separately; a load that reaches the host floor is
+stopped by the supervisor.
+
+### Allocator mode
+
+If a load needs expandable segments off: Use the existing `EXL3_EXPANDABLE_SEGMENTS=0`
+(or `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`) in that lane profile before the library import.
+It recovers about **0.5 GiB** of fragmentation, not capacity. There is no automatic allocator heuristic.
+
+If the host cap refuses on a particular boot:
+Set `KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB=0` or `KYOJIN_OOM_GUARD=off` for that lane;
+the external supervisor floor is unchanged and still protects the box. Do not disable the supervisor.
+
+### External supervisor
+
+Use `exllamav3/guard.py` (the compatibility path `util/memguard.py` execs it). It watches host
+`MemAvailable` and page cache; it has no device floors and no torch import:
+
+```sh
+python exllamav3/guard.py --fadvise-dir /path/to/model -- python tools/glm/serve.py ...
+```
+
+The host floor defaults to 8 GiB (or `MEMGUARD_FLOOR`) and is the same value
+the preflight plans around. The supervisor logs a sample to `--log`; the serve lanes pass
+`$TMPDIR/memguard.log` so a future event leaves evidence. The serve scripts use a
+`MEMGUARD=auto|1|0` wrapper: `auto` arms `exllamav3/guard.py` on Linux when
+`/proc/meminfo` is readable; use `MEMGUARD=0` to disable it.
+Keep the supervisor external; an in-process watchdog cannot be relied on while the allocator
+or kernel is stalled.
 
 ## Model support
 

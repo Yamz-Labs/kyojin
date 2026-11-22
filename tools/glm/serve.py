@@ -27,8 +27,8 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 import startup_health  # noqa: E402  (GET /health with load progress while the model loads)
 # Shared split helper: pure stdlib at import, it loads exllamav3 lazily after SPEED_ENV.
 from kyojin_serve_split import (  # noqa: E402
-    SplitController, SplitSettings, add_split_arguments, apply_split_env, parse_part0_layers,
-    settings_from_namespace,
+    SplitController, SplitSettings, add_split_arguments, apply_split_env,
+    parse_part0_layers, settings_from_namespace,
 )
 from loopguard import AnswerTap, loop_guard_default  # noqa: E402  (answer-phase loop guard shared with the Qwen server)
 import serve_compat  # noqa: E402  (vLLM-style token-id prompts, cache_salt, /tokenize, usage details)
@@ -843,6 +843,16 @@ class ResidentEngine:
             self.split.load("text", self.model, progressbar=False,
                             callback=startup_health.load_callback(), max_chunk_size=4096)
         else:
+            from exllamav3.device_map import check_single_device_guard
+            extras = []
+            if draft_model is not None:
+                extras.append((draft_model, self.config, draft_cache))
+            if vision_tower is not None:
+                extras.append((vision_tower, self.config, None))
+            check_single_device_guard(self.model, self.config, self.cache, "cuda:0",
+                                      guard_mode=split_settings.guard_mode,
+                                      extra_components=extras,
+                                      logger=lambda m: print(f"serve: {m}", flush=True))
             self.model.load(device="cuda:0", progressbar=False, callback=startup_health.load_callback())
         if num_draft > 0:
             self.draft_model = draft_model

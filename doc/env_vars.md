@@ -709,8 +709,45 @@ Enable GPU/CPU handoff profiling, for debug purposes.
 
 ### `EXL3_EXPANDABLE_SEGMENTS` (default: `1`)
 
-Use expandable segments for all Torch allocations. Opt out with a value of 1 or by explicitly
-setting `PYTORCH_CUDA_ALLOC_CONF`.
+Use expandable segments for all Torch allocations. Opt out with a value of `0` or by explicitly
+setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`. On a unified-memory box, disabling
+expandable segments can recover about **0.5 GiB** of allocator fragmentation around a large cache;
+it does not add capacity. Set it in the lane profile before `import exllamav3` for that case.
+
+### `KYOJIN_OOM_GUARD` (default: `auto`)
+
+Pre-flight memory guard: `auto` refuses a load whose measured weights, cache, part0 slab and
+prefill workspace do not fit before allocating anything; `off` disables the check. The guard is
+read-only and never changes allocator settings or outputs. `1`/`true`/`yes`/`on` are accepted as
+`auto`, and `0`/`false`/`no`/`none` as `off`, matching the launcher-style `MEMGUARD=0/1` values.
+
+There is no per-device GTT or VRAM reserve. Dedicated GPUs are limited by their free VRAM;
+unified-memory devices also account for reclaimable page cache and the shared host floor, so
+cached model shards do not make a fitting load look too large. A dedicated-VRAM allocation
+failure is a process-level error; the host floor is what protects the unified-memory box from
+kernel starvation.
+
+### `MEMGUARD_FLOOR` (default: `8`)
+
+The host `MemAvailable` floor, used by both the pre-flight guard and `exllamav3/guard.py`.
+The preflight plans against `MemAvailable - (floor + margin)`; the supervisor SIGKILLs when
+`MemAvailable < floor`. The name is the established memguard variable, so existing lanes
+keep working. Raise it for a hungrier OS or more background services; lower it only after
+measuring. A non-numeric value is reported on stderr and falls back to the default, rather
+than silently changing the safety floor.
+
+### `KYOJIN_OOM_GUARD_PREFLIGHT_MARGIN_GIB` (default: `1`)
+
+Planning headroom above the supervisor floor. It keeps the preflight from deliberately
+planning at the kill threshold and covers ordinary estimator error. Set it to `0` to plan
+exactly at the floor.
+
+### `KYOJIN_OOM_GUARD_WORKSPACE_GIB` (default: `2.0`)
+
+Estimated transient prefill workspace added to unified (integrated-memory) device footprints;
+dedicated devices use 0. The default 2.0 GiB is a planning estimate, not a universal measurement.
+This is model/context dependent; raise it for a model with a larger prefill scratch area. It is
+not a reserve.
 
 ### `EXL3_LOAD_ARENA` (default: `1`)
 

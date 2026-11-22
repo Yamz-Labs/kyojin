@@ -140,6 +140,18 @@ def _infos(dm, *pairs):
     return out
 
 
+@pytest.fixture(autouse = True)
+def _disable_default_oom_guard(split_modules, monkeypatch):
+    """The CPU placement tests are not guard tests: keep the pre-flight check off.
+
+    The guard integration test passes an explicit guard, so it is unaffected.
+    """
+    dm = split_modules[0]
+    monkeypatch.setattr(dm.GuardPolicy, "from_env",
+                        classmethod(lambda cls, default_mode = "auto", explicit_mode = None:
+                                    cls(mode = explicit_mode or "off")))
+
+
 @pytest.fixture
 def clean_split_env(monkeypatch):
     for key in ("KYOJIN_PART0_DEVICE", "KYOJIN_PART1_DEVICE", "KYOJIN_PART0_LAYERS", "KYOJIN_ENDCAPS"):
@@ -723,3 +735,143 @@ def test_split_settings_off_is_a_noop(split_modules, monkeypatch):
     assert os.environ["EXL3_PF_HC_FUSE"] == "0"
     assert os.environ["EXL3_PF_GR_FUSE"] == "0"
     assert os.environ["EXL3_GR_PF_FUSE"] == "0"
+
+
+def _fake_guard_probe(dm, monkeypatch, *, mg, part0_total=16 * 1024 ** 3,
+                      part1_total=118 * 1024 ** 3, host_available=120 * 1024 ** 3):
+    monkeypatch.setattr(dm.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(dm, "device_total_bytes",
+                        lambda i: part0_total if i == 1 else part1_total)
+    monkeypatch.setattr(dm, "device_free_bytes",
+                        lambda i: part0_total if i == 1 else part1_total)
+    monkeypatch.setattr(dm, "device_reusable_bytes",
+                        lambda i: part0_total if i == 1 else part1_total)
+    monkeypatch.setattr(mg, "is_unified_device", lambda i: i == 0)
+    monkeypatch.setattr(dm, "host_available_bytes", lambda: host_available)
+
+
+def test_split_plan_guard_passes_or_refuses_before_allocation(split_modules, monkeypatch):
+    dm, _bridge, _split = split_modules
+    mg = __import__("exllamav3.memory_guard", fromlist = ["OOMGuardError"])
+    gib = dm.GIB
+
+    small = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
+    small_cfg = FakeConfig({f"layer.{i}": gib // 2 for i in range(4)})
+    _fake_guard_probe(dm, monkeypatch, mg=mg)
+    plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
+                        guard = dm.OOMGuard(dm.GuardPolicy(mode = "auto"),
+                                            logger = lambda *_a: None),
+                        logger = lambda *_a: None)
+    plan.add("text", small, config = small_cfg)
+    plan.build()
+    assert plan.guard_report is not None and plan.guard_report.ok
+    footprints = {r.footprint.index: r.footprint for r in plan.guard_report.device_results}
+    # cuda:0 is the unified part1: configured workspace plus the host check.
+    assert footprints[0].unified and footprints[0].workspace_bytes == 2 * gib
+    # cuda:1 is a dedicated part0: no workspace, only the hard-fit device cap.
+    assert not footprints[1].unified and footprints[1].workspace_bytes == 0
+    assert plan.guard_report.host_result is not None
+
+    huge = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
+    huge_cfg = FakeConfig({f"layer.{i}": 40 * gib for i in range(4)})
+    plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
+                        guard = dm.OOMGuard(dm.GuardPolicy(mode = "auto"),
+                                            logger = lambda *_a: None),
+                        logger = lambda *_a: None)
+    plan.add("text", huge, config = huge_cfg)
+    with pytest.raises(mg.OOMGuardError, match = "pre-flight OOM guard"):
+        plan.build()
+
+    # off skips the check entirely.
+    off = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
+                       guard = dm.OOMGuard(dm.GuardPolicy(mode = "off"),
+                                           logger = lambda *_a: None),
+                       logger = lambda *_a: None)
+    off.add("text", huge, config = huge_cfg)
+    off.build()
+    assert off.guard_report is None
+
+
+def test_preload_guard_uses_raw_free_not_allocator_cached(split_modules, monkeypatch):
+    """Before a target is resident, cached blocks do not make a load fit."""
+    dm, _bridge, _split = split_modules
+    mg = __import__("exllamav3.memory_guard", fromlist = ["OOMGuardError"])
+    gib = dm.GIB
+
+    text = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
+    text_cfg = FakeConfig({f"layer.{i}": gib // 2 for i in range(4)})
+    _fake_guard_probe(dm, monkeypatch, mg=mg)
+    monkeypatch.setattr(dm, "device_free_bytes", lambda _i: gib // 10)
+    monkeypatch.setattr(dm, "device_reusable_bytes", lambda _i: 16 * gib)
+
+    plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
+                        guard = dm.OOMGuard(dm.GuardPolicy(mode = "auto"),
+                                            logger = lambda *_a: None),
+                        logger = lambda *_a: None)
+    plan.add("text", text, config = text_cfg)
+    with pytest.raises(mg.OOMGuardError, match = "deficit"):
+        plan.build()
+
+
+def test_late_component_uses_allocator_cached_bytes(split_modules, monkeypatch):
+    """After the target load, reuse the allocator's cached blocks, not raw free."""
+    dm, _bridge, _split = split_modules
+    mg = __import__("exllamav3.memory_guard", fromlist = ["OOMGuardError"])
+    gib = dm.GIB
+
+    text = FakeModel([FakeModule(f"layer.{i}", layer_idx = i) for i in range(4)])
+    text_cfg = FakeConfig({f"layer.{i}": gib // 2 for i in range(4)})
+    mtp = FakeModel([FakeModule("mtp.block.0", layer_idx = 0), FakeModule("mtp.head")])
+    mtp_cfg = FakeConfig({"mtp.block.0": 3 * gib, "mtp.head": gib})
+
+    _fake_guard_probe(dm, monkeypatch, mg=mg)
+    plan = dm.SplitPlan(_devices(dm), endcaps = True, part0_layers = 2,
+                        guard = dm.OOMGuard(dm.GuardPolicy(mode = "auto"),
+                                            logger = lambda *_a: None),
+                        logger = lambda *_a: None)
+    plan.add("text", text, config = text_cfg)
+    plan.build()
+    assert plan.guard_report is not None and plan.guard_report.ok
+    plan.record_load("text", 1.0)
+
+    # Driver-free is 1 GiB, but the allocator holds 15 GiB of reusable cached blocks.
+    raw_free = 1 * gib
+    monkeypatch.setattr(dm, "device_free_bytes", lambda _i: raw_free)
+    monkeypatch.setattr(dm, "device_reusable_bytes", lambda _i: 16 * gib)
+    plan.add("mtp", mtp, config = mtp_cfg)
+    assert plan.guard_report is not None and plan.guard_report.ok
+    part0 = next(r for r in plan.guard_report.device_results if r.footprint.index == 1)
+    assert part0.footprint.need_bytes > raw_free
+    assert part0.capacity_bytes == 16 * gib
+
+    # The same component is refused when only raw free is reported.
+    monkeypatch.setattr(dm, "device_reusable_bytes", lambda _i: raw_free)
+    with pytest.raises(mg.OOMGuardError, match = "deficit"):
+        plan.check_guard()
+
+def test_guard_mode_is_normalized_from_env_style_values(split_modules):
+    _dm, _bridge, split = split_modules
+    assert split.SplitSettings(part0_layers = 1, oom_guard = "OFF").guard_mode == "off"
+
+
+def test_single_device_guard_includes_extra_components(split_modules, monkeypatch):
+    dm, _bridge, _split = split_modules
+    mg = __import__("exllamav3.memory_guard", fromlist = ["OOMGuardError"])
+    gib = dm.GIB
+    monkeypatch.setattr(dm.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(mg, "device_total_bytes", lambda _i: 118 * gib)
+    monkeypatch.setattr(mg, "device_free_bytes", lambda _i: 118 * gib)
+    monkeypatch.setattr(mg, "host_available_bytes", lambda: 120 * gib)
+    monkeypatch.setattr(mg, "is_unified_device", lambda _i: True)
+
+    target = FakeModel([FakeModule("layer.0", layer_idx = 0)])
+    target_cfg = FakeConfig({"layer.0": 1 * gib})
+    extra = FakeModel([FakeModule("mtp.0")])
+    extra_cfg = FakeConfig({"mtp.0": 116 * gib})
+
+    dm.check_single_device_guard(target, target_cfg, None, 0, guard_mode = "auto",
+                                 logger = lambda *_a: None)
+    with pytest.raises(mg.OOMGuardError, match = "refused the load"):
+        dm.check_single_device_guard(target, target_cfg, None, 0, guard_mode = "auto",
+                                     extra_components = [(extra, extra_cfg, None)],
+                                     logger = lambda *_a: None)
