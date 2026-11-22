@@ -259,7 +259,7 @@ def sparse_mla_attend(q_lat, q_pe, ckv, k_pe, qpos, sel, scale, sinks, scl=None)
     T, H, R = q_lat.shape
     P = k_pe.shape[1]
     qf = scl is not None           # ckv = uint8 e4m3 bytes [N, R], scl [N] fp32, k_pe bf16 [N, P]
-    assert sel.tail and q_lat.dtype == torch.float32 and (ckv.dtype == torch.uint8 if qf else ckv.dtype == torch.float32) and q_lat.stride(-1) == 1 and q_pe.stride(-1) == 1 and ckv.stride(-1) == 1 and k_pe.stride(-1) == 1
+    assert sel.tail and q_lat.dtype == torch.float32 and (ckv.dtype == torch.uint8 if qf else ckv.dtype in (torch.float32, torch.float16)) and q_lat.stride(-1) == 1 and q_pe.stride(-1) == 1 and ckv.stride(-1) == 1 and k_pe.stride(-1) == 1
     out = torch.empty(T, H, R, dtype=torch.float32, device=q_lat.device)
     if qf and HB_ON and HB_SPLIT != 0 and H % HB == 0 and R == triton.next_power_of_2(R) and R <= 1024:
         from . import ref_fused as _rf
