@@ -950,7 +950,9 @@
               # which has no pytest CI). Left out of the check until that
               # lands; harmless afterwards (grep matches nothing).
               files=$(ls tests/test_*_cpu.py | grep -v test_ablit_qwen_cpu)
-              timeout 240 pytest $files -q
+              # The container entrypoint is authored in flake.nix, so its test
+              # reads the shell out of the flake; no GPU, network or model.
+              timeout 240 pytest $files docker/test_flake_entrypoint.py -q
               runHook postCheck
             '';
             installPhase = ''
