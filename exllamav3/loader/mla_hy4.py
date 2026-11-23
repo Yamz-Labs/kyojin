@@ -87,11 +87,16 @@ def _sp_hip_call(mla, kcache, T, sel, qcat):
 class Hy4MLA:
     """One attention layer: cur [T, n_embd] (normed collapsed stream) -> kqv / gated / out, with a K cache the caller keeps."""
 
-    def __init__(self, g, layer: int, q8_act: bool = False, f16_kv: bool = False, lin=None):
+    def __init__(self, g, layer: int, q8_act: bool = False, f16_kv: bool = False, lin=None,
+                 kv_f16: bool = False):
         m = g.meta
         p = m["general.architecture"] + "."
         b = f"blk.{layer}."
         self.layer, self.q8_act, self.f16_kv = layer, q8_act, f16_kv
+        # HY4_KV_DTYPE=fp16 stores the K-cache rows in fp16 instead of fp32. Reads already
+        # clamp().half() on entry, and mla_bgemv / append_kv_ring / index_copy_ all follow
+        # dtype, so this is storage-only: it changes no output value.
+        self.kv_f16 = kv_f16 or os.environ.get("HY4_KV_DTYPE", "fp32") == "fp16"
         lin = lin or (lambda n: load_dense(g, n))        # lin(name) -> fp32 [N, K] or a QLinear (stored bytes, hy4_forward.py)
         self.H = int(list(m[p + "attention.head_count"])[layer])
         self.hd, self.vd = m[p + "attention.key_length_mla"], m[p + "attention.value_length_mla"]
@@ -122,6 +127,10 @@ class Hy4MLA:
         return q8_0_roundtrip(x) if self.q8_act and tag not in self.q8_skip else x
 
     def _h(self, x, part="k"):
+        # kv_f16: the K-cache buffer itself is fp16 (HY4_KV_DTYPE=fp16). Only the cache rows
+        # ("k") are stored narrow; q stays fp32 and the reads already clamp().half() on entry.
+        if getattr(self, "kv_f16", False) and part == "k":
+            return x.clamp(-65504.0, 65504.0).half()
         return x.half().float() if self.f16_kv and part in self.f16_parts else x
 
     def _w16(self, name):

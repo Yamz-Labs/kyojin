@@ -38,6 +38,10 @@ PRIME_SPARSE = os.environ.get("HY4_PRIME_SPARSE", "1") == "1"      # draft-cache
 PRIME_IX_BLK = int(os.environ.get("HY4_PRIME_IX_BLK", "16384"))           # draft-cache fill: pooled groups above this use the blocked linear-time selection
 VG_RING = 4096 if int(os.environ.get("HY4_SWA_RING", "0")) else 0      # rows of the indexer (value | gate) ring: one prime call (2048 rows) + the open group
 RING_ROWS = int(os.environ.get("HY4_SWA_RING", "0"))      # >= 1: K rows of window layers in a ring buffer of this many rows (e.g. 1024) instead of cap rows
+_KV_DTYPE = os.environ.get("HY4_KV_DTYPE", "fp32").strip().lower()
+if _KV_DTYPE not in ("fp32", "fp16"):
+    raise RuntimeError(f"HY4_KV_DTYPE must be fp32 or fp16, got {_KV_DTYPE!r}")
+K_CACHE_DTYPE = torch.float16 if _KV_DTYPE == "fp16" else torch.float32   # storage dtype of the K-cache rows (reads clamp().half() on entry either way)
 _POOL = ThreadPoolExecutor(max_workers=_IO_W)
 SPLIT = os.environ.get("HY4_GRAPH_SPLIT", "1") == "1"      # 3 graphs per step, cut before the first two Engram layers: the rows of the later layers are staged while the GPU runs the earlier ones
 STAGE_VEC = os.environ.get("HY4_STAGE_VEC", "1") == "1"   # vectorised Engram hash + a few big read chunks (engram_stage); 0 = the per-row python path
@@ -310,7 +314,7 @@ class GraphDecoder:
             b = st.kv.get(i)
             if getattr(m, "kv_ring", 0):
                 if b is None or b.shape[0] != m.kv_ring:
-                    st.kv[i] = torch.zeros(m.kv_ring, 512 + 64, dtype=torch.float32, device=fw.dev)
+                    st.kv[i] = torch.zeros(m.kv_ring, 512 + 64, dtype=K_CACHE_DTYPE, device=fw.dev)
                 continue
             if KV_FP8 and not m.swa and fw._layer(i).ix and not isinstance(b, _KV8.Fp8KV):          # full-attention layer: fp8 latent cache
                 nb = _KV8.Fp8KV(self.cap, 512, 64, fw.dev)
@@ -319,7 +323,7 @@ class GraphDecoder:
                 st.kv[i] = nb
                 continue
             if b is None or b.shape[0] < self.cap:
-                nb = torch.zeros(self.cap, 512 + 64, dtype=torch.float32, device=fw.dev) if b is None else torch.zeros(self.cap, b.shape[1], dtype=b.dtype, device=fw.dev)
+                nb = torch.zeros(self.cap, 512 + 64, dtype=K_CACHE_DTYPE, device=fw.dev) if b is None else torch.zeros(self.cap, b.shape[1], dtype=b.dtype, device=fw.dev)
                 if b is not None:
                     nb[:b.shape[0]] = b
                 st.kv[i] = nb

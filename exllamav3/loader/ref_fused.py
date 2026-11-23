@@ -618,7 +618,8 @@ def mla_sink_attend(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks=None, windo
         return mla_sink_attend_ref(q_lat, q_pe, ckv, k_pe, qpos, kpos, scale, sinks, window, allow)
     T, H, R = q_lat.shape
     N, P = ckv.shape[0], k_pe.shape[1]
-    if (not _usable(q_lat, ckv) or T > MAX_T or sinks is None or N == 0 or q_lat.dtype != torch.float32 or ckv.dtype != torch.float32
+    if (not _usable(q_lat, ckv) or T > MAX_T or sinks is None or N == 0 or q_lat.dtype != torch.float32
+            or ckv.dtype not in (torch.float32, torch.float16) or k_pe.dtype not in (torch.float32, torch.float16)
             or q_lat.stride(-1) != 1 or q_pe.stride(-1) != 1 or ckv.stride(-1) != 1 or k_pe.stride(-1) != 1):
         if ring:
             raise RuntimeError("ring K buffer: the fused kernel declined and the torch reference cannot read a ring")
