@@ -148,13 +148,25 @@ podman from copying host proxy variables into the container, which otherwise
 breaks the model download when the proxy points at localhost. `--ipc=host`
 with a raised memlock limit is the usual setup for GPU inference runtimes.
 
-The entrypoint downloads the model into the volume on first start and skips
-the download when a pack is already there. Both flavor and repo are required
-and fail fast; there are no silent 50 GB pulls. Each flavor gets its own slot
-(`/models/<flavor>`, overridable with `KYOJIN_MODEL_DIR`), and a marker file
-records which repo filled it, so
-switching repos under the same flavor errors out instead of serving a stale
-pack. Tuning cache (`~/.cache/exllamav3`) lives under `HOME`, which the
+The entrypoint reconciles the model into the volume on every start rather
+than only when the directory is empty: unchanged files cost a listing, files
+the repository gained since the pack was fetched are added, and an
+interrupted transfer is retried on the next start. Both flavor and repo are
+required and fail fast; there are no silent 50 GB pulls. Each flavor gets
+its own slot (`/models/<flavor>`, overridable with `KYOJIN_MODEL_DIR`), and a
+marker file records `repo@revision` (the repo alone when no revision is
+asked for), so switching either under the same flavor errors out instead of
+serving a stale pack. `KYOJIN_MODEL_REVISION` is passed to `hf download` as
+`--revision`; a pack whose quantisations live on branches or tags needs it,
+because the default branch of such a repo carries no weights. A sync that
+cannot reach the Hub does not take a served pack down with it: when the slot
+already holds a pack (`config.json` present), a sync the CLI reports as failed
+is a warning and the start serves what is there, and `HF_HUB_OFFLINE=1` skips
+the sync instead of attempting it. huggingface-hub itself reports an
+unreachable Hub as a no-op on an existing directory (it exits 0 rather than
+failing), so that case also serves, with or without the variable. An empty or
+incomplete slot still stops with an error rather than serving an unloadable
+directory. Tuning cache (`~/.cache/exllamav3`) lives under `HOME`, which the
 entrypoint points at `/models/home` (override with `KYOJIN_HOME`) so a fresh
 container does not re-tune. First start still tunes GEMM kernels (around
 10 minutes with the port closed), same as bare metal. The servers answer

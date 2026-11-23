@@ -738,8 +738,9 @@
           # hipcc; a runtime-lib subset would break that. A later diet to a
           # runtime subset is possible once the first-launch compile set is
           # characterized.
-          # Model packs are NEVER baked in: the entrypoint downloads the
-          # configured repo into /models (a volume) on first start.
+          # Model packs are NEVER baked in: the entrypoint reconciles the
+          # configured repo (and optional revision) into /models (a volume)
+          # on every start.
           kyojinEntryPoint = pkgs.writeShellScript "kyojin-entrypoint" ''
             set -euo pipefail
             flavor="''${KYOJIN_FLAVOR:-}"
@@ -755,26 +756,82 @@
               echo "kyojin-entrypoint: set KYOJIN_MODEL_REPO (e.g. yamz-labs/GLM-5.3-Flash-EXL3-Yamz)" >&2
               exit 2
             fi
+            # Some packs keep each quantisation in its own git branch or tag,
+            # so the default branch holds no weights at all and a revision is
+            # the only way to fetch one.
+            revision="''${KYOJIN_MODEL_REVISION:-}"
             model_dir="''${KYOJIN_MODEL_DIR:-/models/$flavor}"
             # Tuning cache (e.g. GLM's dense GEMM tune, ~8 min first launch)
             # must survive container replacement: keep HOME on the volume.
             export HOME="''${KYOJIN_HOME:-/models/home}"
             mkdir -p "$HOME" "$model_dir"
-            # One slot per flavor; the marker records which repo filled it so
-            # switching repos under the same flavor fails loudly instead of
-            # serving a stale pack.
+            # One slot per flavor; the marker records repo@revision (repo alone
+            # when no revision is asked for) so a pack cannot outlive the
+            # revision it was fetched from: changing either under the same
+            # flavor fails loudly instead of serving what is already on disk.
             marker="$model_dir/.kyojin-repo"
-            if [ -f "$model_dir/config.json" ]; then
-              if [ -f "$marker" ] && [ "$(cat "$marker")" != "$repo" ]; then
-                echo "kyojin-entrypoint: $model_dir holds $(cat "$marker"), not $repo;" >&2
-                echo "  set KYOJIN_MODEL_DIR or empty the directory" >&2
-                exit 2
-              fi
-              echo "kyojin-entrypoint: model present at $model_dir, skipping download" >&2
+            want="$repo"
+            if [ -n "$revision" ]; then
+              want="$repo@$revision"
+            fi
+            if [ -f "$marker" ] && [ "$(cat "$marker")" != "$want" ]; then
+              echo "kyojin-entrypoint: $model_dir holds $(cat "$marker"), not $want;" >&2
+              echo "  set KYOJIN_MODEL_DIR or empty the directory" >&2
+              exit 2
+            fi
+            # Reconcile on every start instead of skipping when config.json is
+            # there: a pack fetched once keeps whatever layout the repo had at
+            # the time, and anything added upstream later (a directory a serve
+            # flag points into, say) is missing from it. hf download against
+            # --local-dir is idempotent -- unchanged files are skipped, files
+            # new to the repo are added, an interrupted transfer is retried --
+            # so a start costs a listing, not the pack.
+            #
+            # A failed sync must not cost a working pack: with no network (or
+            # the Hub down) a complete slot is served as it is, and
+            # HF_HUB_OFFLINE=1 skips the attempt instead of making it and
+            # failing. An empty or incomplete slot still stops with an error.
+            offline="''${HF_HUB_OFFLINE:-}"
+            case "$offline" in
+              1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) offline=1 ;;
+              *) offline=0 ;;
+            esac
+            sync_failed=0
+            if [ "$offline" = 1 ]; then
+              echo "kyojin-entrypoint: HF_HUB_OFFLINE is set, not syncing $want" >&2
             else
-              echo "kyojin-entrypoint: downloading $repo into $model_dir (first start is slow)" >&2
-              hf download "$repo" --local-dir "$model_dir"
-              printf '%s' "$repo" > "$marker"
+              echo "kyojin-entrypoint: syncing $want into $model_dir (unchanged files are skipped)" >&2
+              if [ -n "$revision" ]; then
+                hf download "$repo" --revision "$revision" --local-dir "$model_dir" || sync_failed=1
+              else
+                hf download "$repo" --local-dir "$model_dir" || sync_failed=1
+              fi
+            fi
+            # config.json is the first thing the server loads, so a non-empty
+            # one is the signal that the slot holds a pack worth serving (and
+            # that a revision matched something: a revision that matches
+            # nothing downloads no files and still exits 0).
+            if [ ! -s "$model_dir/config.json" ]; then
+              if [ "$sync_failed" = 1 ]; then
+                echo "kyojin-entrypoint: syncing $want failed and $model_dir holds no complete pack;" >&2
+                echo "  nothing to serve: restore the network or point KYOJIN_MODEL_DIR at a populated slot" >&2
+                exit 1
+              fi
+              if [ "$offline" = 1 ]; then
+                echo "kyojin-entrypoint: offline (HF_HUB_OFFLINE) and $model_dir holds no complete pack;" >&2
+                echo "  nothing to serve: unset HF_HUB_OFFLINE and start with the Hub reachable" >&2
+                exit 1
+              fi
+              echo "kyojin-entrypoint: $want left no config.json in $model_dir;" >&2
+              echo "  check the repo and revision, and note that an unreachable Hub leaves the slot untouched" >&2
+              exit 2
+            fi
+            if [ "$sync_failed" = 1 ]; then
+              echo "kyojin-entrypoint: WARNING: syncing $want failed, serving the pack already at $model_dir" >&2
+              echo "  it may lack files added upstream since it was fetched" >&2
+            fi
+            if [ "$offline" = 0 ] && [ "$sync_failed" = 0 ]; then
+              printf '%s' "$want" > "$marker"
             fi
             echo "kyojin-entrypoint: serving $flavor from $model_dir" >&2
             exec "''${KYOJIN_BIN:-/bin/kyojin-serve-$flavor}" --host 0.0.0.0 --model "$model_dir" "$@"
@@ -907,7 +964,9 @@
               # which has no pytest CI). Left out of the check until that
               # lands; harmless afterwards (grep matches nothing).
               files=$(ls tests/test_*_cpu.py | grep -v test_ablit_qwen_cpu)
-              timeout 240 pytest $files -q
+              # The container entrypoint is authored in flake.nix, so its test
+              # reads the shell out of the flake; no GPU, network or model.
+              timeout 240 pytest $files docker/test_flake_entrypoint.py -q
               runHook postCheck
             '';
             installPhase = ''
