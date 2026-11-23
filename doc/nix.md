@@ -158,10 +158,15 @@ marker file records `repo@revision` (the repo alone when no revision is
 asked for), so switching either under the same flavor errors out instead of
 serving a stale pack. `KYOJIN_MODEL_REVISION` is passed to `hf download` as
 `--revision`; a pack whose quantisations live on branches or tags needs it,
-because the default branch of such a repo carries no weights. A start that
-leaves no `config.json` in the slot stops with an error instead of serving
-an unloadable directory. Tuning cache (`~/.cache/exllamav3`) lives under
-`HOME`, which the
+because the default branch of such a repo carries no weights. A sync that
+cannot reach the Hub does not take a served pack down with it: when the slot
+already holds a pack (`config.json` present), a sync the CLI reports as failed
+is a warning and the start serves what is there, and `HF_HUB_OFFLINE=1` skips
+the sync instead of attempting it. huggingface-hub itself reports an
+unreachable Hub as a no-op on an existing directory (it exits 0 rather than
+failing), so that case also serves, with or without the variable. An empty or
+incomplete slot still stops with an error rather than serving an unloadable
+directory. Tuning cache (`~/.cache/exllamav3`) lives under `HOME`, which the
 entrypoint points at `/models/home` (override with `KYOJIN_HOME`) so a fresh
 container does not re-tune. First start still tunes GEMM kernels (around
 10 minutes with the port closed), same as bare metal. The servers answer

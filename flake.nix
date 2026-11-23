@@ -772,22 +772,53 @@
             # --local-dir is idempotent -- unchanged files are skipped, files
             # new to the repo are added, an interrupted transfer is retried --
             # so a start costs a listing, not the pack.
-            echo "kyojin-entrypoint: syncing $want into $model_dir (unchanged files are skipped)" >&2
-            if [ -n "$revision" ]; then
-              hf download "$repo" --revision "$revision" --local-dir "$model_dir"
+            #
+            # A failed sync must not cost a working pack: with no network (or
+            # the Hub down) a complete slot is served as it is, and
+            # HF_HUB_OFFLINE=1 skips the attempt instead of making it and
+            # failing. An empty or incomplete slot still stops with an error.
+            offline="''${HF_HUB_OFFLINE:-}"
+            case "$offline" in
+              1 | [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn]) offline=1 ;;
+              *) offline=0 ;;
+            esac
+            sync_failed=0
+            if [ "$offline" = 1 ]; then
+              echo "kyojin-entrypoint: HF_HUB_OFFLINE is set, not syncing $want" >&2
             else
-              hf download "$repo" --local-dir "$model_dir"
+              echo "kyojin-entrypoint: syncing $want into $model_dir (unchanged files are skipped)" >&2
+              if [ -n "$revision" ]; then
+                hf download "$repo" --revision "$revision" --local-dir "$model_dir" || sync_failed=1
+              else
+                hf download "$repo" --local-dir "$model_dir" || sync_failed=1
+              fi
             fi
-            # A revision that matches nothing, or the default branch of a
-            # branch-quantised repo, downloads no files and still exits 0; the
-            # marker would then pin an empty slot and the server would die in
-            # load(). Refuse to serve a directory that cannot be a pack.
-            if [ ! -f "$model_dir/config.json" ]; then
+            # config.json is the first thing the server loads, so a non-empty
+            # one is the signal that the slot holds a pack worth serving (and
+            # that a revision matched something: a revision that matches
+            # nothing downloads no files and still exits 0).
+            if [ ! -s "$model_dir/config.json" ]; then
+              if [ "$sync_failed" = 1 ]; then
+                echo "kyojin-entrypoint: syncing $want failed and $model_dir holds no complete pack;" >&2
+                echo "  nothing to serve: restore the network or point KYOJIN_MODEL_DIR at a populated slot" >&2
+                exit 1
+              fi
+              if [ "$offline" = 1 ]; then
+                echo "kyojin-entrypoint: offline (HF_HUB_OFFLINE) and $model_dir holds no complete pack;" >&2
+                echo "  nothing to serve: unset HF_HUB_OFFLINE and start with the Hub reachable" >&2
+                exit 1
+              fi
               echo "kyojin-entrypoint: $want left no config.json in $model_dir;" >&2
-              echo "  check the repo, and set KYOJIN_MODEL_REVISION if the weights live on a branch or tag" >&2
+              echo "  check the repo and revision, and note that an unreachable Hub leaves the slot untouched" >&2
               exit 2
             fi
-            printf '%s' "$want" > "$marker"
+            if [ "$sync_failed" = 1 ]; then
+              echo "kyojin-entrypoint: WARNING: syncing $want failed, serving the pack already at $model_dir" >&2
+              echo "  it may lack files added upstream since it was fetched" >&2
+            fi
+            if [ "$offline" = 0 ] && [ "$sync_failed" = 0 ]; then
+              printf '%s' "$want" > "$marker"
+            fi
             echo "kyojin-entrypoint: serving $flavor from $model_dir" >&2
             exec "''${KYOJIN_BIN:-/bin/kyojin-serve-$flavor}" --host 0.0.0.0 --model "$model_dir" "$@"
           '';
