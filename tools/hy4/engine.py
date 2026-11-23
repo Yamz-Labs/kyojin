@@ -21,6 +21,26 @@ CHUNK_DEFAULT = 8192
 PRIME_ROWS = int(os.environ.get("HY4_PRIME_ROWS", "2048"))           # rows per batched MTP draft-cache fill call
 
 
+def head_state_window(n: int, prime_rows: int):
+    """-> (lo, count): the prompt rows whose trunk head states the MTP draft head reads.
+
+    The draft head consumes prompt rows [lo, n-1]; lo = n-1-prime_rows when prime_rows > 0, else 0.
+    Rows before lo are never read, so prefill does not have to materialise them. prefill() and
+    _prime_draft() both take lo from here, so the collector and the consumer cannot drift apart.
+    """
+    lo = 0 if prime_rows <= 0 else max(0, n - 1 - prime_rows)
+    return lo, n - lo
+
+
+def copy_head_state_rows(out, st, s: int, e: int, lo: int):
+    """Copy the part of the chunk head state `st` (prompt rows s..e-1) that lies at or after `lo`
+    into `out`, whose row 0 is prompt row `lo`."""
+    if e <= lo:
+        return
+    a = max(s, lo)
+    out[a - lo:e - lo].copy_(st[a - s:e - s])
+
+
 WARMUP_MIN = 256        # below this many prompt tokens a warm-up compiles nothing useful: skip it
 WARMUP_PAD = 16         # row alignment of the last prefill chunk (the static buffers also keep 64 spare rows, see serve.apply_env)
 
@@ -258,15 +278,23 @@ class Hy4Engine:
         n = len(ids)
         self.phase("prefill")
         M.prefetch_engram(ids, self.chunk)
-        states, lg = [], None
+        # The MTP draft head reads the head states of rows [lo, n-1] only (see head_state_window), so
+        # prefill keeps just those rows. Collecting every row and torch.cat-ing them costs
+        # 2 x n x 3072 x 4 B of peak memory - 22.9 GiB at a 1M prompt - and OOMs there.
+        lo = head_state_window(n, self.prime_rows)[0]
+        H, lg = None, None
         for s, e in self.hf.chunk_plan(0, n, self.chunk):
             lg = M.step(ids[s:e])
-            states.append(M.head_state(M._x))
+            st = M.head_state(M._x)
             M._x = None
+            if e > lo:                      # rows before lo are never read by the draft head
+                if H is None:
+                    H = torch.empty(n - lo, st.shape[1], dtype=st.dtype, device=st.device)
+                copy_head_state_rows(H, st, s, e, lo)
             torch.cuda.synchronize()
         y = int(torch.argmax(lg))
-        H = torch.cat(states) if len(states) > 1 else states[0]
-        self._H = H
+        if H is None:
+            raise RuntimeError("prefill produced no head states")
         hcur = H[-1:].clone()
         t = time.perf_counter()
         self.last_stats["prefill_trunk_s"] = t - self._t0
@@ -280,7 +308,7 @@ class Hy4Engine:
         bench harness does one position at a time with MT.chain(.., k=1))"""
         torch, MT = self.torch, self.MT
         n = len(ids)
-        lo = 0 if self.prime_rows <= 0 else max(0, n - 1 - self.prime_rows)
+        lo = head_state_window(n, self.prime_rows)[0]       # H starts at prompt row lo
         tok = torch.tensor(ids, dtype=torch.long, device=self.dev)
         ar = MT.ar
         s = lo
@@ -289,15 +317,15 @@ class Hy4Engine:
         try:
             while s < n - 1:
                 e = min(n - 1, s + PRIME_ROWS)
-                MT.prime(tok[s + 1:e + 1], H[s:e], ar[s:e], ((e + 3) // 4) * 4)
+                MT.prime(tok[s + 1:e + 1], H[s - lo:e - lo], ar[s:e], ((e + 3) // 4) * 4)
                 s = e
             self.last_stats["prime_mode"] = "batched" if lo == 0 else f"batched tail {n - 1 - lo}"
         except Exception as ex:           # noqa: BLE001 - the draft only affects speed, never the output: fall back to the last 128 rows one by one
             print(f"draft cache fill failed ({type(ex).__name__}: {ex}); falling back to a short per-row fill", flush=True)
             torch.cuda.synchronize()
             MT.reset()
-            for j in range(max(0, n - 129), n - 1):
-                MT.chain(tok[j + 1:j + 2], H[j:j + 1], j, 1)
+            for j in range(max(lo, n - 129), n - 1):
+                MT.chain(tok[j + 1:j + 2], H[j - lo:j + 1 - lo], j, 1)
             self.last_stats["prime_mode"] = "per-row tail 128 (batched failed)"
         finally:
             if f16 is None:
